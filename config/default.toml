@@ -1,0 +1,100 @@
+# ClawSolana — default development configuration
+#
+# Copy this file to claw.toml and edit it for your environment.
+# Sensitive values (API keys, keypairs) should be passed via environment
+# variables (CLAW_LLM_API_KEY, CLAW_RPC_URL) rather than stored in this file.
+#
+# SECURITY: Never commit a config file that contains real API keys or private keys.
+
+# ── Daemon ─────────────────────────────────────────────────────────────────
+[daemon]
+# Path to the SQLite database file. Will be created if it does not exist.
+db_path = "./data/claw.db"
+# Optional PID file path
+# pid_file = "/tmp/clawd.pid"
+
+# How long to keep terminal (consumed/expired/rejected) pending-state rows
+# before purging. These rows are useful for post-mortem / audit correlation.
+terminal_retention_days = 14
+
+# How often the background purge task runs (in hours).
+# Set to 0 to disable periodic purge (startup purge still runs).
+terminal_purge_interval_hours = 6
+
+# ── Network ────────────────────────────────────────────────────────────────
+[network]
+# Options: "devnet" | "testnet" | "mainnet-beta" | "localnet"
+network = "devnet"
+
+# ── RPC ────────────────────────────────────────────────────────────────────
+[rpc]
+# Primary RPC endpoint. Override with CLAW_RPC_URL.
+primary_url = "https://api.devnet.solana.com"
+
+# Optional fallback endpoints (tried if primary is unavailable)
+fallback_urls = [
+    # "https://devnet.helius-rpc.com/?api-key=YOUR_KEY",
+]
+
+# WebSocket endpoint for subscriptions
+ws_url = "wss://api.devnet.solana.com"
+
+# Per-request timeout in milliseconds
+timeout_ms = 15000
+
+# ── Wallets ────────────────────────────────────────────────────────────────
+# One or more wallets to load at startup.
+# For development you can use a keypair JSON file generated with:
+#   solana-keygen new --outfile ~/.config/solana/devnet.json
+
+# Example: load from file
+# [[wallets]]
+# label = "devnet-hot-wallet"
+# signer_type = "local_keypair"
+# keypair_path = "~/.config/solana/devnet.json"
+
+# Example: load from base58 (for testing only — never commit real keys)
+# [[wallets]]
+# label = "test-wallet"
+# signer_type = "local_keypair"
+# keypair_base58 = "PASTE_BASE58_KEY_HERE"
+
+# ── Policy ─────────────────────────────────────────────────────────────────
+[policy]
+# When true, all mainnet transactions require explicit human approval.
+# STRONGLY recommended to keep this enabled.
+mainnet_safe_defaults = true
+
+# Programs that are explicitly allowed to be invoked.
+# If non-empty, any transaction referencing an unlisted program will be rejected.
+# Leave empty to allow all programs (appropriate for development).
+program_allowlist = [
+    # "11111111111111111111111111111111",                # System program
+    # "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token
+    # "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bC8",  # Associated Token Account
+]
+
+# Pubkeys that can never receive funds from this system.
+destination_denylist = []
+
+# ── LLM ────────────────────────────────────────────────────────────────────
+[llm]
+# Anthropic API key. Override with CLAW_LLM_API_KEY (recommended).
+api_key = ""  # Set via CLAW_LLM_API_KEY env var
+
+# Model to use. claude-sonnet-4-6 is the recommended default.
+model = "claude-sonnet-4-6"
+
+# ── API ────────────────────────────────────────────────────────────────────
+[api]
+# Local bind address. Keep this as 127.0.0.1 — never expose to 0.0.0.0
+# unless you have a reverse proxy with TLS and authentication in front.
+bind_addr = "127.0.0.1"
+port = 7070
+
+# ── Logging ────────────────────────────────────────────────────────────────
+[logging]
+# "pretty" for development, "json" for production/containers
+format = "pretty"
+# RUST_LOG compatible filter string
+level = "info,claw_gateway=debug,claw_agent_runtime=debug"

@@ -1,0 +1,25 @@
+[package]
+name        = "claw-api"
+description = "Local HTTP/WS control surface for the ClawSolana daemon"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+claw-types        = { workspace = true }
+claw-observability = { workspace = true }
+
+axum        = { workspace = true }
+tower       = { workspace = true }
+tower-http  = { workspace = true }
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+chrono      = { workspace = true }
+anyhow      = { workspace = true }
+futures     = { workspace = true }

@@ -1,0 +1,28 @@
+[package]
+name        = "claw-tool-system"
+description = "Tool registry, dispatch, and built-in Solana tools for ClawSolana"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+claw-types        = { workspace = true }
+claw-observability = { workspace = true }
+claw-solana-core  = { workspace = true }
+
+async-trait = { workspace = true }
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+schemars    = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+chrono      = { workspace = true }
+anyhow      = { workspace = true }
+bincode     = { workspace = true }
+base64      = { workspace = true }
+solana-sdk  = { workspace = true }
+solana-client = { workspace = true }

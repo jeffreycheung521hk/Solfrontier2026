@@ -1,0 +1,25 @@
+[package]
+name        = "claw-state-store"
+description = "SQLite-backed persistence layer for ClawSolana"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+claw-types        = { workspace = true }
+claw-observability = { workspace = true }
+
+sqlx       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+uuid       = { workspace = true }
+chrono     = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+tokio      = { workspace = true }
+anyhow     = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

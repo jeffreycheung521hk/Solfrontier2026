@@ -1,0 +1,12 @@
+[build]
+# Keep build artifacts in a shared target directory
+# target-dir = "target"  # default, explicit for clarity
+
+[alias]
+clawd = "run --bin clawd --"
+claw  = "run --bin claw --"
+
+# Enforce no unsafe in security-sensitive crates at the workspace level.
+# Individual crates can opt-in to unsafe with an explicit override.
+# [target.'cfg(all())'.rustflags]
+# Leave this commented; enforce via #![forbid(unsafe_code)] in each crate instead.

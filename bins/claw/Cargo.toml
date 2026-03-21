@@ -1,0 +1,24 @@
+[package]
+name        = "claw"
+description = "ClawSolana CLI — control the clawd daemon from the terminal"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "claw"
+path = "src/main.rs"
+
+[dependencies]
+claw-types = { workspace = true }
+
+tokio      = { workspace = true }
+clap       = { workspace = true }
+reqwest    = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
+chrono     = { workspace = true }
+uuid       = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name        = "clawd"
+description = "ClawSolana daemon — the always-on Solana agent control plane"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "clawd"
+path = "src/main.rs"
+
+[dependencies]
+claw-gateway      = { workspace = true }
+claw-observability = { workspace = true }
+
+tokio   = { workspace = true }
+clap    = { workspace = true }
+anyhow  = { workspace = true }
+tracing = { workspace = true }
