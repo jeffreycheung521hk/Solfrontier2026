@@ -60,16 +60,18 @@ The system is designed so that entities proposing transactions **never hold sign
 | **Audit** | Append-only SQLite, every proposal/simulation/decision/signature recorded | Live |
 | **Events** | SSE stream, session-scoped filtering, heartbeat | Live |
 | **Verification** | 4-step ed25519 check for external wallet signatures | Live |
+| **Wallet ownership** | Challenge-response proof before wallet binding (ed25519 nonce signing) | Live |
+| **Phantom bridge** | Minimal browser signing page (connect, bind, sign, submit) | Live (alpha) |
+| **LLM providers** | OpenAI (GPT-4o) and Anthropic (Claude) with auto-detection | Live |
 
 ### What Is Not Yet Complete
 
-- **External wallet connectivity** — verification layer works; browser-to-daemon Phantom bridge not finished
-- **Wallet ownership proof** — `bind_wallet` accepts pubkey without challenge-response
 - **On-chain submission** — `sendTransaction` + retry + confirmation tracking not implemented
 - **Rate limiting** — no rate limiting on API endpoints
 - **Configurable policy rules** — current policy is code-defined; no runtime policy configuration
 - **Context trimming** — `trim_if_needed()` can orphan tool_use blocks without their tool_result pairs
 - **Multi-signer orchestration** — single signer per request only
+- **External signer formalization** — `SignerType::External` config mode not yet live in daemon
 
 ---
 
@@ -164,7 +166,9 @@ AgentRole::Ops       → All except SignTransaction, SendTransaction
 | `GET` | `/sessions/:id/events` | Yes | SSE event stream |
 | `POST` | `/sessions/:id/approve` | Yes | Approve/reject pending tx |
 | `GET` | `/sessions/:id/approvals` | Yes | List approval requests |
-| `POST` | `/sessions/:id/bind-wallet` | Yes | Bind external wallet |
+| `POST` | `/sessions/:id/bind-wallet` | Yes | Bind external wallet (legacy, no proof) |
+| `POST` | `/sessions/:id/wallet-bind-challenge` | Yes | Request wallet ownership challenge |
+| `POST` | `/sessions/:id/wallet-bind-confirm` | Yes | Submit signed challenge + bind |
 | `POST` | `/sessions/:id/wallet-signatures` | Yes | Submit signed tx |
 | `GET` | `/sessions/:id/wallet-signatures` | Yes | List pending sign requests |
 
@@ -222,8 +226,9 @@ timeout_ms = 15000
 mainnet_safe_defaults = true
 
 [llm]
-model = "claude-sonnet-4-6"
-# api_key via CLAW_LLM_API_KEY env var
+provider = "openai"           # "openai" or "anthropic"
+model = "gpt-4o"              # or "claude-sonnet-4-6" for Anthropic
+# api_key via OPENAI_API_KEY or CLAW_LLM_API_KEY env var
 
 [api]
 bind_addr = "127.0.0.1"
@@ -238,8 +243,11 @@ level = "info"
 
 | Variable | Purpose |
 |----------|---------|
-| `CLAW_LLM_API_KEY` | Anthropic Claude API key |
+| `OPENAI_API_KEY` | OpenAI API key (auto-detected, sets provider to `openai`) |
+| `CLAW_LLM_API_KEY` | Anthropic Claude API key (sets provider to `anthropic`) |
+| `CLAW_LLM_PROVIDER` | Override LLM provider: `openai` or `anthropic` |
 | `CLAW_API_TOKEN` | Bearer token for HTTP API auth (auto-generated if not set) |
+| `CLAW_RPC_URL` | Override Solana RPC endpoint |
 
 ---
 
@@ -250,6 +258,7 @@ level = "info"
 - **Append-only audit** — no update/delete methods on `AuditRepository`
 - **API local-only** — hard-coded bind to `127.0.0.1`, never `0.0.0.0`
 - **Ed25519 verification** — 4-step check for external wallet signatures
+- **Wallet ownership proof** — challenge-response with session-bound nonce before binding
 - **Tool/LLM boundary** — tool outputs structurally isolated in `tool_result` content blocks with untrusted-data prefix
 - **Spend double-count protection** — `UNIQUE(transaction_id)` + `INSERT OR IGNORE`
 - **Capability dispatch** — fail-closed; unknown capabilities rejected

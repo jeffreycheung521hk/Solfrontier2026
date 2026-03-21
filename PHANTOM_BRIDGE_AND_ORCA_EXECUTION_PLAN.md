@@ -1,6 +1,6 @@
 # Phantom Bridge and Orca Execution Plan
 
-> **Status (2026-03-21):** This plan was written before the SignatureOrchestrator and durable-first work (Sessions 13+). **Phase 2 (backend production flow)** is largely complete — the orchestrator now handles adapter routing, durable pending lifecycle, and exactly-once completion. **Phase 1 (Phantom bridge)** and **Phase 3 (Orca execution)** are not yet started. The sequencing has been updated: wallet ownership proof (challenge-response) is now a prerequisite for the Phantom bridge. Orca execution is deferred to Phase 1 in the roadmap, after wallet connectivity and send/confirm are complete. For current priorities, see [TASK.md](TASK.md) and [ROADMAP.md](ROADMAP.md).
+> **Status (2026-03-21):** This plan was written before the SignatureOrchestrator and durable-first work (Sessions 13+). **Phase 2 (backend production flow)** is complete — the orchestrator handles adapter routing, durable pending lifecycle, and exactly-once completion. **Phase 1 (Phantom bridge)** is now implemented — `bridge/index.html` provides connect, challenge-response bind, signTransaction, and submit. **Wallet ownership proof** is complete — challenge-response with session-bound nonce and cross-session hijack protection. **Phase 3 (Orca execution)** is not yet started — deferred to after send/confirm pipeline. For current priorities, see [TASK.md](TASK.md) and [ROADMAP.md](ROADMAP.md).
 
 ---
 

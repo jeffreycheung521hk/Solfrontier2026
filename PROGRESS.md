@@ -1,8 +1,58 @@
 # ClawSolana — Progress Log
 
 **Last Updated:** 2026-03-21
-**Sessions:** 14 (through orchestrator, durability, foundation audit, product repositioning)
-**Tests:** 200+, zero failures
+**Sessions:** 15 (through wallet ownership proof, Phantom bridge, OpenAI support)
+**Tests:** 218, zero failures
+
+---
+
+## Session 15 — 2026-03-21 (Phase 1.1–1.2: Wallet Proof + Phantom Bridge + OpenAI)
+
+### Build status
+- `cargo check` PASS
+- `cargo test` PASS — 218 tests, zero failures
+
+### Objective
+
+Complete Phase 1.1 (wallet ownership proof) and Phase 1.2 (Phantom browser bridge). Add OpenAI LLM support. Fix cross-session binding hijack vulnerability.
+
+### Changes
+
+1. **Wallet ownership proof (A1)** — `wallet_challenge.rs` + `wallet_challenges.rs` repository + SQLite migration
+   - Challenge-response: nonce generation → Phantom signMessage → ed25519 verify → bind
+   - Session-bound: cross-session hijack protection (verify_challenge checks session_id)
+   - 9 integration tests including replay, expiry, mismatch, cross-session
+
+2. **Phantom browser bridge (A2)** — `bridge/index.html`
+   - Single-file HTML+JS, ESM CDN imports, no build step
+   - Connect Phantom → bind via challenge-response → sign pending requests → submit
+   - CORS enabled on API server (`CorsLayer`)
+
+3. **OpenAI LLM client** — `openai.rs` with auto-detection
+   - `OPENAI_API_KEY` env var auto-sets provider to `openai`
+   - Config: `provider` field, `model` field
+   - 7 unit tests for message/tool serialization mapping
+
+4. **Security fix** — `verify_challenge()` now validates `session_id` match
+   - Prevents Session B from using Session A's challenge to bind a wallet
+
+5. **Config improvements** — `wallets` field now optional (`serde(default)`), daemon starts without LLM key
+
+### Files added
+- `crates/gateway/src/wallet_challenge.rs` — challenge-response service
+- `crates/state-store/src/wallet_challenges.rs` — SQLite repository
+- `crates/state-store/src/migrations/0005_wallet_bind_challenges.sql` — migration
+- `crates/api/src/routes/wallet_challenges.rs` — API routes
+- `crates/agent-runtime/src/llm/openai.rs` — OpenAI client
+- `bridge/index.html` — Phantom signing bridge
+- `crates/gateway/tests/n19_wallet_challenge.rs` — 9 challenge tests
+- `crates/gateway/tests/n20_external_wallet_e2e.rs` — E2E wallet flow tests
+
+### Test delta
+- +9 wallet challenge tests (n19)
+- +7 OpenAI serialization tests
+- +E2E external wallet tests (n20)
+- Total: 218 tests (was ~200)
 
 ---
 

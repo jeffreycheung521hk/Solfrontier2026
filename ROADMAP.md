@@ -3,7 +3,7 @@
 **Product:** Policy-gated transaction control plane for Solana.
 
 **Created:** 2026-03-19 | **Updated:** 2026-03-21
-**Baseline:** Session 13+ complete (200+ tests, zero failures, durable-first orchestration operational)
+**Baseline:** Session 15 complete (218 tests, zero failures, durable-first orchestration + wallet ownership proof + Phantom bridge)
 **Companion:** [ARCHITECTURE_CONTROL.md](ARCHITECTURE_CONTROL.md) — system invariants, plane model, failure modes
 
 ---
@@ -25,7 +25,7 @@ The control plane is the product core. These phases define the progression from 
 | N1–N8 foundation audit (200+ tests) | ✅ Done |
 | P0-3: Session-request binding check | Open |
 | P1-2: Rate limiting | Open |
-| P1-3: `bind_wallet` challenge-response | Open |
+| P1-3: `bind_wallet` challenge-response | ✅ Done |
 | N12: Context trimming (tool_use/tool_result pairs) | Open |
 
 **Exit Criteria:** All P0 fixed, durable pending state operational, 200+ tests passing.
@@ -36,17 +36,19 @@ The control plane is the product core. These phases define the progression from 
 
 > The control plane is validated. The highest-value next step is completing the execution path. Without real wallet connectivity and on-chain submission, the control plane governs nothing downstream.
 
-#### 1.1 — Wallet Ownership Proof
-- [ ] Challenge-response for `bind_wallet`
-- [ ] `POST /sessions/:id/wallet-bind-challenge` → server generates nonce
-- [ ] `POST /sessions/:id/wallet-bind-confirm` → pubkey + signature + nonce
-- [ ] Server ed25519 verifies before binding
-- [ ] Persist challenge state (session_id, nonce, expires_at, consumed)
+#### 1.1 — Wallet Ownership Proof ✅
+- [x] Challenge-response for `bind_wallet` — `wallet_challenge.rs` + 9 tests
+- [x] `POST /sessions/:id/wallet-bind-challenge` → server generates session-bound nonce
+- [x] `POST /sessions/:id/wallet-bind-confirm` → pubkey + signature + nonce
+- [x] Server ed25519 verifies before binding
+- [x] Persist challenge state (session_id, nonce, expires_at, consumed)
+- [x] Cross-session hijack protection (session_id verified on confirm)
 
-#### 1.2 — Phantom Browser Bridge
-- [ ] Minimal HTML/JS page — connect Phantom, pull pending requests, signTransaction, POST back
-- [ ] Phantom only; no WalletConnect
-- [ ] No full UI — just the signing bridge
+#### 1.2 — Phantom Browser Bridge ✅
+- [x] Minimal HTML/JS page — `bridge/index.html`
+- [x] Connect Phantom → bind via challenge-response → signTransaction → POST back
+- [x] Phantom only; no WalletConnect
+- [x] CORS enabled on API server for local bridge
 
 #### 1.3 — External Signer Formalization
 - [ ] `SignerType::External` from deferred to live in daemon config

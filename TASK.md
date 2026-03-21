@@ -1,7 +1,7 @@
 # ClawSolana — Task Tracker
 
 **Updated:** 2026-03-21
-**Build:** cargo check PASS, cargo test PASS (200+ tests, zero failures)
+**Build:** cargo check PASS, cargo test PASS (218 tests, zero failures)
 **Roadmap:** See [ROADMAP.md](ROADMAP.md)
 
 ---
@@ -31,23 +31,21 @@
 - [x] P1-1 hardening: mark-terminal-before-remove, `purge_terminal()`, no fire-and-forget writes
 - [x] Semantic cleanup: `abort_pending()` for rollback vs `expire()` for natural TTL
 - [x] N1–N8 foundation audit — 38 targeted tests proving no regression
+- [x] A1: Wallet ownership proof — challenge-response with session-bound nonce, 9 tests (incl. cross-session hijack)
+- [x] A2: Phantom browser bridge — bridge/index.html (connect, bind, sign, submit)
+- [x] OpenAI LLM support — auto-detects OPENAI_API_KEY, provider config field, 7 tests
+- [x] CORS enabled on API server for local bridge development
+- [x] Cross-session binding hijack fix — verify_challenge checks session_id
 
 ---
 
 ## Current Priorities — Phase 1: Execution Completeness
 
-> The control plane is validated. The highest-value next step is completing the execution path: real wallet connectivity + on-chain submission. Without this, the control plane has no downstream path to govern.
+> Wallet ownership proof and Phantom bridge are implemented. Next: formalize external signer mode and complete the on-chain execution path.
 
-- [ ] **A1: Wallet ownership proof** — challenge-response for `bind_wallet`
-  - `POST /sessions/:id/wallet-bind-challenge` → server generates nonce
-  - `POST /sessions/:id/wallet-bind-confirm` → pubkey + signature + nonce
-  - Server ed25519 verifies before calling `bind_wallet()`
-  - Persist: session_id, wallet_pubkey, nonce, expires_at, consumed
+- [x] **A1: Wallet ownership proof** — ✅ Done (challenge-response, session-bound nonce, 9 tests)
 
-- [ ] **A2: Phantom browser bridge** — minimal client-side wallet connect
-  - Small HTML/JS page (not a full UI)
-  - Connect Phantom → pull pending requests → signTransaction → POST back
-  - Phantom only; no WalletConnect yet
+- [x] **A2: Phantom browser bridge** — ✅ Done (bridge/index.html, Phantom signMessage + signTransaction)
 
 - [ ] **A3: External signer formalization** — `SignerType::External` from deferred to live
   - Config can declare a wallet as external

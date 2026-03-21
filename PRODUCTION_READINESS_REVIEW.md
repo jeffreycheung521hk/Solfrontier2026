@@ -4,7 +4,8 @@
 > - **P0-1 (atomic race):** Fixed — `SignatureOrchestrator.complete()` uses atomic `DashMap::remove()`
 > - **P0-2 (request expiry):** Fixed — reaper task with 30s interval, 120s TTL
 > - **P1-1 (pending state persistence):** Fixed — SQLite-backed with lifecycle state, durable-first semantics
-> - Remaining open: P0-3 (session binding), P1-2 (rate limiting), P1-3 (wallet ownership proof), P1-4 (event durability)
+> - **P1-3 (wallet ownership proof):** Fixed — challenge-response with session-bound nonce, cross-session hijack protection
+>> Remaining open: P0-3 (session binding), P1-2 (rate limiting), P1-4 (event durability)
 > - The V2 architecture proposed in §7 has been partially implemented via `SignatureOrchestrator` + `DurablePendingState`.
 
 **Reviewer:** Principal Engineer

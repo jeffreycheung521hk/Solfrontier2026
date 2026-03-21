@@ -1,8 +1,8 @@
 # ClawSolana — Session Handoff
 
 **Last updated:** 2026-03-21
-**State:** `cargo check` PASS, `cargo test` PASS (200+ tests, zero failures)
-**Current phase:** Entering Phase 1 — Execution Completeness
+**State:** `cargo check` PASS, `cargo test` PASS (218 tests, zero failures)
+**Current phase:** Phase 1 — Execution Completeness (A1+A2 done, A3+A4 next)
 **Product positioning:** Policy-gated transaction control plane for Solana
 
 ---
@@ -28,6 +28,10 @@ ClawSolana is a transaction control plane, not just a signing tool. The core con
 | `abort_pending()` rollback | 13+ | Distinct from natural `expire()` — persistence failure cleanup |
 | Terminal row purge | 13+ | Startup + periodic (6h default), 14-day configurable retention |
 | N1–N8 foundation audit | 13+ | 38 targeted tests, no regressions found |
+| A1: Wallet ownership proof | 15 | Challenge-response, session-bound nonce, cross-session hijack fix, 9 tests |
+| A2: Phantom browser bridge | 15 | `bridge/index.html` — connect, bind, sign, submit |
+| OpenAI LLM client | 15 | Auto-detects `OPENAI_API_KEY`, provider config, 7 tests |
+| CORS on API server | 15 | Allows local bridge to call daemon |
 
 ### Current Invariants
 
@@ -45,31 +49,23 @@ ClawSolana is a transaction control plane, not just a signing tool. The core con
 |-----|----------|-------|
 | **P0-3:** Session-request binding | High | Submit endpoint doesn't verify session ownership |
 | **P1-2:** Rate limiting | Medium | No rate limiting on API endpoints |
-| **P1-3:** Wallet binding ownership proof | High | `bind_wallet` accepts bare pubkey, no challenge-response |
+| **P1-3:** Wallet binding ownership proof | ✅ Done | Challenge-response implemented with session binding |
 | **P1-4:** Durable event log | Low | Events are fire-and-forget broadcast |
 | **N12:** Context trimming pairs | Medium | `trim_if_needed()` can orphan tool_use without tool_result |
 | **N14:** On-chain submission | High | `sendTransaction` + confirmation tracking not implemented |
-| **External wallet E2E** | High | Verification layer done; browser bridge not finished |
+| **External wallet E2E** | Medium | Phantom bridge exists; needs real devnet E2E test |
 
 ---
 
 ## Recommended Next Engineering Path
 
-### Phase A — External Wallet Connectivity (highest value)
+### Phase A — External Wallet Connectivity
 
-1. **Wallet ownership proof** — challenge-response for `bind_wallet`
-   - `POST /sessions/:id/wallet-bind-challenge` → nonce
-   - `POST /sessions/:id/wallet-bind-confirm` → pubkey + signature + nonce
-   - Server ed25519 verify before binding
-
-2. **Phantom browser bridge** — minimal client page
-   - Connect wallet, pull pending requests, signTransaction, POST back
-   - Phantom only, no WalletConnect
-
+1. ~~**Wallet ownership proof**~~ — ✅ Done (challenge-response, session-bound nonce)
+2. ~~**Phantom browser bridge**~~ — ✅ Done (bridge/index.html)
 3. **External signer formalization** — `SignerType::External` from deferred to live
    - Config declares external wallet, routing works end-to-end
-
-4. **End-to-end connectivity test** — session → bind → propose → approve → sign → verify
+4. **End-to-end connectivity test** — session → bind → propose → approve → sign → verify on devnet
 
 ### Phase B — On-Chain Execution
 
