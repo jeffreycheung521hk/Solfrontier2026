@@ -23,6 +23,7 @@ pub struct ClawConfig {
     pub daemon: DaemonConfig,
     pub network: NetworkConfig,
     pub rpc: RpcConfig,
+    #[serde(default)]
     pub wallets: Vec<WalletConfig>,
     pub policy: PolicyConfig,
     pub llm: LlmConfig,
@@ -139,17 +140,25 @@ impl Default for PolicyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
-    /// Anthropic API key. Override with CLAW_LLM_API_KEY env var.
+    /// LLM provider: "anthropic" or "openai". Default: "openai".
+    #[serde(default = "default_llm_provider")]
+    pub provider: String,
+    /// API key. Override with CLAW_LLM_API_KEY env var.
     pub api_key: String,
-    /// Model to use.
+    /// Model to use. Depends on provider:
+    /// - anthropic: "claude-sonnet-4-6" (default)
+    /// - openai: "gpt-4o" (default)
     pub model: String,
 }
+
+fn default_llm_provider() -> String { "openai".to_string() }
 
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            provider: "openai".to_string(),
             api_key: "".to_string(),
-            model: "claude-sonnet-4-6".to_string(),
+            model: "gpt-4o".to_string(),
         }
     }
 }
@@ -201,6 +210,17 @@ impl ClawConfig {
         if let Ok(key) = std::env::var("CLAW_LLM_API_KEY") {
             config.llm.api_key = key;
         }
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            if config.llm.api_key.is_empty() {
+                config.llm.api_key = key;
+                if config.llm.provider != "openai" {
+                    config.llm.provider = "openai".to_string();
+                }
+            }
+        }
+        if let Ok(provider) = std::env::var("CLAW_LLM_PROVIDER") {
+            config.llm.provider = provider;
+        }
         if let Ok(url) = std::env::var("CLAW_RPC_URL") {
             config.rpc.primary_url = url;
         }
@@ -216,22 +236,36 @@ impl ClawConfig {
             rpc:     RpcConfig::default(),
             wallets: vec![],
             policy:  PolicyConfig::default(),
-            llm:     LlmConfig {
-                api_key: std::env::var("CLAW_LLM_API_KEY").unwrap_or_default(),
-                model: "claude-sonnet-4-6".to_string(),
+            llm:     {
+                // Auto-detect provider: prefer CLAW_LLM_API_KEY, fallback to OPENAI_API_KEY
+                let (provider, api_key, model) = if let Ok(key) = std::env::var("CLAW_LLM_API_KEY") {
+                    let prov = std::env::var("CLAW_LLM_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
+                    let m = if prov == "openai" { "gpt-4o" } else { "claude-sonnet-4-6" };
+                    (prov, key, m.to_string())
+                } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                    ("openai".to_string(), key, "gpt-4o".to_string())
+                } else {
+                    ("openai".to_string(), String::new(), "gpt-4o".to_string())
+                };
+                LlmConfig { provider, api_key, model }
             },
             api:     ApiConfig::default(),
             logging: LoggingConfig::default(),
         }
     }
 
-    /// Validates that required fields are present.
-    pub fn validate(&self) -> Result<(), GatewayError> {
+    /// Validates config and returns warnings for missing optional fields.
+    /// The daemon can start without an LLM key — wallet bind, signing,
+    /// and approval flows work without it. Only agent message handling
+    /// (POST /sessions/:id/messages) requires an LLM key.
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
         if self.llm.api_key.is_empty() {
-            return Err(GatewayError::Config(
-                "LLM API key is required. Set CLAW_LLM_API_KEY or llm.api_key in config.".to_string(),
-            ));
+            warnings.push(
+                "No LLM API key set. Agent message handling will be unavailable. \
+                 Set CLAW_LLM_API_KEY for full functionality.".to_string(),
+            );
         }
-        Ok(())
+        warnings
     }
 }

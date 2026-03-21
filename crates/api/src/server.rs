@@ -28,7 +28,10 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing::info;
 
 use claw_observability::HealthRegistry;
@@ -42,6 +45,7 @@ use crate::{
         health::health_handler,
         messages::send_message,
         sessions::{close_session, list_sessions, open_session},
+        wallet_challenges::{create_wallet_challenge, confirm_wallet_challenge},
         wallet_signatures::{bind_wallet, list_wallet_signatures, submit_wallet_signature},
     },
 };
@@ -73,6 +77,9 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         .route("/sessions/:id/wallet-signatures", post(submit_wallet_signature))
         .route("/sessions/:id/wallet-signatures", get(list_wallet_signatures))
         .route("/sessions/:id/bind-wallet", post(bind_wallet))
+        // Wallet ownership proof (challenge-response)
+        .route("/sessions/:id/wallet-bind-challenge", post(create_wallet_challenge))
+        .route("/sessions/:id/wallet-bind-confirm", post(confirm_wallet_challenge))
         // SSE event stream
         .route("/sessions/:id/events", get(session_events))
         .route_layer(middleware::from_fn_with_state(
@@ -81,9 +88,17 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         ))
         .with_state(state);
 
+    // CORS: Allow local bridge pages to call the daemon API.
+    // Only permits localhost origins. In production, restrict further.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     Router::new()
         .merge(public)
         .merge(protected)
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
 }
 

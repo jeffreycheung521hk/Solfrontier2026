@@ -16,6 +16,7 @@ pub mod pending_signing;
 pub mod session_mgr;
 pub mod supervisor;
 pub mod tools;
+pub mod wallet_challenge;
 
 pub use approval_store::ApprovalStore;
 pub use config::{ClawConfig, RpcConfig};

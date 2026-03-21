@@ -37,6 +37,7 @@ use claw_api::{
     AppState, ApprovalHandler, ApprovalHandlerRef, AuthToken,
     EventSubscriber, EventSubscriberRef,
     MessageHandler, MessageHandlerRef, SessionManagerRef, SessionOps,
+    WalletChallengeHandler, WalletChallengeHandlerRef, WalletChallengeInfo,
     WalletSignatureHandler, WalletSignatureHandlerRef, WalletSignatureOutcome,
     PendingWalletSignatureInfo,
 };
@@ -103,6 +104,27 @@ impl EventSubscriber for StubEventSubscriber {
         let (tx, rx) = broadcast::channel(1);
         drop(tx);
         rx
+    }
+}
+
+struct StubWalletChallengeHandler;
+
+impl WalletChallengeHandler for StubWalletChallengeHandler {
+    fn create_challenge(
+        &self,
+        _session_id: &SessionId,
+        _wallet_pubkey: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<WalletChallengeInfo, String>> + Send + '_>> {
+        Box::pin(async { Err("stub: not implemented".to_string()) })
+    }
+    fn verify_and_bind(
+        &self,
+        _session_id: &SessionId,
+        _challenge_id: &str,
+        _wallet_pubkey: &str,
+        _signature_b64: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        Box::pin(async { Err("stub: not implemented".to_string()) })
     }
 }
 
@@ -243,6 +265,7 @@ fn setup() -> TestHarness {
         approval: ApprovalHandlerRef::new(Arc::new(StubApprovalHandler)),
         events: EventSubscriberRef::new(Arc::new(StubEventSubscriber)),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(handler)),
+        wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubWalletChallengeHandler)),
         auth_token: AuthToken::new(token.clone()),
     };
 

@@ -28,6 +28,7 @@ pub mod sessions;
 pub mod spend;
 pub mod tool_traces;
 pub mod transactions;
+pub mod wallet_challenges;
 pub mod wallets;
 
 pub use audit::AuditRepository;
@@ -38,4 +39,5 @@ pub use sessions::SessionRepository;
 pub use spend::SpendRepository;
 pub use tool_traces::ToolTraceRepository;
 pub use transactions::TransactionRepository;
+pub use wallet_challenges::WalletChallengeRepository;
 pub use wallets::WalletRepository;

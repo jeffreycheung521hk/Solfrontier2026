@@ -36,13 +36,14 @@ use std::future::Future;
 use std::pin::Pin;
 
 use claw_agent_runtime::{
-    llm::{anthropic::AnthropicClient, LlmClientRef},
+    llm::{anthropic::AnthropicClient, openai::OpenAiClient, LlmClientRef},
     Agent, AgentRouter,
 };
 use claw_api::{
     AppState, ApprovalHandler, ApprovalHandlerRef, AuthToken,
     EventSubscriber, EventSubscriberRef,
     MessageHandler, MessageHandlerRef, SessionManagerRef, SessionOps,
+    WalletChallengeHandler, WalletChallengeHandlerRef, WalletChallengeInfo,
     WalletSignatureHandler, WalletSignatureHandlerRef, WalletSignatureOutcome,
     PendingWalletSignatureInfo,
 };
@@ -178,10 +179,25 @@ impl GatewayDaemon {
         );
 
         // ── 5. LLM client ─────────────────────────────────────────────────
-        let llm: LlmClientRef = Arc::new(
-            AnthropicClient::new(config.llm.api_key.clone())
-                .with_model(config.llm.model.clone()),
-        );
+        let llm: LlmClientRef = match config.llm.provider.as_str() {
+            "openai" => {
+                info!(model = %config.llm.model, "using OpenAI LLM provider");
+                Arc::new(
+                    OpenAiClient::new(config.llm.api_key.clone())
+                        .with_model(config.llm.model.clone()),
+                )
+            }
+            "anthropic" | _ => {
+                info!(model = %config.llm.model, "using Anthropic LLM provider");
+                Arc::new(
+                    AnthropicClient::new(config.llm.api_key.clone())
+                        .with_model(config.llm.model.clone()),
+                )
+            }
+        };
+        if config.llm.api_key.is_empty() {
+            warn!("no LLM API key set — agent message handling will be unavailable");
+        }
 
         // ── 6. Agent + AgentRouter ────────────────────────────────────────
         let agent        = Arc::new(Agent::new(llm.clone()));
@@ -429,12 +445,20 @@ impl GatewayDaemon {
             durable:         durable_state.clone(),
         }));
 
+        let wallet_challenge_repo = claw_state_store::WalletChallengeRepository::new(db.pool().clone());
+        let wallet_challenge_handler_ref = WalletChallengeHandlerRef::new(Arc::new(GatewayWalletChallengeHandler {
+            challenge_service: crate::wallet_challenge::WalletChallengeService::new(wallet_challenge_repo),
+            external_wallet:   external_wallet.clone(),
+            audit:             audit_repo.clone(),
+        }));
+
         let app_state = AppState {
             session_mgr:       session_ref,
             message_handler:   message_handler_ref,
             approval:          approval_handler_ref,
             events:            event_subscriber_ref,
             wallet_signatures: wallet_sig_handler_ref,
+            wallet_challenges: wallet_challenge_handler_ref,
             auth_token:        AuthToken::new(api_token),
         };
 
@@ -1147,5 +1171,82 @@ struct GatewayEventSubscriber {
 impl EventSubscriber for GatewayEventSubscriber {
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<GatewayEvent> {
         self.event_bus.subscribe()
+    }
+}
+
+// ── WalletChallengeHandler adapter ────────────────────────────────────────
+
+struct GatewayWalletChallengeHandler {
+    challenge_service: crate::wallet_challenge::WalletChallengeService,
+    external_wallet:   ExternalWalletStore,
+    audit:             AuditRepository,
+}
+
+impl WalletChallengeHandler for GatewayWalletChallengeHandler {
+    fn create_challenge(
+        &self,
+        session_id: &SessionId,
+        wallet_pubkey: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<WalletChallengeInfo, String>> + Send + '_>> {
+        let session_id = session_id.clone();
+        let wallet_pubkey = wallet_pubkey.to_string();
+        Box::pin(async move {
+            let result = self.challenge_service.create_challenge(&session_id, &wallet_pubkey).await
+                .map_err(|e| e.to_string())?;
+            Ok(WalletChallengeInfo {
+                challenge_id: result.challenge_id,
+                message: result.message,
+                expires_at: result.expires_at,
+            })
+        })
+    }
+
+    fn verify_and_bind(
+        &self,
+        session_id: &SessionId,
+        challenge_id: &str,
+        wallet_pubkey: &str,
+        signature_b64: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        let session_id = session_id.clone();
+        let challenge_id = challenge_id.to_string();
+        let wallet_pubkey = wallet_pubkey.to_string();
+        let signature_b64 = signature_b64.to_string();
+        Box::pin(async move {
+            // Decode the base64 signature.
+            let sig_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&signature_b64)
+                .map_err(|e| format!("invalid base64 signature: {e}"))?;
+
+            // Verify the challenge (includes session binding check).
+            let verified_pubkey = self.challenge_service
+                .verify_challenge(&session_id, &challenge_id, &wallet_pubkey, &sig_bytes)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // On success: bind the wallet.
+            self.external_wallet.bind_wallet(&session_id, &verified_pubkey);
+
+            // Audit the verified binding.
+            let _ = self.audit.append(
+                Some(&session_id.to_string()),
+                &challenge_id,
+                "wallet_bind_verified",
+                "challenge_response",
+                &serde_json::json!({
+                    "wallet_pubkey": verified_pubkey,
+                    "challenge_id": challenge_id,
+                }),
+                AuditSeverity::Info,
+            ).await;
+
+            info!(
+                session = %session_id,
+                wallet = %verified_pubkey,
+                "wallet bound via challenge-response ownership proof"
+            );
+
+            Ok(verified_pubkey)
+        })
     }
 }

@@ -260,6 +260,72 @@ impl EventSubscriberRef {
     }
 }
 
+/// Handles wallet ownership challenge-response flow.
+///
+/// The challenge-response proves that a client controls the private key
+/// of the wallet pubkey before `bind_wallet()` is called.
+pub trait WalletChallengeHandler: Send + Sync + 'static {
+    /// Create a challenge for the given session and wallet pubkey.
+    /// Returns challenge_id, message to sign, and expiry.
+    fn create_challenge(
+        &self,
+        session_id: &SessionId,
+        wallet_pubkey: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<WalletChallengeInfo, String>> + Send + '_>>;
+
+    /// Verify a challenge response and bind the wallet on success.
+    /// Returns the verified wallet pubkey.
+    fn verify_and_bind(
+        &self,
+        session_id: &SessionId,
+        challenge_id: &str,
+        wallet_pubkey: &str,
+        signature_b64: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
+}
+
+/// Info returned when a challenge is created.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletChallengeInfo {
+    /// The challenge ID (for the confirm step).
+    pub challenge_id: String,
+    /// The canonical message the client must sign.
+    pub message: String,
+    /// When this challenge expires (Unix ms).
+    pub expires_at: i64,
+}
+
+/// A cloneable reference to a `WalletChallengeHandler` implementation.
+#[derive(Clone)]
+pub struct WalletChallengeHandlerRef(pub Arc<dyn WalletChallengeHandler>);
+
+impl WalletChallengeHandlerRef {
+    /// Wraps a `WalletChallengeHandler` implementation.
+    pub fn new(inner: Arc<dyn WalletChallengeHandler>) -> Self {
+        Self(inner)
+    }
+
+    /// Create a challenge.
+    pub async fn create_challenge(
+        &self,
+        session_id: &SessionId,
+        wallet_pubkey: &str,
+    ) -> Result<WalletChallengeInfo, String> {
+        self.0.create_challenge(session_id, wallet_pubkey).await
+    }
+
+    /// Verify and bind.
+    pub async fn verify_and_bind(
+        &self,
+        session_id: &SessionId,
+        challenge_id: &str,
+        wallet_pubkey: &str,
+        signature_b64: &str,
+    ) -> Result<String, String> {
+        self.0.verify_and_bind(session_id, challenge_id, wallet_pubkey, signature_b64).await
+    }
+}
+
 /// The shared state injected into every route handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -273,6 +339,8 @@ pub struct AppState {
     pub events:              EventSubscriberRef,
     /// External wallet signature handling.
     pub wallet_signatures:   WalletSignatureHandlerRef,
+    /// Wallet ownership challenge-response.
+    pub wallet_challenges:   WalletChallengeHandlerRef,
     /// Bearer token for API authentication.
     pub auth_token:          AuthToken,
 }

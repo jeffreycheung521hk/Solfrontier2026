@@ -25,6 +25,7 @@ pub use server::{create_router, start};
 pub use state::{
     AppState, ApprovalHandler, ApprovalHandlerRef, EventSubscriber, EventSubscriberRef,
     MessageHandler, MessageHandlerRef, SessionManagerRef, SessionOps,
+    WalletChallengeHandler, WalletChallengeHandlerRef, WalletChallengeInfo,
     WalletSignatureHandler, WalletSignatureHandlerRef, WalletSignatureOutcome,
     PendingWalletSignatureInfo,
 };
