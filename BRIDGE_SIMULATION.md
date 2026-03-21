@@ -1,5 +1,7 @@
 # External Signer Bridge Simulation
 
+> **Status (2026-03-21):** The bridge simulation tests described here are still valid and passing. Since this document was written, the signing path now routes through `SignatureOrchestrator` rather than direct `ExternalWalletStore`. The simulation approach (in-process axum Router + tower oneshot) remains the same pattern.
+
 ## Purpose
 
 This document describes how the external signer bridge is tested **without a real wallet** (Phantom, Ledger, etc.). The backend is wallet-provider agnostic. "External signer" means any client-side signing workflow.

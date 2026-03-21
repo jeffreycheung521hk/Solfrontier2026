@@ -1,5 +1,7 @@
 # External Signer Hardening Plan
 
+> **Status (2026-03-21):** All three hardening passes (PASS 1–3) are **complete**. The items in this plan were implemented in Sessions 11–13. Additionally, the SignatureOrchestrator (Session 13+) supersedes the direct `ExternalWalletStore` flow described here — verification now routes through `orchestrator.complete()`. This document is retained as historical design context. For current status, see [TASK.md](TASK.md) and [HANDOFF.md](HANDOFF.md).
+
 ## Purpose
 
 This document defines the safe, step-by-step hardening plan for the **External Signer Bridge** in ClawSolana.

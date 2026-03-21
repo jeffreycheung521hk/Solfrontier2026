@@ -1,10 +1,38 @@
 # ClawSolana
 
-**Alpha-stage Solana signing orchestration gateway — Rust-first, approval-gated, restart-safe.**
+**Policy-gated transaction control plane for Solana.**
 
-ClawSolana is a local daemon (`clawd`) that connects an AI agent (Claude / Anthropic LLM) to the Solana blockchain via a typed tool system, a policy-gated transaction pipeline, and a durable signature orchestration layer. Users interact via HTTP API or CLI client (`claw`).
+ClawSolana is a Rust-native daemon that sits between intent sources (AI agents, operators, automated services) and signing authorities (wallets, signers) on Solana. It enforces a compile-time-guaranteed pipeline — **simulate → policy → approve → sign → verify** — ensuring no transaction reaches a signer without passing simulation, policy evaluation, and (where required) human approval.
 
-> **Status: Alpha.** Core orchestration, approval flow, durability, and capability boundaries are implemented and tested. Real external wallet connectivity (Phantom bridge) is still under active development. This is not a production-ready wallet product.
+The system is designed so that entities proposing transactions **never hold signing authority**, and entities holding signing authority **never see a transaction the control plane hasn't vetted**.
+
+> **Status: Alpha.** Core control plane, policy enforcement, durable pending lifecycle, and capability boundaries are implemented and tested (200+ tests). External wallet browser bridge and on-chain submission are under active development. This is not a production-ready wallet product.
+
+---
+
+## What This System Is
+
+- A **transaction control plane** — governs which transactions proceed, under what conditions, with what approvals
+- A **policy enforcement layer** — evaluates spend limits, approval rules, and capability boundaries before any transaction reaches a signer
+- A **signing orchestrator** — routes approved transactions to the correct signing authority (local keypair, external wallet, future: MPC/hardware)
+- An **audit system** — every proposal, simulation, policy decision, approval, and signature is recorded to append-only SQLite
+- An **agent-safe execution boundary** — AI agents can propose actions but are structurally prevented from signing or sending transactions
+
+## What This System Is Not
+
+- **Not a wallet** — does not hold, manage, or custody private keys in the wallet-product sense
+- **Not a signing proxy** — a proxy forwards requests; ClawSolana *evaluates* requests against policy, *gates* them through approval, *tracks* spend, and *audits* every step
+- **Not a frontend dApp** — backend daemon with HTTP API; the planned Phantom bridge is a minimal signing client, not a user-facing application
+- **Not an RPC abstraction** — uses RPC for simulation and (planned) submission, not as a general proxy
+
+## How It Differs
+
+| System | Role | ClawSolana's relationship |
+|--------|------|--------------------------|
+| **Wallet** (Phantom, Backpack) | Holds keys, signs when user approves | ClawSolana is **upstream** — decides which transactions should reach a wallet |
+| **RPC endpoint** (Helius, Triton) | Submits transactions to Solana | ClawSolana is **upstream** — decides which signed transactions should be submitted |
+| **Signer service** (Turnkey, Fireblocks) | Manages key material, signs on request | ClawSolana is **upstream** — governs which signing requests are issued |
+| **Agent framework** (LangChain, AutoGPT) | Generates intents and tool calls | ClawSolana is **downstream** — receives proposals from agents and subjects them to the full pipeline |
 
 ---
 
@@ -13,66 +41,75 @@ ClawSolana is a local daemon (`clawd`) that connects an AI agent (Claude / Anthr
 | Metric | Value |
 |--------|-------|
 | **Build** | `cargo check` PASS |
-| **Tests** | 200 tests, zero failures |
+| **Tests** | 200+ tests, zero failures |
 | **Last updated** | 2026-03-21 |
-| **Stage** | Alpha — architecture prototype with real test coverage |
+| **Stage** | Alpha — infrastructure prototype with real test coverage |
 | **Production readiness** | NOT PRODUCTION-READY |
 
-### What Works
+### Current Capabilities
 
-- Compile-time enforced simulation-before-signing (typestate pipeline)
-- Per-session capability narrowing by agent role (no role grants `SignTransaction`)
-- Human-in-the-loop approval with background signing resume
-- Signature orchestrator with adapter routing (local + external wallet adapters)
-- Durable pending state lifecycle (SQLite-backed, survives daemon restart)
-- Durable-first semantics: no `request_id` exposed without durable backing
-- Startup recovery with TTL-based expiry of stale pending requests
-- Exactly-once completion semantics via atomic consume-on-attempt
-- Full audit trail (append-only SQLite)
-- Spend tracking with double-count protection (`INSERT OR IGNORE`)
-- Native Anthropic tool_use/tool_result content blocks (structurally isolated)
-- SSE event stream with session-scoped filtering
-- Ed25519 verification for external wallet signatures (4-step check)
-- Compute budget instruction prepend (idempotent, single-pass)
-- Orca Whirlpool read-only tools (pool info, quote, validation)
-- API token hardening, `#![forbid(unsafe_code)]` in critical crates
-- Periodic terminal-row purge (configurable retention)
+| Layer | Capability | Status |
+|-------|-----------|--------|
+| **Pipeline** | Typestate-enforced simulate → policy → approve → sign | Compile-time guaranteed |
+| **Policy** | Spend caps, daily limits, mainnet-safe defaults, human-approval rules | Live |
+| **Approval** | Async human-in-the-loop with background resume, one-time-actionable | Live, durable-first |
+| **Orchestrator** | Local + external wallet adapter routing, exactly-once completion | Live |
+| **Durability** | SQLite-backed pending state with lifecycle (pending/consumed/expired/rejected) | Live, restart-safe |
+| **Capability** | Per-session role narrowing; no role grants SignTransaction or SendTransaction | Live |
+| **Spend** | Cumulative tracking with INSERT OR IGNORE dedup, policy-aware | Live |
+| **Audit** | Append-only SQLite, every proposal/simulation/decision/signature recorded | Live |
+| **Events** | SSE stream, session-scoped filtering, heartbeat | Live |
+| **Verification** | 4-step ed25519 check for external wallet signatures | Live |
 
 ### What Is Not Yet Complete
 
-- **External wallet connectivity** — the Phantom bridge protocol is implemented at the verification layer, but end-to-end browser-to-daemon wallet-connect flow is not yet finished
-- **On-chain transaction submission** — `sendTransaction` + retry + confirmation tracking not yet implemented
+- **External wallet connectivity** — verification layer works; browser-to-daemon Phantom bridge not finished
+- **Wallet ownership proof** — `bind_wallet` accepts pubkey without challenge-response
+- **On-chain submission** — `sendTransaction` + retry + confirmation tracking not implemented
 - **Rate limiting** — no rate limiting on API endpoints
-- **Wallet binding ownership proof** — `bind_wallet` accepts pubkey without challenge-response
+- **Configurable policy rules** — current policy is code-defined; no runtime policy configuration
 - **Context trimming** — `trim_if_needed()` can orphan tool_use blocks without their tool_result pairs
-- **Ledger / hardware signer support** — only `LocalKeypair` signer type is supported
-- **Multi-protocol DeFi execution** — Orca tools are read-only; swap/LP execution is Phase 1
+- **Multi-signer orchestration** — single signer per request only
 
 ---
 
 ## Architecture
 
 ```
-claw-types (zero deps) ← shared vocabulary
-    ↓
-claw-observability, claw-state-store, claw-solana-core
-    ↓
-claw-wallet-engine, claw-risk-engine, claw-tool-system
-    ↓
-claw-agent-runtime, claw-channels, claw-api
-    ↓
-claw-gateway (orchestrator) → SessionManager, EventBus, SignatureOrchestrator
-    ↓
-bins/clawd (daemon), bins/claw (CLI client)
+┌─────────────────────────────────────────────────────────────┐
+│                     INTENT SOURCES                          │
+│   AI Agents  │  Operators  │  Services  │  Dashboards       │
+└──────┬───────────┬─────────────┬──────────────┬─────────────┘
+       │           │             │              │
+       ▼           ▼             ▼              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 CLAWSOLANA CONTROL PLANE                     │
+│                                                             │
+│  Capability Dispatch → Typestate Pipeline → Orchestrator    │
+│  (role check,          (simulate,           (adapter route, │
+│   tool gate,            policy,              pending life-  │
+│   fail-closed)          approval)            cycle, verify) │
+│                                                             │
+│  Durable State  │  Spend Tracking  │  Audit + Events        │
+│  (SQLite,        (dedup,            (append-only,            │
+│   lifecycle,      policy context)    SSE broadcast)          │
+│   recovery)                                                 │
+└──────┬──────────────────────────────────┬───────────────────┘
+       │                                  │
+       ▼                                  ▼
+┌──────────────────┐          ┌────────────────────────┐
+│  LOCAL WALLET     │          │  EXTERNAL WALLET        │
+│  ADAPTER          │          │  ADAPTER                │
+│  (SecretKeystore, │          │  (unsigned tx → client, │
+│   sync sign)      │          │   client signs,         │
+│                   │          │   4-step ed25519 verify) │
+└──────┬────────────┘          └───────────┬─────────────┘
+       │                                   │
+       ▼                                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    SOLANA NETWORK                            │
+└─────────────────────────────────────────────────────────────┘
 ```
-
-### Key architectural boundaries
-
-| Boundary | Control Plane | Execution Plane |
-|----------|--------------|-----------------|
-| **Owns** | Simulation, policy, approval, audit, spend, events | Wallet adapters, signing, verification, pending lifecycle |
-| **Store** | ApprovalStore, PendingSigningStore | SignatureOrchestrator pending map |
-| **Durability** | DurablePendingState (SQLite write-through) | Orchestrator recovery via `recover_pending()` |
 
 ### Crate Overview (13 core + 2 binaries)
 
@@ -104,6 +141,17 @@ TransactionProposal
 
 Each stage transition is enforced at compile time. You cannot call `sign()` without a valid `ApprovedTransaction`.
 
+### Capability Model
+
+```
+AgentRole::Research  → ReadWallet, ReadChain, SimulateTransaction
+AgentRole::Execution → + BuildTransaction, ProposeSigning
+AgentRole::Risk      → ReadChain, ReadWallet, ManageSubscriptions
+AgentRole::Ops       → All except SignTransaction, SendTransaction
+```
+
+`SignTransaction` and `SendTransaction` are **never** granted to any agent role. Signing authority stays in gateway infrastructure.
+
 ### HTTP API Surface (127.0.0.1:7070)
 
 | Method | Path | Auth | Purpose |
@@ -120,16 +168,18 @@ Each stage transition is enforced at compile time. You cannot call `sign()` with
 | `POST` | `/sessions/:id/wallet-signatures` | Yes | Submit signed tx |
 | `GET` | `/sessions/:id/wallet-signatures` | Yes | List pending sign requests |
 
-### Capability Model
+---
 
-```
-AgentRole::Research  → ReadWallet, ReadChain, SimulateTransaction
-AgentRole::Execution → + BuildTransaction, ProposeSigning
-AgentRole::Risk      → ReadChain, ReadWallet, ManageSubscriptions
-AgentRole::Ops       → All except SignTransaction, SendTransaction
-```
+## Roadmap
 
-`SignTransaction` and `SendTransaction` are **never** granted to any agent role. Signing authority stays in gateway infrastructure.
+See [ROADMAP.md](ROADMAP.md) for the full phased plan.
+
+| Phase | Focus | Status |
+|-------|-------|--------|
+| **Phase 0** | Production readiness — typestate pipeline, durability, orchestrator | **Near complete** |
+| **Phase 1** | Execution completeness — Phantom bridge, wallet proof, sendTransaction | **Next** |
+| **Phase 2** | Policy engine expansion — configurable rules, approval matrix, signer constraints | Planned |
+| **Phase 3** | Enterprise control plane — multi-signer, MPC integration, treasury workflows | Planned |
 
 ---
 
@@ -139,10 +189,10 @@ AgentRole::Ops       → All except SignTransaction, SendTransaction
 # Clone and verify build
 cargo check
 
-# Run all tests (200 tests, ~1 second)
+# Run all tests (200+ tests, ~1 second)
 cargo test
 
-# Review project status
+# Review current priorities
 cat TASK.md
 ```
 
@@ -223,42 +273,6 @@ See [PRODUCTION_READINESS_REVIEW.md](PRODUCTION_READINESS_REVIEW.md) for full de
 | Event durability | Open | Events are fire-and-forget broadcast, no replay |
 | On-chain submission | Open | `sendTransaction` not yet implemented |
 | External wallet E2E | Open | Verification layer done; browser bridge not finished |
-
----
-
-## Project Structure
-
-```
-ClawSolana/
-├── bins/
-│   ├── claw/                    # CLI client binary
-│   └── clawd/                   # Daemon binary
-├── crates/
-│   ├── agent-runtime/           # ReAct loop, LLM client, personas
-│   ├── api/                     # Axum HTTP server, auth, routes
-│   ├── channels/                # Channel adapters
-│   ├── gateway/                 # Control plane, orchestrator, durable pending state
-│   │   └── tests/               # Integration tests (n6, n7, n10, n15, n16, n18)
-│   ├── observability/           # Logging, metrics, health
-│   ├── risk-engine/             # Policy evaluation, spend tracking
-│   ├── solana-core/             # RPC, simulation, blockhash, compute
-│   ├── state-store/             # SQLite persistence (audit, spend, pending state)
-│   ├── tool-system/             # Tool registry, dispatch, capabilities
-│   │   └── tools/protocols/     # Protocol-specific tools (Orca)
-│   ├── types/                   # Shared domain types
-│   └── wallet-engine/           # Signing pipeline, keystore
-├── config/
-│   └── default.toml             # Default configuration
-├── docs/
-│   └── threat-model.md          # Security threat model
-├── scripts/
-│   └── simulate_bridge.sh       # Bridge simulation script
-├── Cargo.toml                   # Workspace root
-├── TASK.md                      # Task tracker
-├── PROGRESS.md                  # Session-by-session development log
-├── HANDOFF.md                   # Session handoff status
-└── PRODUCTION_READINESS_REVIEW.md
-```
 
 ---
 

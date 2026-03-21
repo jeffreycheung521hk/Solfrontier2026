@@ -1,8 +1,49 @@
 # ClawSolana — Progress Log
 
 **Last Updated:** 2026-03-21
-**Sessions:** 13+ (through orchestrator integration, durability hardening, foundation audit)
-**Tests:** 200, zero failures
+**Sessions:** 14 (through orchestrator, durability, foundation audit, product repositioning)
+**Tests:** 200+, zero failures
+
+---
+
+## Session 14 — 2026-03-21 (Product Repositioning — Transaction Control Plane)
+
+### Build status
+- `cargo check` PASS
+- `cargo test` PASS — 200+ tests, zero failures
+- No code changes in this session — product-level refactor only
+
+### Objective
+
+Upgrade the product definition from "signing orchestration gateway" to "policy-gated transaction control plane for Solana." This is alignment with existing capabilities, not rebranding — the system already enforces policy, gates approvals, tracks spend, audits every step, and prevents agents from holding signing authority.
+
+### Changes
+
+1. **README.md** — replaced opening definition; added "What This System Is / Is Not" and "How It Differs" sections; restructured around control plane framing
+2. **ROADMAP.md** — restructured into 3 core control plane phases (Execution Completeness → Policy Engine → Enterprise Control Plane) + separate "Execution Adapters" section for protocol integrations; removed phase numbers from DeFi/protocol work
+3. **TASK.md** — aligned priorities with Phase 1 (Execution Completeness)
+4. **HANDOFF.md** — updated current phase to "Phase 1 — Execution Completeness"; added paragraph on why Phantom integration is critical
+5. **PROGRESS.md** — this entry
+
+### Key decisions
+
+- **Control plane = product core.** The pipeline (simulate → policy → approve → sign → verify), capability boundaries, durability, and audit trail are the product. Protocol integrations (Orca, Solend, Jupiter) are downstream applications.
+- **DeFi adapters are not phases.** They are orthogonal to control plane progression and should not gate core infrastructure work.
+- **Phase 1 priority is execution completeness:** wallet ownership proof, Phantom bridge, sendTransaction, confirmation tracking. This transforms the control plane from "validated but disconnected" to "governing real wallet operations."
+
+### Files changed
+```
+README.md          — product definition upgrade
+ROADMAP.md         — restructured phases + execution adapters
+TASK.md            — priority reorder
+HANDOFF.md         — phase + direction update
+PROGRESS.md        — this entry
+EXTERNAL_SIGNER_HARDENING_PLAN.md    — status note (completed)
+PHANTOM_BRIDGE_AND_ORCA_EXECUTION_PLAN.md — status note (partially superseded)
+PRODUCTION_READINESS_REVIEW.md       — status note (P0-1/P0-2/P1-1 resolved)
+ARCHITECTURE_CONTROL.md              — status note (INV-9/INV-10 additions)
+BRIDGE_SIMULATION.md                 — status note (still valid)
+```
 
 ---
 

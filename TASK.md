@@ -1,105 +1,101 @@
 # ClawSolana — Task Tracker
 
 **Updated:** 2026-03-21
-**Build:** cargo check PASS, cargo test PASS (200 tests, zero failures)
-**Roadmap:** See [ROADMAP.md](ROADMAP.md) — North Star: Autonomous & Intent-Based DeFi Orchestrator
+**Build:** cargo check PASS, cargo test PASS (200+ tests, zero failures)
+**Roadmap:** See [ROADMAP.md](ROADMAP.md)
 
 ---
 
-## Completed (Sessions 1–10)
+## Completed
 
+### Sessions 1–10: N1–N8 Foundation
 - [x] P1–P7: Security baseline (typestate pipeline, audit, tool boundary, capability enforcement, no unsafe)
-- [x] N1: Per-session capability narrowing — `CapabilitySet::for_role(AgentRole)` with 9 tests
-- [x] N2: Human approval round-trip — `ApprovalStore` + `POST /approve` + `GET /approvals` + audit + events
-- [x] N3: SSE event stream — `GET /sessions/:id/events` with session-scoped filtering, lag handling, 30s heartbeat
-- [x] N4: Wallet loading at startup — `LocalKeypair` from file or base58 into `SecretKeystore`
-- [x] N5: Sign-path resume — `SubmitForSigningTool` + `PendingSigningStore` + `ApprovalMode::HumanGranted` + background signing task
-- [x] STEP 4: Orca read-only tools — `orca_get_whirlpool`, `orca_get_quote`, `orca_check_pool` with 5 tests
-- [x] N6: Capability wiring fix (`ProposeSigning`) + integration smoke test (7 tests) — approve/reject/duplicate/typestate/capability/events/audit
-- [x] N7: Spend tracking accumulator — SQLite `spend_ledger`, `SpendRepository`, wired into signing tool + policy eval, 7 tests
-- [x] N8: Native tool_result blocks — structured `ContentBlock` types, Anthropic-native tool_use/tool_result blocks, 8 new tests
-- [x] N9: Compute budget prepend — `prepend_compute_budget()`, idempotent, single-pass before simulation, finalized tx in AwaitingApproval, 6 new tests
-- [x] N10A/N11: External signer bridge — `ExternalWalletStore`, session-wallet binding, signed tx verification (message bytes + signer), `WalletSignatureHandler` trait + API routes, audit + SSE events, 10 new tests
-- [x] N10B: External signer hardening — signature index fix, rejection audit logs, transaction_id in rejection events, pending_for_session implemented, blockhash/CU tampering tests, 3 new tests
-- [x] N10C: Verification layer — `verify_signed_tx()` with 4-step ed25519, `submit_signed_transaction()` store-level handler, `VerifyError`/`SubmitError` types, 8 new tests in n10a
-- [x] N10D: HTTP bridge simulation — 3 HTTP round-trip tests (happy path, tampered message, wrong signer) via axum Router + tower::ServiceExt
-- [x] N10E: Daemon integration tests — 3 tests with real SQLite audit/spend + EventBus (concurrent race exactly-once, restart resilience, full approval→external sign flow)
-- [x] N10F: Production readiness review — P0/P1/P2 issue registry, V2 architecture proposal (persistent store, idempotency keys, event durability, reaper, metrics)
-- [x] N15: Signature Orchestrator skeleton — `SignatureOrchestrator`, `WalletAdapter` trait, `LocalWalletAdapter`, `ExternalWalletAdapter`, `ExternalWalletBindings` read-only trait, pending-only lifecycle, exactly-once semantics via atomic `DashMap::remove()`, `DuplicateRequestId` rejection, consume-on-attempt `complete()`/`expire()`, reaper support (`expired_candidates()`), 12 new tests
-- [x] STEP 5: Orchestrator integration — `SubmitForSigningTool`, `resume_after_approval`, `submit_signed_tx_inner` routed through `SignatureOrchestrator`; expiry reaper wired in daemon
-- [x] STEP 6: Orchestrator integration tests — 13 tests (auto/human approved × local/external, tampered completion, race, expiry, metadata cleanup)
-- [x] P0-1: Atomic completion — `SignatureOrchestrator.complete()` via atomic `DashMap::remove()` (consume-on-attempt)
-- [x] P0-2: Request expiry reaper — Tokio interval task (30s check, 120s TTL), `WalletSignatureExpired` events
-- [x] P1-1: Durable pending state — SQLite tables with explicit lifecycle state (`pending`/`consumed`/`expired`/`rejected`), startup recovery, durable-first create semantics, atomic signature+meta persist, `abort_pending()` rollback
-- [x] P1-1 hardening: mark-terminal-before-remove ordering, `purge_terminal()` with 14-day configurable retention, startup + periodic purge, no fire-and-forget writes
-- [x] Semantic cleanup: `abort_pending()` for rollback vs `expire()` for natural TTL, `persist_signature_and_meta()` atomic DB transaction
-- [x] N1–N8 foundation audit — 38 targeted tests proving no regression from orchestrator/durability work
+- [x] N1: Per-session capability narrowing — `CapabilitySet::for_role(AgentRole)` with 11 tests
+- [x] N2: Human approval round-trip — `ApprovalStore` + API routes + audit + events
+- [x] N3: SSE event stream — session-scoped filtering, lag handling, 30s heartbeat
+- [x] N4: Wallet loading at startup — `LocalKeypair` from file or base58
+- [x] N5: Sign-path resume — park/signal/take + background signing task
+- [x] N6: Capability wiring + integration smoke test (7 tests)
+- [x] N7: Spend tracking accumulator — SQLite spend_ledger, INSERT OR IGNORE dedup, 7 tests
+- [x] N8: Native tool_result blocks — structured ContentBlock types, 8 tests
+- [x] N9: Compute budget prepend — idempotent, single-pass before simulation, 6 tests
+- [x] N10A–F: External signer bridge — session-wallet binding, ed25519 verification (4-step), HTTP bridge simulation, daemon integration, production readiness review
+
+### Sessions 13+: Orchestrator & Durability
+- [x] N15: Signature Orchestrator — adapter dispatch, pending lifecycle, exactly-once semantics, 12 tests
+- [x] STEP 5: Orchestrator integration — SubmitForSigningTool + resume + handler routed through orchestrator
+- [x] STEP 6: Orchestrator integration tests — 13 tests (auto/human × local/external, race, expiry)
+- [x] P0-1: Atomic completion — `SignatureOrchestrator.complete()` via atomic `DashMap::remove()`
+- [x] P0-2: Request expiry reaper — 30s interval, 120s TTL, `WalletSignatureExpired` events
+- [x] P1-1: Durable pending state — SQLite lifecycle state, startup recovery, durable-first create
+- [x] P1-1 hardening: mark-terminal-before-remove, `purge_terminal()`, no fire-and-forget writes
+- [x] Semantic cleanup: `abort_pending()` for rollback vs `expire()` for natural TTL
+- [x] N1–N8 foundation audit — 38 targeted tests proving no regression
 
 ---
 
-## Current Phase: Phase 0 — Production Readiness & V1 Foundation
+## Current Priorities — Phase 1: Execution Completeness
 
-> After completing Phase 0, we proceed strictly to Phase 1 per [ROADMAP.md](ROADMAP.md).
+> The control plane is validated. The highest-value next step is completing the execution path: real wallet connectivity + on-chain submission. Without this, the control plane has no downstream path to govern.
 
-### Remaining P0 Items
+- [ ] **A1: Wallet ownership proof** — challenge-response for `bind_wallet`
+  - `POST /sessions/:id/wallet-bind-challenge` → server generates nonce
+  - `POST /sessions/:id/wallet-bind-confirm` → pubkey + signature + nonce
+  - Server ed25519 verifies before calling `bind_wallet()`
+  - Persist: session_id, wallet_pubkey, nonce, expires_at, consumed
 
-- [ ] **P0-3:** Session-request binding — verify session_id ownership before accepting wallet signature submissions
-  - **Where:** `crates/claw-api/src/routes/wallet_signatures.rs`
-  - **Fix:** Add session_id guard on submit endpoint
+- [ ] **A2: Phantom browser bridge** — minimal client-side wallet connect
+  - Small HTML/JS page (not a full UI)
+  - Connect Phantom → pull pending requests → signTransaction → POST back
+  - Phantom only; no WalletConnect yet
 
-### Remaining P1 Hardening
+- [ ] **A3: External signer formalization** — `SignerType::External` from deferred to live
+  - Config can declare a wallet as external
+  - Signing tool routes to external pending path (not local default signer)
+  - Session binding + orchestrator routing works end-to-end
 
-- [x] **P1-1:** Pending state persistence — DONE (durable-first, SQLite lifecycle state, startup recovery)
-- [ ] **P1-2:** Rate limiting on submit endpoint (Tower middleware)
-- [ ] **P1-3:** `bind_wallet` challenge-response (signed nonce ownership proof)
-- [ ] **P1-4:** Durable event log (SQLite persistence + replay endpoint)
+- [ ] **A4: End-to-end connectivity test** — manual or semi-automated
+  - session → bind wallet (with challenge) → agent proposes tx → approval → external sign → verify → accepted
 
-### Technical Debt & Foundation
+### Phase B — On-Chain Execution
 
-- [ ] **N12:** Context trimming preserves tool_use/tool_result pairs atomically
-  - **Where:** `crates/agent-runtime/src/llm/context.rs` → `trim_if_needed()`
+- [ ] **B1: sendTransaction** — submit verified signed tx to Solana RPC
+  - `send_raw_transaction` → get signature → audit → `TransactionSubmitted` event
+- [ ] **B2: Confirmation tracking** — poll or websocket
+  - Status: submitted → confirmed → finalized → failed/dropped/expired
+- [ ] **B3: Basic retry / rebroadcast policy**
+  - Same signed bytes can be resent; max retry count; blockhash expired = fail
+  - No auto-resign or replacement tx in V1
+
+### Phase C — Hardening & Operational Readiness
+
+- [ ] **C1: Rate limiting** — per API token, per session, message size limit, 429 response
+- [ ] **C2: Context trimming fix (N12)** — trim in tool_use/tool_result pairs, not individual entries
+- [ ] **C3: Metrics / operational visibility** — basic counters for pending/signed/expired/rejected
+- [ ] **C4: `bind_wallet` persistence** — if needed for cross-restart session continuity
+
+### Remaining Phase 0 Items (fix alongside or before Phase A)
+
+- [ ] **P0-3:** Session-request binding — verify session_id ownership before accepting wallet signatures
 - [ ] **N13:** Two-pass compute budget optimization (simulate → tighten CU → re-simulate)
-- [ ] **N14:** On-chain transaction submission (`sendTransaction` + retry + confirmation tracking)
 - [ ] Clean up compiler warnings (unused imports, missing docs)
 
-### Phase 0 Exit Criteria
-- All P0 fixed, P1-1 through P1-4 resolved
-- Transactions actually land on devnet via `sendTransaction`
-- 200+ tests passing ✅ (achieved: 200)
-
 ---
 
-## Up Next: Phase 1 — Single-Protocol DeFi Execution (Orca)
+## Deferred (Not Current Priority)
 
-> Full details in [ROADMAP.md](ROADMAP.md) Phase 1. Do NOT start until Phase 0 exit criteria are met.
-
-Key deliverables:
-- `DeFiAction` trait + `ProtocolAdapter` abstraction
-- Orca swap/LP execution tools (replacing read-only V1)
-- `TransactionComposer` for multi-instruction atomic bundling
-- Phantom Bridge E2E (browser → sign → devnet)
-- Pool state analysis tools (tick distribution, IL, PnL)
-
----
-
-## Remaining Gaps (Documented, Not Bugs — Addressed in Roadmap)
-
-### Deferred to Phase 1
-- Orca swap execution (currently read-only)
+### Phase 1+ (after Phase A/B/C)
+- Orca swap execution (currently read-only tools only)
 - Full CL tick-array quote (V1 uses constant product approximation)
-- `orca_check_pool` configurable allowlist
-
-### Deferred to Phase 2+
+- `DeFiAction` trait + `ProtocolAdapter` abstraction
 - Multi-protocol support (Solend, Jupiter)
-- Cross-protocol risk engine (Health Factor simulator, IL calculator)
+
+### Phase 2+
+- Cross-protocol risk engine
 - Per-session wallet selection, Ledger signer support
-
-### Deferred to Phase 3+
 - Autonomous observers, cron/scheduler
-- Emergency Escape Pod
-- Flow toxicity / volatility analysis
 
-### Deferred to Phase 4
+### Phase 3+
 - Intent parsing (fuzzy text → DeFi actions)
 - Telegram / voice channel adapters
-- Portfolio dashboard API
+- Emergency Escape Pod

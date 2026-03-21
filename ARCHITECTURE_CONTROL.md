@@ -4,8 +4,14 @@
 
 **Authority:** Any code change that violates an invariant defined here requires explicit sign-off and an update to this document first. "Move the fence, don't step over it."
 
-**Created:** 2026-03-19
+**Created:** 2026-03-19 | **Updated:** 2026-03-21
 **Companion:** [ROADMAP.md](ROADMAP.md) (phased delivery plan)
+
+> **Update (2026-03-21):** The invariants in this document remain valid. Since creation, the following architectural additions have been made that extend (but do not violate) these invariants:
+> - **INV-9 (implicit): Durable-first pending state** — no externally visible `request_id` without SQLite backing. Implemented via `DurablePendingState` with lifecycle state (`pending`/`consumed`/`expired`/`rejected`).
+> - **INV-10 (implicit): Mark-terminal-before-remove** — DB row must be marked terminal before in-memory removal, preventing stale resurrection on crash.
+> - **`abort_pending()` vs `expire()`** — rollback cleanup and natural TTL expiry are semantically distinct operations on the orchestrator.
+> - These additions are consistent with INV-6 (Fail-Closed on Ambiguity) and INV-3 (Append-Only Audit Trail).
 
 ---
 
