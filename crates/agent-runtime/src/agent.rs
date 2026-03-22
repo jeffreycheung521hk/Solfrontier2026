@@ -32,7 +32,7 @@ use crate::{
     session::AgentSession,
 };
 
-const MAX_ITERATIONS: u32 = 10;
+const MAX_ITERATIONS: u32 = 100;
 
 /// The agent executor.
 ///
