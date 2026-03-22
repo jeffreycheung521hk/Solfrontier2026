@@ -69,19 +69,22 @@ pub struct SimulatedTransaction {
     pub inner: Transaction,
     /// The simulation result that granted this token.
     pub simulation: SimulationResult,
+    /// The `lastValidBlockHeight` from the blockhash used in this transaction.
+    /// Used downstream for lifecycle tracking expiry calculations.
+    pub last_valid_block_height: u64,
 }
 
 impl SimulatedTransaction {
     // pub(crate) keeps this within the wallet-engine crate only.
     // The gateway uses this via the `resume_signing_after_approval` path,
     // which is safe because it only reconstructs from a previously-verified simulation.
-    pub fn new_unchecked(inner: Transaction, simulation: SimulationResult) -> Self {
+    pub fn new_unchecked(inner: Transaction, simulation: SimulationResult, last_valid_block_height: u64) -> Self {
         // INVARIANT: caller MUST have verified simulation.success == true before calling this.
         debug_assert!(
             simulation.success,
             "SimulatedTransaction::new_unchecked called with a failed simulation — this is a bug"
         );
-        Self { inner, simulation }
+        Self { inner, simulation, last_valid_block_height }
     }
 }
 
@@ -276,7 +279,7 @@ impl TransactionReviewPipeline {
         }
 
         // ── Step 3: Attach fresh blockhash ─────────────────────────────────────
-        let (recent_blockhash, _last_valid) = self.blockhash_mgr.get_fresh().await?;
+        let (recent_blockhash, last_valid_block_height) = self.blockhash_mgr.get_fresh().await?;
         tx.message.recent_blockhash = recent_blockhash;
 
         // ── Step 4: Simulate the FINALIZED transaction ─────────────────────────
@@ -312,7 +315,7 @@ impl TransactionReviewPipeline {
 
         // ONLY path to SimulatedTransaction: successful simulation.
         // The tx here is the FINALIZED transaction (with compute budget prepended).
-        Ok(SimulatedTransaction::new_unchecked(tx, sim_result))
+        Ok(SimulatedTransaction::new_unchecked(tx, sim_result, last_valid_block_height))
     }
 
     // ── Stage 2: Policy evaluation ────────────────────────────────────────────
@@ -542,7 +545,7 @@ mod tests {
         };
 
         // This should succeed — simulation.success == true
-        let _simulated = SimulatedTransaction::new_unchecked(tx.clone(), successful_sim);
+        let _simulated = SimulatedTransaction::new_unchecked(tx.clone(), successful_sim, 1000);
 
         // A failed simulation should NOT be passable to SimulatedTransaction
         // In production code, simulate() returns Err if !sim_output.success.
@@ -578,7 +581,7 @@ mod tests {
             success: true, error: None, compute_units_used: Some(1000),
             logs: vec![], return_data: None, account_diffs: vec![], fee_lamports: Some(5000),
         };
-        let simulated = SimulatedTransaction::new_unchecked(tx, successful_sim);
+        let simulated = SimulatedTransaction::new_unchecked(tx, successful_sim, 1000);
 
         // Approved verdict → OK
         let approved_verdict = PolicyVerdict::Approved { rule_name: "test".into() };

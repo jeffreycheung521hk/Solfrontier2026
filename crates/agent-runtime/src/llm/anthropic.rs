@@ -16,7 +16,7 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 
 use claw_types::tool::ToolSpec;
 
@@ -151,6 +151,11 @@ fn parse_response(resp: Value) -> Result<LlmResponse, AgentError> {
         .as_str()
         .unwrap_or("end_turn")
         .to_string();
+
+    info!(
+        stop_reason = %stop_reason,
+        "Anthropic raw stop_reason"
+    );
 
     let input_tokens = resp["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32;
     let output_tokens = resp["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32;

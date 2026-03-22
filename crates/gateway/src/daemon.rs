@@ -435,6 +435,14 @@ impl GatewayDaemon {
             event_bus: event_bus.clone(),
         }));
 
+        // ── Transaction Tracker + Lifecycle Persister (Phase 1.4) ────────
+        let tracking_repo = claw_state_store::TransactionTrackingRepository::new(db.pool().clone());
+        let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx_tracker = Arc::new(claw_solana_core::tracker::TransactionTracker::with_change_channel(
+            Arc::new(rpc_pool.clone()),
+            lifecycle_tx,
+        ));
+
         let wallet_sig_handler_ref = WalletSignatureHandlerRef::new(Arc::new(GatewayWalletSignatureHandler {
             orchestrator:    main_orchestrator.clone(),
             external_wallet: external_wallet.clone(),
@@ -443,6 +451,9 @@ impl GatewayDaemon {
             audit:           audit_repo.clone(),
             spend:           spend_repo.clone(),
             durable:         durable_state.clone(),
+            rpc_client:      rpc_client.clone(),
+            tracker:         tx_tracker.clone(),
+            tracking_repo:   tracking_repo.clone(),
         }));
 
         let wallet_challenge_repo = claw_state_store::WalletChallengeRepository::new(db.pool().clone());
@@ -599,6 +610,80 @@ impl GatewayDaemon {
                 retention_days = config.daemon.terminal_retention_days,
                 "terminal-row purge task started"
             );
+        }
+
+        // ── 13c. Transaction lifecycle tracker + persister (Phase 1.4) ────
+        //
+        // Two background tasks:
+        // 1. TransactionTracker: polls RPC, feeds calculate_next_state()
+        // 2. LifecyclePersister: receives state changes, persists + emits events
+        {
+            // Startup recovery: load non-terminal tracking rows from DB.
+            match tracking_repo.load_active().await {
+                Ok(rows) => {
+                    let mut recovered = 0u64;
+                    let mut expired_on_startup = 0u64;
+
+                    // Get current block height for pre-filtering.
+                    let startup_height = match rpc_client.get_slot(None).await {
+                        Ok(h) => h,
+                        Err(_) => 0, // If RPC fails, don't pre-filter — let tracker handle it.
+                    };
+
+                    for row in rows {
+                        let lvbh = row.last_valid_block_height as u64;
+                        let sbh = row.submission_block_height as u64;
+
+                        // Pre-filter: if block height is way past expiry, mark expired in DB.
+                        if startup_height > 0 && startup_height > lvbh + 32 {
+                            let _ = tracking_repo.mark_expired(&row.signature).await;
+                            expired_on_startup += 1;
+                            continue;
+                        }
+
+                        // Re-register into tracker memory.
+                        if let Ok(sig) = row.signature.parse::<solana_sdk::signature::Signature>() {
+                            if let (Ok(tx_id), Ok(req_id)) = (
+                                row.transaction_id.parse::<uuid::Uuid>(),
+                                row.request_id.parse::<uuid::Uuid>(),
+                            ) {
+                                tx_tracker.track(
+                                    sig, tx_id, req_id,
+                                    row.session_id, row.wallet_pubkey,
+                                    lvbh, sbh,
+                                );
+                                recovered += 1;
+                            }
+                        }
+                    }
+
+                    if recovered > 0 || expired_on_startup > 0 {
+                        info!(
+                            recovered,
+                            expired_on_startup,
+                            "transaction tracking recovery complete"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to load tracking rows for recovery — starting fresh");
+                }
+            }
+
+            // Spawn the lifecycle persister.
+            let persister = crate::lifecycle_persister::LifecyclePersister::new(
+                tracking_repo.clone(),
+                audit_repo.clone(),
+                event_bus.clone(),
+                lifecycle_rx,
+            );
+            tokio::spawn(persister.run());
+            info!("lifecycle persister started");
+
+            // Spawn the tracker polling loop.
+            let tracker_ref = tx_tracker.clone();
+            tokio::spawn(async move { tracker_ref.run().await });
+            info!("transaction lifecycle tracker started");
         }
 
         // ── 14. Hold runtime alive until shutdown ─────────────────────────
@@ -942,6 +1027,9 @@ struct GatewayWalletSignatureHandler {
     audit:            AuditRepository,
     spend:            SpendRepository,
     durable:          DurablePendingState,
+    rpc_client:       ClawRpcClient,
+    tracker:          Arc<claw_solana_core::tracker::TransactionTracker>,
+    tracking_repo:    claw_state_store::TransactionTrackingRepository,
 }
 
 impl WalletSignatureHandler for GatewayWalletSignatureHandler {
@@ -958,19 +1046,43 @@ impl WalletSignatureHandler for GatewayWalletSignatureHandler {
     }
 
     fn pending_for_session(&self, session_id: &SessionId) -> Vec<PendingWalletSignatureInfo> {
-        // Use the orchestrator's pending_for_session for execution-plane pending state.
+        // Internal storage uses bincode. Browser needs Solana wire format.
+        // Convert at the API boundary: bincode → Transaction → wire format.
         self.orchestrator
             .pending_for_session(session_id)
             .into_iter()
-            .map(|summary| {
-                let unsigned_tx_b64 = base64::engine::general_purpose::STANDARD.encode(&summary.finalized_tx_bytes);
-                PendingWalletSignatureInfo {
+            .filter_map(|summary| {
+                let tx: solana_sdk::transaction::Transaction =
+                    bincode::deserialize(&summary.finalized_tx_bytes).ok()?;
+
+                // Build wire format: [compact-u16 sig_count] [sigs] [message_data()]
+                let msg_data = tx.message_data();
+                let sig_count = tx.signatures.len();
+                let mut wire = Vec::with_capacity(3 + sig_count * 64 + msg_data.len());
+                // compact-u16 encode sig_count
+                {
+                    let mut val = sig_count;
+                    loop {
+                        let mut elem = (val & 0x7f) as u8;
+                        val >>= 7;
+                        if val > 0 { elem |= 0x80; }
+                        wire.push(elem);
+                        if val == 0 { break; }
+                    }
+                }
+                for sig in &tx.signatures {
+                    wire.extend_from_slice(sig.as_ref());
+                }
+                wire.extend_from_slice(&msg_data);
+
+                let unsigned_tx_b64 = base64::engine::general_purpose::STANDARD.encode(&wire);
+                Some(PendingWalletSignatureInfo {
                     request_id:      summary.request_id.0,
                     transaction_id:  summary.transaction_id,
                     description:     summary.description,
                     expected_signer: summary.expected_signer,
                     unsigned_tx_b64,
-                }
+                })
             })
             .collect()
     }
@@ -1004,17 +1116,32 @@ impl GatewayWalletSignatureHandler {
         let session_str = session_id.to_string();
 
         // Decode the submitted signed transaction from base64.
-        let signed_tx_bytes = match base64::engine::general_purpose::STANDARD.decode(&signed_tx_b64) {
+        let raw_bytes = match base64::engine::general_purpose::STANDARD.decode(&signed_tx_b64) {
             Ok(b) => b,
             Err(e) => {
                 return WalletSignatureOutcome {
                     request_id,
                     accepted: false,
                     signature: None,
+                    tx_signature: None,
+                    submitted: false,
                     error: Some(format!("invalid base64: {e}")),
                 };
             }
         };
+
+        // Browser sends wire format. Orchestrator internal storage is bincode.
+        // Convert wire → bincode at the API boundary.
+        // Wire: [compact-u16 sig_count] [sigs] [message_data (compact-u16 vecs)]
+        // Bincode: [u64 LE sig_count] [sigs] [message (u64 LE vecs)]
+        //
+        // Approach: parse wire to get Transaction (via message_data → Message),
+        // then bincode::serialize back. But Message doesn't implement Deserialize
+        // from wire format via bincode.
+        //
+        // Simpler: pass wire bytes directly to orchestrator. The external_adapter
+        // now handles wire format verification natively.
+        let signed_tx_bytes = raw_bytes;
 
         // Convert the UUID to a SignatureRequestId for the orchestrator.
         let sig_request_id = SignatureRequestId::from(request_id);
@@ -1028,9 +1155,10 @@ impl GatewayWalletSignatureHandler {
             }) => {
                 // Accepted — record spend, audit, events.
                 // transaction_id and expected_signer come from the consumed SignatureRequest.
-                // fee_lamports comes from the caller-side CompletionMetadataStore.
-                let fee_lamports = self.completion_meta.take(&request_id)
-                    .and_then(|m| m.fee_lamports);
+                // fee_lamports and last_valid_block_height from CompletionMetadataStore.
+                let meta = self.completion_meta.take(&request_id);
+                let fee_lamports = meta.as_ref().and_then(|m| m.fee_lamports);
+                let last_valid_block_height = meta.as_ref().and_then(|m| m.last_valid_block_height).unwrap_or(0);
 
                 // P1-1 hardening: mark terminal BEFORE any further processing.
                 self.durable.mark_signature_terminal(&sig_request_id, "consumed", Some("signature accepted")).await;
@@ -1088,11 +1216,168 @@ impl GatewayWalletSignatureHandler {
                     "external wallet signature accepted via orchestrator"
                 );
 
+                // ── Phase 1.4: Submit verified signed tx to Solana RPC ──────
+                //
+                // The transaction has been verified (message bytes match, ed25519
+                // valid). Now submit the EXACT same signed bytes to the network.
+                // CRITICAL: Do NOT re-sign, mutate, or reconstruct the transaction.
+                //
+                // If RPC submission fails, the request remains consumed (terminal).
+                // We do NOT put it back in the pending queue. The verification was
+                // valid; only the broadcast failed.
+                let (tx_signature, submitted, send_error) = match self.rpc_client
+                    .send_raw_transaction(&signed_tx_bytes)
+                    .await
+                {
+                    Ok(tx_sig) => {
+                        info!(
+                            session = %session_str,
+                            request_id = %request_id,
+                            tx_signature = %tx_sig,
+                            "transaction submitted to Solana network"
+                        );
+
+                        // Register with the lifecycle tracker for confirmation polling.
+                        // The tracker feeds the pure state machine (calculate_next_state)
+                        // and drives Submitted → Confirmed → Finalized / Failed / Expired.
+                        if let Ok(sig) = tx_sig.parse::<solana_sdk::signature::Signature>() {
+                            // Capture submission block height for lifecycle tracking.
+                            // Use confirmed commitment for best recency/stability balance.
+                            // Fallback to last_valid_block_height - 150 (Solana blockhash TTL)
+                            // if RPC fails, which is conservative but avoids the zero-height
+                            // bug that would cause immediate Dropped classification.
+                            let submission_block_height = match self.rpc_client
+                                .get_block_height(None)
+                                .await
+                            {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "getBlockHeight failed after submission — using fallback"
+                                    );
+                                    // Fallback: estimate from blockhash validity window.
+                                    // last_valid_block_height - 150 ≈ height at blockhash creation.
+                                    // If last_valid_block_height is 0 (recovery path without
+                                    // metadata), use 1 as a safe sentinel — never write the
+                                    // poison value 0 which causes premature Dropped/Expired.
+                                    let fallback = last_valid_block_height.saturating_sub(150);
+                                    if fallback == 0 { 1 } else { fallback }
+                                }
+                            };
+
+                            // Persist tracking row to DB first (durable-first).
+                            // If persistence fails, do NOT register in-memory — no
+                            // in-memory-only tracking state is allowed (INV: durable-first).
+                            match self.tracking_repo.insert(
+                                &tx_sig,
+                                &transaction_id.to_string(),
+                                &request_id.to_string(),
+                                &session_str,
+                                &expected_signer,
+                                last_valid_block_height,
+                                submission_block_height,
+                            ).await {
+                                Ok(()) => {
+                                    // DB row exists — safe to register in-memory.
+                                    self.tracker.track(
+                                        sig,
+                                        transaction_id,
+                                        request_id,
+                                        session_str.clone(),
+                                        expected_signer.clone(),
+                                        last_valid_block_height,
+                                        submission_block_height,
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        session = %session_str,
+                                        request_id = %request_id,
+                                        tx_signature = %tx_sig,
+                                        error = %e,
+                                        "tracking persistence failed — transaction submitted \
+                                         but will not be tracked (no in-memory-only state allowed)"
+                                    );
+
+                                    let _ = self.audit.append(
+                                        Some(&session_str),
+                                        &request_id.to_string(),
+                                        "tracking_persistence_failed",
+                                        "execution",
+                                        &json!({
+                                            "request_id":     request_id,
+                                            "transaction_id": transaction_id,
+                                            "tx_signature":   tx_sig,
+                                            "error":          e.to_string(),
+                                        }),
+                                        AuditSeverity::Warning,
+                                    ).await;
+                                }
+                            }
+                        }
+
+                        let _ = self.audit.append(
+                            Some(&session_str),
+                            &request_id.to_string(),
+                            "transaction_submitted",
+                            "execution",
+                            &json!({
+                                "request_id":     request_id,
+                                "transaction_id": transaction_id,
+                                "wallet_pubkey":  expected_signer,
+                                "tx_signature":   tx_sig,
+                            }),
+                            AuditSeverity::Info,
+                        ).await;
+
+                        self.event_bus.publish(GatewayEvent::TransactionSent(
+                            claw_types::events::TransactionLifecycleEvent {
+                                header:         claw_types::events::EventHeader::new(Some(session_id.clone())),
+                                session_id:     session_id.clone(),
+                                transaction_id,
+                                wallet_pubkey:  expected_signer.clone(),
+                                status:         claw_types::transaction::TransactionStatus::Sent,
+                                signature:      Some(tx_sig.clone()),
+                            },
+                        ));
+
+                        (Some(tx_sig), true, None)
+                    }
+                    Err(e) => {
+                        let reason = e.to_string();
+                        warn!(
+                            session = %session_str,
+                            request_id = %request_id,
+                            error = %reason,
+                            "RPC sendTransaction failed — signature was valid but broadcast failed"
+                        );
+
+                        let _ = self.audit.append(
+                            Some(&session_str),
+                            &request_id.to_string(),
+                            "transaction_send_failed",
+                            "execution",
+                            &json!({
+                                "request_id":     request_id,
+                                "transaction_id": transaction_id,
+                                "wallet_pubkey":  expected_signer,
+                                "error":          reason,
+                            }),
+                            AuditSeverity::Warning,
+                        ).await;
+
+                        (None, false, Some(reason))
+                    }
+                };
+
                 WalletSignatureOutcome {
                     request_id,
                     accepted: true,
                     signature: Some(signature),
-                    error: None,
+                    tx_signature,
+                    submitted,
+                    error: send_error,
                 }
             }
 
@@ -1106,6 +1391,8 @@ impl GatewayWalletSignatureHandler {
                     request_id,
                     accepted: false,
                     signature: None,
+                    tx_signature: None,
+                    submitted: false,
                     error: Some("internal error: unexpected pending state".to_string()),
                 }
             }
@@ -1155,6 +1442,8 @@ impl GatewayWalletSignatureHandler {
                     request_id,
                     accepted: false,
                     signature: None,
+                    tx_signature: None,
+                    submitted: false,
                     error: Some(reason),
                 }
             }

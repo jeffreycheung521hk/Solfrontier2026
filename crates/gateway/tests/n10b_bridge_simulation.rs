@@ -153,6 +153,8 @@ impl WalletSignatureHandler for TestWalletSignatureHandler {
                         request_id,
                         accepted: false,
                         signature: None,
+                        tx_signature: None,
+                        submitted: false,
                         error: Some(format!("invalid base64: {e}")),
                     };
                 }
@@ -165,6 +167,8 @@ impl WalletSignatureHandler for TestWalletSignatureHandler {
                         request_id,
                         accepted: true,
                         signature: Some("test-signature".into()),
+                        tx_signature: None,
+                        submitted: false,
                         error: None,
                     }
                 }
@@ -173,6 +177,8 @@ impl WalletSignatureHandler for TestWalletSignatureHandler {
                         request_id,
                         accepted: false,
                         signature: None,
+                        tx_signature: None,
+                        submitted: false,
                         error: Some(e.to_string()),
                     }
                 }

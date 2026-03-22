@@ -9,7 +9,7 @@
 
 ## Current State Summary
 
-ClawSolana is a transaction control plane, not just a signing tool. The core control plane — typestate pipeline, policy enforcement, capability boundaries, durable pending lifecycle, audit trail — is implemented and tested. What remains is completing the **execution path**: real wallet connectivity, on-chain submission, and confirmation tracking.
+ClawSolana is a transaction control plane, not just a signing tool. The core control plane — typestate pipeline, policy enforcement, capability boundaries, durable pending lifecycle, audit trail — is implemented and tested. On-chain submission (`send_raw_transaction`) and lifecycle tracking (Submitted → Confirmed → Finalized / Failed / Expired) are implemented with durable persistence and restart recovery. What remains is completing the **execution path**: external signer formalization, retry/rebroadcast policy, and end-to-end devnet validation.
 
 **Why Phantom integration is critical now:** The control plane's value proposition is that it sits between intent sources and signing authorities. Without a real signing authority connected, the system is a validated control plane with no downstream path. Phantom integration transforms ClawSolana from "policy engine with simulated signing" into "policy engine governing real wallet operations." This is the single highest-value step to prove the architecture works end-to-end.
 
@@ -52,8 +52,8 @@ ClawSolana is a transaction control plane, not just a signing tool. The core con
 | **P1-3:** Wallet binding ownership proof | ✅ Done | Challenge-response implemented with session binding |
 | **P1-4:** Durable event log | Low | Events are fire-and-forget broadcast |
 | **N12:** Context trimming pairs | Medium | `trim_if_needed()` can orphan tool_use without tool_result |
-| **N14:** On-chain submission | High | `sendTransaction` + confirmation tracking not implemented |
-| **External wallet E2E** | Medium | Phantom bridge exists; needs real devnet E2E test |
+| **N14:** On-chain submission | ✅ Done | `send_raw_transaction` + lifecycle tracking (Submitted→Finalized/Failed/Expired), durable persistence, restart recovery |
+| **External wallet E2E** | Medium | Phantom bridge + submission done; needs real devnet E2E test |
 
 ---
 
@@ -67,10 +67,10 @@ ClawSolana is a transaction control plane, not just a signing tool. The core con
    - Config declares external wallet, routing works end-to-end
 4. **End-to-end connectivity test** — session → bind → propose → approve → sign → verify on devnet
 
-### Phase B — On-Chain Execution
+### Phase B — On-Chain Execution *(mostly complete)*
 
-5. **sendTransaction** — submit verified signed tx to Solana RPC
-6. **Confirmation tracking** — poll/websocket, status: submitted → confirmed → finalized
+5. ~~**sendTransaction**~~ — ✅ Done (`send_raw_transaction` after orchestrator verification)
+6. ~~**Confirmation tracking**~~ — ✅ Done (adaptive RPC polling, lifecycle state machine, durable persistence, restart recovery)
 7. **Basic retry policy** — same signed bytes rebroadcast, max retries, blockhash expired = fail
 
 ### Phase C — Hardening

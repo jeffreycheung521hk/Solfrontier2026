@@ -11,6 +11,7 @@ pub mod durable_pending;
 pub mod errors;
 pub mod event_bus;
 pub mod external_wallet;
+pub mod lifecycle_persister;
 pub mod orchestrator;
 pub mod pending_signing;
 pub mod session_mgr;

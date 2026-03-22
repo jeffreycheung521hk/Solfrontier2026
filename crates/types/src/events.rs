@@ -50,8 +50,18 @@ pub enum GatewayEvent {
     ApprovalReceived(ApprovalLifecycleEvent),
     TransactionSigned(TransactionLifecycleEvent),
     TransactionSent(TransactionLifecycleEvent),
+    /// Emitted when a verified signed transaction is submitted to Solana RPC.
+    TransactionSubmitted(TransactionLifecycleEvent),
     TransactionConfirmed(TransactionLifecycleEvent),
+    /// Emitted when a confirmed transaction reaches finalized commitment (rooted).
+    TransactionFinalized(TransactionLifecycleEvent),
     TransactionFailed(TransactionFailedEvent),
+    /// Emitted when a submitted transaction fails on-chain (non-null err from RPC).
+    TransactionExecutionFailed(TransactionFailedEvent),
+    /// Emitted when a submitted transaction is not observed after grace period.
+    TransactionDropped(TransactionLifecycleEvent),
+    /// Emitted when a transaction's blockhash expires before it is observed on-chain.
+    TransactionExpired(TransactionLifecycleEvent),
 
     // ── External wallet signing ──────────────────────────────────────────────
     /// Emitted when a transaction is awaiting an external wallet's signature.

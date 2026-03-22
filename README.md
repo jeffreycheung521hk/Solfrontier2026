@@ -6,7 +6,7 @@ ClawSolana is a Rust-native daemon that sits between intent sources (AI agents, 
 
 The system is designed so that entities proposing transactions **never hold signing authority**, and entities holding signing authority **never see a transaction the control plane hasn't vetted**.
 
-> **Status: Alpha.** Core control plane, policy enforcement, durable pending lifecycle, and capability boundaries are implemented and tested (200+ tests). External wallet browser bridge and on-chain submission are under active development. This is not a production-ready wallet product.
+> **Status: Alpha.** Core control plane, policy enforcement, durable pending lifecycle, capability boundaries, on-chain submission, and transaction lifecycle tracking are implemented and tested (220+ tests). Retry/rebroadcast policy and external signer formalization are under active development. This is not a production-ready wallet product.
 
 ---
 
@@ -66,7 +66,7 @@ The system is designed so that entities proposing transactions **never hold sign
 
 ### What Is Not Yet Complete
 
-- **On-chain submission** — `sendTransaction` + retry + confirmation tracking not implemented
+- **On-chain submission** — `sendTransaction` and lifecycle tracking are implemented; retry/rebroadcast policy not yet added
 - **Rate limiting** — no rate limiting on API endpoints
 - **Configurable policy rules** — current policy is code-defined; no runtime policy configuration
 - **Context trimming** — `trim_if_needed()` can orphan tool_use blocks without their tool_result pairs
@@ -181,7 +181,7 @@ See [ROADMAP.md](ROADMAP.md) for the full phased plan.
 | Phase | Focus | Status |
 |-------|-------|--------|
 | **Phase 0** | Production readiness — typestate pipeline, durability, orchestrator | **Near complete** |
-| **Phase 1** | Execution completeness — Phantom bridge, wallet proof, sendTransaction | **Next** |
+| **Phase 1** | Execution completeness — Phantom bridge, wallet proof, sendTransaction, lifecycle tracking | **In progress** |
 | **Phase 2** | Policy engine expansion — configurable rules, approval matrix, signer constraints | Planned |
 | **Phase 3** | Enterprise control plane — multi-signer, MPC integration, treasury workflows | Planned |
 
@@ -278,10 +278,11 @@ See [PRODUCTION_READINESS_REVIEW.md](PRODUCTION_READINESS_REVIEW.md) for full de
 | Pending state durability | Resolved | SQLite-backed with lifecycle state (`pending`/`consumed`/`expired`/`rejected`) |
 | Session-request binding | Open | Submit endpoint does not verify session ownership |
 | Rate limiting | Open | No rate limiting on API endpoints |
-| Wallet binding auth | Open | No challenge-response for `bind_wallet` |
+| Wallet binding auth | Resolved | Challenge-response for `bind_wallet` with session-bound nonce |
 | Event durability | Open | Events are fire-and-forget broadcast, no replay |
-| On-chain submission | Open | `sendTransaction` not yet implemented |
-| External wallet E2E | Open | Verification layer done; browser bridge not finished |
+| On-chain submission | Implemented | `send_raw_transaction` + lifecycle tracking (Submitted → Confirmed → Finalized / Failed / Expired) |
+| Retry / rebroadcast | Open | Same-bytes rebroadcast policy not yet added |
+| External wallet E2E | Partial | Verification layer + browser bridge done; needs real devnet E2E test |
 
 ---
 

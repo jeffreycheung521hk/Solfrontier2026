@@ -13,7 +13,7 @@
   button:disabled { opacity: 0.4; cursor: not-allowed; }
   input { font-family: monospace; padding: 3px 6px; background: #222; color: #eee; border: 1px solid #555; }
   code { color: #8af; }
-  .ok { color: #8f8; } .err { color: #f88; } .info { color: #8af; }
+  .ok { color: #8f8; } .err { color: #f88; } .info { color: #8af; } .warn { color: #fa0; }
   #log { background: #0a0a0a; padding: 1em; max-height: 280px; overflow-y: auto;
          font-size: 11px; white-space: pre-wrap; border: 1px solid #333; }
   .req-item { border: 1px solid #444; padding: 8px; margin: 6px 0; background: #1a1a1a; }
@@ -49,19 +49,30 @@
 </fieldset>
 
 <fieldset>
+  <legend>4. Transaction Events (SSE)</legend>
+  <button id="btnEvents" disabled>Connect Events</button>
+  <button id="btnEventsStop" disabled>Disconnect</button>
+  <span id="eventsStatus" style="color:#888">Not connected</span>
+  <div id="eventsList" style="margin-top:6px; font-size:11px"></div>
+</fieldset>
+
+<fieldset>
   <legend>Log</legend>
   <div id="log"></div>
 </fieldset>
 
+<!-- ── @solana/web3.js UMD bundle (includes Buffer polyfill) ──── -->
+<script src="https://unpkg.com/@solana/web3.js@1.95.8/lib/index.iife.min.js"></script>
+
 <script type="module">
 // ── Imports ───────────────────────────────────────────────────────
-// Using ESM CDN. Transaction.from() accepts bincode/wire bytes.
-import { Transaction, VersionedTransaction }
-  from 'https://esm.sh/@solana/web3.js@1.95.8';
+// UMD bundle exposes window.solanaWeb3
+const { Transaction, VersionedTransaction } = window.solanaWeb3;
 
 // ── State ─────────────────────────────────────────────────────────
 let provider = null;
 let connectedPubkey = null;
+let eventSource = null;
 
 // ── DOM ───────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -73,6 +84,27 @@ function log(msg, cls = 'info') {
   line.className = cls;
   line.textContent = `[${ts}] ${msg}`;
   $log.prepend(line);
+}
+
+// ── Utilities ─────────────────────────────────────────────────────
+
+function base64ToUint8(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function uint8ToBase64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function esc(s) {
+  const d = document.createElement('span');
+  d.textContent = s;
+  return d.innerHTML;
 }
 
 // ── API helper ────────────────────────────────────────────────────
@@ -92,18 +124,20 @@ function api(path, opts = {}) {
 
 // ── 1. Connect Phantom ────────────────────────────────────────────
 $('btnConnect').onclick = async () => {
-  if (!window.solana?.isPhantom) {
+  if (!window.phantom?.solana?.isPhantom && !window.solana?.isPhantom) {
     log('Phantom wallet not found. Install the Phantom browser extension.', 'err');
     return;
   }
   try {
-    provider = window.solana;
+    // Prefer window.phantom.solana (Phantom v2), fall back to window.solana
+    provider = window.phantom?.solana || window.solana;
     const resp = await provider.connect();
     connectedPubkey = resp.publicKey.toBase58();
     $('walletStatus').textContent = connectedPubkey;
     $('walletStatus').style.color = '#8f8';
     $('btnBind').disabled = false;
     $('btnRefresh').disabled = false;
+    $('btnEvents').disabled = false;
     log(`Connected: ${connectedPubkey}`, 'ok');
   } catch (e) {
     log(`Connect failed: ${e.message}`, 'err');
@@ -210,36 +244,76 @@ async function signRequest(req, btn) {
   btn.textContent = 'Signing...';
 
   try {
-    // Decode the base64 unsigned transaction.
-    // Backend sends bincode-serialized bytes (Solana SDK format).
+    // 1. Decode the base64 unsigned transaction.
+    //    Backend sends Solana WIRE FORMAT (compact-u16 sig count prefix).
     const txBytes = base64ToUint8(req.unsigned_tx_b64);
+    log(`Raw wire bytes len: ${txBytes.length}, first 4: ${Array.from(txBytes.slice(0,4)).map(b=>b.toString(16).padStart(2,'0')).join(' ')}`, 'info');
 
-    // Try to deserialize as a legacy Transaction first.
-    // Transaction.from() accepts Solana wire-format bytes.
-    let tx;
-    try {
-      tx = Transaction.from(Buffer.from(txBytes));
-    } catch (e1) {
-      // Fallback: try VersionedTransaction
-      try {
-        tx = VersionedTransaction.deserialize(txBytes);
-      } catch (e2) {
-        throw new Error(`Cannot deserialize transaction: legacy=${e1.message}, versioned=${e2.message}`);
+    // Round-trip check: deserialize then re-serialize, compare lengths
+    const rtTx = Transaction.from(txBytes);
+    const rtBytes = rtTx.serialize({requireAllSignatures: false, verifySignatures: false});
+    log(`Round-trip: in=${txBytes.length} out=${rtBytes.length} match=${txBytes.length === rtBytes.length}`, txBytes.length === rtBytes.length ? 'ok' : 'err');
+
+    // 2. Parse wire format to find message boundary.
+    //    Wire: [compact-u16 sig_count] [64 * sig_count signatures] [message bytes]
+    let wireOffset = 0;
+    let wireSigCount = 0;
+    let shift = 0;
+    while (wireOffset < txBytes.length) {
+      const b = txBytes[wireOffset++];
+      wireSigCount |= (b & 0x7f) << shift;
+      if ((b & 0x80) === 0) break;
+      shift += 7;
+    }
+    const sigSectionStart = wireOffset;
+    const msgOffset = wireOffset + wireSigCount * 64;
+    const originalMsgBytes = txBytes.slice(msgOffset);
+
+    // 3. Deserialize for Phantom to sign.
+    const tx = Transaction.from(txBytes);
+    log(`Blockhash: ${tx.recentBlockhash}, sigs: ${wireSigCount}`, 'info');
+
+    // Debug: check if Transaction.from() recompiled the message
+    const reserializedUnsigned = tx.serialize({requireAllSignatures: false, verifySignatures: false});
+    let rOff2 = 0, rSc2 = 0, rSh2 = 0;
+    while (rOff2 < reserializedUnsigned.length) {
+      const b = reserializedUnsigned[rOff2++];
+      rSc2 |= (b & 0x7f) << rSh2;
+      if ((b & 0x80) === 0) break;
+      rSh2 += 7;
+    }
+    const reserMsgBytes = reserializedUnsigned.slice(rOff2 + rSc2 * 64);
+    const msgMatch = originalMsgBytes.length === reserMsgBytes.length &&
+      originalMsgBytes.every((b, i) => b === reserMsgBytes[i]);
+    log(`Message preserved after Transaction.from(): ${msgMatch} (orig ${originalMsgBytes.length} vs reser ${reserMsgBytes.length})`, msgMatch ? 'ok' : 'err');
+    if (!msgMatch) {
+      // Find first difference
+      for (let i = 0; i < Math.max(originalMsgBytes.length, reserMsgBytes.length); i++) {
+        if (originalMsgBytes[i] !== reserMsgBytes[i]) {
+          log(`First diff at byte ${i}: orig=0x${(originalMsgBytes[i]||0).toString(16)} reser=0x${(reserMsgBytes[i]||0).toString(16)}`, 'err');
+          break;
+        }
       }
     }
 
     log(`Requesting Phantom signature for ${req.request_id}...`);
 
-    // Sign with Phantom — this pops up the approval dialog.
+    // 4. Sign with Phantom — pops approval dialog.
+    //    Phantom does NOT broadcast — it only returns the signed tx.
     const signed = await provider.signTransaction(tx);
 
-    // Serialize the signed transaction back to bytes.
+    // 5. Use signed.serialize() directly.
+    //    Phantom signs the message bytes from the Transaction object.
+    //    We must send those exact bytes (with Phantom's signature) to the backend.
+    //    The backend will handle format conversion.
     const signedBytes = signed.serialize();
+    log(`Signed tx serialized: ${signedBytes.length} bytes`, 'info');
     const signedB64 = uint8ToBase64(signedBytes);
 
     log('Signed, submitting to backend...');
 
-    // POST the signed transaction to the backend.
+    // 5. POST the signed bytes to the backend.
+    //    Backend will: verify → submit to RPC → track lifecycle.
     const resp = await api('/wallet-signatures', {
       method: 'POST',
       body: JSON.stringify({
@@ -250,9 +324,17 @@ async function signRequest(req, btn) {
     const result = await resp.json();
 
     if (resp.ok && result.accepted) {
-      log(`Accepted! signature: ${result.signature}`, 'ok');
-      btn.textContent = 'Done';
-      btn.style.color = '#8f8';
+      let msg = `Accepted! signature: ${result.signature}`;
+      if (result.submitted && result.tx_signature) {
+        msg += ` | submitted: ${result.tx_signature}`;
+      } else if (result.submitted) {
+        msg += ' | submitted to network';
+      } else if (result.error) {
+        msg += ` | broadcast failed: ${result.error}`;
+      }
+      log(msg, 'ok');
+      btn.textContent = result.submitted ? 'Submitted' : 'Signed (not broadcast)';
+      btn.style.color = result.submitted ? '#8f8' : '#fa0';
     } else {
       log(`Rejected: ${result.error || JSON.stringify(result)}`, 'err');
       btn.textContent = 'Failed';
@@ -266,43 +348,99 @@ async function signRequest(req, btn) {
   }
 }
 
-// ── Utilities ─────────────────────────────────────────────────────
+// ── 4. SSE Event Stream ───────────────────────────────────────────
 
-function base64ToUint8(b64) {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
+$('btnEvents').onclick = () => {
+  const sid = $('sessionId').value.trim();
+  if (!sid) { log('Session ID required for events', 'err'); return; }
 
-function uint8ToBase64(bytes) {
-  let bin = '';
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
-}
+  if (eventSource) { eventSource.close(); eventSource = null; }
 
-function esc(s) {
-  const d = document.createElement('span');
-  d.textContent = s;
-  return d.innerHTML;
-}
+  const base = $('apiBase').value.replace(/\/+$/, '');
+  const token = $('token').value.trim();
+  const url = `${base}/sessions/${sid}/events?token=${encodeURIComponent(token)}`;
 
-// ── Buffer polyfill for @solana/web3.js in browser ────────────────
-if (typeof globalThis.Buffer === 'undefined') {
-  // Minimal Buffer shim — web3.js needs Buffer.from() and .alloc()
-  globalThis.Buffer = {
-    from(data, encoding) {
-      if (data instanceof Uint8Array) return data;
-      if (typeof data === 'string') {
-        if (encoding === 'base64') return base64ToUint8(data);
-        return new TextEncoder().encode(data);
-      }
-      if (Array.isArray(data)) return new Uint8Array(data);
-      return new Uint8Array(data);
-    },
-    alloc(size) { return new Uint8Array(size); },
-    isBuffer(obj) { return obj instanceof Uint8Array; },
+  eventSource = new EventSource(url);
+  $('eventsStatus').textContent = 'Connecting...';
+  $('eventsStatus').style.color = '#8af';
+  $('btnEventsStop').disabled = false;
+
+  eventSource.onopen = () => {
+    $('eventsStatus').textContent = 'Connected';
+    $('eventsStatus').style.color = '#8f8';
+    log('SSE event stream connected', 'ok');
   };
+
+  eventSource.onmessage = (e) => {
+    if (e.data === ':heartbeat' || e.data.startsWith(':')) return;
+
+    try {
+      const event = JSON.parse(e.data);
+      handleEvent(event);
+    } catch {
+      // Non-JSON (heartbeat comments)
+    }
+  };
+
+  eventSource.onerror = () => {
+    $('eventsStatus').textContent = 'Disconnected';
+    $('eventsStatus').style.color = '#f88';
+    log('SSE event stream disconnected', 'warn');
+  };
+};
+
+$('btnEventsStop').onclick = () => {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+  $('eventsStatus').textContent = 'Disconnected';
+  $('eventsStatus').style.color = '#888';
+  $('btnEventsStop').disabled = true;
+  log('SSE event stream closed', 'info');
+};
+
+// Transaction lifecycle event types we care about
+const TX_EVENTS = new Set([
+  'TransactionSigned', 'TransactionSent', 'TransactionSubmitted',
+  'TransactionConfirmed', 'TransactionFinalized',
+  'TransactionFailed', 'TransactionExecutionFailed',
+  'TransactionDropped', 'TransactionExpired',
+  'WalletSignatureRequested', 'WalletSignatureReceived',
+  'WalletSignatureRejected', 'WalletSignatureExpired',
+]);
+
+function handleEvent(event) {
+  // Extract event type — SSE JSON has a "type" or top-level tag
+  const eventType = event.type || Object.keys(event)[0] || 'unknown';
+
+  if (TX_EVENTS.has(eventType)) {
+    const payload = event[eventType] || event;
+    const sig = payload.signature || payload.tx_signature || '';
+    const txId = payload.transaction_id || '';
+    const status = payload.status || eventType;
+
+    // Color based on state
+    let cls = 'info';
+    if (eventType.includes('Finalized') || eventType.includes('Received')) cls = 'ok';
+    if (eventType.includes('Failed') || eventType.includes('Rejected') ||
+        eventType.includes('Dropped') || eventType.includes('Expired')) cls = 'err';
+    if (eventType.includes('Confirmed')) cls = 'ok';
+
+    log(`[EVENT] ${eventType}${sig ? ' sig=' + sig.slice(0, 16) + '...' : ''}${txId ? ' tx=' + txId.slice(0, 8) : ''}`, cls);
+
+    // Add to events panel
+    const div = document.createElement('div');
+    div.style.color = cls === 'ok' ? '#8f8' : cls === 'err' ? '#f88' : '#8af';
+    div.style.fontSize = '11px';
+    div.textContent = `${new Date().toISOString().slice(11, 23)} ${eventType}${sig ? ' ' + sig.slice(0, 20) + '...' : ''}`;
+    $('eventsList').prepend(div);
+
+    // Keep events list bounded
+    while ($('eventsList').children.length > 50) {
+      $('eventsList').removeChild($('eventsList').lastChild);
+    }
+  }
 }
 </script>
 </body>

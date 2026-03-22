@@ -289,7 +289,7 @@ async fn n5_resume_with_durable_local_path() {
 
     // Park
     let decision_rx = pending_signing.park(
-        request_id, proposal.clone(), &tx, sim.clone(), verdict,
+        request_id, proposal.clone(), &tx, sim.clone(), verdict, 1000,
     ).unwrap();
 
     // Clone for signaling later
@@ -404,7 +404,7 @@ async fn n5_consumed_durable_approval_not_recoverable_after_restart() {
 
     // Step 2: Park + signal + resume (full approval flow).
     let decision_rx = pending_signing.park(
-        request_id, proposal.clone(), &tx, sim, verdict,
+        request_id, proposal.clone(), &tx, sim, verdict, 1000,
     ).unwrap();
     let pending_for_signal = pending_signing.clone();
 
@@ -598,7 +598,7 @@ async fn n7_rejected_approval_does_not_record_spend() {
     };
 
     let decision_rx = pending_signing.park(
-        request_id, proposal.clone(), &tx, sim, verdict,
+        request_id, proposal.clone(), &tx, sim, verdict, 1000,
     ).unwrap();
     let pending_for_signal = pending_signing.clone();
 
@@ -705,7 +705,7 @@ async fn n7_spend_recorded_exactly_once_on_resume_path() {
     };
 
     let decision_rx = pending_signing.park(
-        request_id, proposal.clone(), &tx, sim, verdict,
+        request_id, proposal.clone(), &tx, sim, verdict, 1000,
     ).unwrap();
     let pending_for_signal = pending_signing.clone();
 
@@ -784,8 +784,13 @@ fn event_matches_session(event: &GatewayEvent, session_id: &SessionId) -> bool {
         GatewayEvent::ApprovalReceived(e)          => &e.session_id == session_id,
         GatewayEvent::TransactionSigned(e)         => &e.session_id == session_id,
         GatewayEvent::TransactionSent(e)           => &e.session_id == session_id,
+        GatewayEvent::TransactionSubmitted(e)      => &e.session_id == session_id,
         GatewayEvent::TransactionConfirmed(e)      => &e.session_id == session_id,
+        GatewayEvent::TransactionFinalized(e)      => &e.session_id == session_id,
         GatewayEvent::TransactionFailed(e)         => &e.session_id == session_id,
+        GatewayEvent::TransactionExecutionFailed(e) => &e.session_id == session_id,
+        GatewayEvent::TransactionDropped(e)        => &e.session_id == session_id,
+        GatewayEvent::TransactionExpired(e)        => &e.session_id == session_id,
         GatewayEvent::WalletSignatureRequested(e)  => &e.session_id == session_id,
         GatewayEvent::WalletSignatureReceived(e)   => &e.session_id == session_id,
         GatewayEvent::WalletSignatureRejected(e)   => &e.session_id == session_id,

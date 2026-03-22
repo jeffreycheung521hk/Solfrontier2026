@@ -463,6 +463,7 @@ async fn full_approval_then_external_sign_flow() {
         &tx,
         fake_simulation(),
         PolicyVerdict::RequiresHumanApproval { reason: "amount exceeds threshold".into(), rule_name: "high_value".into() },
+        1000,
     ).unwrap();
 
     // Audit: approval requested

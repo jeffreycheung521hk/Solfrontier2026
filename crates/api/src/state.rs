@@ -83,10 +83,14 @@ pub trait EventSubscriber: Send + Sync + 'static {
 pub struct WalletSignatureOutcome {
     /// The request ID that was resolved.
     pub request_id: uuid::Uuid,
-    /// `true` if the signed transaction was accepted and submitted.
+    /// `true` if the signed transaction was accepted (verification passed).
     pub accepted: bool,
-    /// On-chain signature (present only if accepted and submitted).
+    /// The wallet's ed25519 signature (present if verification passed).
     pub signature: Option<String>,
+    /// On-chain transaction signature from RPC sendTransaction (present if submitted).
+    pub tx_signature: Option<String>,
+    /// Whether the transaction was successfully submitted to the Solana network.
+    pub submitted: bool,
     /// Error message if verification or submission failed.
     pub error: Option<String>,
 }

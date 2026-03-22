@@ -307,6 +307,7 @@ impl DurablePendingState {
                         Ok(id) => {
                             completion_meta.insert(id, CompletionMeta {
                                 fee_lamports: row.fee_lamports.map(|f| f as u64),
+                                last_valid_block_height: None, // not persisted in completion meta table
                             });
                             report.recovered_meta += 1;
                         }
@@ -366,8 +367,11 @@ impl DurablePendingState {
         let request_id = Uuid::parse_str(&row.request_id)
             .map_err(|e| format!("request_id parse: {e}"))?;
 
+        // Recovery path: the durable row doesn't store last_valid_block_height.
+        // Use 0 here; the value will be re-captured from the blockhash manager
+        // at submission time if the approval resumes into the external wallet path.
         let _decision_rx = pending_signing.park(
-            request_id, proposal, &tx, simulation, verdict,
+            request_id, proposal, &tx, simulation, verdict, 0,
         ).map_err(|e| format!("re-park: {e}"))?;
 
         Ok(())

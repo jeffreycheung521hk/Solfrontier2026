@@ -26,7 +26,10 @@ pub mod errors;
 pub mod fees;
 pub mod rpc;
 pub mod simulation;
+pub mod submission;
 pub mod subscriptions;
+pub mod tracker;
+pub mod tx_lifecycle;
 
 pub use blockhash::BlockhashManager;
 pub use errors::SolanaError;

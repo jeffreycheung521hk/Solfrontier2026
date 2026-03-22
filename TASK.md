@@ -57,10 +57,8 @@
 
 ### Phase B — On-Chain Execution
 
-- [ ] **B1: sendTransaction** — submit verified signed tx to Solana RPC
-  - `send_raw_transaction` → get signature → audit → `TransactionSubmitted` event
-- [ ] **B2: Confirmation tracking** — poll or websocket
-  - Status: submitted → confirmed → finalized → failed/dropped/expired
+- [x] **B1: sendTransaction** — ✅ Done (`send_raw_transaction` → signature → audit → `TransactionSent` event)
+- [x] **B2: Confirmation tracking** — ✅ Done (adaptive RPC polling, lifecycle state machine: Submitted → Confirmed → Finalized / Failed / Dropped / Expired, durable persistence via `transaction_tracking` table, idempotent event emission, restart recovery)
 - [ ] **B3: Basic retry / rebroadcast policy**
   - Same signed bytes can be resent; max retry count; blockhash expired = fail
   - No auto-resign or replacement tx in V1

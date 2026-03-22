@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 
 use claw_types::tool::ToolSpec;
 
@@ -214,6 +214,12 @@ fn parse_openai_response(resp: Value) -> Result<LlmResponse, AgentError> {
         "length" => "max_tokens".to_string(),
         other => other.to_string(),
     };
+
+    info!(
+        finish_reason = %finish_reason,
+        stop_reason = %stop_reason,
+        "OpenAI raw finish_reason"
+    );
 
     let input_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
     let output_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;

@@ -66,6 +66,11 @@ pub struct ParkedApproval {
     /// Used to reconstitute `ApprovedTransaction::new_unchecked()`.
     pub policy_verdict: PolicyVerdict,
 
+    /// The `lastValidBlockHeight` from the blockhash used in this transaction.
+    /// Threaded from the pipeline's `SimulatedTransaction` so the resume path
+    /// can populate `CompletionMeta` with a real value instead of zero.
+    pub last_valid_block_height: u64,
+
     /// Sender half of the oneshot that wakes the parked sign task.
     /// `true` = operator approved, `false` = operator rejected.
     /// `None` after the decision has been consumed (prevent double-fire).
@@ -98,6 +103,7 @@ impl PendingSigningStore {
         tx: &Transaction,
         simulation: SimulationResult,
         policy_verdict: PolicyVerdict,
+        last_valid_block_height: u64,
     ) -> Result<oneshot::Receiver<bool>, String> {
         let tx_bytes = bincode::serialize(tx)
             .map_err(|e| format!("failed to serialize parked transaction: {e}"))?;
@@ -111,6 +117,7 @@ impl PendingSigningStore {
                 tx_bytes,
                 simulation,
                 policy_verdict,
+                last_valid_block_height,
                 decision_tx: Some(decision_tx),
             },
         );

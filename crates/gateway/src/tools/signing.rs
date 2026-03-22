@@ -296,6 +296,7 @@ impl Tool for SubmitForSigningTool {
 
         let simulation = approved.inner.simulation.clone();
         let policy_verdict = approved.policy_verdict.clone();
+        let last_valid_block_height = approved.inner.last_valid_block_height;
         let finalized_tx = approved.inner.inner;
 
         // ── Routing decision: awaiting approval vs execution-ready ──────────────
@@ -336,6 +337,7 @@ impl Tool for SubmitForSigningTool {
                 &finalized_tx,
                 simulation.clone(),
                 policy_verdict.clone(),
+                last_valid_block_height,
             ).map_err(|e| ToolError::ExecutionFailed(e))?;
 
             self.approval_store.register(approval_request.clone());
@@ -425,6 +427,8 @@ impl Tool for SubmitForSigningTool {
 
         // ── Execution-ready: route through SignatureOrchestrator ─────────────────
 
+        // Internal storage: bincode format (Rust-native).
+        // Conversion to wire format happens at the API boundary (pending_for_session).
         let finalized_tx_bytes = bincode::serialize(&finalized_tx)
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to serialize tx: {e}")))?;
 
@@ -549,6 +553,7 @@ impl Tool for SubmitForSigningTool {
                 // and expose the request_id externally.
                 self.completion_meta.insert(request_id.0, CompletionMeta {
                     fee_lamports: simulation.fee_lamports,
+                    last_valid_block_height: Some(last_valid_block_height),
                 });
 
                 let unsigned_tx_b64 = base64::engine::general_purpose::STANDARD.encode(&finalized_tx_bytes);
@@ -826,6 +831,11 @@ pub async fn resume_after_approval(
             // and emit operator-visible events.
             completion_meta.insert(wallet_sig_request_id, CompletionMeta {
                 fee_lamports: simulation.fee_lamports,
+                last_valid_block_height: if parked.last_valid_block_height > 0 {
+                    Some(parked.last_valid_block_height)
+                } else {
+                    None // Recovery path: captured at submission via get_block_height()
+                },
             });
 
             let _ = audit.append(

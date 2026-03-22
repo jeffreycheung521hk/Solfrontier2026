@@ -183,7 +183,7 @@ async fn approve_signs_and_emits_events() {
 
     // ── Step 1: Park the transaction (simulates SubmitForSigningTool's AwaitingApproval) ──
     let decision_rx = pending_signing
-        .park(request_id, proposal.clone(), &tx, sim.clone(), verdict.clone())
+        .park(request_id, proposal.clone(), &tx, sim.clone(), verdict.clone(), 1000)
         .expect("park should succeed");
 
     assert_eq!(pending_signing.parked_count(), 1);
@@ -360,7 +360,7 @@ async fn reject_emits_failure_event_no_signing() {
     let mut rx = event_bus.subscribe();
 
     let decision_rx = pending_signing
-        .park(request_id, proposal.clone(), &tx, sim.clone(), verdict.clone())
+        .park(request_id, proposal.clone(), &tx, sim.clone(), verdict.clone(), 1000)
         .expect("park should succeed");
 
     let approval_request = ApprovalRequest {
@@ -473,7 +473,7 @@ async fn typestate_integrity_preserved() {
     assert!(sim.success, "precondition: sim must be successful");
 
     // SimulatedTransaction::new_unchecked succeeds with successful sim.
-    let simulated = SimulatedTransaction::new_unchecked(tx, sim);
+    let simulated = SimulatedTransaction::new_unchecked(tx, sim, 1000);
 
     // ApprovedTransaction::new_unchecked succeeds with non-blocked verdict.
     let verdict = PolicyVerdict::RequiresHumanApproval {

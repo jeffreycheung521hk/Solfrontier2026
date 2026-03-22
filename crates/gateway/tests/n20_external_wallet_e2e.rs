@@ -183,7 +183,7 @@ async fn external_wallet_full_e2e_challenge_bind_approve_sign_complete() {
 
     // Park in PendingSigningStore (awaiting human approval).
     let decision_rx = pending_signing
-        .park(request_id, proposal.clone(), &tx, sim.clone(), verdict.clone())
+        .park(request_id, proposal.clone(), &tx, sim.clone(), verdict.clone(), 1000)
         .expect("park should succeed");
 
     // Register in ApprovalStore.

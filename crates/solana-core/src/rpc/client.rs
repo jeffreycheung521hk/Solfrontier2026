@@ -204,6 +204,64 @@ impl ClawRpcClient {
         Ok(fees)
     }
 
+    /// Returns the current block height.
+    ///
+    /// Used by the daemon to capture `submission_block_height` immediately
+    /// after `sendTransaction`, anchoring lifecycle tracking grace periods.
+    #[instrument(skip(self))]
+    pub async fn get_block_height(
+        &self,
+        commitment: Option<CommitmentLevel>,
+    ) -> Result<u64, SolanaError> {
+        let commitment = to_sdk_commitment(commitment.unwrap_or(CommitmentLevel::Confirmed));
+        let client = self.pool.read_client()?;
+
+        let height = client
+            .get_block_height_with_commitment(commitment)
+            .await
+            .map_err(|e| {
+                self.pool.record_failure(&client.url());
+                SolanaError::Client(e.to_string())
+            })?;
+
+        self.pool.record_success(&client.url());
+        Ok(height)
+    }
+
+    /// Submits a signed transaction to the Solana network.
+    ///
+    /// The transaction bytes must be a fully-signed, serialized transaction
+    /// (bincode format). This method does NOT re-sign or modify the transaction.
+    ///
+    /// Uses the write-preferred endpoint from the RPC pool.
+    ///
+    /// Returns the transaction signature as a base58 string on success.
+    #[instrument(skip(self, signed_tx_bytes), fields(tx_bytes_len = signed_tx_bytes.len()))]
+    pub async fn send_raw_transaction(
+        &self,
+        signed_tx_bytes: &[u8],
+    ) -> Result<String, SolanaError> {
+        use solana_sdk::transaction::Transaction;
+
+        let tx: Transaction = bincode::deserialize(signed_tx_bytes)
+            .map_err(|e| SolanaError::Serialization(format!("deserialize signed tx: {e}")))?;
+
+        let client = self.pool.write_client()?;
+
+        // Use send_transaction which handles serialization internally.
+        let signature = client
+            .send_transaction(&tx)
+            .await
+            .map_err(|e| {
+                self.pool.record_failure(&client.url());
+                SolanaError::Client(format!("sendTransaction: {e}"))
+            })?;
+
+        self.pool.record_success(&client.url());
+
+        Ok(signature.to_string())
+    }
+
     /// Returns the underlying pool for advanced use.
     pub fn pool(&self) -> &RpcPool {
         &self.pool

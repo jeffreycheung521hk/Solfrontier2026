@@ -24,6 +24,9 @@ use uuid::Uuid;
 pub struct CompletionMeta {
     /// Fee from simulation result. Used for spend recording.
     pub fee_lamports: Option<u64>,
+    /// The `lastValidBlockHeight` from the blockhash used in this transaction.
+    /// Used by the lifecycle tracker for deterministic expiry.
+    pub last_valid_block_height: Option<u64>,
 }
 
 /// Thread-safe, in-memory store for completion metadata.

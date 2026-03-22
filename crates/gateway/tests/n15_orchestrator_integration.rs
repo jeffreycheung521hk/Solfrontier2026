@@ -283,7 +283,7 @@ async fn auto_approved_external_pending_then_complete() {
     assert_eq!(ext.orchestrator.pending_count(), 1);
 
     // Stash completion metadata (as the signing tool would)
-    infra.completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000) });
+    infra.completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000), last_valid_block_height: None });
 
     // Sign externally
     let mut signed_tx: Transaction = bincode::deserialize(&pending_tx_bytes).unwrap();
@@ -339,6 +339,7 @@ async fn human_approved_local_signs_via_orchestrator_after_approval() {
             reason: "test".into(),
             rule_name: "test-rule".into(),
         },
+        1000,
     ).expect("park should succeed");
 
     assert_eq!(infra.pending_signing.parked_count(), 1);
@@ -423,6 +424,7 @@ async fn human_approved_external_pending_then_complete_after_approval() {
             reason: "high value".into(),
             rule_name: "high-value-guard".into(),
         },
+        1000,
     ).expect("park");
 
     // Spawn resume task
@@ -520,7 +522,7 @@ async fn tampered_completion_fails_and_consumes_entry() {
     assert_eq!(ext.orchestrator.pending_count(), 1);
 
     // Stash completion metadata
-    completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000) });
+    completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000), last_valid_block_height: None });
 
     // Create a TAMPERED transaction (different destination, different amount)
     let evil_to = Pubkey::new_unique();
@@ -677,7 +679,7 @@ async fn expiry_reaper_expires_old_requests() {
     ext.orchestrator.submit(request).await.expect("submit");
 
     // Stash completion metadata
-    infra.completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000) });
+    infra.completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000), last_valid_block_height: None });
 
     assert_eq!(ext.orchestrator.pending_count(), 1);
 
@@ -751,7 +753,7 @@ async fn completion_meta_consumed_on_success() {
     ext.orchestrator.submit(request).await.unwrap();
 
     // Stash metadata
-    completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(7777) });
+    completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(7777), last_valid_block_height: None });
 
     // Complete successfully
     let mut signed_tx = tx.clone();
@@ -783,7 +785,7 @@ async fn completion_meta_cleaned_on_verification_failure() {
     let request_id = request.id;
     ext.orchestrator.submit(request).await.unwrap();
 
-    completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000) });
+    completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000), last_valid_block_height: None });
 
     // Attempt with UNSIGNED tx (signer didn't sign → verification fails)
     let unsigned_bytes = bincode::serialize(&tx).unwrap();
@@ -811,7 +813,7 @@ async fn completion_meta_cleaned_on_expiry() {
     let request_id = request.id;
     ext.orchestrator.submit(request).await.unwrap();
 
-    completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000) });
+    completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000), last_valid_block_height: None });
 
     // Expire
     ext.orchestrator.expire(&request_id).unwrap();
@@ -831,7 +833,7 @@ async fn completion_meta_not_found_does_not_leak() {
     let unknown_id = Uuid::new_v4();
 
     // Inserting metadata for a request that was never submitted
-    completion_meta.insert(unknown_id, CompletionMeta { fee_lamports: Some(5000) });
+    completion_meta.insert(unknown_id, CompletionMeta { fee_lamports: Some(5000), last_valid_block_height: None });
 
     // Cleanup removes it cleanly
     completion_meta.remove(&unknown_id);

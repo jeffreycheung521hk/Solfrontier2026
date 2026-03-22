@@ -38,11 +38,15 @@ pub struct SubmitWalletSignatureRequest {
 pub struct SubmitWalletSignatureResponse {
     /// The request ID.
     pub request_id: Uuid,
-    /// Whether the signed transaction was accepted.
+    /// Whether the signed transaction was accepted (verification passed).
     pub accepted: bool,
-    /// On-chain signature if accepted and submitted.
+    /// The wallet's ed25519 signature.
     pub signature: Option<String>,
-    /// Error message if rejected.
+    /// On-chain transaction signature from RPC sendTransaction.
+    pub tx_signature: Option<String>,
+    /// Whether the transaction was submitted to the network.
+    pub submitted: bool,
+    /// Error message if rejected or submission failed.
     pub error: Option<String>,
 }
 
@@ -86,6 +90,8 @@ pub async fn submit_wallet_signature(
             request_id: outcome.request_id,
             accepted: outcome.accepted,
             signature: outcome.signature,
+            tx_signature: outcome.tx_signature,
+            submitted: outcome.submitted,
             error: outcome.error,
         }),
     )

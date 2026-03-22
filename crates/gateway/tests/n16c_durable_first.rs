@@ -234,7 +234,7 @@ async fn durable_first_happy_path_external_pending() {
 
     // Step 3: Now safe to populate in-memory metadata.
     let completion_meta = CompletionMetadataStore::new();
-    completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000) });
+    completion_meta.insert(request_id.0, CompletionMeta { fee_lamports: Some(5000), last_valid_block_height: None });
 
     // Verify: DB has both rows.
     assert_eq!(repo.load_pending_signatures().await.unwrap().len(), 1);

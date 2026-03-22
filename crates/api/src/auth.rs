@@ -38,6 +38,9 @@ impl AuthToken {
 
 /// Axum middleware that validates the `Authorization: Bearer <token>` header.
 ///
+/// Also accepts `?token=<value>` as a query parameter fallback for SSE
+/// endpoints, since `EventSource` does not support custom request headers.
+///
 /// Requests without a valid token receive `401 Unauthorized`.
 /// The comparison uses constant-time equality to prevent timing attacks.
 pub async fn require_bearer_token(
@@ -45,14 +48,28 @@ pub async fn require_bearer_token(
     request: Request,
     next: Next,
 ) -> Response {
-    let provided = request
+    // Try Authorization header first (preferred).
+    let from_header = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
+
+    // Fallback: ?token= query parameter (for EventSource/SSE).
+    let from_query = request
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|pair| pair.strip_prefix("token="))
+                .map(|v| v.to_string())
+        });
+
+    let provided = from_header.or(from_query);
 
     match provided {
-        Some(token) if constant_time_eq(token, expected.value()) => {
+        Some(ref token) if constant_time_eq(token, expected.value()) => {
             next.run(request).await
         }
         _ => (
