@@ -1046,43 +1046,23 @@ impl WalletSignatureHandler for GatewayWalletSignatureHandler {
     }
 
     fn pending_for_session(&self, session_id: &SessionId) -> Vec<PendingWalletSignatureInfo> {
-        // Internal storage uses bincode. Browser needs Solana wire format.
-        // Convert at the API boundary: bincode → Transaction → wire format.
+        // Solana SDK's bincode::serialize(Transaction) IS the wire format.
+        // Transaction.signatures uses #[serde(with = "short_vec")] (compact-u16),
+        // and Message fields also use short_vec. So bincode output matches what
+        // web3.js Transaction.from() expects. No conversion needed.
         self.orchestrator
             .pending_for_session(session_id)
             .into_iter()
-            .filter_map(|summary| {
-                let tx: solana_sdk::transaction::Transaction =
-                    bincode::deserialize(&summary.finalized_tx_bytes).ok()?;
-
-                // Build wire format: [compact-u16 sig_count] [sigs] [message_data()]
-                let msg_data = tx.message_data();
-                let sig_count = tx.signatures.len();
-                let mut wire = Vec::with_capacity(3 + sig_count * 64 + msg_data.len());
-                // compact-u16 encode sig_count
-                {
-                    let mut val = sig_count;
-                    loop {
-                        let mut elem = (val & 0x7f) as u8;
-                        val >>= 7;
-                        if val > 0 { elem |= 0x80; }
-                        wire.push(elem);
-                        if val == 0 { break; }
-                    }
-                }
-                for sig in &tx.signatures {
-                    wire.extend_from_slice(sig.as_ref());
-                }
-                wire.extend_from_slice(&msg_data);
-
-                let unsigned_tx_b64 = base64::engine::general_purpose::STANDARD.encode(&wire);
-                Some(PendingWalletSignatureInfo {
+            .map(|summary| {
+                let unsigned_tx_b64 = base64::engine::general_purpose::STANDARD
+                    .encode(&summary.finalized_tx_bytes);
+                PendingWalletSignatureInfo {
                     request_id:      summary.request_id.0,
                     transaction_id:  summary.transaction_id,
                     description:     summary.description,
                     expected_signer: summary.expected_signer,
                     unsigned_tx_b64,
-                })
+                }
             })
             .collect()
     }
@@ -1130,17 +1110,8 @@ impl GatewayWalletSignatureHandler {
             }
         };
 
-        // Browser sends wire format. Orchestrator internal storage is bincode.
-        // Convert wire → bincode at the API boundary.
-        // Wire: [compact-u16 sig_count] [sigs] [message_data (compact-u16 vecs)]
-        // Bincode: [u64 LE sig_count] [sigs] [message (u64 LE vecs)]
-        //
-        // Approach: parse wire to get Transaction (via message_data → Message),
-        // then bincode::serialize back. But Message doesn't implement Deserialize
-        // from wire format via bincode.
-        //
-        // Simpler: pass wire bytes directly to orchestrator. The external_adapter
-        // now handles wire format verification natively.
+        // Solana SDK bincode = wire format (short_vec for all Vec fields).
+        // Browser's signed.serialize() output is directly bincode-deserializable.
         let signed_tx_bytes = raw_bytes;
 
         // Convert the UUID to a SignatureRequestId for the orchestrator.
