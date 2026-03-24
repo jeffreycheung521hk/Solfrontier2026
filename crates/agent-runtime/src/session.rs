@@ -1,7 +1,6 @@
 //! Agent session: tracks the state of one agent execution context.
 
 use chrono::{DateTime, Utc};
-use uuid::Uuid;
 
 use claw_types::{agent::AgentRole, session::SessionId};
 

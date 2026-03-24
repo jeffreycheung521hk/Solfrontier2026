@@ -26,7 +26,7 @@
 //! - Database persistence (future layer)
 //! - Event emission (future layer)
 //! - WebSocket subscriptions (future layer)
-//! - Retry / rebroadcast policy (future layer)
+//! - Retry / rebroadcast policy (B3: implemented via `RetryPolicy`)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,6 +114,27 @@ const MAX_BATCH_SIZE: usize = 256;
 /// Base polling interval for the tracker loop.
 const BASE_TICK: Duration = Duration::from_secs(2);
 
+// ── Retry / rebroadcast policy (B3) ──────────────────────────────────────
+
+/// Configuration for automatic rebroadcast of dropped transactions.
+///
+/// When a transaction transitions to `Dropped` (not observed after the grace
+/// period but blockhash is still valid), the tracker can resubmit the same
+/// signed bytes to the RPC. Solana deduplicates by signature, so this is safe.
+///
+/// `Expired` (blockhash invalid) is always terminal — no retry, no re-sign in V1.
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    /// Maximum number of rebroadcast attempts per transaction.
+    pub max_retries: u32,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self { max_retries: 3 }
+    }
+}
+
 /// In-memory transaction lifecycle tracker.
 ///
 /// Tracks submitted transactions by polling `getSignatureStatuses` and
@@ -130,6 +151,8 @@ pub struct TransactionTracker {
     /// Channel for emitting state changes to the LifecyclePersister.
     /// If no persister is connected (None), state changes are only in-memory.
     change_tx: Option<mpsc::UnboundedSender<StateChange>>,
+    /// B3: Retry policy for rebroadcasting dropped transactions.
+    retry_policy: RetryPolicy,
 }
 
 impl TransactionTracker {
@@ -139,6 +162,7 @@ impl TransactionTracker {
             rpc_pool,
             tracking: Arc::new(DashMap::new()),
             change_tx: None,
+            retry_policy: RetryPolicy::default(),
         }
     }
 
@@ -151,7 +175,14 @@ impl TransactionTracker {
             rpc_pool,
             tracking: Arc::new(DashMap::new()),
             change_tx: Some(change_tx),
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    /// Sets the retry policy for this tracker.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
     }
 
     /// Begin tracking a newly submitted transaction.
@@ -328,6 +359,54 @@ impl TransactionTracker {
                 }
             }
 
+            // Step 4b (B3): Rebroadcast dropped transactions if retries remain.
+            // Collect candidates first (no DashMap refs held across await).
+            let rebroadcast_candidates: Vec<(Signature, Vec<u8>)> = self.tracking
+                .iter()
+                .filter_map(|entry| {
+                    let record = entry.value();
+                    if record.state == TxState::Dropped
+                        && record.retry_count < self.retry_policy.max_retries
+                        && record.signed_tx_bytes.is_some()
+                        && current_height <= record.last_valid_block_height
+                    {
+                        Some((*entry.key(), record.signed_tx_bytes.clone().unwrap()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for (sig, tx_bytes) in &rebroadcast_candidates {
+                match self.rebroadcast(tx_bytes).await {
+                    Ok(_) => {
+                        if let Some(mut entry) = self.tracking.get_mut(sig) {
+                            let record = entry.value_mut();
+                            record.retry_count += 1;
+                            // Reset to Submitted so the grace period restarts.
+                            record.state = TxState::Submitted;
+                            record.submission_block_height = current_height;
+                            info!(
+                                signature = %sig,
+                                retry = record.retry_count,
+                                max = self.retry_policy.max_retries,
+                                "rebroadcast dropped transaction"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(mut entry) = self.tracking.get_mut(sig) {
+                            entry.value_mut().retry_count += 1;
+                        }
+                        warn!(
+                            signature = %sig,
+                            error = %e,
+                            "rebroadcast failed"
+                        );
+                    }
+                }
+            }
+
             // Step 5: Remove entries that should no longer be tracked.
             let to_remove: Vec<Signature> = self.tracking
                 .iter()
@@ -445,6 +524,37 @@ impl TransactionTracker {
                 err: s.err.as_ref().map(|e| format!("{e:?}")),
                 slot: Some(s.slot),
             },
+        }
+    }
+
+    /// B3: Rebroadcast signed transaction bytes to the RPC.
+    ///
+    /// Uses the same `sendTransaction` config as the original submission:
+    /// skip_preflight=true, max_retries=0 (we manage retries ourselves).
+    /// Solana deduplicates by signature, so resubmitting identical bytes is safe.
+    async fn rebroadcast(&self, signed_tx_bytes: &[u8]) -> Result<(), String> {
+        let tx: solana_sdk::transaction::Transaction = bincode::deserialize(signed_tx_bytes)
+            .map_err(|e| format!("failed to deserialize tx for rebroadcast: {e}"))?;
+
+        let client = self.rpc_pool.write_client()
+            .or_else(|_| self.rpc_pool.read_client())
+            .map_err(|e| format!("RPC pool exhausted: {e}"))?;
+
+        let config = solana_client::rpc_config::RpcSendTransactionConfig {
+            skip_preflight: true,
+            max_retries: Some(0),
+            ..Default::default()
+        };
+
+        match client.send_transaction_with_config(&tx, config).await {
+            Ok(_sig) => {
+                self.rpc_pool.record_success(&client.url());
+                Ok(())
+            }
+            Err(e) => {
+                self.rpc_pool.record_failure(&client.url());
+                Err(format!("sendTransaction failed: {e}"))
+            }
         }
     }
 }

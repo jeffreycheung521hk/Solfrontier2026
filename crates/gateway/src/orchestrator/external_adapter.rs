@@ -30,11 +30,10 @@ use tracing::{info, instrument, warn};
 
 use super::adapter::{ExternalWalletBindings, WalletAdapter};
 use super::types::{
-    SignatureError, SignatureOutcome, SignatureRequest, SignatureRequestId,
+    SignatureError, SignatureOutcome, SignatureRequest,
 };
 
 // Re-use the existing pure verification function from external_wallet module.
-use crate::external_wallet::verify_signed_tx;
 
 /// Execution Plane only.
 /// Handles signing for external wallets (Phantom, etc.) that sign out-of-band.

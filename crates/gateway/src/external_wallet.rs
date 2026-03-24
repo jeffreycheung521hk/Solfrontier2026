@@ -212,17 +212,33 @@ pub struct ExternalWalletStore {
     /// Pending signature requests keyed by request_id.
     pending: Arc<DashMap<Uuid, PendingWalletSignature>>,
 
-    /// Session → set of bound external wallet pubkeys.
+    /// Session → set of bound external wallet pubkeys (runtime-bound via bind_wallet).
     bindings: Arc<DashMap<SessionId, DashSet<String>>>,
+
+    /// Pubkeys declared as external in config (A3).
+    /// These are recognized across ALL sessions without needing bind_wallet.
+    config_bound_pubkeys: Arc<DashSet<String>>,
 }
 
 impl ExternalWalletStore {
     /// Creates an empty store.
     pub fn new() -> Self {
         Self {
-            pending:  Arc::new(DashMap::new()),
-            bindings: Arc::new(DashMap::new()),
+            pending:              Arc::new(DashMap::new()),
+            bindings:             Arc::new(DashMap::new()),
+            config_bound_pubkeys: Arc::new(DashSet::new()),
         }
+    }
+
+    /// Registers a pubkey as a config-declared external wallet (A3).
+    /// Config-bound wallets are recognized across all sessions.
+    pub fn register_config_external(&self, pubkey: &str) {
+        self.config_bound_pubkeys.insert(pubkey.to_string());
+    }
+
+    /// Returns true if the pubkey is a config-declared external wallet.
+    pub fn is_config_external(&self, pubkey: &str) -> bool {
+        self.config_bound_pubkeys.contains(pubkey)
     }
 
     // ── Session-wallet binding ────────────────────────────────────────────────
@@ -236,8 +252,13 @@ impl ExternalWalletStore {
     }
 
     /// Returns `true` if the given pubkey is bound as an external wallet
-    /// for the given session.
+    /// for the given session (runtime-bound) or declared as external in config (A3).
     pub fn is_external_wallet(&self, session_id: &SessionId, pubkey: &str) -> bool {
+        // Config-declared external wallets are recognized across all sessions.
+        if self.config_bound_pubkeys.contains(pubkey) {
+            return true;
+        }
+        // Runtime-bound: session-specific binding via bind_wallet.
         self.bindings
             .get(session_id)
             .map(|set| set.contains(pubkey))

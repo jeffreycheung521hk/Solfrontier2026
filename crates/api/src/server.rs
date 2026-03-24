@@ -37,7 +37,7 @@ use tracing::info;
 use claw_observability::HealthRegistry;
 
 use crate::{
-    auth::{require_bearer_token, AuthToken},
+    auth::require_bearer_token,
     errors::ApiError,
     routes::{
         approve::{list_approvals, submit_approval},

@@ -27,7 +27,7 @@ use axum::{
     },
     Json,
 };
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self};
 use serde_json::json;
 use std::convert::Infallible;
 use std::time::Duration;
@@ -62,7 +62,7 @@ pub async fn session_events(
     }
 
     // ── Subscribe to the event bus ────────────────────────────────────────────
-    let mut rx = state.events.subscribe();
+    let rx = state.events.subscribe();
 
     // ── Build the SSE stream ──────────────────────────────────────────────────
     let stream = stream::unfold(

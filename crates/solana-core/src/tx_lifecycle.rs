@@ -262,6 +262,15 @@ pub struct TrackingRecord {
     pub dropped_emitted: bool,
     /// Whether `TransactionExpired` has been emitted.
     pub expired_emitted: bool,
+
+    // ── Retry / rebroadcast (B3) ────────────────────────────────────
+
+    /// The signed transaction bytes for rebroadcast.
+    /// Solana deduplicates by signature, so resubmitting the same bytes is safe.
+    pub signed_tx_bytes: Option<Vec<u8>>,
+
+    /// How many times this transaction has been rebroadcast after Dropped.
+    pub retry_count: u32,
 }
 
 impl TrackingRecord {
@@ -276,6 +285,23 @@ impl TrackingRecord {
         wallet_pubkey: String,
         last_valid_block_height: u64,
         submission_block_height: u64,
+    ) -> Self {
+        Self::with_bytes(
+            signature, transaction_id, request_id, session_id,
+            wallet_pubkey, last_valid_block_height, submission_block_height, None,
+        )
+    }
+
+    /// Creates a new tracking record with signed bytes for potential rebroadcast.
+    pub fn with_bytes(
+        signature: String,
+        transaction_id: Uuid,
+        request_id: Uuid,
+        session_id: String,
+        wallet_pubkey: String,
+        last_valid_block_height: u64,
+        submission_block_height: u64,
+        signed_tx_bytes: Option<Vec<u8>>,
     ) -> Self {
         Self {
             signature,
@@ -293,6 +319,8 @@ impl TrackingRecord {
             failed_emitted: false,
             dropped_emitted: false,
             expired_emitted: false,
+            signed_tx_bytes,
+            retry_count: 0,
         }
     }
 

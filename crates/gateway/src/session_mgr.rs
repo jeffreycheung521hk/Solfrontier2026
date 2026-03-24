@@ -7,7 +7,7 @@ use tracing::{info, warn};
 use claw_types::{
     agent::AgentRole,
     events::{GatewayEvent, SessionClosedEvent, SessionOpenedEvent, EventHeader},
-    session::{SessionId, SessionState, SessionSummary},
+    session::{SessionId, SessionState},
 };
 use chrono::Utc;
 
@@ -65,7 +65,7 @@ impl SessionManager {
 
     /// Closes a session.
     pub fn close(&self, id: &SessionId, reason: &str) {
-        if let Some((_, mut record)) = self.sessions.remove(id) {
+        if let Some((_, _record)) = self.sessions.remove(id) {
             info!(session = %id, reason, "session closed");
             self.event_bus.publish(GatewayEvent::SessionClosed(SessionClosedEvent {
                 header:     EventHeader::new(Some(id.clone())),

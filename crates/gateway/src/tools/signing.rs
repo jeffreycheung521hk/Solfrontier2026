@@ -54,9 +54,8 @@ use claw_tool_system::{errors::ToolError, tool::Tool};
 use claw_types::{
     approval::ApprovalRequest,
     events::{ApprovalLifecycleEvent, EventHeader, GatewayEvent, TransactionFailedEvent, TransactionLifecycleEvent, WalletSignatureEvent},
-    policy::PolicyVerdict,
     tool::{ToolInput, ToolOutput, ToolSpec},
-    transaction::{SimulationResult, TransactionProposal, TransactionStatus},
+    transaction::{TransactionProposal, TransactionStatus},
 };
 use claw_wallet_engine::pipeline::TransactionReviewPipeline;
 

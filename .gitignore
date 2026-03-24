@@ -33,3 +33,4 @@ Thumbs.db
 
 # Local config overrides (keep config/default.toml as the template)
 claw.toml
+data/

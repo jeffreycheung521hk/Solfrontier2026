@@ -250,6 +250,21 @@ impl GatewayDaemon {
         let approval_store    = ApprovalStore::new();
         let pending_signing   = PendingSigningStore::new();
         let external_wallet   = ExternalWalletStore::new();
+
+        // A3: Register config-declared external wallets so they are
+        // recognized across all sessions without needing bind_wallet.
+        for wallet_cfg in &config.wallets {
+            if wallet_cfg.signer_type == SignerType::External {
+                if let Some(ref pubkey) = wallet_cfg.pubkey {
+                    external_wallet.register_config_external(pubkey);
+                    info!(
+                        label = %wallet_cfg.label,
+                        pubkey = %pubkey,
+                        "registered config-declared external wallet"
+                    );
+                }
+            }
+        }
         let completion_meta   = CompletionMetadataStore::new();
         let audit_repo        = AuditRepository::new(db.pool().clone());
         let spend_repo        = claw_state_store::SpendRepository::new(db.pool().clone());
@@ -258,33 +273,45 @@ impl GatewayDaemon {
         let durable_state      = DurablePendingState::new(pending_state_repo);
 
         // Build the main SignatureOrchestrator — shared between tool, handler, and reaper.
-        let main_orchestrator = if let Some((_, pubkey_str)) = loaded_wallets.first() {
-            let pubkey = pubkey_str.parse::<solana_sdk::pubkey::Pubkey>()
-                .map_err(|e| GatewayError::Startup(format!("invalid wallet pubkey: {e}")))?;
+        // A3: Build adapter chain dynamically based on configured wallets.
+        let main_orchestrator = {
+            let mut adapters: Vec<Arc<dyn crate::orchestrator::adapter::WalletAdapter>> = Vec::new();
 
-            let signer: SignerRef = Arc::new(
-                LocalKeypairSigner::new(pubkey, keystore.clone())
-            );
+            // External adapter is always added when any external wallet exists
+            // (config-declared or runtime-bound). Must come BEFORE local adapter
+            // so that external wallets are matched first.
+            let has_external = config.wallets.iter().any(|w| w.signer_type == SignerType::External);
+            if has_external || !external_wallet.wallets_for_session(&SessionId::from(uuid::Uuid::nil())).is_empty() {
+                let external_adapter = Arc::new(ExternalWalletAdapter::new(
+                    Arc::new(external_wallet.clone()),
+                ));
+                adapters.push(external_adapter);
+            }
 
-            // Build adapter chain: external first (more specific), then local.
-            let local_adapter = Arc::new(LocalWalletAdapter::new(signer.clone(), keystore.clone()));
-            let external_adapter = Arc::new(ExternalWalletAdapter::new(
-                Arc::new(external_wallet.clone()),
-            ));
-            SignatureOrchestrator::new(vec![external_adapter, local_adapter])
-        } else {
-            // No wallets — orchestrator with no adapters (fail-closed).
-            SignatureOrchestrator::new(vec![])
+            // Local adapter when a local keypair wallet is loaded.
+            let local_wallet = loaded_wallets.iter()
+                .zip(config.wallets.iter())
+                .find(|(_, cfg)| cfg.signer_type == SignerType::LocalKeypair);
+
+            if let Some(((_, pubkey_str), _)) = local_wallet {
+                let pubkey = pubkey_str.parse::<solana_sdk::pubkey::Pubkey>()
+                    .map_err(|e| GatewayError::Startup(format!("invalid wallet pubkey: {e}")))?;
+                let signer: SignerRef = Arc::new(
+                    LocalKeypairSigner::new(pubkey, keystore.clone())
+                );
+                let local_adapter = Arc::new(LocalWalletAdapter::new(signer.clone(), keystore.clone()));
+                adapters.push(local_adapter);
+            }
+
+            if adapters.is_empty() {
+                info!("no wallet adapters — orchestrator will reject all signing requests");
+            }
+            SignatureOrchestrator::new(adapters)
         };
 
-        let registry = if let Some((label, pubkey_str)) = loaded_wallets.first() {
-            let pubkey = pubkey_str.parse::<solana_sdk::pubkey::Pubkey>()
-                .map_err(|e| GatewayError::Startup(format!("invalid wallet pubkey: {e}")))?;
-
-            let signer: SignerRef = Arc::new(
-                LocalKeypairSigner::new(pubkey, keystore.clone())
-            );
-
+        // A3: The signing tool is active when ANY wallet is loaded (local or external).
+        let has_any_wallet = !loaded_wallets.is_empty();
+        let registry = if has_any_wallet {
             let pipeline = TransactionReviewPipeline::new(
                 rpc_client.clone(),
                 sim_client,
@@ -308,9 +335,8 @@ impl GatewayDaemon {
             ).with_durable(durable_state.clone()));
 
             info!(
-                label = %label,
-                "submit_for_signing tool active (wallet: {})",
-                pubkey_str
+                wallet_count = loaded_wallets.len(),
+                "submit_for_signing tool active"
             );
 
             registry.with_tool(submit_tool)
@@ -761,10 +787,15 @@ fn load_wallet_into_keystore(
             ))
         }
         SignerType::External => {
-            Err(format!(
-                "wallet '{}': External signer is not yet supported in V1 — deferred",
-                wallet_cfg.label
-            ))
+            // A3: External wallets have no key material to load.
+            // The pubkey is declared in config and registered as config-bound.
+            match wallet_cfg.pubkey {
+                Some(ref pubkey) if !pubkey.is_empty() => Ok(pubkey.clone()),
+                _ => Err(format!(
+                    "wallet '{}' is External but 'pubkey' is not set in config",
+                    wallet_cfg.label
+                )),
+            }
         }
         SignerType::ReadOnly => {
             Err(format!(
@@ -952,6 +983,10 @@ impl ApprovalHandler for GatewayApprovalHandler {
         self.store.pending_for_session(session_id)
     }
 
+    fn session_for_request(&self, request_id: uuid::Uuid) -> Option<SessionId> {
+        self.store.session_for_request(request_id)
+    }
+
     fn decide(
         &self,
         decision: ApprovalDecision,
@@ -1116,6 +1151,38 @@ impl GatewayWalletSignatureHandler {
 
         // Convert the UUID to a SignatureRequestId for the orchestrator.
         let sig_request_id = SignatureRequestId::from(request_id);
+
+        // P0-3: Verify the request belongs to this session before completing.
+        // Prevents Session B from submitting a signature for Session A's request.
+        match self.orchestrator.session_for_request(&sig_request_id) {
+            Some(ref owner) if owner != session_id => {
+                warn!(
+                    request_id = %request_id,
+                    url_session = %session_id,
+                    owner_session = %owner,
+                    "session-request binding violation: request belongs to a different session"
+                );
+                return WalletSignatureOutcome {
+                    request_id,
+                    accepted: false,
+                    signature: None,
+                    tx_signature: None,
+                    submitted: false,
+                    error: Some("request not found for this session".into()),
+                };
+            }
+            None => {
+                return WalletSignatureOutcome {
+                    request_id,
+                    accepted: false,
+                    signature: None,
+                    tx_signature: None,
+                    submitted: false,
+                    error: Some("no pending request with this ID".into()),
+                };
+            }
+            Some(_) => {} // session matches — proceed
+        }
 
         // Call orchestrator.complete() — atomic consume-on-attempt.
         // The orchestrator handles verification via the ExternalWalletAdapter.

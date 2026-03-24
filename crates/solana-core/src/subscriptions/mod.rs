@@ -9,10 +9,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::{broadcast, RwLock};
-use tracing::{info, warn};
+use tracing::info;
 use uuid::Uuid;
 
 use claw_types::solana::SolanaEvent;
@@ -88,8 +87,8 @@ impl SubscriptionManager {
     async fn run_account_subscription(
         id: Uuid,
         pubkey: String,
-        ws_url: String,
-        tx: broadcast::Sender<SolanaEvent>,
+        _ws_url: String,
+        _tx: broadcast::Sender<SolanaEvent>,
     ) {
         // TODO: Phase 3 — implement with solana_pubsub_client::PubsubClient
         // with exponential backoff reconnect logic.

@@ -4,7 +4,6 @@
 //! V2: exponential backoff + max restart count + alerting on repeated failure.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;

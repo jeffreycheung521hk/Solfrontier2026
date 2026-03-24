@@ -108,6 +108,17 @@ impl ApprovalStore {
         (outcome, Some(request))
     }
 
+    /// Peek at which session owns a pending request (P0-3: session-request binding).
+    ///
+    /// Returns `Some(session_id)` if the request exists and is undecided.
+    /// Does NOT consume or modify the entry.
+    pub fn session_for_request(&self, request_id: Uuid) -> Option<SessionId> {
+        self.pending
+            .get(&request_id)
+            .filter(|entry| !entry.decided)
+            .map(|entry| entry.session_id.clone())
+    }
+
     /// Returns the number of currently pending (undecided) requests.
     pub fn pending_count(&self) -> usize {
         self.pending.len()

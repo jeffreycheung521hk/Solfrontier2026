@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     errors::SolanaError,
-    rpc::{RpcPool, ClawRpcClient},
+    rpc::RpcPool,
 };
 
 /// How many slots of buffer before expiry we consider a hash stale.

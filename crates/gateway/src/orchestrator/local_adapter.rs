@@ -23,7 +23,7 @@ use claw_wallet_engine::signer::SignerRef;
 
 use super::adapter::WalletAdapter;
 use super::types::{
-    SignatureError, SignatureOutcome, SignatureRequest, SignatureRequestId,
+    SignatureError, SignatureOutcome, SignatureRequest,
 };
 
 /// Execution Plane only.

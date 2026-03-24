@@ -1,10 +1,7 @@
 //! SPL Token and Token-2022 account decoders.
 
 use serde::{Deserialize, Serialize};
-use solana_account_decoder::parse_token::{UiTokenAccount, UiMint};
-use solana_sdk::account::Account;
 
-use crate::errors::SolanaError;
 
 /// Decoded SPL token mint data.
 #[derive(Debug, Clone, Serialize, Deserialize)]

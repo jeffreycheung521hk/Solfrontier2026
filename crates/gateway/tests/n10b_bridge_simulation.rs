@@ -87,6 +87,9 @@ impl ApprovalHandler for StubApprovalHandler {
     fn pending_for_session(&self, _session_id: &SessionId) -> Vec<ApprovalRequest> {
         vec![]
     }
+    fn session_for_request(&self, _request_id: uuid::Uuid) -> Option<SessionId> {
+        None
+    }
     fn decide(
         &self,
         _decision: ApprovalDecision,

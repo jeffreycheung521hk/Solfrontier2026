@@ -367,6 +367,18 @@ impl SignatureOrchestrator {
         self.pending.len()
     }
 
+    /// Peek at which session owns a pending request (P0-3: session-request binding).
+    ///
+    /// Returns `Some(session_id)` if the request exists in the pending map.
+    /// Does NOT consume or modify the entry. Used by callers to verify that
+    /// the session from the URL path actually owns the request before completing
+    /// or approving it.
+    pub fn session_for_request(&self, request_id: &SignatureRequestId) -> Option<SessionId> {
+        self.pending
+            .get(request_id)
+            .map(|entry| entry.value().request.session_id.clone())
+    }
+
     // ── Recovery ──────────────────────────────────────────────────────────
 
     /// Inject a recovered pending entry directly into the pending map.

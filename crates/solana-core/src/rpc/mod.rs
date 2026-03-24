@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use claw_types::solana::CommitmentLevel;
 
@@ -91,7 +91,7 @@ impl EndpointState {
         }
     }
 
-    fn is_available(&self, failure_threshold: u32, recovery_interval: Duration) -> bool {
+    fn is_available(&self, _failure_threshold: u32, recovery_interval: Duration) -> bool {
         match self.circuit_open_since {
             None => true,
             Some(since) => {

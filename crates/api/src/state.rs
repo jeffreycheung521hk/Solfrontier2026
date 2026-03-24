@@ -58,6 +58,9 @@ pub trait ApprovalHandler: Send + Sync + 'static {
     /// Returns all pending approval requests for the given session.
     fn pending_for_session(&self, session_id: &SessionId) -> Vec<ApprovalRequest>;
 
+    /// Peek at which session owns a pending request (P0-3: session-request binding).
+    fn session_for_request(&self, request_id: uuid::Uuid) -> Option<SessionId>;
+
     /// Processes an operator decision.
     ///
     /// Returns the outcome and, on success, the original request so callers
@@ -237,6 +240,11 @@ impl ApprovalHandlerRef {
     /// Returns pending approval requests for a session.
     pub fn pending_for_session(&self, session_id: &SessionId) -> Vec<ApprovalRequest> {
         self.0.pending_for_session(session_id)
+    }
+
+    /// Peek at which session owns a pending request (P0-3).
+    pub fn session_for_request(&self, request_id: uuid::Uuid) -> Option<SessionId> {
+        self.0.session_for_request(request_id)
     }
 
     /// Processes an operator decision.

@@ -17,7 +17,7 @@ use solana_sdk::{
     commitment_config::CommitmentConfig,
 };
 use solana_transaction_status::UiTransactionEncoding;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
 use claw_types::transaction::{AccountDiff, SimulationResult};
 

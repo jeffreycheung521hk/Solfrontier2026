@@ -77,6 +77,21 @@ pub async fn submit_approval(
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "session not found or not active" }))).into_response();
     }
 
+    // ── P0-3: Verify request belongs to this session ─────────────────────────
+    match state.approval.session_for_request(req.request_id) {
+        Some(ref owner) if owner != &session_id => {
+            return (StatusCode::NOT_FOUND, Json(json!({
+                "error": "no pending approval request with this ID for the session"
+            }))).into_response();
+        }
+        None => {
+            return (StatusCode::NOT_FOUND, Json(json!({
+                "error": "no pending approval request with this ID for the session"
+            }))).into_response();
+        }
+        Some(_) => {} // session matches — proceed
+    }
+
     // ── Build decision and dispatch ───────────────────────────────────────────
     let decision = if req.approved {
         ApprovalDecision::approve(req.request_id, req.note.clone())

@@ -7,16 +7,15 @@
 
 use std::str::FromStr;
 
-use solana_client::rpc_config::{RpcTransactionConfig, RpcAccountInfoConfig};
+use solana_client::rpc_config::RpcTransactionConfig;
 use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 use solana_sdk::{
     account::Account,
-    commitment_config::CommitmentConfig,
     pubkey::Pubkey,
     signature::Signature,
 };
 use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding};
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use claw_types::solana::CommitmentLevel;
 

@@ -262,10 +262,48 @@ impl ContextManager {
     fn trim_if_needed(&mut self) {
         // Remove oldest entries until under the token limit.
         // Keep at least 2 entries (1 user + 1 assistant) for coherence.
+        //
+        // C2 fix: tool_use/tool_result pairs must be removed together.
+        // Orphaning either side violates the Messages API contract.
         while self.estimated_tokens > self.max_tokens && self.entries.len() > 2 {
-            let removed = self.entries.remove(0);
-            self.estimated_tokens =
-                self.estimated_tokens.saturating_sub(removed.estimated_tokens());
+            // Count how many entries to remove as a group.
+            let remove_count = self.trim_group_size();
+            if remove_count == 0 || self.entries.len().saturating_sub(remove_count) < 2 {
+                break; // Would leave fewer than 2 entries — stop trimming.
+            }
+            for _ in 0..remove_count {
+                let removed = self.entries.remove(0);
+                self.estimated_tokens =
+                    self.estimated_tokens.saturating_sub(removed.estimated_tokens());
+            }
+        }
+    }
+
+    /// Returns the number of leading entries to remove as a single group.
+    ///
+    /// - If entries[0] is `AssistantToolUse`, remove it plus all consecutive
+    ///   `ToolResult` entries that follow (the paired results).
+    /// - If entries[0] is `ToolResult` (orphaned from a previous partial trim —
+    ///   should not happen with this logic, but defensive), remove consecutive
+    ///   `ToolResult` entries.
+    /// - Otherwise, remove 1 entry.
+    fn trim_group_size(&self) -> usize {
+        match self.entries.first() {
+            Some(ContextEntry::AssistantToolUse { .. }) => {
+                // Remove this tool_use + all consecutive tool_results after it.
+                1 + self.entries[1..]
+                    .iter()
+                    .take_while(|e| matches!(e, ContextEntry::ToolResult { .. }))
+                    .count()
+            }
+            Some(ContextEntry::ToolResult { .. }) => {
+                // Defensive: remove consecutive orphaned tool_results.
+                self.entries
+                    .iter()
+                    .take_while(|e| matches!(e, ContextEntry::ToolResult { .. }))
+                    .count()
+            }
+            _ => 1,
         }
     }
 }
@@ -432,5 +470,72 @@ mod tests {
         // 4. Assistant final text
         assert_eq!(messages[3].role, "assistant");
         assert!(matches!(&messages[3].content[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn trim_removes_tool_use_and_tool_result_as_pair() {
+        // C2 fix: trimming must never orphan a tool_use without its tool_results
+        // or leave tool_results without a preceding tool_use.
+        //
+        // Use a small token budget so trimming is triggered.
+        // Each entry is ~content.len()/4 tokens.
+        // "x".repeat(200) = 50 tokens each.
+        let mut ctx = ContextManager::new(200); // 200 token budget
+
+        // Entry 1: user instruction (~50 tokens)
+        ctx.push_user(&"x".repeat(200));
+
+        // Entry 2: assistant tool_use (~50 tokens)
+        let tool_calls = vec![LlmToolCall {
+            id: "tc_1".to_string(),
+            tool_name: "get_balance".to_string(),
+            input: serde_json::json!({}),
+        }];
+        ctx.push_assistant_tool_use(Some("y".repeat(150)), tool_calls);
+
+        // Entry 3: tool_result (~50 tokens)
+        ctx.push_tool_result("get_balance", "tc_1", &"z".repeat(200));
+
+        // Entry 4: assistant response (~50 tokens) — this push should trigger trimming
+        ctx.push_assistant(&"w".repeat(200));
+
+        let messages = ctx.messages();
+
+        // Verify: no orphaned tool_result without a preceding tool_use.
+        for (i, msg) in messages.iter().enumerate() {
+            if msg.has_tool_results() {
+                assert!(
+                    i > 0 && messages[i - 1].has_tool_use(),
+                    "tool_result at index {i} has no preceding tool_use — trim broke the pair"
+                );
+            }
+        }
+
+        // Verify: no orphaned tool_use without a following tool_result.
+        for (i, msg) in messages.iter().enumerate() {
+            if msg.has_tool_use() {
+                assert!(
+                    i + 1 < messages.len() && messages[i + 1].has_tool_results(),
+                    "tool_use at index {i} has no following tool_result — trim broke the pair"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trim_group_size_for_tool_use_entry() {
+        let mut ctx = ContextManager::new(100_000);
+
+        // Push tool_use followed by 2 tool_results
+        let tool_calls = vec![
+            LlmToolCall { id: "tc_1".to_string(), tool_name: "a".into(), input: serde_json::json!({}) },
+            LlmToolCall { id: "tc_2".to_string(), tool_name: "b".into(), input: serde_json::json!({}) },
+        ];
+        ctx.push_assistant_tool_use(None, tool_calls);
+        ctx.push_tool_result("a", "tc_1", "res_a");
+        ctx.push_tool_result("b", "tc_2", "res_b");
+
+        // Group size should be 3 (1 tool_use + 2 tool_results)
+        assert_eq!(ctx.trim_group_size(), 3);
     }
 }

@@ -107,6 +107,9 @@ pub struct WalletConfig {
     /// For LocalKeypair: base58-encoded private key (use keypair_path in production).
     /// SECURITY: Never commit this to source control.
     pub keypair_base58: Option<String>,
+    /// For External: the base58-encoded public key of the external wallet.
+    /// Required when signer_type = "external".
+    pub pubkey: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

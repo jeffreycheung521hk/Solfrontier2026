@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 use claw_types::{

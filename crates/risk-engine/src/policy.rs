@@ -11,7 +11,7 @@ use claw_types::{
     solana::SolanaNetwork,
 };
 
-use crate::{context::PolicyEvaluationContext, errors::RiskError};
+use crate::context::PolicyEvaluationContext;
 
 /// A compiled set of policy rules.
 #[derive(Debug, Clone)]

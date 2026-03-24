@@ -60,6 +60,14 @@ keypair_path = "/Users/YOUR_USERNAME/.config/solana/devnet.json"
 # signer_type = "local_keypair"
 # keypair_base58 = "PASTE_BASE58_KEY_HERE"
 
+# Example: external wallet (e.g., Phantom)
+# Requires only the pubkey — no key material is loaded.
+# Transactions targeting this wallet route to the external signing path.
+# [[wallets]]
+# label = "phantom-wallet"
+# signer_type = "external"
+# pubkey = "YOUR_PHANTOM_PUBKEY_BASE58"
+
 # ── Policy ─────────────────────────────────────────────────────────────────
 [policy]
 # When true, all mainnet transactions require explicit human approval.

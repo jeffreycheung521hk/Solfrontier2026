@@ -11,9 +11,7 @@
 use std::time::Duration;
 
 use tokio::sync::oneshot;
-use tracing::instrument;
 
-use crate::errors::WalletError;
 
 /// How the approval step should behave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
