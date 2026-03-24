@@ -1,8 +1,77 @@
 # ClawSolana — Progress Log
 
-**Last Updated:** 2026-03-21
-**Sessions:** 15 (through wallet ownership proof, Phantom bridge, OpenAI support)
-**Tests:** 218, zero failures
+**Last Updated:** 2026-03-24
+**Sessions:** 16 (through toolchain upgrade, E2E validation, wallet context injection)
+**Tests:** 276, zero failures
+
+---
+
+## Session 16 — 2026-03-24 (Phase 1.5: Toolchain + E2E Validation + Agent Wallet Context)
+
+### Build status
+- `cargo check` PASS (Rust 1.94.0 stable)
+- `cargo test` PASS — 276 tests, zero failures
+- E2E live test PASS — OpenAI GPT-4o-mini agent successfully queried devnet wallet balance (0.8 SOL)
+
+### Objective
+
+Upgrade Rust toolchain (unblocking all compilation), inject wallet context into agent system prompts (fixing GPT pubkey hallucination), and validate full E2E pipeline on devnet.
+
+### Changes
+
+1. **Rust toolchain upgrade** — 1.82.0 → 1.94.0 stable
+   - Added `rust-toolchain.toml` to pin stable channel
+   - Installed OpenSSL Win64 for `openssl-sys` dependency (Solana SDK → secp256r1)
+   - 276 tests pass (up from 218 — more crates now compile)
+
+2. **Wallet context injection into agent system prompts**
+   - `AgentSession.wallet_context: Option<String>` — runtime context field
+   - `build_system_prompt()` appends wallet pubkeys to system prompt
+   - `GatewaySessionAdapter` builds context from `loaded_wallets` at startup
+   - Fixes: GPT no longer hallucinates wallet pubkeys; uses actual configured address
+
+3. **Session-request binding security (P0-3)**
+   - `orchestrator.session_for_request()` peek method
+   - Submit endpoint verifies session ownership before accepting wallet signatures
+   - Approval endpoint verifies session ownership before signaling decisions
+
+4. **Context trimming fix (C2)**
+   - `trim_if_needed()` now removes tool_use/tool_result in pairs
+   - Prevents orphaned entries that violate LLM API contracts
+
+5. **Transaction retry/rebroadcast foundation (B3)**
+   - `RetryPolicy` struct with configurable max_retries, interval, blockhash handling
+   - Tracker integration for rebroadcast on `Dropped` state
+
+6. **Keygen utility** — `bins/keygen` binary for generating devnet keypairs
+   - Also `scripts/gen_keypair.rs` standalone script
+
+7. **E2E live validation** — full pipeline tested on devnet:
+   - Session open → agent receives "check my wallet balance" → GPT calls `get_wallet_balance` with correct pubkey → RPC returns 0.8 SOL → response to user
+
+### Files added
+- `rust-toolchain.toml` — pin Rust stable
+- `bins/keygen/` — keypair generation binary
+- `scripts/gen_keypair.rs` — standalone keypair script
+
+### Files modified
+- `crates/agent-runtime/src/session.rs` — wallet_context field
+- `crates/agent-runtime/src/personas/mod.rs` — build_system_prompt()
+- `crates/agent-runtime/src/agent.rs` — use dynamic system prompt
+- `crates/agent-runtime/src/router.rs` — pass wallet_context to open_session
+- `crates/gateway/src/daemon.rs` — wallet context generation, session-request binding
+- `crates/agent-runtime/src/llm/context.rs` — pair-safe context trimming
+- `crates/solana-core/src/tracker.rs` — retry/rebroadcast support
+- `crates/gateway/src/orchestrator/mod.rs` — session_for_request()
+- 20+ other files (security hardening, cleanup, dependency updates)
+
+### Test delta
+- +58 tests (276 total, up from 218)
+- Zero failures
+
+### Key decisions
+- **Wallet context via system prompt** — simplest approach, no trait changes needed
+- **OpenSSL pre-built binaries** — Windows doesn't support Solana CLI installer; used ShiningLight OpenSSL + env vars
 
 ---
 

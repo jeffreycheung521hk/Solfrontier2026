@@ -2,8 +2,8 @@
 
 **Product:** Policy-gated transaction control plane for Solana.
 
-**Created:** 2026-03-19 | **Updated:** 2026-03-21
-**Baseline:** Session 15 complete (218 tests, zero failures, durable-first orchestration + wallet ownership proof + Phantom bridge)
+**Created:** 2026-03-19 | **Updated:** 2026-03-24
+**Baseline:** Session 16 complete (276 tests, zero failures, Rust 1.94.0, E2E devnet validated)
 **Companion:** [ARCHITECTURE_CONTROL.md](ARCHITECTURE_CONTROL.md) — system invariants, plane model, failure modes
 
 ---
@@ -23,10 +23,10 @@ The control plane is the product core. These phases define the progression from 
 | P1-1: Durable pending state (SQLite lifecycle, startup recovery, durable-first) | ✅ Done |
 | P1-1 hardening: mark-terminal-before-remove, `abort_pending()`, purge | ✅ Done |
 | N1–N8 foundation audit (200+ tests) | ✅ Done |
-| P0-3: Session-request binding check | Open |
+| P0-3: Session-request binding check | ✅ Done |
 | P1-2: Rate limiting | Open |
 | P1-3: `bind_wallet` challenge-response | ✅ Done |
-| N12: Context trimming (tool_use/tool_result pairs) | Open |
+| N12: Context trimming (tool_use/tool_result pairs) | ✅ Done |
 
 **Exit Criteria:** All P0 fixed, durable pending state operational, 200+ tests passing.
 
@@ -55,15 +55,16 @@ The control plane is the product core. These phases define the progression from 
 - [ ] Signing tool routes to external pending path for external wallets
 - [ ] Session binding + orchestrator routing works end-to-end
 
-#### 1.4 — On-Chain Submission
-- [ ] `sendTransaction` after verification passes
-- [ ] Confirmation tracking: submitted → confirmed → finalized / failed
-- [ ] Basic retry: same signed bytes, max retries, blockhash expired = fail
+#### 1.4 — On-Chain Submission *(mostly complete)*
+- [x] `sendTransaction` after verification passes
+- [x] Confirmation tracking: submitted → confirmed → finalized / failed
+- [~] Basic retry: foundation in place (RetryPolicy struct, tracker integration), needs config wiring
 
-#### 1.5 — Operational Safety
+#### 1.5 — Operational Safety *(mostly complete)*
 - [ ] Rate limiting (per token, per session, 429 response)
-- [ ] Session-request binding (P0-3)
-- [ ] Context trimming fix (tool_use/tool_result pair-safe)
+- [x] Session-request binding (P0-3) — ✅ Done
+- [x] Context trimming fix (tool_use/tool_result pair-safe) — ✅ Done
+- [x] Wallet context injection — agent system prompts include loaded wallet pubkeys
 
 #### 1.6 — End-to-End Test
 - [ ] Session → bind (with challenge) → propose → approve → external sign → verify → submit → confirmed on devnet

@@ -6,7 +6,7 @@ ClawSolana is a Rust-native daemon that sits between intent sources (AI agents, 
 
 The system is designed so that entities proposing transactions **never hold signing authority**, and entities holding signing authority **never see a transaction the control plane hasn't vetted**.
 
-> **Status: Alpha.** Core control plane, policy enforcement, durable pending lifecycle, capability boundaries, on-chain submission, and transaction lifecycle tracking are implemented and tested (220+ tests). Retry/rebroadcast policy and external signer formalization are under active development. This is not a production-ready wallet product.
+> **Status: Alpha.** Core control plane, policy enforcement, durable pending lifecycle, capability boundaries, on-chain submission, and transaction lifecycle tracking are implemented and tested (276 tests, Rust 1.94.0). Full pipeline validated end-to-end on devnet (agent → tool call → RPC → correct result). External signer formalization is under active development. This is not a production-ready wallet product.
 
 ---
 
@@ -40,10 +40,10 @@ The system is designed so that entities proposing transactions **never hold sign
 
 | Metric | Value |
 |--------|-------|
-| **Build** | `cargo check` PASS |
-| **Tests** | 200+ tests, zero failures |
-| **Last updated** | 2026-03-21 |
-| **Stage** | Alpha — infrastructure prototype with real test coverage |
+| **Build** | `cargo check` PASS (Rust 1.94.0 stable) |
+| **Tests** | 276 tests, zero failures |
+| **Last updated** | 2026-03-24 |
+| **Stage** | Alpha — E2E validated on devnet |
 | **Production readiness** | NOT PRODUCTION-READY |
 
 ### Current Capabilities

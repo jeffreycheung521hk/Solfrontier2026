@@ -1,7 +1,8 @@
 # ClawSolana — Task Tracker
 
-**Updated:** 2026-03-21
-**Build:** cargo check PASS, cargo test PASS (218 tests, zero failures)
+**Updated:** 2026-03-24
+**Build:** cargo check PASS, cargo test PASS (276 tests, zero failures)
+**Rust:** 1.94.0 stable
 **Roadmap:** See [ROADMAP.md](ROADMAP.md)
 
 ---
@@ -37,20 +38,30 @@
 - [x] CORS enabled on API server for local bridge development
 - [x] Cross-session binding hijack fix — verify_challenge checks session_id
 
+### Session 16: Toolchain + E2E Validation + Agent Wallet Context
+- [x] Rust toolchain upgrade — 1.82.0 → 1.94.0 stable, `rust-toolchain.toml`
+- [x] OpenSSL Win64 setup for `openssl-sys` dependency
+- [x] P0-3: Session-request binding — verify session_id ownership before accepting signatures
+- [x] C2: Context trimming fix — trim tool_use/tool_result in pairs, not individually
+- [x] B3 foundation: Retry/rebroadcast policy structs + tracker integration
+- [x] Wallet context injection — agent system prompts include loaded wallet pubkeys
+- [x] Keygen utility — `bins/keygen` binary + `scripts/gen_keypair.rs`
+- [x] E2E live validation — GPT agent queried devnet wallet balance (0.8 SOL) successfully
+
 ---
 
 ## Current Priorities — Phase 1: Execution Completeness
 
-> Wallet ownership proof and Phantom bridge are implemented. Next: formalize external signer mode and complete the on-chain execution path.
+> Toolchain upgraded, agent wallet context fixed, E2E pipeline validated on devnet. Next: formalize external signer and complete retry policy.
 
 - [x] **A1: Wallet ownership proof** — ✅ Done (challenge-response, session-bound nonce, 9 tests)
 
 - [x] **A2: Phantom browser bridge** — ✅ Done (bridge/index.html, Phantom signMessage + signTransaction)
 
 - [ ] **A3: External signer formalization** — `SignerType::External` from deferred to live
-  - Config can declare a wallet as external
+  - Config can declare a wallet as external with pubkey only
+  - `config_bound_pubkeys` in `ExternalWalletStore` for operator-declared wallets
   - Signing tool routes to external pending path (not local default signer)
-  - Session binding + orchestrator routing works end-to-end
 
 - [ ] **A4: End-to-end connectivity test** — manual or semi-automated
   - session → bind wallet (with challenge) → agent proposes tx → approval → external sign → verify → accepted
@@ -58,23 +69,23 @@
 ### Phase B — On-Chain Execution
 
 - [x] **B1: sendTransaction** — ✅ Done (`send_raw_transaction` → signature → audit → `TransactionSent` event)
-- [x] **B2: Confirmation tracking** — ✅ Done (adaptive RPC polling, lifecycle state machine: Submitted → Confirmed → Finalized / Failed / Dropped / Expired, durable persistence via `transaction_tracking` table, idempotent event emission, restart recovery)
-- [ ] **B3: Basic retry / rebroadcast policy**
+- [x] **B2: Confirmation tracking** — ✅ Done (adaptive RPC polling, lifecycle state machine, durable persistence, restart recovery)
+- [~] **B3: Basic retry / rebroadcast policy** — foundation in place (RetryPolicy struct, tracker integration), needs wiring from config
   - Same signed bytes can be resent; max retry count; blockhash expired = fail
   - No auto-resign or replacement tx in V1
 
 ### Phase C — Hardening & Operational Readiness
 
 - [ ] **C1: Rate limiting** — per API token, per session, message size limit, 429 response
-- [ ] **C2: Context trimming fix (N12)** — trim in tool_use/tool_result pairs, not individual entries
+- [x] **C2: Context trimming fix (N12)** — ✅ Done (trim in tool_use/tool_result pairs)
 - [ ] **C3: Metrics / operational visibility** — basic counters for pending/signed/expired/rejected
 - [ ] **C4: `bind_wallet` persistence** — if needed for cross-restart session continuity
 
-### Remaining Phase 0 Items (fix alongside or before Phase A)
+### Remaining Phase 0 Items
 
-- [ ] **P0-3:** Session-request binding — verify session_id ownership before accepting wallet signatures
+- [x] **P0-3:** Session-request binding — ✅ Done (verify session_id ownership)
 - [ ] **N13:** Two-pass compute budget optimization (simulate → tighten CU → re-simulate)
-- [ ] Clean up compiler warnings (unused imports, missing docs)
+- [ ] Clean up compiler warnings (unused imports, missing docs — 39 warnings remaining)
 
 ---
 

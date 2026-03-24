@@ -47,8 +47,10 @@ impl AgentRouter {
         id: SessionId,
         role: AgentRole,
         channel: impl Into<String>,
+        wallet_context: Option<String>,
     ) -> SessionId {
-        let session = AgentSession::new(id.clone(), role, channel);
+        let mut session = AgentSession::new(id.clone(), role, channel);
+        session.wallet_context = wallet_context;
         self.sessions.write().await.insert(id.clone(), session);
         id
     }

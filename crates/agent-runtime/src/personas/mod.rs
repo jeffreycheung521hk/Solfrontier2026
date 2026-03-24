@@ -5,13 +5,22 @@ pub mod research;
 
 use claw_types::agent::AgentRole;
 
-/// Returns the system prompt for a given agent role.
+/// Returns the base system prompt for a given agent role.
 pub fn system_prompt_for(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Research  => research::SYSTEM_PROMPT,
         AgentRole::Execution => execution::SYSTEM_PROMPT,
         AgentRole::Risk      => RISK_SYSTEM_PROMPT,
         AgentRole::Ops       => OPS_SYSTEM_PROMPT,
+    }
+}
+
+/// Builds the full system prompt by appending runtime wallet context.
+pub fn build_system_prompt(role: AgentRole, wallet_context: Option<&str>) -> String {
+    let base = system_prompt_for(role);
+    match wallet_context {
+        Some(ctx) => format!("{base}\n\n---\n\nSESSION CONTEXT:\n{ctx}"),
+        None      => base.to_string(),
     }
 }
 

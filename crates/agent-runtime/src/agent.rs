@@ -28,7 +28,7 @@ use claw_tool_system::ToolDispatcher;
 use crate::{
     errors::AgentError,
     llm::LlmClientRef,
-    personas::system_prompt_for,
+    personas::build_system_prompt,
     session::AgentSession,
 };
 
@@ -60,7 +60,10 @@ impl Agent {
         dispatcher: ToolDispatcher,
         tool_traces: &ToolTraceRepository,
     ) -> Result<AgentResponse, AgentError> {
-        let system_prompt = system_prompt_for(session.agent_role);
+        let system_prompt = build_system_prompt(
+            session.agent_role,
+            session.wallet_context.as_deref(),
+        );
         let tool_specs = dispatcher.registry().all_specs();
 
         // Add the operator's command to history as a trusted UserInstruction.
@@ -79,7 +82,7 @@ impl Agent {
             let context_messages = session.context.messages();
             let response = self
                 .llm
-                .complete(system_prompt, &context_messages, &tool_specs)
+                .complete(&system_prompt, &context_messages, &tool_specs)
                 .await?;
 
             // If there are tool calls, dispatch them and continue

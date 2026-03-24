@@ -15,6 +15,8 @@ pub struct AgentSession {
     pub context:     ContextManager,
     pub task_count:  u64,
     pub tool_calls:  u64,
+    /// Runtime context injected into the system prompt (e.g. wallet pubkeys).
+    pub wallet_context: Option<String>,
 }
 
 impl AgentSession {
@@ -27,6 +29,7 @@ impl AgentSession {
             context:     ContextManager::new(100_000), // ~100k tokens max
             task_count:  0,
             tool_calls:  0,
+            wallet_context: None,
         }
     }
 }

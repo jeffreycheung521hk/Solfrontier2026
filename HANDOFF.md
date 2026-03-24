@@ -1,17 +1,19 @@
 # ClawSolana — Session Handoff
 
-**Last updated:** 2026-03-21
-**State:** `cargo check` PASS, `cargo test` PASS (218 tests, zero failures)
-**Current phase:** Phase 1 — Execution Completeness (A1+A2 done, A3+A4 next)
+**Last updated:** 2026-03-24
+**State:** `cargo check` PASS, `cargo test` PASS (276 tests, zero failures)
+**Rust:** 1.94.0 stable
+**Current phase:** Phase 1 — Execution Completeness (A1+A2+P0-3+C2 done, A3+A4 next)
 **Product positioning:** Policy-gated transaction control plane for Solana
+**Last E2E validation:** 2026-03-24 — GPT agent queried devnet wallet balance (0.8 SOL) via full pipeline
 
 ---
 
 ## Current State Summary
 
-ClawSolana is a transaction control plane, not just a signing tool. The core control plane — typestate pipeline, policy enforcement, capability boundaries, durable pending lifecycle, audit trail — is implemented and tested. On-chain submission (`send_raw_transaction`) and lifecycle tracking (Submitted → Confirmed → Finalized / Failed / Expired) are implemented with durable persistence and restart recovery. What remains is completing the **execution path**: external signer formalization, retry/rebroadcast policy, and end-to-end devnet validation.
+ClawSolana is a transaction control plane for Solana. The core control plane — typestate pipeline, policy enforcement, capability boundaries, durable pending lifecycle, audit trail — is implemented and tested. On-chain submission and lifecycle tracking are complete with durable persistence and restart recovery. The agent-to-RPC pipeline has been **validated end-to-end on devnet**: session → OpenAI GPT agent → tool call → RPC → correct result.
 
-**Why Phantom integration is critical now:** The control plane's value proposition is that it sits between intent sources and signing authorities. Without a real signing authority connected, the system is a validated control plane with no downstream path. Phantom integration transforms ClawSolana from "policy engine with simulated signing" into "policy engine governing real wallet operations." This is the single highest-value step to prove the architecture works end-to-end.
+**Key milestone (Session 16):** The Rust toolchain was upgraded from 1.82.0 to 1.94.0, unblocking all compilation. Wallet context injection was added so LLM agents know the actual wallet pubkey (fixing a GPT pubkey hallucination bug). Session-request binding security (P0-3) and context trimming fix (C2) were completed. The full pipeline was live-tested on devnet successfully.
 
 ### Completed Beyond N1–N8
 
@@ -47,13 +49,15 @@ ClawSolana is a transaction control plane, not just a signing tool. The core con
 
 | Gap | Priority | Notes |
 |-----|----------|-------|
-| **P0-3:** Session-request binding | High | Submit endpoint doesn't verify session ownership |
+| **P0-3:** Session-request binding | ✅ Done | Submit + approval endpoints verify session ownership |
 | **P1-2:** Rate limiting | Medium | No rate limiting on API endpoints |
 | **P1-3:** Wallet binding ownership proof | ✅ Done | Challenge-response implemented with session binding |
 | **P1-4:** Durable event log | Low | Events are fire-and-forget broadcast |
-| **N12:** Context trimming pairs | Medium | `trim_if_needed()` can orphan tool_use without tool_result |
-| **N14:** On-chain submission | ✅ Done | `send_raw_transaction` + lifecycle tracking (Submitted→Finalized/Failed/Expired), durable persistence, restart recovery |
-| **External wallet E2E** | Medium | Phantom bridge + submission done; needs real devnet E2E test |
+| **N12:** Context trimming pairs | ✅ Done | `trim_if_needed()` now removes tool_use/tool_result in pairs |
+| **N14:** On-chain submission | ✅ Done | `send_raw_transaction` + lifecycle tracking, durable persistence, restart recovery |
+| **A3:** External signer formalization | High | `SignerType::External` config support, routing to external pending path |
+| **B3:** Retry/rebroadcast | Medium | Foundation in place, needs config wiring |
+| **Compiler warnings** | Low | 39 warnings (missing docs, unused imports) |
 
 ---
 

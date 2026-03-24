@@ -436,9 +436,24 @@ impl GatewayDaemon {
         // ── 12. API server ────────────────────────────────────────────────
         let api_token = load_api_token();
 
+        // Build wallet context for agent system prompts.
+        let wallet_context = if loaded_wallets.is_empty() {
+            None
+        } else {
+            let lines: Vec<String> = loaded_wallets.iter().map(|(label, pubkey)| {
+                format!("- Wallet \"{label}\": {pubkey}")
+            }).collect();
+            Some(format!(
+                "Default wallet pubkey: {}\nAll loaded wallets:\n{}",
+                loaded_wallets[0].1,
+                lines.join("\n"),
+            ))
+        };
+
         let session_ref = SessionManagerRef::new(Arc::new(GatewaySessionAdapter {
-            session_mgr:  session_mgr.clone(),
-            agent_router: agent_router.clone(),
+            session_mgr:    session_mgr.clone(),
+            agent_router:   agent_router.clone(),
+            wallet_context,
         }));
 
         let message_handler_ref = MessageHandlerRef::new(Arc::new(GatewayMessageHandler {
@@ -853,8 +868,10 @@ fn load_api_token() -> String {
 // ── SessionOps adapter ─────────────────────────────────────────────────────
 
 struct GatewaySessionAdapter {
-    session_mgr:  SessionManager,
-    agent_router: Arc<AgentRouter>,
+    session_mgr:    SessionManager,
+    agent_router:   Arc<AgentRouter>,
+    /// Wallet context string injected into every new session's system prompt.
+    wallet_context: Option<String>,
 }
 
 impl SessionOps for GatewaySessionAdapter {
@@ -862,8 +879,9 @@ impl SessionOps for GatewaySessionAdapter {
         let id = self.session_mgr.open(role, channel.clone());
         let router = self.agent_router.clone();
         let id2    = id.clone();
+        let wallet_ctx = self.wallet_context.clone();
         tokio::spawn(async move {
-            router.open_session(id2, role, channel).await;
+            router.open_session(id2, role, channel, wallet_ctx).await;
         });
         id
     }
