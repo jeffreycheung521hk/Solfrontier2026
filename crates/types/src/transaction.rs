@@ -47,6 +47,8 @@ pub struct InstructionSummary {
     pub program_id:  String,
     pub program_name: Option<String>,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_lamports: Option<u64>,
     pub accounts:    Vec<AccountRole>,
 }
 

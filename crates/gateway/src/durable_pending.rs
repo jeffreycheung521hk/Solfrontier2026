@@ -359,13 +359,46 @@ impl DurablePendingState {
             created_at:           approval.requested_at,
         };
 
-        approval_store.register(approval);
+        let request_id = Uuid::parse_str(&row.request_id)
+            .map_err(|e| format!("request_id parse: {e}"))?;
+
+        // Recover the workflow from the persisted verdict.
+        // If the verdict carried an approval_chain, rebuild a multi-stage workflow.
+        // Otherwise fall back to single-stage.
+        let workflow = match &verdict {
+            PolicyVerdict::RequiresHumanApproval { approval_chain: Some(chain), .. } => {
+                use claw_types::approval::ApprovalStage;
+                let stages = chain
+                    .iter()
+                    .enumerate()
+                    .map(|(i, cs)| ApprovalStage {
+                        index: i,
+                        allowed_roles: vec![cs.role.clone()],
+                        min_approvals: cs.min_approvals,
+                        decisions: vec![],
+                    })
+                    .collect();
+                let now = chrono::Utc::now();
+                claw_types::approval::ApprovalWorkflow {
+                    request_id,
+                    session_id: approval.session_id.clone(),
+                    state: claw_types::approval::ApprovalWorkflowState::Pending,
+                    stages,
+                    created_at: now,
+                    updated_at: now,
+                    expires_at: None,
+                }
+            }
+            _ => claw_types::approval::ApprovalWorkflow::single_stage(
+                request_id,
+                approval.session_id.clone(),
+                approval.required_approver_role.clone(),
+            ),
+        };
+        approval_store.register(approval, workflow);
 
         let tx: solana_sdk::transaction::Transaction = bincode::deserialize(&tx_bytes)
             .map_err(|e| format!("tx deserialize: {e}"))?;
-
-        let request_id = Uuid::parse_str(&row.request_id)
-            .map_err(|e| format!("request_id parse: {e}"))?;
 
         // Recovery path: the durable row doesn't store last_valid_block_height.
         // Use 0 here; the value will be re-captured from the blockhash manager

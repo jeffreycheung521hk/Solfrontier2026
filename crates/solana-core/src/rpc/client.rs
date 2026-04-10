@@ -28,7 +28,7 @@ use crate::errors::SolanaError;
 pub struct ClawRpcClient {
     pool: RpcPool,
     default_commitment: CommitmentLevel,
-    max_retries: u32,
+    _max_retries: u32,
 }
 
 impl ClawRpcClient {
@@ -36,7 +36,7 @@ impl ClawRpcClient {
         Self {
             pool,
             default_commitment,
-            max_retries: 3,
+            _max_retries: 3,
         }
     }
 
@@ -247,9 +247,16 @@ impl ClawRpcClient {
 
         let client = self.pool.write_client()?;
 
-        // Use send_transaction which handles serialization internally.
+        // Skip preflight: we already simulated upstream in the pipeline.
+        // Preflight uses processed commitment which may reject valid blockhashes.
+        use solana_client::rpc_config::RpcSendTransactionConfig;
+        let config = RpcSendTransactionConfig {
+            skip_preflight: true,
+            max_retries: Some(0),
+            ..Default::default()
+        };
         let signature = client
-            .send_transaction(&tx)
+            .send_transaction_with_config(&tx, config)
             .await
             .map_err(|e| {
                 self.pool.record_failure(&client.url());

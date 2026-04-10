@@ -24,7 +24,8 @@
 //!
 //! # Durability
 //!
-//! In-memory only (V1). Lost on restart. Same posture as `PendingSigningStore`.
+//! Session-wallet bindings are persisted to SQLite (C4) and recovered
+//! on daemon restart. Pending signature requests remain in-memory only.
 
 use std::fmt;
 use std::sync::Arc;
@@ -34,8 +35,10 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::Transaction;
 use tokio::sync::oneshot;
+use tracing::warn;
 use uuid::Uuid;
 
+use claw_state_store::WalletBindingRepository;
 use claw_types::{
     policy::PolicyVerdict,
     session::SessionId,
@@ -206,7 +209,12 @@ pub struct PendingWalletSignature {
     pub response_tx: Option<oneshot::Sender<Option<Transaction>>>,
 }
 
-/// In-memory store for external wallet signature requests.
+/// Store for external wallet signature requests and session-wallet bindings.
+///
+/// Bindings are kept in-memory (`DashMap`) for fast reads and optionally
+/// persisted to SQLite (`WalletBindingRepository`) for cross-restart
+/// continuity (C4). When the repo is set, `bind_wallet()` and
+/// `unbind_session()` write through to the database.
 #[derive(Clone)]
 pub struct ExternalWalletStore {
     /// Pending signature requests keyed by request_id.
@@ -218,16 +226,47 @@ pub struct ExternalWalletStore {
     /// Pubkeys declared as external in config (A3).
     /// These are recognized across ALL sessions without needing bind_wallet.
     config_bound_pubkeys: Arc<DashSet<String>>,
+
+    /// Optional SQLite persistence for session-wallet bindings (C4).
+    binding_repo: Option<WalletBindingRepository>,
 }
 
 impl ExternalWalletStore {
-    /// Creates an empty store.
+    /// Creates an empty store (no persistence).
     pub fn new() -> Self {
         Self {
             pending:              Arc::new(DashMap::new()),
             bindings:             Arc::new(DashMap::new()),
             config_bound_pubkeys: Arc::new(DashSet::new()),
+            binding_repo:         None,
         }
+    }
+
+    /// Sets the SQLite repository for durable binding persistence (C4).
+    pub fn with_binding_repo(mut self, repo: WalletBindingRepository) -> Self {
+        self.binding_repo = Some(repo);
+        self
+    }
+
+    /// Loads previously persisted bindings into the in-memory store.
+    /// Called once at daemon startup after the repo is set.
+    pub async fn load_persisted_bindings(&self) -> Result<usize, String> {
+        let repo = match &self.binding_repo {
+            Some(r) => r,
+            None => return Ok(0),
+        };
+        let rows = repo.load_all().await.map_err(|e| e.to_string())?;
+        let count = rows.len();
+        for row in rows {
+            let sid = SessionId::from(
+                row.session_id.parse::<uuid::Uuid>().map_err(|e| e.to_string())?,
+            );
+            self.bindings
+                .entry(sid)
+                .or_insert_with(DashSet::new)
+                .insert(row.wallet_pubkey);
+        }
+        Ok(count)
     }
 
     /// Registers a pubkey as a config-declared external wallet (A3).
@@ -244,11 +283,31 @@ impl ExternalWalletStore {
     // ── Session-wallet binding ────────────────────────────────────────────────
 
     /// Binds an external wallet pubkey to a session.
+    ///
+    /// Updates the in-memory store immediately and persists to SQLite
+    /// (best-effort — log on failure but don't block the caller).
     pub fn bind_wallet(&self, session_id: &SessionId, pubkey: &str) {
         self.bindings
             .entry(session_id.clone())
             .or_insert_with(DashSet::new)
             .insert(pubkey.to_string());
+
+        // Write-through to SQLite (C4).
+        if let Some(repo) = &self.binding_repo {
+            let repo = repo.clone();
+            let sid = session_id.to_string();
+            let pk = pubkey.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = repo.bind(&sid, &pk).await {
+                    warn!(
+                        session = %sid,
+                        pubkey = %pk,
+                        error = %e,
+                        "C4: failed to persist wallet binding to SQLite"
+                    );
+                }
+            });
+        }
     }
 
     /// Returns `true` if the given pubkey is bound as an external wallet
@@ -276,6 +335,21 @@ impl ExternalWalletStore {
     /// Unbinds all external wallets for a session (on session close).
     pub fn unbind_session(&self, session_id: &SessionId) {
         self.bindings.remove(session_id);
+
+        // Write-through to SQLite (C4).
+        if let Some(repo) = &self.binding_repo {
+            let repo = repo.clone();
+            let sid = session_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = repo.unbind_session(&sid).await {
+                    warn!(
+                        session = %sid,
+                        error = %e,
+                        "C4: failed to remove wallet bindings from SQLite"
+                    );
+                }
+            });
+        }
     }
 
     // ── Pending signature management ──────────────────────────────────────────

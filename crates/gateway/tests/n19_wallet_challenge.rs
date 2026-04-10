@@ -206,7 +206,7 @@ async fn invalid_signature_format_rejected() {
 #[tokio::test]
 async fn unknown_challenge_not_found() {
     let (service, _db) = setup().await;
-    let (signing_key, pubkey) = make_keypair();
+    let (_signing_key, pubkey) = make_keypair();
     let session_id = SessionId::from(Uuid::new_v4());
 
     let result = service.verify_challenge(

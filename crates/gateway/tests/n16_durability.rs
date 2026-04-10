@@ -28,14 +28,12 @@ use uuid::Uuid;
 
 use claw_gateway::{
     approval_store::ApprovalStore,
-    completion_metadata::{CompletionMeta, CompletionMetadataStore},
+    completion_metadata::CompletionMetadataStore,
     durable_pending::DurablePendingState,
-    event_bus::EventBus,
     external_wallet::ExternalWalletStore,
     orchestrator::SignatureOrchestrator,
     orchestrator::external_adapter::ExternalWalletAdapter,
-    orchestrator::local_adapter::LocalWalletAdapter,
-    orchestrator::types::{SignatureError, SignatureOutcome, SignatureRequest, SignatureRequestId},
+    orchestrator::types::{SignatureError, SignatureOutcome, SignatureRequestId},
     pending_signing::PendingSigningStore,
 };
 use claw_state_store::{
@@ -47,11 +45,6 @@ use claw_types::{
     policy::PolicyVerdict,
     session::SessionId,
     transaction::{SimulationResult, TransactionProposal},
-};
-use claw_wallet_engine::{
-    keystore::SecretKeystore,
-    local::LocalKeypairSigner,
-    signer::SignerRef,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -122,6 +115,8 @@ async fn pending_approval_survives_restart() {
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "test".into(),
         rule_name: "test-rule".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
 
     let approval_request = ApprovalRequest {
@@ -132,7 +127,8 @@ async fn pending_approval_survives_restart() {
         policy_verdict: verdict.clone(),
         simulation: simulation.clone(),
         requested_at: chrono::Utc::now(),
-        decided: false,
+        decided:         false,
+        required_approver_role: None,
     };
 
     let tx_bytes = bincode::serialize(&tx).unwrap();
@@ -173,7 +169,7 @@ async fn pending_approval_survives_restart() {
     assert!(parked_proposal.is_some());
 
     // The recovered entry should be signalable (fresh oneshot).
-    let signaled = pending_signing2.signal(request_id, true);
+    let signaled = pending_signing2.signal(request_id, claw_types::approval::ApprovalWorkflowState::Approved);
     assert!(signaled, "recovered entry should be signalable");
 }
 
@@ -204,7 +200,7 @@ async fn pending_external_signature_survives_restart() {
     ).await.unwrap();
 
     // Simulate restart: fresh orchestrator with external adapter.
-    let (ext_wallet, orchestrator2) = make_external_orchestrator(&session_id, &pubkey);
+    let (_ext_wallet, orchestrator2) = make_external_orchestrator(&session_id, &pubkey);
 
     let approval_store2 = ApprovalStore::new();
     let pending_signing2 = PendingSigningStore::new();
@@ -298,6 +294,8 @@ async fn stale_recovered_request_fails_closed() {
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "test".into(),
         rule_name: "test-rule".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
     let proposal = fake_proposal(session_id.clone(), &pubkey.to_string());
 
@@ -309,7 +307,8 @@ async fn stale_recovered_request_fails_closed() {
         policy_verdict: verdict.clone(),
         simulation: simulation.clone(),
         requested_at: chrono::Utc::now(),
-        decided: false,
+        decided:         false,
+        required_approver_role: None,
     };
 
     let tx_bytes = bincode::serialize(&tx).unwrap();
@@ -374,13 +373,16 @@ async fn consumed_request_not_reloaded() {
     let simulation = fake_simulation();
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "test".into(), rule_name: "test-rule".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
     let proposal = fake_proposal(session_id.clone(), &pubkey.to_string());
     let approval = ApprovalRequest {
         id: request_id, session_id: session_id.clone(),
         transaction_id: proposal.id, description: "consumed test".into(),
         policy_verdict: verdict.clone(), simulation: simulation.clone(),
-        requested_at: chrono::Utc::now(), decided: false,
+        requested_at: chrono::Utc::now(), decided:         false,
+        required_approver_role: None,
     };
     let tx = make_test_tx(&pubkey, &Pubkey::new_unique());
     let tx_bytes = bincode::serialize(&tx).unwrap();
@@ -586,4 +588,100 @@ async fn startup_with_corrupt_record_fails_closed() {
     let remaining_sigs = repo.load_pending_signatures().await.unwrap();
     assert_eq!(remaining_approvals.len(), 0, "corrupt row should be removed");
     assert_eq!(remaining_sigs.len(), 0, "corrupt row should be removed");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TEST 9: Multi-stage approval chain survives restart via production recovery
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn multi_stage_chain_recovered_from_durable_state() {
+    use claw_types::approval::{ApprovalChainStage, ApprovalDecision, ApprovalOutcome};
+
+    let db = setup_db().await;
+    let repo = PendingStateRepository::new(db.pool().clone());
+    let durable = DurablePendingState::new(repo.clone());
+
+    let session_id = SessionId::from(Uuid::new_v4());
+    let keypair = Keypair::new();
+    let pubkey = keypair.pubkey();
+    let to = Pubkey::new_unique();
+    let tx = make_test_tx(&pubkey, &to);
+    let proposal = fake_proposal(session_id.clone(), &pubkey.to_string());
+    let request_id = Uuid::new_v4();
+    let simulation = fake_simulation();
+
+    // Verdict with a multi-stage approval chain (risk → treasury).
+    let verdict = PolicyVerdict::RequiresHumanApproval {
+        reason: "high-value chain".into(),
+        rule_name: "chain-rule".into(),
+        required_approver_role: None,
+        approval_chain: Some(vec![
+            ApprovalChainStage { role: "risk".into(), description: "Risk review".into(), min_approvals: 1 },
+            ApprovalChainStage { role: "treasury".into(), description: "Treasury sign-off".into(), min_approvals: 1 },
+        ]),
+    };
+
+    let approval_request = ApprovalRequest {
+        id: request_id,
+        session_id: session_id.clone(),
+        transaction_id: proposal.id,
+        description: "multi-stage test".into(),
+        policy_verdict: verdict.clone(),
+        simulation: simulation.clone(),
+        requested_at: chrono::Utc::now(),
+        decided: false,
+        required_approver_role: None,
+    };
+
+    let tx_bytes = bincode::serialize(&tx).unwrap();
+
+    // Persist the approval (this stores the verdict JSON which contains the chain).
+    durable.persist_approval(
+        request_id, &approval_request, &proposal,
+        &tx_bytes, &simulation, &verdict,
+    ).await.unwrap();
+
+    // ── Simulate daemon restart ─────────────────────────────────────────────
+    let approval_store2 = ApprovalStore::new();
+    let pending_signing2 = PendingSigningStore::new();
+    let orchestrator2 = SignatureOrchestrator::new(vec![]);
+    let completion_meta2 = CompletionMetadataStore::new();
+
+    let report = durable.recover(
+        Duration::from_secs(300),
+        &approval_store2,
+        &pending_signing2,
+        &orchestrator2,
+        &completion_meta2,
+    ).await;
+
+    assert_eq!(report.recovered_approvals, 1, "should recover the multi-stage approval");
+    assert_eq!(report.corrupt_approvals, 0);
+
+    // ── Verify the recovered workflow is MULTI-STAGE ────────────────────────
+    let recovered_workflow = approval_store2.get_workflow(request_id);
+    assert!(recovered_workflow.is_some(), "workflow should be recovered");
+    let wf = recovered_workflow.unwrap();
+    assert_eq!(wf.stages.len(), 2, "should have 2 stages (risk → treasury)");
+    assert_eq!(wf.stages[0].allowed_roles, vec!["risk"]);
+    assert_eq!(wf.stages[1].allowed_roles, vec!["treasury"]);
+    assert_eq!(wf.stages[0].min_approvals, 1);
+    assert_eq!(wf.stages[1].min_approvals, 1);
+    assert!(wf.stages[0].decisions.is_empty(), "stage 0 should be undecided");
+    assert!(wf.stages[1].decisions.is_empty(), "stage 1 should be undecided");
+
+    // ── Verify the recovered workflow can be decided through stages ──────────
+    // Stage 0: risk approves → StageAdvanced
+    let d1 = ApprovalDecision::approve_as(request_id, None, "risk".into());
+    let (o1, _) = approval_store2.decide(&d1);
+    assert!(matches!(o1, ApprovalOutcome::StageAdvanced { .. }),
+        "stage 0 should advance: {:?}", o1);
+
+    // Stage 1: treasury approves → Approved (terminal)
+    let d2 = ApprovalDecision::approve_as(request_id, None, "treasury".into());
+    let (o2, req) = approval_store2.decide(&d2);
+    assert_eq!(o2, ApprovalOutcome::Approved, "should complete after both stages");
+    assert!(req.is_some());
+    assert_eq!(approval_store2.pending_count(), 0);
 }

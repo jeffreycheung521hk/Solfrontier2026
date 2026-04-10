@@ -20,8 +20,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::{Signer as DalekSigner, SigningKey};
-use rand::RngCore;
-use serde_json::json;
 use solana_sdk::{
     hash::Hash,
     message::Message,
@@ -34,7 +32,7 @@ use uuid::Uuid;
 
 use claw_gateway::{
     approval_store::ApprovalStore,
-    completion_metadata::{CompletionMeta, CompletionMetadataStore},
+    completion_metadata::CompletionMetadataStore,
     event_bus::EventBus,
     external_wallet::ExternalWalletStore,
     orchestrator::SignatureOrchestrator,
@@ -55,7 +53,7 @@ use claw_types::{
     events::{EventHeader, GatewayEvent},
     policy::PolicyVerdict,
     session::SessionId,
-    transaction::{SimulationResult, TransactionProposal, TransactionStatus},
+    transaction::{SimulationResult, TransactionProposal},
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -167,6 +165,8 @@ async fn external_wallet_full_e2e_challenge_bind_approve_sign_complete() {
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "mainnet policy".into(),
         rule_name: "mainnet-guard".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
 
     let proposal = TransactionProposal {
@@ -195,9 +195,11 @@ async fn external_wallet_full_e2e_challenge_bind_approve_sign_complete() {
         policy_verdict: verdict,
         simulation: sim.clone(),
         requested_at: chrono::Utc::now(),
-        decided: false,
+        decided:         false,
+        required_approver_role: None,
     };
-    approval_store.register(approval_request);
+    let wf = claw_types::approval::ApprovalWorkflow::single_stage(approval_request.id, approval_request.session_id.clone(), None);
+    approval_store.register(approval_request, wf);
 
     // Emit ApprovalRequested event.
     event_bus.publish(GatewayEvent::ApprovalRequested(
@@ -244,7 +246,7 @@ async fn external_wallet_full_e2e_challenge_bind_approve_sign_complete() {
     let decision = ApprovalDecision::approve(request_id, Some("looks good".into()));
     let (outcome, _) = approval_store.decide(&decision);
     assert_eq!(outcome, ApprovalOutcome::Approved);
-    pending_for_signal.signal(request_id, true);
+    pending_for_signal.signal(request_id, claw_types::approval::ApprovalWorkflowState::Approved);
 
     // Wait for resume task to complete.
     tokio::time::timeout(Duration::from_secs(5), resume_handle)
@@ -334,7 +336,7 @@ async fn external_wallet_full_e2e_challenge_bind_approve_sign_complete() {
     // 11d: Spend not yet recorded here (spend is recorded by the daemon
     // handler, not by orchestrator.complete). Verify it's zero, proving
     // no premature spend recording happened.
-    let session_spend = spend
+    let _session_spend = spend
         .session_spend(&session_id.to_string())
         .await
         .unwrap();
@@ -372,9 +374,9 @@ async fn external_wallet_full_e2e_challenge_bind_approve_sign_complete() {
 #[tokio::test]
 async fn external_wallet_e2e_auto_approved_direct_pending() {
     let db = setup_db().await;
-    let event_bus = EventBus::new();
+    let _event_bus = EventBus::new();
     let external_wallet = ExternalWalletStore::new();
-    let completion_meta = CompletionMetadataStore::new();
+    let _completion_meta = CompletionMetadataStore::new();
     let challenge_repo = WalletChallengeRepository::new(db.pool().clone());
     let challenge_service = WalletChallengeService::new(challenge_repo);
 

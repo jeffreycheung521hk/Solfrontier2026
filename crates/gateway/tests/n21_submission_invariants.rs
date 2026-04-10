@@ -298,6 +298,7 @@ async fn durable_first_db_insert_required_before_tracker() {
         sig, tx_id, req_id,
         session_id.to_string(), wallet.clone(),
         last_valid, submission_height,
+        None,
     );
 
     // Verify: tracker has the entry.

@@ -1,7 +1,7 @@
 //! `claw-agent-runtime` — agent orchestration layer.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 
 pub mod agent;
 pub mod errors;

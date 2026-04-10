@@ -21,6 +21,8 @@ tokio              = { workspace = true }
 async-trait        = { workspace = true }
 futures            = { workspace = true }
 
+dashmap        = { workspace = true }
+
 # Metrics
 # Using a lightweight custom approach for V1; swap for prometheus crate in V2
 # prometheus = { version = "0.13" }

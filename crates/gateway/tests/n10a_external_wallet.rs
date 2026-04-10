@@ -240,7 +240,7 @@ fn compute_budget_tampering_rejected() {
 #[test]
 fn wrong_wallet_signature_rejected() {
     let expected_signer = Keypair::new();
-    let wrong_signer = Keypair::new();
+    let _wrong_signer = Keypair::new();
     let to = Pubkey::new_unique();
 
     let tx = make_test_tx(&expected_signer.pubkey(), &to);
@@ -534,7 +534,7 @@ fn reject_on_signer_mismatch() {
     let store = ExternalWalletStore::new();
     let session = SessionId::from(Uuid::new_v4());
     let expected_signer = Keypair::new();
-    let wrong_signer = Keypair::new();
+    let _wrong_signer = Keypair::new();
     let to = Pubkey::new_unique();
 
     // The tx is built with expected_signer as fee payer.

@@ -17,7 +17,7 @@
 //! - Persistence (that's `claw-state-store`)
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 
 pub mod context;
 pub mod errors;

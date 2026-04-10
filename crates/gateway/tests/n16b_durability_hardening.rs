@@ -20,12 +20,12 @@ use uuid::Uuid;
 
 use claw_gateway::{
     approval_store::ApprovalStore,
-    completion_metadata::{CompletionMeta, CompletionMetadataStore},
+    completion_metadata::CompletionMetadataStore,
     durable_pending::DurablePendingState,
     external_wallet::ExternalWalletStore,
     orchestrator::SignatureOrchestrator,
     orchestrator::external_adapter::ExternalWalletAdapter,
-    orchestrator::types::{SignatureError, SignatureOutcome, SignatureRequest, SignatureRequestId},
+    orchestrator::types::{SignatureError, SignatureRequestId},
     pending_signing::PendingSigningStore,
 };
 use claw_state_store::{
@@ -96,12 +96,15 @@ async fn persist_approval_returns_result() {
     let simulation = fake_simulation();
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "test".into(), rule_name: "test-rule".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
     let approval = ApprovalRequest {
         id: Uuid::new_v4(), session_id: session_id.clone(),
         transaction_id: proposal.id, description: "test".into(),
         policy_verdict: verdict.clone(), simulation: simulation.clone(),
-        requested_at: chrono::Utc::now(), decided: false,
+        requested_at: chrono::Utc::now(), decided:         false,
+        required_approver_role: None,
     };
     let tx = make_test_tx(&pubkey, &Pubkey::new_unique());
     let tx_bytes = bincode::serialize(&tx).unwrap();
@@ -130,13 +133,16 @@ async fn consumed_approval_not_recovered() {
     let simulation = fake_simulation();
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "test".into(), rule_name: "r".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
     let request_id = Uuid::new_v4();
     let approval = ApprovalRequest {
         id: request_id, session_id: session_id.clone(),
         transaction_id: proposal.id, description: "test".into(),
         policy_verdict: verdict.clone(), simulation: simulation.clone(),
-        requested_at: chrono::Utc::now(), decided: false,
+        requested_at: chrono::Utc::now(), decided:         false,
+        required_approver_role: None,
     };
     let tx = make_test_tx(&pubkey, &Pubkey::new_unique());
     let tx_bytes = bincode::serialize(&tx).unwrap();

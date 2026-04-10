@@ -1,7 +1,7 @@
 //! Chain state tools.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::json;
 use tracing::instrument;
 
 use claw_solana_core::rpc::ClawRpcClient;

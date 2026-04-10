@@ -23,7 +23,7 @@ use solana_sdk::{
     hash::Hash,
     message::Message,
     pubkey::Pubkey,
-    signature::{Keypair, Signature},
+    signature::Keypair,
     signer::Signer as SolanaSigner,
     system_instruction,
     transaction::Transaction,
@@ -160,7 +160,7 @@ async fn external_adapter_routes_to_pending() {
     let orch = SignatureOrchestrator::new(vec![external]);
 
     let request = make_request(payer.pubkey(), tx_bytes.clone());
-    let request_id = request.id;
+    let _request_id = request.id;
 
     let outcome = orch.submit(request).await.expect("submit should succeed");
 

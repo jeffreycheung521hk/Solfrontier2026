@@ -29,6 +29,33 @@ pub struct ClawConfig {
     pub llm: LlmConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    /// Webhook alerting configuration. When enabled, policy violations and
+    /// approval lifecycle events are POSTed to the configured URL.
+    #[serde(default)]
+    pub alerting: AlertingConfig,
+    /// Named operators with per-token identity and role assignments.
+    /// When non-empty, each operator gets their own bearer token and roles.
+    /// When empty, falls back to single `CLAW_API_TOKEN` with anonymous identity.
+    #[serde(default)]
+    pub operators: Vec<OperatorConfig>,
+}
+
+/// An operator declaration with token and role assignments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorConfig {
+    /// Unique operator identifier (used in audit trail).
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Bearer token for this operator. Override with env var `CLAW_OPERATOR_<ID>_TOKEN`.
+    pub token: Option<String>,
+    /// Roles this operator holds (e.g., ["risk", "treasury"]).
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +137,30 @@ pub struct WalletConfig {
     /// For External: the base58-encoded public key of the external wallet.
     /// Required when signer_type = "external".
     pub pubkey: Option<String>,
+    /// Per-wallet policy constraints. These rules are applied in addition to
+    /// (and before) global and session policy rules when this wallet signs.
+    #[serde(default)]
+    pub policy: Option<WalletPolicyConfig>,
+}
+
+/// Per-wallet policy configuration.
+///
+/// Allows operators to set wallet-specific constraints that are stricter
+/// than the global policy. Evaluated before session and global rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletPolicyConfig {
+    /// Maximum transfer amount per transaction (in lamports).
+    /// Transactions exceeding this require human approval.
+    pub max_amount_lamports: Option<u64>,
+    /// Program IDs this wallet is allowed to interact with.
+    /// If non-empty, transactions invoking unlisted programs are rejected.
+    #[serde(default)]
+    pub program_allowlist: Vec<String>,
+    /// Approver role required for any transaction from this wallet.
+    pub required_approver_role: Option<String>,
+    /// Additional custom policy rules for this wallet.
+    #[serde(default)]
+    pub rules: Vec<PolicyRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +177,34 @@ pub struct PolicyConfig {
     /// Use mainnet safe defaults (require human approval for all mainnet txs).
     #[serde(default = "default_true")]
     pub mainnet_safe_defaults: bool,
+    /// Per-role default policy profiles.
+    #[serde(default)]
+    pub role_profiles: Vec<RolePolicyProfile>,
+    /// Maximum time (in seconds) an approval workflow can remain pending
+    /// before being automatically expired. Default: 300 (5 minutes).
+    #[serde(default = "default_approval_lease_seconds")]
+    pub approval_lease_seconds: u64,
+}
+
+fn default_approval_lease_seconds() -> u64 { 300 }
+
+/// A default policy rule set bound to a specific `AgentRole`.
+///
+/// Example TOML:
+/// ```toml
+/// [[policy.role_profiles]]
+/// role = "execution"
+/// rules = [
+///   { name = "exec-cap", description = "Cap execution to 0.1 SOL", condition = { type = "AmountExceedsLamports", threshold = 100000000 }, action = { type = "RequireHumanApproval", reason = "execution role: amount exceeds 0.1 SOL" } }
+/// ]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolePolicyProfile {
+    /// The agent role this profile applies to (e.g., "execution", "risk", "ops").
+    pub role: String,
+    /// Policy rules for this role (evaluated after caller overrides, before global rules).
+    #[serde(default)]
+    pub rules: Vec<PolicyRule>,
 }
 
 fn default_true() -> bool { true }
@@ -137,6 +216,8 @@ impl Default for PolicyConfig {
             program_allowlist: vec![],
             destination_denylist: vec![],
             mainnet_safe_defaults: true,
+            role_profiles: vec![],
+            approval_lease_seconds: default_approval_lease_seconds(),
         }
     }
 }
@@ -183,6 +264,40 @@ impl Default for ApiConfig {
     }
 }
 
+/// Webhook alerting configuration.
+///
+/// When `enabled` is true and `webhook_url` is set, the daemon POSTs
+/// JSON payloads for policy violations, approval lifecycle events, and
+/// signing lease expirations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertingConfig {
+    /// Whether alerting is enabled. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The URL to POST alert payloads to.
+    pub webhook_url: Option<String>,
+    /// Maximum number of delivery retries per alert. Default: 3.
+    #[serde(default = "default_alert_max_retries")]
+    pub max_retries: u32,
+    /// Timeout per delivery attempt in milliseconds. Default: 5000.
+    #[serde(default = "default_alert_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_alert_max_retries() -> u32 { 3 }
+fn default_alert_timeout_ms() -> u64 { 5000 }
+
+impl Default for AlertingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webhook_url: None,
+            max_retries: default_alert_max_retries(),
+            timeout_ms: default_alert_timeout_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     /// "json" or "pretty"
@@ -196,6 +311,48 @@ impl Default for LoggingConfig {
         Self {
             format: "pretty".to_string(),
             level: "info".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Maximum number of rebroadcast attempts per dropped transaction.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_max_retries() -> u32 { 3 }
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self { max_retries: default_max_retries() }
+    }
+}
+
+/// Per-token sliding-window rate limiting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    /// Whether rate limiting is enabled. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum requests per window per bearer token. Default: 60.
+    #[serde(default = "default_requests_per_minute")]
+    pub requests_per_minute: u32,
+    /// Extra burst allowance above the per-minute rate. Default: 10.
+    #[serde(default = "default_burst_size")]
+    pub burst_size: u32,
+}
+
+fn default_requests_per_minute() -> u32 { 60 }
+fn default_burst_size() -> u32 { 10 }
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            requests_per_minute: default_requests_per_minute(),
+            burst_size: default_burst_size(),
         }
     }
 }
@@ -252,8 +409,12 @@ impl ClawConfig {
                 };
                 LlmConfig { provider, api_key, model }
             },
-            api:     ApiConfig::default(),
-            logging: LoggingConfig::default(),
+            api:        ApiConfig::default(),
+            logging:    LoggingConfig::default(),
+            retry:      RetryConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            alerting:   AlertingConfig::default(),
+            operators:  vec![],
         }
     }
 

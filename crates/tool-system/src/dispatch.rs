@@ -19,7 +19,7 @@ use std::time::Instant;
 use tokio::time::{timeout, Duration};
 use tracing::{instrument, warn};
 
-use claw_types::tool::{ToolInput, ToolOutput, ToolTraceStatus};
+use claw_types::tool::{ToolInput, ToolOutput};
 
 use crate::{
     errors::ToolError,

@@ -58,10 +58,12 @@ use claw_wallet_engine::{
 
 // ── Mock Signer ──────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct MockSigner {
     pubkey: Pubkey,
 }
 
+#[allow(dead_code)]
 impl MockSigner {
     fn new() -> Self {
         Self { pubkey: Pubkey::new_unique() }
@@ -74,7 +76,7 @@ impl Signer for MockSigner {
         self.pubkey
     }
 
-    async fn sign_transaction(&self, tx: &mut Transaction) -> Result<Signature, WalletError> {
+    async fn sign_transaction(&self, _tx: &mut Transaction) -> Result<Signature, WalletError> {
         // Return a deterministic fake signature.
         Ok(Signature::new_unique())
     }
@@ -173,6 +175,8 @@ async fn approve_signs_and_emits_events() {
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason:    "mainnet policy requires human approval".into(),
         rule_name: "mainnet-guard".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
     let mut proposal = make_proposal(session_id.clone());
     proposal.wallet_pubkey = real_pubkey.to_string();
@@ -200,7 +204,8 @@ async fn approve_signs_and_emits_events() {
         id: request_id,
         ..approval_request
     };
-    approval_store.register(approval_request);
+    let wf = claw_types::approval::ApprovalWorkflow::single_stage(approval_request.id, approval_request.session_id.clone(), None);
+    approval_store.register(approval_request, wf);
     assert_eq!(approval_store.pending_count(), 1);
 
     // Emit ApprovalRequested event (as SubmitForSigningTool would).
@@ -249,7 +254,7 @@ async fn approve_signs_and_emits_events() {
     assert_eq!(approval_store.pending_count(), 0, "request consumed after decision");
 
     // Signal the parked signing task.
-    let signaled = pending_signing.signal(request_id, true);
+    let signaled = pending_signing.signal(request_id, claw_types::approval::ApprovalWorkflowState::Approved);
     assert!(signaled, "signal must reach the parked task");
 
     // Emit ApprovalReceived event (as GatewayApprovalHandler would).
@@ -352,6 +357,8 @@ async fn reject_emits_failure_event_no_signing() {
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason:    "mainnet policy".into(),
         rule_name: "mainnet-guard".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
     let mut proposal = make_proposal(session_id.clone());
     proposal.wallet_pubkey = real_pubkey.to_string();
@@ -367,7 +374,8 @@ async fn reject_emits_failure_event_no_signing() {
         id: request_id,
         ..ApprovalRequest::new(session_id.clone(), proposal.id, "test reject", verdict, sim)
     };
-    approval_store.register(approval_request);
+    let wf = claw_types::approval::ApprovalWorkflow::single_stage(approval_request.id, approval_request.session_id.clone(), None);
+    approval_store.register(approval_request, wf);
 
     // Spawn resume task.
     let pending_for_resume = pending_signing.clone();
@@ -401,7 +409,7 @@ async fn reject_emits_failure_event_no_signing() {
     let (outcome, _) = approval_store.decide(&decision);
     assert_eq!(outcome, ApprovalOutcome::Rejected);
 
-    let signaled = pending_signing.signal(request_id, false);
+    let signaled = pending_signing.signal(request_id, claw_types::approval::ApprovalWorkflowState::Rejected);
     assert!(signaled);
 
     tokio::time::timeout(Duration::from_secs(5), resume_handle)
@@ -443,6 +451,8 @@ async fn duplicate_decision_rejected() {
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "test".into(),
         rule_name: "test-rule".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
     let request_id = Uuid::new_v4();
 
@@ -450,7 +460,8 @@ async fn duplicate_decision_rejected() {
         id: request_id,
         ..ApprovalRequest::new(session_id, Uuid::new_v4(), "dup test", verdict, sim)
     };
-    approval_store.register(approval_request);
+    let wf = claw_types::approval::ApprovalWorkflow::single_stage(approval_request.id, approval_request.session_id.clone(), None);
+    approval_store.register(approval_request, wf);
 
     // First decision succeeds.
     let d1 = ApprovalDecision::approve(request_id, None);
@@ -460,8 +471,8 @@ async fn duplicate_decision_rejected() {
     // Second decision on the same request_id fails.
     let d2 = ApprovalDecision::approve(request_id, None);
     let (outcome2, _) = approval_store.decide(&d2);
-    assert_eq!(outcome2, ApprovalOutcome::NotFound,
-        "duplicate decision must return NotFound (entry already consumed)");
+    assert_eq!(outcome2, ApprovalOutcome::AlreadyDecided,
+        "duplicate decision must return AlreadyDecided (workflow is terminal)");
 }
 
 /// Typestate integrity: SimulatedTransaction requires success==true,
@@ -479,6 +490,8 @@ async fn typestate_integrity_preserved() {
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason:    "test".into(),
         rule_name: "test-rule".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
     assert!(!verdict.is_blocked(), "RequiresHumanApproval must not be blocked");
     let _approved = ApprovedTransaction::new_unchecked(simulated, verdict);

@@ -15,6 +15,8 @@
 //! | POST   | /sessions/:id/approve       | Yes  | Submit operator approval/rejection |
 //! | GET    | /sessions/:id/approvals     | Yes  | List pending approval requests   |
 //! | GET    | /sessions/:id/events        | Yes  | SSE stream of session events     |
+//! | POST   | /sessions/:id/propose-transfer | Yes | Direct SOL transfer proposal  |
+//! | GET    | /metrics                    | Yes  | Operational metrics (JSON)       |
 //!
 //! Future routes (V2): /tools, /subscriptions, /wallets
 //!
@@ -44,6 +46,8 @@ use crate::{
         events::session_events,
         health::health_handler,
         messages::send_message,
+        metrics::metrics_handler,
+        propose::propose_transfer,
         sessions::{close_session, list_sessions, open_session},
         wallet_challenges::{create_wallet_challenge, confirm_wallet_challenge},
         wallet_signatures::{bind_wallet, list_wallet_signatures, submit_wallet_signature},
@@ -64,7 +68,7 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         .with_state(health);
 
     // Routes that DO require auth
-    let protected = Router::new()
+    let mut protected = Router::new()
         .route("/sessions", get(list_sessions))
         .route("/sessions", post(open_session))
         .route("/sessions/:id", delete(close_session))
@@ -82,8 +86,26 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         .route("/sessions/:id/wallet-bind-confirm", post(confirm_wallet_challenge))
         // SSE event stream
         .route("/sessions/:id/events", get(session_events))
+        // Operational metrics
+        .route("/metrics", get(metrics_handler))
+        // Direct transaction proposal (bypasses LLM agent)
+        .route("/sessions/:id/propose-transfer", post(propose_transfer));
+
+    // Rate limiting layer — applied after auth, before handlers.
+    if let Some(ref limiter) = state.rate_limiter {
+        protected = protected.route_layer(middleware::from_fn_with_state(
+            limiter.clone(),
+            crate::rate_limit::rate_limit_middleware,
+        ));
+    }
+
+    let auth_state = crate::auth::AuthState {
+        token: state.auth_token.clone(),
+        registry: state.operator_registry.clone(),
+    };
+    let protected = protected
         .route_layer(middleware::from_fn_with_state(
-            state.auth_token.clone(),
+            auth_state,
             require_bearer_token,
         ))
         .with_state(state);

@@ -51,6 +51,87 @@ pub fn compute_limit_from_simulation(simulated_units: u64) -> u32 {
     with_headroom.clamp(1_000, 1_400_000) as u32
 }
 
+/// Minimum CU savings (vs DEFAULT) to justify a second simulation pass.
+/// If the derived limit is within this fraction of DEFAULT, skip re-simulation.
+pub const TWO_PASS_THRESHOLD: f64 = 0.10;
+
+/// Replaces the `SetComputeUnitLimit` instruction in a transaction with
+/// a new limit value. Returns `true` if a replacement was made, `false`
+/// if no `SetComputeUnitLimit` instruction was found.
+///
+/// The transaction must be unsigned. The message is rebuilt with the
+/// new instruction data while preserving all other instructions.
+pub fn replace_compute_unit_limit(tx: &mut Transaction, new_limit: u32) -> bool {
+    debug_assert!(
+        tx.signatures.is_empty()
+            || tx.signatures.iter().all(|s| *s == solana_sdk::signature::Signature::default()),
+        "replace_compute_unit_limit called on a signed transaction — this is a bug"
+    );
+
+    let cb_id: Pubkey = compute_budget::id();
+
+    // Decompile all instructions, replacing the SetComputeUnitLimit one.
+    let mut found = false;
+    let payer = tx.message.account_keys.first().copied();
+    let new_limit_ix = set_compute_unit_limit(new_limit);
+
+    let new_instructions: Vec<Instruction> = tx
+        .message
+        .instructions
+        .iter()
+        .map(|compiled_ix| {
+            let program_id = tx.message.account_keys[compiled_ix.program_id_index as usize];
+            if program_id == cb_id && is_set_compute_unit_limit_data(&compiled_ix.data) {
+                found = true;
+                return new_limit_ix.clone();
+            }
+            // Decompile unchanged instruction.
+            let accounts = compiled_ix
+                .accounts
+                .iter()
+                .map(|&idx| {
+                    let pubkey = tx.message.account_keys[idx as usize];
+                    let is_signer = tx.message.is_signer(idx as usize);
+                    let is_writable = tx.message.is_maybe_writable(idx as usize, None);
+                    solana_sdk::instruction::AccountMeta {
+                        pubkey,
+                        is_signer,
+                        is_writable,
+                    }
+                })
+                .collect();
+            Instruction {
+                program_id,
+                accounts,
+                data: compiled_ix.data.clone(),
+            }
+        })
+        .collect();
+
+    if found {
+        let blockhash = tx.message.recent_blockhash;
+        tx.message = Message::new(&new_instructions, payer.as_ref());
+        tx.message.recent_blockhash = blockhash;
+    }
+
+    found
+}
+
+/// Checks whether a compute budget instruction's data encodes a
+/// `SetComputeUnitLimit`. The discriminator byte is 0x02.
+fn is_set_compute_unit_limit_data(data: &[u8]) -> bool {
+    // ComputeBudgetInstruction::SetComputeUnitLimit is encoded as:
+    //   [0x02] [u32 little-endian]  = 5 bytes total
+    data.len() == 5 && data[0] == 0x02
+}
+
+/// Returns `true` if the derived CU limit is meaningfully tighter than the
+/// current limit — i.e., the savings justify a second simulation pass.
+pub fn should_tighten(current_limit: u32, derived_limit: u32) -> bool {
+    let savings = current_limit.saturating_sub(derived_limit) as f64 / current_limit as f64;
+    savings > TWO_PASS_THRESHOLD
+}
+
 /// Returns `true` if the transaction already contains any Compute Budget
 /// program instructions (`SetComputeUnitLimit` or `SetComputeUnitPrice`).
 ///
@@ -120,7 +201,7 @@ pub fn prepend_compute_budget(
                 .map(|&idx| {
                     let pubkey = tx.message.account_keys[idx as usize];
                     let is_signer = tx.message.is_signer(idx as usize);
-                    let is_writable = tx.message.is_writable(idx as usize);
+                    let is_writable = tx.message.is_maybe_writable(idx as usize, None);
                     solana_sdk::instruction::AccountMeta {
                         pubkey,
                         is_signer,
@@ -255,5 +336,168 @@ mod tests {
         assert_eq!(compute_limit_from_simulation(500), 1_000);
         // Maximum clamp
         assert_eq!(compute_limit_from_simulation(2_000_000), 1_400_000);
+    }
+
+    // ── N13: replace_compute_unit_limit tests ──────────────────────────────
+
+    #[test]
+    fn replace_updates_compute_unit_limit() {
+        let mut tx = make_test_tx();
+        prepend_compute_budget(&mut tx, 200_000, 1000);
+        assert_eq!(tx.message.instructions.len(), 3);
+
+        let replaced = replace_compute_unit_limit(&mut tx, 50_000);
+        assert!(replaced, "should find and replace the SetComputeUnitLimit");
+
+        // Still 3 instructions (limit + price + transfer).
+        assert_eq!(tx.message.instructions.len(), 3);
+
+        // Verify the new limit data: discriminator 0x02 + u32 LE.
+        let limit_ix = &tx.message.instructions[0];
+        let cb_id = compute_budget::id();
+        assert_eq!(
+            tx.message.account_keys[limit_ix.program_id_index as usize],
+            cb_id,
+        );
+        assert_eq!(limit_ix.data.len(), 5);
+        assert_eq!(limit_ix.data[0], 0x02);
+        let encoded_limit = u32::from_le_bytes(limit_ix.data[1..5].try_into().unwrap());
+        assert_eq!(encoded_limit, 50_000);
+    }
+
+    #[test]
+    fn replace_returns_false_when_no_compute_budget() {
+        let mut tx = make_test_tx();
+        assert!(!replace_compute_unit_limit(&mut tx, 50_000));
+        // Transaction should be unchanged.
+        assert_eq!(tx.message.instructions.len(), 1);
+    }
+
+    #[test]
+    fn replace_preserves_price_and_original_instructions() {
+        let from = Pubkey::new_unique();
+        let to1 = Pubkey::new_unique();
+        let to2 = Pubkey::new_unique();
+        let ix1 = system_instruction::transfer(&from, &to1, 1000);
+        let ix2 = system_instruction::transfer(&from, &to2, 2000);
+        let msg = Message::new(&[ix1, ix2], Some(&from));
+        let mut tx = Transaction::new_unsigned(msg);
+
+        prepend_compute_budget(&mut tx, 200_000, 500);
+        assert_eq!(tx.message.instructions.len(), 4); // limit + price + 2 transfers
+
+        replace_compute_unit_limit(&mut tx, 80_000);
+        assert_eq!(tx.message.instructions.len(), 4);
+
+        // Price instruction (index 1) should still be compute budget.
+        let cb_id = compute_budget::id();
+        assert_eq!(
+            tx.message.account_keys[tx.message.instructions[1].program_id_index as usize],
+            cb_id,
+        );
+
+        // Last two should still be system transfers.
+        let system_id = solana_sdk::system_program::id();
+        assert_eq!(
+            tx.message.account_keys[tx.message.instructions[2].program_id_index as usize],
+            system_id,
+        );
+        assert_eq!(
+            tx.message.account_keys[tx.message.instructions[3].program_id_index as usize],
+            system_id,
+        );
+    }
+
+    #[test]
+    fn should_tighten_thresholds() {
+        // 200k → 50k = 75% savings → tighten
+        assert!(should_tighten(200_000, 50_000));
+        // 200k → 110k = 45% savings → tighten
+        assert!(should_tighten(200_000, 110_000));
+        // 200k → 185k = 7.5% savings → don't tighten (below 10%)
+        assert!(!should_tighten(200_000, 185_000));
+        // 200k → 200k = 0% → don't tighten
+        assert!(!should_tighten(200_000, 200_000));
+        // Edge: derived > current → don't tighten (saturating_sub → 0)
+        assert!(!should_tighten(100_000, 200_000));
+    }
+
+    // ── N13: Full two-pass flow integration test ────────────────────────────
+
+    /// Simulates the full N13 two-pass flow at the compute.rs level:
+    /// prepend(DEFAULT) → "simulate" → derive CU → should_tighten? → replace → verify.
+    #[test]
+    fn n13_two_pass_full_flow() {
+        let mut tx = make_test_tx();
+
+        // Pass 1: prepend with DEFAULT_COMPUTE_UNITS
+        assert!(prepend_compute_budget(&mut tx, DEFAULT_COMPUTE_UNITS, 500));
+        let ix_count = tx.message.instructions.len(); // 3: limit + price + transfer
+
+        // "First simulation" reports 50k CU used
+        let simulated_cu: u64 = 50_000;
+        let derived_limit = compute_limit_from_simulation(simulated_cu);
+        assert_eq!(derived_limit, 55_000); // 50k * 1.1
+
+        // Decision: should we tighten?
+        assert!(should_tighten(DEFAULT_COMPUTE_UNITS, derived_limit));
+
+        // Pass 2: replace with tighter limit
+        assert!(replace_compute_unit_limit(&mut tx, derived_limit));
+
+        // Instruction count unchanged
+        assert_eq!(tx.message.instructions.len(), ix_count);
+
+        // Verify the limit instruction now encodes 55_000
+        let limit_ix = &tx.message.instructions[0];
+        assert_eq!(limit_ix.data[0], 0x02); // SetComputeUnitLimit discriminator
+        let encoded = u32::from_le_bytes(limit_ix.data[1..5].try_into().unwrap());
+        assert_eq!(encoded, 55_000);
+
+        // Price instruction still present
+        let cb_id = compute_budget::id();
+        assert_eq!(
+            tx.message.account_keys[tx.message.instructions[1].program_id_index as usize],
+            cb_id,
+        );
+
+        // Original transfer still present
+        let system_id = solana_sdk::system_program::id();
+        assert_eq!(
+            tx.message.account_keys[tx.message.instructions[2].program_id_index as usize],
+            system_id,
+        );
+    }
+
+    /// When CU usage is close to DEFAULT, skip the second pass entirely.
+    #[test]
+    fn n13_skip_when_savings_too_small() {
+        // Simulation reports 185k CU → derived = 203_500 → exceeds DEFAULT
+        // should_tighten returns false
+        let simulated_cu: u64 = 185_000;
+        let derived = compute_limit_from_simulation(simulated_cu);
+        assert_eq!(derived, 203_500); // 185k * 1.1
+        assert!(!should_tighten(DEFAULT_COMPUTE_UNITS, derived));
+    }
+
+    /// Fallback: if second sim would fail, caller restores DEFAULT.
+    /// This test verifies replace can restore the original value.
+    #[test]
+    fn n13_fallback_restores_default() {
+        let mut tx = make_test_tx();
+        prepend_compute_budget(&mut tx, DEFAULT_COMPUTE_UNITS, 0);
+
+        // Tighten to 55k
+        replace_compute_unit_limit(&mut tx, 55_000);
+        let limit_ix = &tx.message.instructions[0];
+        assert_eq!(u32::from_le_bytes(limit_ix.data[1..5].try_into().unwrap()), 55_000);
+
+        // "Second sim failed" — restore DEFAULT
+        replace_compute_unit_limit(&mut tx, DEFAULT_COMPUTE_UNITS);
+        let limit_ix = &tx.message.instructions[0];
+        assert_eq!(
+            u32::from_le_bytes(limit_ix.data[1..5].try_into().unwrap()),
+            DEFAULT_COMPUTE_UNITS,
+        );
     }
 }

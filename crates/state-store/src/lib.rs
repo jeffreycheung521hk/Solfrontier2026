@@ -18,28 +18,34 @@
 //! - Single writer enforced by the connection pool configuration
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 
+pub mod approval_workflow;
 pub mod audit;
 pub mod db;
 pub mod errors;
 pub mod pending_state;
+pub mod session_policy;
 pub mod sessions;
 pub mod spend;
 pub mod tool_traces;
 pub mod tracking;
 pub mod transactions;
+pub mod wallet_bindings;
 pub mod wallet_challenges;
 pub mod wallets;
 
+pub use approval_workflow::ApprovalWorkflowRepository;
 pub use audit::AuditRepository;
 pub use db::{Database, DatabaseConfig};
 pub use errors::StoreError;
 pub use pending_state::PendingStateRepository;
+pub use session_policy::SessionPolicyRepository;
 pub use sessions::SessionRepository;
 pub use spend::SpendRepository;
 pub use tool_traces::ToolTraceRepository;
 pub use transactions::TransactionRepository;
 pub use tracking::TransactionTrackingRepository;
+pub use wallet_bindings::WalletBindingRepository;
 pub use wallet_challenges::WalletChallengeRepository;
 pub use wallets::WalletRepository;

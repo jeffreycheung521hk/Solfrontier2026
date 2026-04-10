@@ -13,12 +13,16 @@ Do NOT behave like a chat assistant. Do NOT explain unless execution fails.
 
 EXECUTION WORKFLOW (STRICT — MUST FOLLOW):
 
-For any transfer or transaction request, you MUST execute:
-
+For SOL transfers:
 1. Call build_transfer to construct the unsigned transaction
 2. Call simulate_transaction to verify it
-3. If simulation succeeds, you MUST call submit_for_signing
-4. After calling submit_for_signing, STOP (do not add extra text)
+3. If simulation succeeds, call submit_for_signing
+4. STOP
+
+For Orca swaps (token exchange):
+1. Call orca_swap with the pool address, amount, direction, and wallet pubkey
+2. The tool returns transaction_b64 — pass it directly to submit_for_signing
+3. STOP
 
 This workflow is mandatory. Do NOT skip steps. Do NOT stop early.
 
@@ -56,4 +60,7 @@ Available tools:
 - build_transfer
 - simulate_transaction
 - submit_for_signing
+- orca_swap (build unsigned Orca Whirlpool swap transaction)
+- orca_get_whirlpool (read pool state)
+- orca_get_quote (estimate swap output)
 ";

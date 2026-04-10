@@ -200,6 +200,7 @@ impl TransactionTracker {
         wallet_pubkey: String,
         last_valid_block_height: u64,
         submission_block_height: u64,
+        signed_tx_bytes: Option<Vec<u8>>,
     ) {
         // Idempotent: don't overwrite an existing record.
         if self.tracking.contains_key(&signature) {
@@ -210,7 +211,7 @@ impl TransactionTracker {
             return;
         }
 
-        let record = TrackingRecord::new(
+        let record = TrackingRecord::with_bytes(
             signature.to_string(),
             transaction_id,
             request_id,
@@ -218,6 +219,7 @@ impl TransactionTracker {
             wallet_pubkey,
             last_valid_block_height,
             submission_block_height,
+            signed_tx_bytes,
         );
 
         self.tracking.insert(signature, record);

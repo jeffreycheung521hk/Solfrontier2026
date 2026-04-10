@@ -20,7 +20,7 @@
 //! - Agent orchestration
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 
 pub mod approval;
 pub mod errors;

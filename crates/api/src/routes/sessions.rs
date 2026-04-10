@@ -13,7 +13,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use claw_types::{agent::AgentRole, session::SessionId};
+use claw_types::{agent::AgentRole, policy::PolicyRule, session::SessionId};
 
 use crate::server::AppState;
 
@@ -21,6 +21,9 @@ use crate::server::AppState;
 pub struct OpenSessionRequest {
     pub role:    AgentRole,
     pub channel: Option<String>,
+    /// Optional per-session policy rules. Evaluated before global rules.
+    #[serde(default)]
+    pub policy_overrides: Option<Vec<PolicyRule>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,7 +42,7 @@ pub async fn open_session(
     Json(req): Json<OpenSessionRequest>,
 ) -> Response {
     let channel = req.channel.unwrap_or_else(|| "api".to_string());
-    let session_id = state.session_mgr.open(req.role, channel);
+    let session_id = state.session_mgr.open(req.role, channel, req.policy_overrides);
 
     (
         StatusCode::CREATED,

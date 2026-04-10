@@ -1,7 +1,6 @@
 //! The `Tool` trait — the interface every tool implements.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use claw_types::tool::{ToolInput, ToolOutput, ToolSpec};
 

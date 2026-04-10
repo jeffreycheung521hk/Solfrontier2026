@@ -78,13 +78,68 @@ mainnet_safe_defaults = true
 # If non-empty, any transaction referencing an unlisted program will be rejected.
 # Leave empty to allow all programs (appropriate for development).
 program_allowlist = [
-    # "11111111111111111111111111111111",                # System program
-    # "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token
-    # "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bC8",  # Associated Token Account
+    "11111111111111111111111111111111",                # System program
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bC8",  # Associated Token Account
+    "ComputeBudget111111111111111111111111111111",     # Compute Budget
 ]
 
 # Pubkeys that can never receive funds from this system.
-destination_denylist = []
+destination_denylist = [
+    "BurnAddress1111111111111111111111111111111",      # Example burn address
+]
+
+# ── Custom policy rules ───────────────────────────────────────────────────
+# Rules are evaluated in order; the first matching rule wins.
+# Custom rules run BEFORE the built-in defaults (mainnet-requires-human, etc.).
+
+# Rule 1: Escalate transfers >= 0.01 SOL to human approval
+[[policy.rules]]
+name = "large-transfer-requires-human"
+description = "Require human approval for transfers >= 0.01 SOL"
+condition = { type = "AmountExceedsLamports", threshold = 10_000_000 }
+action = { type = "RequireHumanApproval", reason = "transfer amount exceeds 0.01 SOL threshold" }
+
+# Rule 2: Reject transactions to denied destinations
+[[policy.rules]]
+name = "denylist-block"
+description = "Block transactions to denied destinations"
+condition = "DestinationInDenylist"
+action = { type = "Reject", reason = "destination is on the deny list" }
+
+# Rule 3: Reject transactions invoking unlisted programs
+[[policy.rules]]
+name = "allowlist-block"
+description = "Block transactions invoking programs not on the allow list"
+condition = "ProgramNotInAllowlist"
+action = { type = "Reject", reason = "program is not on the allow list" }
+
+# ── Per-role default policy profiles ──────────────────────────────────────
+# When a session opens with a given role, the matching profile's rules are
+# automatically injected. Caller overrides take precedence over profile rules.
+# Evaluation order: caller overrides → role profile → global rules → defaults.
+
+# Execution role: cap individual transfers at 0.1 SOL
+[[policy.role_profiles]]
+role = "execution"
+rules = [
+    { name = "exec-amount-cap", description = "Execution role: require human for transfers >= 0.1 SOL", condition = { type = "AmountExceedsLamports", threshold = 100_000_000 }, action = { type = "RequireHumanApproval", reason = "execution role: amount exceeds 0.1 SOL" } },
+]
+
+# Example: Block transactions outside business hours (Mon-Fri 9-17 HKT)
+# [[policy.rules]]
+# name = "business-hours-only"
+# description = "Block transactions outside Mon-Fri 9am-5pm HKT"
+# condition = { type = "OutsideAllowedHours", start_hour = 9, end_hour = 17, allowed_days = [1,2,3,4,5], utc_offset_hours = 8 }
+# action = { type = "Reject", reason = "transactions only allowed during business hours (Mon-Fri 9-17 HKT)" }
+
+# Research role: read-only, block all signing attempts
+# (Research agents should never reach submit_for_signing, but fail-safe here)
+[[policy.role_profiles]]
+role = "research"
+rules = [
+    { name = "research-block-all", description = "Research role: block all transactions", condition = "Always", action = { type = "Reject", reason = "research role cannot submit transactions" } },
+]
 
 # ── LLM ────────────────────────────────────────────────────────────────────
 [llm]
@@ -107,6 +162,30 @@ model = "gpt-4o-mini"
 # unless you have a reverse proxy with TLS and authentication in front.
 bind_addr = "127.0.0.1"
 port = 7070
+
+# ── Retry / Rebroadcast ───────────────────────────────────────────────────
+[retry]
+# Maximum number of rebroadcast attempts for dropped transactions.
+# Solana deduplicates by signature, so resubmitting the same bytes is safe.
+max_retries = 3
+
+# ── Rate Limiting ─────────────────────────────────────────────────────────
+[rate_limit]
+# Per-token sliding window. All protected routes share one counter per bearer token.
+enabled = true
+# Maximum requests allowed per 60-second window (excluding burst).
+requests_per_minute = 60
+# Extra burst allowance above the per-minute rate.
+burst_size = 10
+
+# ── Alerting ──────────────────────────────────────────────────────────────
+[alerting]
+# When enabled, policy violations and approval events are POSTed as JSON
+# to the webhook URL. Delivery is non-blocking with retry.
+enabled = false
+# webhook_url = "https://hooks.slack.com/services/T.../B.../..."
+# max_retries = 3
+# timeout_ms = 5000
 
 # ── Logging ────────────────────────────────────────────────────────────────
 [logging]

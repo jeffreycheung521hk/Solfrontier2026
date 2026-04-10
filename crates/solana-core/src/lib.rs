@@ -17,7 +17,7 @@
 //! - The "build a transfer" business logic (that's in `claw-tool-system`)
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 
 pub mod blockhash;
 pub mod compute;

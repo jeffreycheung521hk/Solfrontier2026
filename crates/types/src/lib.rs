@@ -11,7 +11,8 @@
 //! a named type. "Stringly-typed" patterns are explicitly prohibited.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs, clippy::pedantic)]
+#![allow(missing_docs)]
+#![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 pub mod agent;
@@ -20,6 +21,7 @@ pub mod approval;
 pub mod errors;
 pub mod events;
 pub mod messages;
+pub mod operator;
 pub mod policy;
 pub mod session;
 pub mod solana;

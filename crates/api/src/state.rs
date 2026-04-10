@@ -20,6 +20,7 @@ use claw_types::{
     agent::{AgentCommand, AgentResponse, AgentRole},
     approval::{ApprovalDecision, ApprovalOutcome, ApprovalRequest},
     events::GatewayEvent,
+    policy::PolicyRule,
     session::SessionId,
 };
 
@@ -28,7 +29,8 @@ use crate::auth::AuthToken;
 /// Minimal session management interface needed by the API layer.
 pub trait SessionOps: Send + Sync + 'static {
     /// Opens a new session and returns its ID.
-    fn open(&self, role: AgentRole, channel: String) -> SessionId;
+    /// `policy_overrides`: optional per-session policy rules evaluated before global rules.
+    fn open(&self, role: AgentRole, channel: String, policy_overrides: Option<Vec<PolicyRule>>) -> SessionId;
     /// Closes a session by ID.
     fn close(&self, id: &SessionId, reason: &str);
     /// Returns the number of active sessions.
@@ -187,8 +189,8 @@ impl SessionManagerRef {
     }
 
     /// Opens a new session.
-    pub fn open(&self, role: AgentRole, channel: impl Into<String>) -> SessionId {
-        self.0.open(role, channel.into())
+    pub fn open(&self, role: AgentRole, channel: impl Into<String>, policy_overrides: Option<Vec<PolicyRule>>) -> SessionId {
+        self.0.open(role, channel.into(), policy_overrides)
     }
 
     /// Closes a session.
@@ -338,6 +340,56 @@ impl WalletChallengeHandlerRef {
     }
 }
 
+/// Result of proposing a transaction through the signing pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposeTransferResult {
+    /// "awaiting_wallet_signature" or "signed"
+    pub status: String,
+    /// The wallet signature request ID (if awaiting external wallet).
+    pub wallet_signature_request_id: Option<uuid::Uuid>,
+    /// Base64-encoded unsigned transaction (if awaiting external wallet).
+    pub unsigned_tx_b64: Option<String>,
+    /// The on-chain signature (if auto-signed locally).
+    pub signature: Option<String>,
+    /// Error message (if failed).
+    pub error: Option<String>,
+}
+
+/// Direct transaction proposal interface (bypasses LLM agent).
+///
+/// Provides deterministic transaction building for E2E testing and
+/// operator-driven workflows.
+pub trait TransactionProposer: Send + Sync + 'static {
+    /// Builds a SOL transfer and routes it through the full signing pipeline.
+    fn propose_transfer(
+        &self,
+        session_id: &SessionId,
+        from: &str,
+        to: &str,
+        lamports: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<ProposeTransferResult, String>> + Send + '_>>;
+}
+
+/// A cloneable reference to a `TransactionProposer` implementation.
+#[derive(Clone)]
+pub struct TransactionProposerRef(pub Arc<dyn TransactionProposer>);
+
+impl TransactionProposerRef {
+    pub fn new(inner: Arc<dyn TransactionProposer>) -> Self {
+        Self(inner)
+    }
+
+    pub async fn propose_transfer(
+        &self,
+        session_id: &SessionId,
+        from: &str,
+        to: &str,
+        lamports: u64,
+    ) -> Result<ProposeTransferResult, String> {
+        self.0.propose_transfer(session_id, from, to, lamports).await
+    }
+}
+
 /// The shared state injected into every route handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -353,6 +405,14 @@ pub struct AppState {
     pub wallet_signatures:   WalletSignatureHandlerRef,
     /// Wallet ownership challenge-response.
     pub wallet_challenges:   WalletChallengeHandlerRef,
-    /// Bearer token for API authentication.
+    /// Bearer token for API authentication (legacy single-token mode).
     pub auth_token:          AuthToken,
+    /// Token-to-operator identity mapping. Empty = legacy single-token mode.
+    pub operator_registry:   crate::auth::OperatorRegistry,
+    /// Metrics counters for observability.
+    pub metrics:             std::sync::Arc<claw_observability::metrics::MetricsRegistry>,
+    /// Direct transaction proposal (bypasses LLM agent).
+    pub propose:             Option<TransactionProposerRef>,
+    /// Per-token sliding-window rate limiter (None = disabled).
+    pub rate_limiter:        Option<crate::rate_limit::RateLimiter>,
 }

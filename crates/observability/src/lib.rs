@@ -15,7 +15,7 @@
 //! - Alert routing (that's in `claw-gateway`)
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 
 pub mod correlation;
 pub mod health;

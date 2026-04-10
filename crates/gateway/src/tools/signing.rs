@@ -43,7 +43,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use serde_json::json;
-use solana_sdk::transaction::Transaction;
+use solana_sdk::{
+    compute_budget,
+    pubkey::Pubkey,
+    system_instruction::SystemInstruction,
+    system_program,
+    transaction::Transaction,
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -54,11 +60,13 @@ use claw_tool_system::{errors::ToolError, tool::Tool};
 use claw_types::{
     approval::ApprovalRequest,
     events::{ApprovalLifecycleEvent, EventHeader, GatewayEvent, TransactionFailedEvent, TransactionLifecycleEvent, WalletSignatureEvent},
+    policy::PolicyVerdict,
     tool::{ToolInput, ToolOutput, ToolSpec},
-    transaction::{TransactionProposal, TransactionStatus},
+    transaction::{AccountRole, InstructionSummary, TransactionProposal, TransactionStatus},
 };
 use claw_wallet_engine::pipeline::TransactionReviewPipeline;
 
+use claw_observability::metrics::MetricsRegistry;
 use crate::{
     approval_store::ApprovalStore,
     completion_metadata::{CompletionMeta, CompletionMetadataStore},
@@ -68,6 +76,7 @@ use crate::{
     orchestrator::SignatureOrchestrator,
     orchestrator::types::{SignatureOutcome, SignatureRequest, SignatureRequestId},
     pending_signing::PendingSigningStore,
+    session_policy::SessionPolicyStore,
 };
 
 /// Gateway-private tool that runs the full transaction review pipeline.
@@ -86,6 +95,17 @@ pub struct SubmitForSigningTool {
     external_wallet:  ExternalWalletStore,
     completion_meta:  CompletionMetadataStore,
     durable:          Option<DurablePendingState>,
+    metrics:          Arc<MetricsRegistry>,
+    /// Per-session policy overrides (shared with GatewaySessionAdapter).
+    session_policy:   SessionPolicyStore,
+    /// Per-wallet policy rules (from config, read-only).
+    wallet_policy:    crate::wallet_policy::WalletPolicyStore,
+    /// Approval lease duration in seconds.
+    approval_lease_seconds: u64,
+    /// Policy alert dispatcher.
+    alerts:           crate::policy_alerting::AlertDispatcher,
+    /// RPC client for submitting signed transactions to the network.
+    rpc_client:       Option<claw_solana_core::rpc::ClawRpcClient>,
 }
 
 impl SubmitForSigningTool {
@@ -101,6 +121,11 @@ impl SubmitForSigningTool {
         network:          claw_types::solana::SolanaNetwork,
         external_wallet:  ExternalWalletStore,
         completion_meta:  CompletionMetadataStore,
+        metrics:          Arc<MetricsRegistry>,
+        session_policy:   SessionPolicyStore,
+        wallet_policy:    crate::wallet_policy::WalletPolicyStore,
+        approval_lease_seconds: u64,
+        alerts:           crate::policy_alerting::AlertDispatcher,
     ) -> Self {
         Self {
             pipeline,
@@ -115,12 +140,24 @@ impl SubmitForSigningTool {
             external_wallet,
             completion_meta,
             durable: None,
+            metrics,
+            session_policy,
+            wallet_policy,
+            approval_lease_seconds,
+            alerts,
+            rpc_client: None,
         }
     }
 
     /// Enable durable persistence for pending state (P1-1).
     pub fn with_durable(mut self, durable: DurablePendingState) -> Self {
         self.durable = Some(durable);
+        self
+    }
+
+    /// Enable auto-submission of signed transactions to the network.
+    pub fn with_rpc_client(mut self, rpc: claw_solana_core::rpc::ClawRpcClient) -> Self {
+        self.rpc_client = Some(rpc);
         self
     }
 }
@@ -166,6 +203,8 @@ impl Tool for SubmitForSigningTool {
                     "wallet_signature_request_id":  { "type": ["string", "null"] },
                     "unsigned_tx_b64":              { "type": ["string", "null"] },
                     "policy_verdict":               { "type": ["string", "null"] },
+                    "policy_rule_name":             { "type": ["string", "null"] },
+                    "policy_reason":                { "type": ["string", "null"] },
                     "error":                        { "type": ["string", "null"] }
                 }
             }),
@@ -208,9 +247,11 @@ impl Tool for SubmitForSigningTool {
             network:              self.network,
             description:          description.clone(),
             transaction_b64:      tx_b64.to_string(),
-            instructions_summary: vec![],
+            instructions_summary: summarize_transaction_instructions(&tx),
             created_at:           chrono::Utc::now(),
         };
+
+        self.metrics.transactions_proposed.increment();
 
         // Query accumulated spend for policy evaluation.
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -231,6 +272,25 @@ impl Tool for SubmitForSigningTool {
         let proposal_for_policy = proposal.clone();
         let session_id_for_policy = input.session_id.clone();
 
+        // Build the layered effective policy:
+        //   wallet rules → session rules → global rules → defaults
+        let mut effective_policy = match self.session_policy.get(&input.session_id) {
+            Some(session_rules) => {
+                info!(
+                    session = %session_str,
+                    session_rules = session_rules.len(),
+                    "using session-scoped policy overrides"
+                );
+                policy_set.with_session_rules(&session_rules)
+            }
+            None => (*policy_set).clone(),
+        };
+
+        // Prepend wallet-specific rules (highest priority after wallet itself).
+        if let Some(wallet_rules) = self.wallet_policy.get(&wallet_pubkey) {
+            effective_policy = effective_policy.with_session_rules(wallet_rules);
+        }
+
         // Stage 1: Simulate
         let simulated = self.pipeline.simulate(&proposal, tx).await
             .map_err(|e| match e {
@@ -242,6 +302,10 @@ impl Tool for SubmitForSigningTool {
             })?;
 
         // Stage 2: Policy evaluation
+        // Capture evaluation metadata from the closure for audit/observability.
+        let eval_meta: std::cell::Cell<Option<(usize, usize, Option<usize>)>> =
+            std::cell::Cell::new(None);
+
         let approved = match self.pipeline.evaluate_policy(
             &proposal,
             simulated,
@@ -254,37 +318,52 @@ impl Tool for SubmitForSigningTool {
                     session_spend_lamports:       session_spend,
                     wallet_daily_spend_lamports:  wallet_daily_spend,
                 };
-                policy_set.evaluate(&ctx)
+                let result = effective_policy.evaluate(&ctx);
+                eval_meta.set(Some((
+                    result.rules_total,
+                    result.rules_evaluated,
+                    result.matched_rule_index,
+                )));
+                result.verdict
             },
         ) {
             Ok(a) => a,
             Err(claw_wallet_engine::errors::WalletError::PolicyBlocked { verdict }) => {
+                self.metrics.policy_rejections.increment();
+                if let Some(rule) = verdict.rule_name() {
+                    self.metrics.policy_rule_hits.increment(rule);
+                }
                 warn!(
                     session = %session_str,
                     verdict = %verdict.label(),
+                    rule = ?verdict.rule_name(),
                     "transaction blocked by policy"
                 );
 
                 let _ = self.audit.append(
                     Some(&session_str),
                     &proposal.id.to_string(),
-                    "transaction_policy_blocked",
+                    "policy_evaluation",
                     "pipeline",
-                    &json!({
-                        "proposal_id":    proposal.id,
-                        "policy_verdict": verdict.label(),
-                    }),
+                    &policy_evaluation_audit(&proposal, &verdict, eval_meta.get()),
                     AuditSeverity::Warning,
                 ).await;
+
+                self.alerts.send(
+                    "policy_rejected",
+                    claw_types::alert::AlertSeverity::Warning,
+                    &policy_blocked_error(&verdict),
+                    policy_evaluation_audit(&proposal, &verdict, eval_meta.get()),
+                );
 
                 return Ok(ToolOutput {
                     tool_name:   "submit_for_signing".to_string(),
                     success:     false,
-                    data:        Some(json!({
+                    data:        Some(with_policy_fields(json!({
                         "status":         "policy_blocked",
                         "policy_verdict": verdict.label(),
-                    })),
-                    error:       Some(format!("policy blocked: {}", verdict.label())),
+                    }), &verdict)),
+                    error:       Some(policy_blocked_error(&verdict)),
                     duration_ms: 0,
                 });
             }
@@ -298,6 +377,24 @@ impl Tool for SubmitForSigningTool {
         let last_valid_block_height = approved.inner.last_valid_block_height;
         let finalized_tx = approved.inner.inner;
 
+        // ── Policy observability: audit + per-rule counter ─────────────────────
+        if let Some(rule) = policy_verdict.rule_name() {
+            self.metrics.policy_rule_hits.increment(rule);
+        }
+        let audit_severity = if policy_verdict.requires_human() {
+            AuditSeverity::Warning
+        } else {
+            AuditSeverity::Info
+        };
+        let _ = self.audit.append(
+            Some(&session_str),
+            &proposal.id.to_string(),
+            "policy_evaluation",
+            "pipeline",
+            &policy_evaluation_audit(&proposal, &policy_verdict, eval_meta.get()),
+            audit_severity,
+        ).await;
+
         // ── Routing decision: awaiting approval vs execution-ready ──────────────
 
         if policy_verdict.requires_human() {
@@ -305,6 +402,16 @@ impl Tool for SubmitForSigningTool {
 
             // Park in PendingSigningStore (Control Plane) for human approval.
             let request_id = Uuid::new_v4();
+
+            // Extract approval chain or single role from the verdict.
+            let (required_approver_role, approval_chain) = match &policy_verdict {
+                PolicyVerdict::RequiresHumanApproval {
+                    required_approver_role,
+                    approval_chain,
+                    ..
+                } => (required_approver_role.clone(), approval_chain.clone()),
+                _ => (None, None),
+            };
 
             let approval_request = ApprovalRequest {
                 id:              request_id,
@@ -315,6 +422,38 @@ impl Tool for SubmitForSigningTool {
                 simulation:      simulation.clone(),
                 requested_at:    chrono::Utc::now(),
                 decided:         false,
+                required_approver_role: required_approver_role.clone(),
+            };
+
+            // Build the approval workflow (single-stage or multi-stage).
+            let workflow = if let Some(ref chain) = approval_chain {
+                use claw_types::approval::ApprovalStage;
+                let stages = chain
+                    .iter()
+                    .enumerate()
+                    .map(|(i, cs)| ApprovalStage {
+                        index: i,
+                        allowed_roles: vec![cs.role.clone()],
+                        min_approvals: cs.min_approvals,
+                        decisions: vec![],
+                    })
+                    .collect();
+                let now = chrono::Utc::now();
+                claw_types::approval::ApprovalWorkflow {
+                    request_id,
+                    session_id: input.session_id.clone(),
+                    state: claw_types::approval::ApprovalWorkflowState::Pending,
+                    stages,
+                    created_at: now,
+                    updated_at: now,
+                    expires_at: None,
+                }.with_lease_seconds(self.approval_lease_seconds)
+            } else {
+                claw_types::approval::ApprovalWorkflow::single_stage(
+                    request_id,
+                    input.session_id.clone(),
+                    required_approver_role,
+                ).with_lease_seconds(self.approval_lease_seconds)
             };
 
             // P1-1 hardening: DB write BEFORE in-memory mutation.
@@ -339,7 +478,7 @@ impl Tool for SubmitForSigningTool {
                 last_valid_block_height,
             ).map_err(|e| ToolError::ExecutionFailed(e))?;
 
-            self.approval_store.register(approval_request.clone());
+            self.approval_store.register(approval_request.clone(), workflow);
 
             let audit_action = if is_external { "approval_requested_external_wallet" } else { "approval_requested" };
             let _ = self.audit.append(
@@ -414,6 +553,7 @@ impl Tool for SubmitForSigningTool {
             if is_external {
                 data["signer_type"] = json!("external");
             }
+            data = with_policy_fields(data, &policy_verdict);
 
             return Ok(ToolOutput {
                 tool_name:   "submit_for_signing".to_string(),
@@ -448,7 +588,7 @@ impl Tool for SubmitForSigningTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("orchestrator: {e}")))?;
 
         match outcome {
-            SignatureOutcome::Signed { signature, request_id: _, signed_tx_bytes: _, adapter_type: _, transaction_id: _, expected_signer: _ } => {
+            SignatureOutcome::Signed { signature, request_id: _, signed_tx_bytes, adapter_type: _, transaction_id: _, expected_signer: _ } => {
                 info!(
                     session = %session_str,
                     proposal_id = %proposal.id,
@@ -493,13 +633,55 @@ impl Tool for SubmitForSigningTool {
                     },
                 ));
 
+                // Auto-submit to RPC if rpc_client is configured.
+                let mut tx_signature = None;
+                let mut submitted = false;
+                if let Some(ref rpc) = self.rpc_client {
+                    match rpc.send_raw_transaction(&signed_tx_bytes).await {
+                        Ok(sig) => {
+                            info!(
+                                session = %session_str,
+                                proposal_id = %proposal.id,
+                                tx_signature = %sig,
+                                "transaction submitted to network"
+                            );
+                            self.metrics.transactions_sent.increment();
+                            self.metrics.rpc_calls_total.increment();
+                            tx_signature = Some(sig);
+                            submitted = true;
+
+                            self.event_bus.publish(GatewayEvent::TransactionSent(
+                                TransactionLifecycleEvent {
+                                    header:         EventHeader::new(Some(input.session_id.clone())),
+                                    session_id:     input.session_id.clone(),
+                                    transaction_id: proposal.id,
+                                    wallet_pubkey:  wallet_pubkey.clone(),
+                                    status:         TransactionStatus::Sent,
+                                    signature:      Some(signature.clone()),
+                                },
+                            ));
+                        }
+                        Err(e) => {
+                            warn!(
+                                session = %session_str,
+                                proposal_id = %proposal.id,
+                                error = %e,
+                                "failed to submit signed transaction to network"
+                            );
+                            self.metrics.rpc_calls_failed.increment();
+                        }
+                    }
+                }
+
                 Ok(ToolOutput {
                     tool_name:   "submit_for_signing".to_string(),
                     success:     true,
-                    data:        Some(json!({
-                        "status":    "signed",
-                        "signature": signature,
-                    })),
+                    data:        Some(with_policy_fields(json!({
+                        "status":       "signed",
+                        "signature":    signature,
+                        "submitted":    submitted,
+                        "tx_signature": tx_signature,
+                    }), &policy_verdict)),
                     error:       None,
                     duration_ms: 0,
                 })
@@ -594,7 +776,7 @@ impl Tool for SubmitForSigningTool {
                 Ok(ToolOutput {
                     tool_name:   "submit_for_signing".to_string(),
                     success:     true,
-                    data:        Some(json!({
+                    data:        Some(with_policy_fields(json!({
                         "status":                       "awaiting_wallet_signature",
                         "wallet_signature_request_id":  request_id.0.to_string(),
                         "unsigned_tx_b64":              unsigned_tx_b64,
@@ -602,7 +784,7 @@ impl Tool for SubmitForSigningTool {
                         "message":                      "Transaction is awaiting signature from the external wallet. \
                                                          Sign the unsigned_tx_b64 and submit via \
                                                          POST /sessions/:id/wallet-signatures."
-                    })),
+                    }), &policy_verdict)),
                     error:       None,
                     duration_ms: 0,
                 })
@@ -621,7 +803,7 @@ impl Tool for SubmitForSigningTool {
 // - On timeout/disconnect: logs and removes parked entry
 
 pub async fn resume_after_approval(
-    decision_rx:     tokio::sync::oneshot::Receiver<bool>,
+    decision_rx:     tokio::sync::oneshot::Receiver<claw_types::approval::ApprovalWorkflowState>,
     request_id:      Uuid,
     proposal:        TransactionProposal,
     orchestrator:    SignatureOrchestrator,
@@ -634,36 +816,37 @@ pub async fn resume_after_approval(
     completion_meta: CompletionMetadataStore,
     durable:         Option<DurablePendingState>,
 ) {
+    use claw_types::approval::ApprovalWorkflowState;
+
     let session_str = session_id.to_string();
 
-    // Wait for the operator's decision.
-    let approved = match decision_rx.await {
-        Ok(decision) => decision,
+    // Wait for the workflow to reach a terminal state.
+    let workflow_state = match decision_rx.await {
+        Ok(state) => state,
         Err(_) => {
             // Sender dropped (e.g., daemon shutting down).
             warn!(
                 session = %session_str,
                 request_id = %request_id,
-                "approval oneshot dropped — cleaning up parked transaction"
+                "approval channel dropped — treating as expired"
             );
-            // P1-1 hardening: mark terminal BEFORE in-memory removal.
             if let Some(ref durable) = durable {
-                durable.mark_approval_terminal(request_id, "consumed", Some("sender dropped")).await;
+                durable.mark_approval_terminal(request_id, "expired", Some("channel dropped")).await;
             }
             pending_signing.remove(&request_id);
             return;
         }
     };
 
-    if !approved {
+    if !workflow_state.is_approved() {
         info!(
             session = %session_str,
             request_id = %request_id,
-            "operator rejected transaction — terminal"
+            state = workflow_state.label(),
+            "workflow reached non-approved terminal state"
         );
-        // P1-1 hardening: mark terminal BEFORE in-memory removal.
         if let Some(ref durable) = durable {
-            durable.mark_approval_terminal(request_id, "rejected", Some("operator rejected")).await;
+            durable.mark_approval_terminal(request_id, workflow_state.label(), None).await;
         }
         pending_signing.remove(&request_id);
 
@@ -898,5 +1081,427 @@ pub async fn resume_after_approval(
                 },
             ));
         }
+    }
+}
+
+// ── Helper: decode instructions from an unsigned transaction ─────────────────
+
+/// Best-effort decode of the instructions in an unsigned `Transaction`.
+/// Returns a summary for each instruction, including transfer amount
+/// when the instruction is a System Program transfer.
+fn summarize_transaction_instructions(tx: &Transaction) -> Vec<InstructionSummary> {
+    tx.message
+        .instructions
+        .iter()
+        .filter_map(|ix| {
+            let program_id_index = ix.program_id_index as usize;
+            let program_id = tx
+                .message
+                .account_keys
+                .get(program_id_index)?
+                .to_string();
+
+            let (program_name, description, transfer_lamports) =
+                decode_instruction(&program_id, &ix.data, &tx.message.account_keys, &ix.accounts);
+
+            let accounts = ix
+                .accounts
+                .iter()
+                .filter_map(|&idx| {
+                    let pubkey = tx.message.account_keys.get(idx as usize)?.to_string();
+                    let is_signer = (idx as usize) < tx.message.header.num_required_signatures as usize;
+                    let is_writable = tx.message.is_maybe_writable(idx as usize, None);
+                    Some(AccountRole {
+                        pubkey,
+                        label: None,
+                        is_signer,
+                        is_writable,
+                    })
+                })
+                .collect();
+
+            Some(InstructionSummary {
+                program_id,
+                program_name,
+                description,
+                transfer_lamports,
+                accounts,
+            })
+        })
+        .collect()
+}
+
+/// Decode a single instruction into (program_name, description, transfer_lamports).
+fn decode_instruction(
+    program_id: &str,
+    data: &[u8],
+    account_keys: &[Pubkey],
+    account_indices: &[u8],
+) -> (Option<String>, String, Option<u64>) {
+    let system_id = system_program::id().to_string();
+    let compute_budget_id = compute_budget::id().to_string();
+
+    if program_id == system_id {
+        // Try to decode as a SystemInstruction (bincode-encoded).
+        if let Ok(sys_ix) = bincode::deserialize::<SystemInstruction>(data) {
+            match sys_ix {
+                SystemInstruction::Transfer { lamports } => {
+                    let to = account_indices
+                        .get(1)
+                        .and_then(|&i| account_keys.get(i as usize))
+                        .map(|pk| pk.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    return (
+                        Some("System Program".to_string()),
+                        format!("Transfer {} lamports to {}", lamports, to),
+                        Some(lamports),
+                    );
+                }
+                SystemInstruction::CreateAccount { lamports, space, owner } => {
+                    return (
+                        Some("System Program".to_string()),
+                        format!(
+                            "CreateAccount: {} lamports, {} bytes, owner {}",
+                            lamports, space, owner
+                        ),
+                        Some(lamports),
+                    );
+                }
+                _ => {
+                    return (
+                        Some("System Program".to_string()),
+                        format!("{:?}", sys_ix),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    if program_id == compute_budget_id {
+        return (
+            Some("Compute Budget".to_string()),
+            "ComputeBudget instruction".to_string(),
+            None,
+        );
+    }
+
+    // Unknown program — return a generic summary.
+    (
+        None,
+        format!("Instruction for program {}", &program_id[..8.min(program_id.len())]),
+        None,
+    )
+}
+
+// ── Helper: attach policy metadata to response JSON ──────────────────────────
+
+/// Merges `policy_rule_name` and `policy_reason` into a response `serde_json::Value`.
+fn with_policy_fields(mut data: serde_json::Value, verdict: &PolicyVerdict) -> serde_json::Value {
+    if let Some(rule_name) = verdict.rule_name() {
+        data["policy_rule_name"] = serde_json::json!(rule_name);
+    }
+    if let Some(reason) = verdict.reason() {
+        data["policy_reason"] = serde_json::json!(reason);
+    }
+    data
+}
+
+/// Builds a human-readable error string for policy-blocked responses.
+fn policy_blocked_error(verdict: &PolicyVerdict) -> String {
+    match (verdict.rule_name(), verdict.reason()) {
+        (Some(rule), Some(reason)) => {
+            format!("policy blocked by rule '{}': {}", rule, reason)
+        }
+        (Some(rule), None) => {
+            format!("policy blocked by rule '{}'", rule)
+        }
+        (None, Some(reason)) => {
+            format!("policy blocked: {}", reason)
+        }
+        (None, None) => {
+            format!("policy blocked: {}", verdict.label())
+        }
+    }
+}
+
+// ── Helper: structured audit payload for policy evaluation ───────────────────
+
+/// Builds a JSON audit payload capturing the full policy evaluation context.
+///
+/// `eval_meta` is `(rules_total, rules_evaluated, matched_rule_index)` captured
+/// from `PolicyEvaluationResult` inside the evaluate closure.
+fn policy_evaluation_audit(
+    proposal: &TransactionProposal,
+    verdict: &PolicyVerdict,
+    eval_meta: Option<(usize, usize, Option<usize>)>,
+) -> serde_json::Value {
+    let programs: Vec<&str> = proposal
+        .instructions_summary
+        .iter()
+        .map(|ix| ix.program_id.as_str())
+        .collect();
+
+    let destinations: Vec<&str> = proposal
+        .instructions_summary
+        .iter()
+        .flat_map(|ix| ix.accounts.iter())
+        .filter(|acc| !acc.is_signer && acc.is_writable)
+        .map(|acc| acc.pubkey.as_str())
+        .collect();
+
+    let total_transfer_lamports: u64 = proposal
+        .instructions_summary
+        .iter()
+        .filter_map(|ix| ix.transfer_lamports)
+        .sum();
+
+    let (rules_total, rules_evaluated, matched_rule_index) = eval_meta.unwrap_or((0, 0, None));
+
+    json!({
+        "proposal_id":             proposal.id,
+        "verdict":                 verdict.label(),
+        "matched_rule":            verdict.rule_name(),
+        "reason":                  verdict.reason(),
+        "rules_total":             rules_total,
+        "rules_evaluated":         rules_evaluated,
+        "matched_rule_index":      matched_rule_index,
+        "instructions_count":      proposal.instructions_summary.len(),
+        "programs":                programs,
+        "destinations":            destinations,
+        "total_transfer_lamports": total_transfer_lamports,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::{
+        message::Message,
+        system_instruction,
+        transaction::Transaction,
+    };
+
+    #[test]
+    fn summarize_system_transfer() {
+        let from = Pubkey::new_unique();
+        let to = Pubkey::new_unique();
+        let lamports = 42_000_000u64;
+
+        let ix = system_instruction::transfer(&from, &to, lamports);
+        let msg = Message::new(&[ix], Some(&from));
+        let tx = Transaction::new_unsigned(msg);
+
+        let summaries = summarize_transaction_instructions(&tx);
+        assert_eq!(summaries.len(), 1);
+
+        let s = &summaries[0];
+        assert_eq!(s.program_id, system_program::id().to_string());
+        assert_eq!(s.program_name.as_deref(), Some("System Program"));
+        assert_eq!(s.transfer_lamports, Some(lamports));
+        assert!(
+            s.description.contains(&lamports.to_string()),
+            "description should mention lamports: {}",
+            s.description
+        );
+        assert!(
+            s.description.contains(&to.to_string()),
+            "description should mention destination: {}",
+            s.description
+        );
+    }
+
+    #[test]
+    fn summarize_unknown_program_fallback() {
+        let from = Pubkey::new_unique();
+        let unknown_program = Pubkey::new_unique();
+
+        let ix = solana_sdk::instruction::Instruction::new_with_bytes(
+            unknown_program,
+            &[0xDE, 0xAD],
+            vec![solana_sdk::instruction::AccountMeta::new(from, true)],
+        );
+        let msg = Message::new(&[ix], Some(&from));
+        let tx = Transaction::new_unsigned(msg);
+
+        let summaries = summarize_transaction_instructions(&tx);
+        assert_eq!(summaries.len(), 1);
+
+        let s = &summaries[0];
+        assert_eq!(s.program_id, unknown_program.to_string());
+        assert!(s.program_name.is_none(), "unknown program should have no name");
+        assert_eq!(s.transfer_lamports, None);
+        assert!(
+            s.description.starts_with("Instruction for program"),
+            "should have fallback description: {}",
+            s.description
+        );
+    }
+
+    #[test]
+    fn summarize_create_account() {
+        let from = Pubkey::new_unique();
+        let new_account = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let lamports = 1_000_000u64;
+        let space = 165u64;
+
+        let ix = system_instruction::create_account(&from, &new_account, lamports, space, &owner);
+        let msg = Message::new(&[ix], Some(&from));
+        let tx = Transaction::new_unsigned(msg);
+
+        let summaries = summarize_transaction_instructions(&tx);
+        assert_eq!(summaries.len(), 1);
+
+        let s = &summaries[0];
+        assert_eq!(s.program_name.as_deref(), Some("System Program"));
+        assert_eq!(s.transfer_lamports, Some(lamports));
+        assert!(
+            s.description.contains("CreateAccount"),
+            "description should mention CreateAccount: {}",
+            s.description
+        );
+    }
+
+    #[test]
+    fn summarize_multiple_instructions() {
+        let from = Pubkey::new_unique();
+        let to1 = Pubkey::new_unique();
+        let to2 = Pubkey::new_unique();
+
+        let ix1 = system_instruction::transfer(&from, &to1, 1_000);
+        let ix2 = system_instruction::transfer(&from, &to2, 2_000);
+        let msg = Message::new(&[ix1, ix2], Some(&from));
+        let tx = Transaction::new_unsigned(msg);
+
+        let summaries = summarize_transaction_instructions(&tx);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].transfer_lamports, Some(1_000));
+        assert_eq!(summaries[1].transfer_lamports, Some(2_000));
+    }
+
+    #[test]
+    fn summarize_compute_budget_instruction() {
+        let payer = Pubkey::new_unique();
+        let to = Pubkey::new_unique();
+
+        let budget_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(200_000);
+        let transfer_ix = system_instruction::transfer(&payer, &to, 5_000);
+        let msg = Message::new(&[budget_ix, transfer_ix], Some(&payer));
+        let tx = Transaction::new_unsigned(msg);
+
+        let summaries = summarize_transaction_instructions(&tx);
+        assert_eq!(summaries.len(), 2);
+
+        assert_eq!(summaries[0].program_name.as_deref(), Some("Compute Budget"));
+        assert_eq!(summaries[0].transfer_lamports, None);
+
+        assert_eq!(summaries[1].program_name.as_deref(), Some("System Program"));
+        assert_eq!(summaries[1].transfer_lamports, Some(5_000));
+    }
+
+    #[test]
+    fn policy_evaluation_audit_captures_full_context() {
+        use claw_types::{
+            policy::PolicyVerdict,
+            session::SessionId,
+            solana::SolanaNetwork,
+            transaction::{AccountRole, InstructionSummary, TransactionProposal},
+        };
+        use uuid::Uuid;
+
+        let proposal = TransactionProposal {
+            id: Uuid::new_v4(),
+            session_id: SessionId::from(Uuid::new_v4()),
+            wallet_pubkey: "wallet".to_string(),
+            network: SolanaNetwork::Devnet,
+            description: "audit test".to_string(),
+            transaction_b64: String::new(),
+            instructions_summary: vec![InstructionSummary {
+                program_id: "11111111111111111111111111111111".to_string(),
+                program_name: Some("System Program".to_string()),
+                description: "Transfer 42000000 lamports".to_string(),
+                transfer_lamports: Some(42_000_000),
+                accounts: vec![
+                    AccountRole {
+                        pubkey: "wallet".to_string(),
+                        label: Some("from".to_string()),
+                        is_signer: true,
+                        is_writable: true,
+                    },
+                    AccountRole {
+                        pubkey: "dest".to_string(),
+                        label: Some("to".to_string()),
+                        is_signer: false,
+                        is_writable: true,
+                    },
+                ],
+            }],
+            created_at: chrono::Utc::now(),
+        };
+
+        let verdict = PolicyVerdict::Rejected {
+            reason: "amount exceeds threshold".to_string(),
+            rule_name: "large-transfer-block".to_string(),
+        };
+
+        let audit = policy_evaluation_audit(&proposal, &verdict, Some((3, 1, Some(0))));
+
+        assert_eq!(audit["verdict"], "rejected");
+        assert_eq!(audit["matched_rule"], "large-transfer-block");
+        assert_eq!(audit["reason"], "amount exceeds threshold");
+        assert_eq!(audit["total_transfer_lamports"], 42_000_000);
+        assert_eq!(audit["instructions_count"], 1);
+
+        let programs = audit["programs"].as_array().unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0], "11111111111111111111111111111111");
+
+        let destinations = audit["destinations"].as_array().unwrap();
+        assert_eq!(destinations.len(), 1);
+        assert_eq!(destinations[0], "dest");
+
+        // A3: evaluation metadata
+        assert_eq!(audit["rules_total"], 3);
+        assert_eq!(audit["rules_evaluated"], 1);
+        assert_eq!(audit["matched_rule_index"], 0);
+    }
+
+    #[test]
+    fn policy_evaluation_audit_approved_has_no_reason() {
+        use claw_types::{
+            policy::PolicyVerdict,
+            session::SessionId,
+            solana::SolanaNetwork,
+            transaction::{TransactionProposal},
+        };
+        use uuid::Uuid;
+
+        let proposal = TransactionProposal {
+            id: Uuid::new_v4(),
+            session_id: SessionId::from(Uuid::new_v4()),
+            wallet_pubkey: "wallet".to_string(),
+            network: SolanaNetwork::Devnet,
+            description: "audit test".to_string(),
+            transaction_b64: String::new(),
+            instructions_summary: vec![],
+            created_at: chrono::Utc::now(),
+        };
+
+        let verdict = PolicyVerdict::Approved {
+            rule_name: "allow-all".to_string(),
+        };
+
+        let audit = policy_evaluation_audit(&proposal, &verdict, Some((3, 1, Some(0))));
+
+        assert_eq!(audit["verdict"], "approved");
+        assert_eq!(audit["matched_rule"], "allow-all");
+        assert!(audit["reason"].is_null());
+        assert_eq!(audit["total_transfer_lamports"], 0);
+
+        // A3: evaluation metadata
+        assert_eq!(audit["rules_total"], 3);
+        assert_eq!(audit["rules_evaluated"], 1);
+        assert_eq!(audit["matched_rule_index"], 0);
     }
 }

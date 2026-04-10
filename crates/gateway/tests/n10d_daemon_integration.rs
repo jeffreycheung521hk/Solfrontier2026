@@ -462,7 +462,7 @@ async fn full_approval_then_external_sign_flow() {
         proposal.clone(),
         &tx,
         fake_simulation(),
-        PolicyVerdict::RequiresHumanApproval { reason: "amount exceeds threshold".into(), rule_name: "high_value".into() },
+        PolicyVerdict::RequiresHumanApproval { reason: "amount exceeds threshold".into(), rule_name: "high_value".into(), required_approver_role: None, approval_chain: None },
         1000,
     ).unwrap();
 
@@ -493,10 +493,10 @@ async fn full_approval_then_external_sign_flow() {
 
     // ── Phase 2: Operator approves ──────────────────────────────────────────
     // Signal the approval decision.
-    pending_signing.signal(approval_request_id, true);
+    pending_signing.signal(approval_request_id, claw_types::approval::ApprovalWorkflowState::Approved);
 
-    let approved = decision_rx.await.expect("decision channel should not drop");
-    assert!(approved, "operator must approve");
+    let workflow_state = decision_rx.await.expect("decision channel should not drop");
+    assert!(workflow_state.is_approved(), "operator must approve");
 
     // Audit: approval received
     let _ = audit.append(

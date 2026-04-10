@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use claw_types::{
     approval::{ApprovalDecision, ApprovalOutcome},
+    operator::OperatorIdentity,
     session::SessionId,
 };
 
@@ -39,6 +40,10 @@ pub struct ApproveRequest {
 
     /// Optional operator note / justification.
     pub note:       Option<String>,
+
+    /// The role claimed by the approver (e.g., "risk", "treasury").
+    /// Required when the policy rule specifies `required_approver_role`.
+    pub approver_role: Option<String>,
 }
 
 /// Response body for a successfully processed decision.
@@ -63,6 +68,7 @@ pub struct ApproveResponse {
 pub async fn submit_approval(
     State(state):    State<AppState>,
     Path(id_str):    Path<String>,
+    operator:        Option<axum::Extension<OperatorIdentity>>,
     Json(req):       Json<ApproveRequest>,
 ) -> Response {
     // ── Parse session ID ──────────────────────────────────────────────────────
@@ -93,10 +99,43 @@ pub async fn submit_approval(
     }
 
     // ── Build decision and dispatch ───────────────────────────────────────────
-    let decision = if req.approved {
+    let identity = operator.map(|axum::Extension(id)| id);
+
+    let mut decision = if req.approved {
         ApprovalDecision::approve(req.request_id, req.note.clone())
     } else {
         ApprovalDecision::reject(req.request_id, req.note.clone())
+    };
+    decision.operator_id = identity.as_ref().map(|id| id.id.to_string());
+
+    // S1e: If operator has authenticated roles, validate the claimed role.
+    // A self-declared role that isn't in the operator's registered role set is rejected.
+    decision.approver_role = match &identity {
+        Some(id) if !id.roles.is_empty() => {
+            match &req.approver_role {
+                // Body claims a role — verify operator actually holds it.
+                Some(claimed) if id.roles.contains(claimed) => Some(claimed.clone()),
+                // Body claims a role the operator doesn't hold — reject.
+                Some(claimed) => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error":          "role_not_held",
+                            "request_id":     req.request_id,
+                            "claimed_role":   claimed,
+                            "operator_roles": id.roles,
+                            "message":        format!(
+                                "Operator '{}' does not hold role '{}'. Registered roles: {:?}",
+                                id.id, claimed, id.roles,
+                            ),
+                        })),
+                    ).into_response();
+                }
+                // Body doesn't specify — use operator's first registered role.
+                None => id.roles.first().cloned(),
+            }
+        }
+        _ => req.approver_role.clone(), // Legacy anonymous: self-declared
     };
 
     let (outcome, maybe_request) = state.approval.decide(decision).await;
@@ -143,6 +182,67 @@ pub async fn submit_approval(
                 "error":      "not_found",
                 "request_id": req.request_id,
                 "message":    "No pending approval request with this ID for the session.",
+            })),
+        ).into_response(),
+
+        ApprovalOutcome::RoleMismatch { required, provided } => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error":             "role_mismatch",
+                "request_id":        req.request_id,
+                "required_role":     required,
+                "provided_role":     provided,
+                "message":           format!(
+                    "This request requires approver role '{}' but '{}' was provided.",
+                    required,
+                    provided.as_deref().unwrap_or("none"),
+                ),
+            })),
+        ).into_response(),
+
+        ApprovalOutcome::StageAdvanced { completed_stage, next_stage, next_required_role } => (
+            StatusCode::OK,
+            Json(json!({
+                "status":              "stage_advanced",
+                "request_id":          req.request_id,
+                "completed_stage":     completed_stage,
+                "next_stage":          next_stage,
+                "next_required_role":  next_required_role,
+                "message":             format!(
+                    "Stage {} approved. Awaiting approval for stage {} (role: {}).",
+                    completed_stage,
+                    next_stage,
+                    next_required_role.as_deref().unwrap_or("any"),
+                ),
+            })),
+        ).into_response(),
+
+        ApprovalOutcome::QuorumProgress { stage, approvals_so_far, approvals_required } => (
+            StatusCode::OK,
+            Json(json!({
+                "status":              "quorum_progress",
+                "request_id":          req.request_id,
+                "stage":               stage,
+                "approvals_so_far":    approvals_so_far,
+                "approvals_required":  approvals_required,
+                "message":             format!(
+                    "Approval recorded for stage {}. {}/{} approvals received.",
+                    stage, approvals_so_far, approvals_required,
+                ),
+            })),
+        ).into_response(),
+
+        ApprovalOutcome::DuplicateOperator { operator_id, stage } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error":        "duplicate_operator",
+                "request_id":   req.request_id,
+                "operator_id":  operator_id,
+                "stage":        stage,
+                "message":      format!(
+                    "Operator '{}' has already voted on stage {}.",
+                    operator_id, stage,
+                ),
             })),
         ).into_response(),
     }

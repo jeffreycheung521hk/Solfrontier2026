@@ -21,12 +21,12 @@ use crate::{errors::ToolError, tool::Tool};
 /// The returned transaction is base64-encoded and must pass through the
 /// simulation + policy pipeline before signing.
 pub struct BuildTransferTool {
-    rpc: ClawRpcClient,
+    _rpc: ClawRpcClient,
 }
 
 impl BuildTransferTool {
     pub fn new(rpc: ClawRpcClient) -> Self {
-        Self { rpc }
+        Self { _rpc: rpc }
     }
 }
 

@@ -41,7 +41,7 @@ use claw_solana_core::{
     BlockhashManager,
     SimulationClient,
     rpc::ClawRpcClient,
-    compute::{self, compute_limit_from_simulation, DEFAULT_COMPUTE_UNITS},
+    compute::{self, compute_limit_from_simulation, should_tighten, DEFAULT_COMPUTE_UNITS},
     fees::PriorityFeeStrategy,
 };
 
@@ -279,7 +279,7 @@ impl TransactionReviewPipeline {
         }
 
         // ── Step 3: Attach fresh blockhash ─────────────────────────────────────
-        let (recent_blockhash, last_valid_block_height) = self.blockhash_mgr.get_fresh().await?;
+        let (recent_blockhash, mut last_valid_block_height) = self.blockhash_mgr.get_fresh().await?;
         tx.message.recent_blockhash = recent_blockhash;
 
         // ── Step 4: Simulate the FINALIZED transaction ─────────────────────────
@@ -297,25 +297,95 @@ impl TransactionReviewPipeline {
             });
         }
 
-        // Log the compute limit derived from actual simulation usage.
-        // V1 uses DEFAULT_COMPUTE_UNITS for the prepended instruction; a future
-        // optimization could re-simulate with the tighter limit derived here.
-        if let Some(cu_used) = sim_output.compute_units_used {
-            let cu_limit = compute_limit_from_simulation(cu_used);
+        // ── Step 5: Two-pass compute budget optimization (N13) ──────────────
+        //
+        // If first simulation reveals CU usage significantly below DEFAULT,
+        // replace the compute unit limit with the tighter derived value,
+        // refresh the blockhash, and re-simulate to confirm success.
+        // On second sim failure, fall back to the first sim result.
+        let (final_tx, final_sim_output) = if let Some(cu_used) = sim_output.compute_units_used {
+            let derived_limit = compute_limit_from_simulation(cu_used);
+
+            if prepended && should_tighten(DEFAULT_COMPUTE_UNITS, derived_limit) {
+                info!(
+                    proposal_id = %proposal.id,
+                    simulated_cu = cu_used,
+                    derived_cu_limit = derived_limit,
+                    default_cu_limit = DEFAULT_COMPUTE_UNITS,
+                    "N13: tightening compute budget — starting second pass"
+                );
+
+                let replaced = compute::replace_compute_unit_limit(&mut tx, derived_limit);
+                if replaced {
+                    // Refresh blockhash for the re-simulation.
+                    let (bh2, lvbh2) = self.blockhash_mgr.get_fresh().await?;
+                    tx.message.recent_blockhash = bh2;
+                    last_valid_block_height = lvbh2;
+
+                    match self.sim_client.simulate(&tx).await {
+                        Ok(sim2) if sim2.success => {
+                            info!(
+                                proposal_id = %proposal.id,
+                                second_pass_cu = sim2.compute_units_used,
+                                applied_cu_limit = derived_limit,
+                                "N13: second simulation succeeded with tighter CU"
+                            );
+                            (tx, sim2)
+                        }
+                        Ok(sim2) => {
+                            warn!(
+                                proposal_id = %proposal.id,
+                                error = ?sim2.error,
+                                "N13: second simulation failed — falling back to first pass"
+                            );
+                            // Restore original CU limit for safety.
+                            compute::replace_compute_unit_limit(&mut tx, DEFAULT_COMPUTE_UNITS);
+                            (tx, sim_output)
+                        }
+                        Err(e) => {
+                            warn!(
+                                proposal_id = %proposal.id,
+                                error = %e,
+                                "N13: second simulation RPC error — falling back to first pass"
+                            );
+                            compute::replace_compute_unit_limit(&mut tx, DEFAULT_COMPUTE_UNITS);
+                            (tx, sim_output)
+                        }
+                    }
+                } else {
+                    info!(
+                        proposal_id = %proposal.id,
+                        simulated_cu = cu_used,
+                        derived_cu_limit = derived_limit,
+                        applied_cu_limit = DEFAULT_COMPUTE_UNITS,
+                        "N13: no SetComputeUnitLimit found to replace — using first pass"
+                    );
+                    (tx, sim_output)
+                }
+            } else {
+                info!(
+                    proposal_id = %proposal.id,
+                    simulated_cu = cu_used,
+                    derived_cu_limit = derived_limit,
+                    applied_cu_limit = DEFAULT_COMPUTE_UNITS,
+                    "compute budget: savings too small for second pass, keeping default"
+                );
+                (tx, sim_output)
+            }
+        } else {
             info!(
                 proposal_id = %proposal.id,
-                simulated_cu = cu_used,
-                derived_cu_limit = cu_limit,
-                applied_cu_limit = DEFAULT_COMPUTE_UNITS,
-                "compute budget: simulated vs applied"
+                "simulation did not report CU usage — keeping default compute budget"
             );
-        }
+            (tx, sim_output)
+        };
 
-        let sim_result = sim_output.into_result();
+        let sim_result = final_sim_output.into_result();
 
         // ONLY path to SimulatedTransaction: successful simulation.
-        // The tx here is the FINALIZED transaction (with compute budget prepended).
-        Ok(SimulatedTransaction::new_unchecked(tx, sim_result, last_valid_block_height))
+        // The tx here is the FINALIZED transaction (with compute budget prepended,
+        // potentially tightened by the N13 two-pass optimization).
+        Ok(SimulatedTransaction::new_unchecked(final_tx, sim_result, last_valid_block_height))
     }
 
     // ── Stage 2: Policy evaluation ────────────────────────────────────────────
@@ -525,7 +595,7 @@ mod tests {
     /// path is through simulate() which enforces this.
     #[test]
     fn simulated_transaction_requires_successful_simulation() {
-        use solana_sdk::{hash::Hash, transaction::Transaction, system_instruction, pubkey::Pubkey};
+        use solana_sdk::{transaction::Transaction, system_instruction, pubkey::Pubkey};
 
         let from = Pubkey::new_unique();
         let to   = Pubkey::new_unique();

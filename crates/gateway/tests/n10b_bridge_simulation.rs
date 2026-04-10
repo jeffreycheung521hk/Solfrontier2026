@@ -59,7 +59,7 @@ struct StubSessionOps {
 }
 
 impl SessionOps for StubSessionOps {
-    fn open(&self, _role: AgentRole, _channel: String) -> SessionId {
+    fn open(&self, _role: AgentRole, _channel: String, _policy_overrides: Option<Vec<claw_types::policy::PolicyRule>>) -> SessionId {
         self.active_session.clone()
     }
     fn close(&self, _id: &SessionId, _reason: &str) {}
@@ -276,6 +276,10 @@ fn setup() -> TestHarness {
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(handler)),
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubWalletChallengeHandler)),
         auth_token: AuthToken::new(token.clone()),
+        metrics: Arc::new(claw_observability::metrics::MetricsRegistry::new()),
+        propose: None,
+        rate_limiter: None,
+        operator_registry: claw_api::auth::OperatorRegistry::new(),
     };
 
     let health = HealthRegistry::new();
@@ -291,7 +295,7 @@ async fn send_json(
     token: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder()
+    let builder = Request::builder()
         .uri(path)
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json");

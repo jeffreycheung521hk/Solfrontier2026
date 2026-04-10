@@ -49,7 +49,7 @@ pub struct ApprovalHandle {
 }
 
 impl ApprovalHandle {
-    pub(crate) fn new() -> (Self, oneshot::Receiver<bool>) {
+    pub(crate) fn _new() -> (Self, oneshot::Receiver<bool>) {
         let (tx, rx) = oneshot::channel();
         (Self { tx }, rx)
     }

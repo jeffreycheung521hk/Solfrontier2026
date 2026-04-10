@@ -22,8 +22,8 @@ use crate::{registry::ToolRegistry, tool::Tool};
 ///
 /// **Transaction building**: `build_transfer` (unsigned only), `simulate_transaction`
 ///
-/// **Orca read-only intelligence**: `orca_get_whirlpool`, `orca_get_quote`, `orca_check_pool`
-/// (no swap execution — read-only protocol intelligence for agent reasoning)
+/// **Orca protocol**: `orca_get_whirlpool`, `orca_get_quote`, `orca_check_pool`, `orca_swap`
+/// (read-only intelligence + swap transaction builder)
 pub fn default_registry(
     rpc: ClawRpcClient,
     sim: SimulationClient,
@@ -40,12 +40,11 @@ pub fn default_registry(
         Arc::new(simulation::SimulateTransactionTool::new(sim)),
         Arc::new(transfer::BuildTransferTool::new(rpc.clone())),
 
-        // ── Orca read-only protocol intelligence ──────────────────────────
-        // These tools fetch and decode Orca Whirlpool on-chain state.
-        // They are READ-ONLY — no swap execution is possible from these tools.
+        // ── Orca protocol tools ───────────────────────────────────────────
         Arc::new(protocols::orca::OrcaGetWhirlpoolTool::new(rpc.clone())),
         Arc::new(protocols::orca::OrcaGetQuoteTool::new(rpc.clone())),
         Arc::new(protocols::orca::OrcaPoolAllowlistTool::new(rpc.clone(), vec![])),
+        Arc::new(protocols::orca::OrcaSwapTool::new(rpc.clone())),
     ];
 
     ToolRegistry::from_tools(tools)

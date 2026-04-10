@@ -575,12 +575,12 @@ async fn conc_duplicate_submit_signed_transaction() {
     }
 
     let mut ok_count = 0usize;
-    let mut not_found_count = 0usize;
+    let mut _not_found_count = 0usize;
     for h in handles {
         if h.await.unwrap() {
             ok_count += 1;
         } else {
-            not_found_count += 1;
+            _not_found_count += 1;
         }
     }
 

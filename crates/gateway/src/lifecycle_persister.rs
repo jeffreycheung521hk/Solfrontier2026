@@ -35,6 +35,7 @@ use claw_types::events::{
 use claw_types::session::SessionId;
 use claw_types::transaction::TransactionStatus;
 
+use claw_observability::metrics::MetricsRegistry;
 use crate::event_bus::EventBus;
 
 /// Listens for transaction lifecycle state changes and persists them
@@ -44,6 +45,7 @@ pub struct LifecyclePersister {
     audit:         AuditRepository,
     event_bus:     EventBus,
     rx:            mpsc::UnboundedReceiver<StateChange>,
+    metrics:       std::sync::Arc<MetricsRegistry>,
 }
 
 impl LifecyclePersister {
@@ -53,8 +55,9 @@ impl LifecyclePersister {
         audit:         AuditRepository,
         event_bus:     EventBus,
         rx:            mpsc::UnboundedReceiver<StateChange>,
+        metrics:       std::sync::Arc<MetricsRegistry>,
     ) -> Self {
-        Self { tracking_repo, audit, event_bus, rx }
+        Self { tracking_repo, audit, event_bus, rx, metrics }
     }
 
     /// Runs the persister loop. Spawned as a background task.
@@ -100,6 +103,7 @@ impl LifecyclePersister {
 
         match &change.to {
             TxState::Confirmed { slot } => {
+                self.metrics.transactions_confirmed.increment();
                 self.emit_confirmed(change, &session_id, *slot).await;
             }
             TxState::Finalized { slot } => {
@@ -109,12 +113,15 @@ impl LifecyclePersister {
                 self.emit_finalized(change, &session_id, *slot).await;
             }
             TxState::Failed { ref err } => {
+                self.metrics.transactions_failed.increment();
                 self.emit_execution_failed(change, &session_id, err).await;
             }
             TxState::Dropped => {
+                self.metrics.transactions_failed.increment();
                 self.emit_dropped(change, &session_id).await;
             }
             TxState::Expired => {
+                self.metrics.transactions_failed.increment();
                 self.emit_expired(change, &session_id).await;
             }
             TxState::Submitted => {

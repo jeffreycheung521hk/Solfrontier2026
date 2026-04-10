@@ -2,6 +2,13 @@
 # Keep build artifacts in a shared target directory
 # target-dir = "target"  # default, explicit for clarity
 
+[env]
+# Prebuilt OpenSSL for solana-sdk -> solana-secp256r1-program -> openssl-sys
+OPENSSL_DIR      = "C:/Program Files/OpenSSL-Win64"
+OPENSSL_LIB_DIR  = "C:/Program Files/OpenSSL-Win64/lib/VC/x64/MD"
+OPENSSL_INCLUDE_DIR = "C:/Program Files/OpenSSL-Win64/include"
+OPENSSL_NO_VENDOR = "1"
+
 [alias]
 clawd = "run --bin clawd --"
 claw  = "run --bin claw --"

@@ -6,6 +6,8 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use dashmap::DashMap;
+
 /// An atomic monotonically-increasing counter.
 #[derive(Debug, Clone, Default)]
 pub struct Counter(Arc<AtomicU64>);
@@ -79,10 +81,97 @@ pub struct MetricsRegistry {
     pub rpc_retries:              Counter,
     pub ws_subscriptions_active:  Gauge,
     pub alerts_emitted:           Counter,
+    pub rate_limit_hits:          Counter,
+
+    /// Per-rule policy hit counters.
+    /// Key: rule name (e.g. "denylist-block"), Value: hit count.
+    /// Dynamic map — new rules automatically get a counter on first hit.
+    /// When migrating to Prometheus/OTel, replace with a `CounterVec` label.
+    pub policy_rule_hits:         CounterMap,
 }
 
 impl MetricsRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// A dynamic map of named counters. Thread-safe, lock-free reads.
+/// Designed to be forward-compatible with Prometheus `CounterVec` or
+/// OpenTelemetry `Meter::u64_counter` with attribute labels.
+#[derive(Debug, Clone, Default)]
+pub struct CounterMap(Arc<DashMap<String, AtomicU64>>);
+
+impl CounterMap {
+    pub fn new() -> Self {
+        Self(Arc::new(DashMap::new()))
+    }
+
+    /// Increment the counter for the given key by 1.
+    pub fn increment(&self, key: &str) {
+        self.0
+            .entry(key.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get the current value for a key. Returns 0 if the key has never been incremented.
+    pub fn get(&self, key: &str) -> u64 {
+        self.0
+            .get(key)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Returns a snapshot of all counters as (key, value) pairs.
+    pub fn snapshot(&self) -> Vec<(String, u64)> {
+        self.0
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_map_increment_and_get() {
+        let map = CounterMap::new();
+        assert_eq!(map.get("rule-a"), 0);
+
+        map.increment("rule-a");
+        map.increment("rule-a");
+        map.increment("rule-b");
+
+        assert_eq!(map.get("rule-a"), 2);
+        assert_eq!(map.get("rule-b"), 1);
+        assert_eq!(map.get("rule-c"), 0);
+    }
+
+    #[test]
+    fn counter_map_snapshot() {
+        let map = CounterMap::new();
+        map.increment("x");
+        map.increment("x");
+        map.increment("y");
+
+        let mut snap = map.snapshot();
+        snap.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(snap, vec![
+            ("x".to_string(), 2),
+            ("y".to_string(), 1),
+        ]);
+    }
+
+    #[test]
+    fn counter_map_clone_shares_state() {
+        let map = CounterMap::new();
+        let clone = map.clone();
+
+        map.increment("shared");
+        assert_eq!(clone.get("shared"), 1);
     }
 }

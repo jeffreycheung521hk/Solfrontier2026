@@ -8,7 +8,7 @@
 //! `Channel` trait and are registered in the gateway's channel router.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 
 pub mod channel;
 pub mod cli;

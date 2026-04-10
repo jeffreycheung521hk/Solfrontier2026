@@ -43,9 +43,11 @@ use claw_api::{
     AppState, ApprovalHandler, ApprovalHandlerRef, AuthToken,
     EventSubscriber, EventSubscriberRef,
     MessageHandler, MessageHandlerRef, SessionManagerRef, SessionOps,
+    TransactionProposer, TransactionProposerRef, ProposeTransferResult,
     WalletChallengeHandler, WalletChallengeHandlerRef, WalletChallengeInfo,
     WalletSignatureHandler, WalletSignatureHandlerRef, WalletSignatureOutcome,
     PendingWalletSignatureInfo,
+    auth::OperatorRegistry,
 };
 use claw_observability::HealthRegistry;
 use claw_risk_engine::PolicySet;
@@ -71,6 +73,7 @@ use claw_types::{
     agent::{AgentCommand, AgentResponse, AgentRole},
     approval::{ApprovalDecision, ApprovalOutcome, ApprovalRequest},
     events::{ApprovalLifecycleEvent, EventHeader, GatewayEvent},
+    policy::{PolicyAction, PolicyCondition, PolicyRule},
     session::SessionId,
     solana::SolanaNetwork,
     wallet::SignerType,
@@ -97,6 +100,7 @@ use crate::{
     orchestrator::types::{SignatureOutcome, SignatureRequestId},
     pending_signing::PendingSigningStore,
     session_mgr::SessionManager,
+    session_policy::SessionPolicyStore,
     supervisor::spawn_supervised,
     tools::SubmitForSigningTool,
 };
@@ -203,13 +207,34 @@ impl GatewayDaemon {
         let agent        = Arc::new(Agent::new(llm.clone()));
         let agent_router = Arc::new(AgentRouter::new());
 
-        // ── 7. Event bus + SessionManager ─────────────────────────────────
+        // ── 7. Event bus + SessionManager + Metrics ─────────────────────
+        let metrics     = Arc::new(claw_observability::metrics::MetricsRegistry::new());
         let event_bus   = EventBus::new();
-        let session_mgr = SessionManager::new(event_bus.clone());
+        let session_mgr = SessionManager::new(event_bus.clone(), metrics.clone());
 
         // ── 8. Risk policy ────────────────────────────────────────────────
         let policy_set = Arc::new(build_policy_set(&config));
+        let session_policy_repo = claw_state_store::SessionPolicyRepository::new(db.pool().clone());
+        let session_policy = SessionPolicyStore::new()
+            .with_repo(session_policy_repo);
+
+        // Recover persisted session policy overrides from previous daemon run.
+        match session_policy.load_persisted().await {
+            Ok(0) => {}
+            Ok(n) => info!(count = n, "recovered persisted session policy overrides"),
+            Err(e) => warn!(error = %e, "failed to load persisted session policy overrides"),
+        }
+
         info!("risk policy engine ready");
+
+        // Build alert dispatcher for policy violation webhooks.
+        let alert_dispatcher = match crate::policy_alerting::PolicyAlertSender::from_config(&config.alerting) {
+            Some(sender) => crate::policy_alerting::AlertDispatcher::Active(sender),
+            None => {
+                info!("policy alerting disabled (set [alerting] enabled=true + webhook_url)");
+                crate::policy_alerting::AlertDispatcher::Disabled
+            }
+        };
 
         // ── 9. Wallet loading (N4) ────────────────────────────────────────
         let keystore = SecretKeystore::new();
@@ -246,10 +271,29 @@ impl GatewayDaemon {
             );
         }
 
+        // Build per-wallet policy store from loaded wallets.
+        let mut wallet_policy_store = crate::wallet_policy::WalletPolicyStore::new();
+        for (i, wallet_cfg) in config.wallets.iter().enumerate() {
+            if let Some((_, ref pubkey)) = loaded_wallets.get(i) {
+                wallet_policy_store.register(pubkey.clone(), wallet_cfg);
+            }
+        }
+
         // ── 10. Pipeline + SignatureOrchestrator + SubmitForSigningTool (STEP 5) ──
         let approval_store    = ApprovalStore::new();
         let pending_signing   = PendingSigningStore::new();
-        let external_wallet   = ExternalWalletStore::new();
+        // C4: Create binding repo and wire into ExternalWalletStore for
+        // durable session-wallet binding persistence across restarts.
+        let binding_repo = claw_state_store::WalletBindingRepository::new(db.pool().clone());
+        let external_wallet = ExternalWalletStore::new()
+            .with_binding_repo(binding_repo);
+
+        // C4: Load previously persisted bindings into memory.
+        match external_wallet.load_persisted_bindings().await {
+            Ok(0) => {}
+            Ok(n) => info!(count = n, "C4: restored persisted wallet bindings"),
+            Err(e) => warn!(error = %e, "C4: failed to load persisted wallet bindings"),
+        }
 
         // A3: Register config-declared external wallets so they are
         // recognized across all sessions without needing bind_wallet.
@@ -311,7 +355,7 @@ impl GatewayDaemon {
 
         // A3: The signing tool is active when ANY wallet is loaded (local or external).
         let has_any_wallet = !loaded_wallets.is_empty();
-        let registry = if has_any_wallet {
+        let (registry, proposer) = if has_any_wallet {
             let pipeline = TransactionReviewPipeline::new(
                 rpc_client.clone(),
                 sim_client,
@@ -332,17 +376,30 @@ impl GatewayDaemon {
                 config.network.network,
                 external_wallet.clone(),
                 completion_meta.clone(),
-            ).with_durable(durable_state.clone()));
+                metrics.clone(),
+                session_policy.clone(),
+                wallet_policy_store.clone(),
+                config.policy.approval_lease_seconds,
+                alert_dispatcher.clone(),
+            ).with_durable(durable_state.clone())
+              .with_rpc_client(rpc_client.clone()));
 
             info!(
                 wallet_count = loaded_wallets.len(),
                 "submit_for_signing tool active"
             );
 
-            registry.with_tool(submit_tool)
+            let registry = registry.with_tool(submit_tool.clone());
+
+            // Build the direct transaction proposer (A4: bypasses LLM agent).
+            let proposer = TransactionProposerRef::new(Arc::new(GatewayTransactionProposer {
+                signing_tool: submit_tool,
+                rpc_client:   rpc_client.clone(),
+            }));
+            (registry, Some(proposer))
         } else {
             info!("no wallets loaded — submit_for_signing tool not available");
-            registry
+            (registry, None)
         };
 
         info!(
@@ -435,6 +492,7 @@ impl GatewayDaemon {
 
         // ── 12. API server ────────────────────────────────────────────────
         let api_token = load_api_token();
+        let operator_registry = build_operator_registry(&config);
 
         // Build wallet context for agent system prompts.
         let wallet_context = if loaded_wallets.is_empty() {
@@ -454,6 +512,8 @@ impl GatewayDaemon {
             session_mgr:    session_mgr.clone(),
             agent_router:   agent_router.clone(),
             wallet_context,
+            session_policy: session_policy.clone(),
+            role_profiles:  config.policy.role_profiles.clone(),
         }));
 
         let message_handler_ref = MessageHandlerRef::new(Arc::new(GatewayMessageHandler {
@@ -469,7 +529,8 @@ impl GatewayDaemon {
             pending_signing: pending_signing.clone(),
             event_bus:       event_bus.clone(),
             audit:           audit_repo.clone(),
-            durable:         durable_state.clone(),
+            _durable:        durable_state.clone(),
+            alerts:          alert_dispatcher.clone(),
         }));
 
         let event_subscriber_ref = EventSubscriberRef::new(Arc::new(GatewayEventSubscriber {
@@ -479,10 +540,14 @@ impl GatewayDaemon {
         // ── Transaction Tracker + Lifecycle Persister (Phase 1.4) ────────
         let tracking_repo = claw_state_store::TransactionTrackingRepository::new(db.pool().clone());
         let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
-        let tx_tracker = Arc::new(claw_solana_core::tracker::TransactionTracker::with_change_channel(
-            Arc::new(rpc_pool.clone()),
-            lifecycle_tx,
-        ));
+        let tx_tracker = Arc::new(
+            claw_solana_core::tracker::TransactionTracker::with_change_channel(
+                Arc::new(rpc_pool.clone()),
+                lifecycle_tx,
+            ).with_retry_policy(claw_solana_core::tracker::RetryPolicy {
+                max_retries: config.retry.max_retries,
+            }),
+        );
 
         let wallet_sig_handler_ref = WalletSignatureHandlerRef::new(Arc::new(GatewayWalletSignatureHandler {
             orchestrator:    main_orchestrator.clone(),
@@ -495,6 +560,7 @@ impl GatewayDaemon {
             rpc_client:      rpc_client.clone(),
             tracker:         tx_tracker.clone(),
             tracking_repo:   tracking_repo.clone(),
+            metrics:         metrics.clone(),
         }));
 
         let wallet_challenge_repo = claw_state_store::WalletChallengeRepository::new(db.pool().clone());
@@ -504,6 +570,16 @@ impl GatewayDaemon {
             audit:             audit_repo.clone(),
         }));
 
+        let rate_limiter = if config.rate_limit.enabled {
+            Some(claw_api::RateLimiter::new(
+                config.rate_limit.requests_per_minute,
+                config.rate_limit.burst_size,
+                metrics.clone(),
+            ))
+        } else {
+            None
+        };
+
         let app_state = AppState {
             session_mgr:       session_ref,
             message_handler:   message_handler_ref,
@@ -512,6 +588,10 @@ impl GatewayDaemon {
             wallet_signatures: wallet_sig_handler_ref,
             wallet_challenges: wallet_challenge_handler_ref,
             auth_token:        AuthToken::new(api_token),
+            operator_registry: operator_registry.clone(),
+            metrics:           metrics.clone(),
+            propose:           proposer,
+            rate_limiter,
         };
 
         let api_handle = claw_api::start(
@@ -692,6 +772,7 @@ impl GatewayDaemon {
                                     sig, tx_id, req_id,
                                     row.session_id, row.wallet_pubkey,
                                     lvbh, sbh,
+                                    None, // startup recovery — signed bytes not persisted yet
                                 );
                                 recovered += 1;
                             }
@@ -717,6 +798,7 @@ impl GatewayDaemon {
                 audit_repo.clone(),
                 event_bus.clone(),
                 lifecycle_rx,
+                metrics.clone(),
             );
             tokio::spawn(persister.run());
             info!("lifecycle persister started");
@@ -824,18 +906,111 @@ fn load_wallet_into_keystore(
 // ── Policy builder ─────────────────────────────────────────────────────────
 
 fn build_policy_set(config: &ClawConfig) -> PolicySet {
-    if config.policy.mainnet_safe_defaults
-        && config.network.network == SolanaNetwork::MainnetBeta
-    {
-        info!("mainnet-safe policy: all transactions require human approval");
-        PolicySet::mainnet_safe_default()
+    let mut rules = config.policy.rules.clone();
+    let default_rules = default_policy_rules(config.network.network, config.policy.mainnet_safe_defaults);
+
+    info!(
+        custom_rules = rules.len(),
+        default_rules = default_rules.len(),
+        allowlist_entries = config.policy.program_allowlist.len(),
+        denylist_entries = config.policy.destination_denylist.len(),
+        network = %config.network.network,
+        "building policy set from config"
+    );
+
+    rules.extend(default_rules);
+
+    PolicySet::new(
+        rules,
+        config.policy.program_allowlist.clone(),
+        config.policy.destination_denylist.clone(),
+    )
+}
+
+fn default_policy_rules(
+    network: SolanaNetwork,
+    mainnet_safe_defaults: bool,
+) -> Vec<PolicyRule> {
+    if mainnet_safe_defaults && network == SolanaNetwork::MainnetBeta {
+        info!("mainnet-safe policy defaults enabled");
+        vec![
+            PolicyRule {
+                name: "mainnet-requires-human".to_string(),
+                description: "All mainnet transactions require human approval".to_string(),
+                condition: PolicyCondition::NetworkIn(vec![SolanaNetwork::MainnetBeta]),
+                action: PolicyAction::RequireHumanApproval {
+                    reason: "mainnet transaction requires explicit operator approval".to_string(),
+                    required_approver_role: None,
+                },
+            },
+            PolicyRule {
+                name: "devnet-allow".to_string(),
+                description: "Allow devnet transactions automatically".to_string(),
+                condition: PolicyCondition::NetworkIn(vec![
+                    SolanaNetwork::Devnet,
+                    SolanaNetwork::Testnet,
+                    SolanaNetwork::Localnet,
+                ]),
+                action: PolicyAction::Approve,
+            },
+        ]
     } else {
-        info!("permissive policy: auto-approve (devnet/testnet)");
-        PolicySet::permissive_default()
+        info!("permissive policy default enabled");
+        vec![PolicyRule {
+            name: "allow-all".to_string(),
+            description: "Approve all transactions (devnet/testnet only)".to_string(),
+            condition: PolicyCondition::Always,
+            action: PolicyAction::Approve,
+        }]
     }
 }
 
 // ── API token bootstrap ────────────────────────────────────────────────────
+
+fn build_operator_registry(config: &ClawConfig) -> OperatorRegistry {
+    use claw_types::operator::{OperatorId, OperatorIdentity};
+
+    if config.operators.is_empty() {
+        info!("no [[operators]] configured — using legacy single-token auth");
+        return OperatorRegistry::new();
+    }
+
+    let mut entries = Vec::with_capacity(config.operators.len());
+
+    for op in &config.operators {
+        // Token: env override `CLAW_OPERATOR_<ID>_TOKEN` takes precedence.
+        let env_key = format!("CLAW_OPERATOR_{}_TOKEN", op.id.to_uppercase());
+        let token = std::env::var(&env_key)
+            .ok()
+            .or_else(|| op.token.clone());
+
+        let Some(token) = token else {
+            warn!(
+                operator_id = %op.id,
+                "operator has no token (set {} or config token field) — skipping",
+                env_key
+            );
+            continue;
+        };
+
+        let identity = OperatorIdentity {
+            id: OperatorId(op.id.clone()),
+            display_name: op.name.clone(),
+            roles: op.roles.clone(),
+        };
+
+        info!(
+            operator_id = %op.id,
+            roles = ?op.roles,
+            "registered operator"
+        );
+
+        entries.push((token, identity));
+    }
+
+    info!(operators = entries.len(), "operator registry built");
+    OperatorRegistry::from_operators(entries)
+}
 
 fn load_api_token() -> String {
     match std::env::var("CLAW_API_TOKEN") {
@@ -868,15 +1043,36 @@ fn load_api_token() -> String {
 // ── SessionOps adapter ─────────────────────────────────────────────────────
 
 struct GatewaySessionAdapter {
-    session_mgr:    SessionManager,
-    agent_router:   Arc<AgentRouter>,
+    session_mgr:      SessionManager,
+    agent_router:     Arc<AgentRouter>,
     /// Wallet context string injected into every new session's system prompt.
-    wallet_context: Option<String>,
+    wallet_context:   Option<String>,
+    /// Per-session policy overrides (shared with SubmitForSigningTool).
+    session_policy:   SessionPolicyStore,
+    /// Per-role default policy profiles from config.
+    role_profiles:    Vec<crate::config::RolePolicyProfile>,
 }
 
 impl SessionOps for GatewaySessionAdapter {
-    fn open(&self, role: AgentRole, channel: String) -> SessionId {
+    fn open(&self, role: AgentRole, channel: String, policy_overrides: Option<Vec<PolicyRule>>) -> SessionId {
         let id = self.session_mgr.open(role, channel.clone());
+
+        // Delegate to extracted, tested function for session policy assembly.
+        let combined = crate::session_policy::build_session_rules(
+            role,
+            policy_overrides,
+            &self.role_profiles,
+        );
+
+        // Store the combined session policy rules (write-through to SQLite).
+        if !combined.is_empty() {
+            let store = self.session_policy.clone();
+            let sid = id.clone();
+            tokio::spawn(async move {
+                store.set(sid, combined).await;
+            });
+        }
+
         let router = self.agent_router.clone();
         let id2    = id.clone();
         let wallet_ctx = self.wallet_context.clone();
@@ -888,6 +1084,14 @@ impl SessionOps for GatewaySessionAdapter {
 
     fn close(&self, id: &SessionId, reason: &str) {
         self.session_mgr.close(id, reason);
+
+        // Remove per-session policy overrides (in-memory + SQLite).
+        let store = self.session_policy.clone();
+        let sid = id.clone();
+        tokio::spawn(async move {
+            store.remove(&sid).await;
+        });
+
         let router = self.agent_router.clone();
         let id2    = id.clone();
         tokio::spawn(async move {
@@ -993,7 +1197,8 @@ struct GatewayApprovalHandler {
     pending_signing: PendingSigningStore,
     event_bus:       EventBus,
     audit:           AuditRepository,
-    durable:         DurablePendingState,
+    _durable:        DurablePendingState,
+    alerts:          crate::policy_alerting::AlertDispatcher,
 }
 
 impl ApprovalHandler for GatewayApprovalHandler {
@@ -1019,48 +1224,66 @@ impl GatewayApprovalHandler {
         decision: ApprovalDecision,
     ) -> (ApprovalOutcome, Option<ApprovalRequest>) {
         let (outcome, maybe_request) = self.store.decide(&decision);
+        let actor = decision.operator_id.as_deref().unwrap_or("operator");
 
+        // ── Audit logging per outcome type ──────────────────────────────────
+        match &outcome {
+            ApprovalOutcome::RoleMismatch { required, provided } => {
+                warn!(request_id = %decision.request_id, %required, ?provided, "role mismatch");
+                let _ = self.audit.append(
+                    None, &decision.request_id.to_string(), "approval_role_mismatch", "operator",
+                    &serde_json::json!({ "request_id": decision.request_id, "required_role": required, "provided_role": provided }),
+                    AuditSeverity::Warning,
+                ).await;
+            }
+            ApprovalOutcome::StageAdvanced { completed_stage, next_stage, next_required_role } => {
+                let _ = self.audit.append(
+                    None, &decision.request_id.to_string(), "approval_stage_advanced", actor,
+                    &serde_json::json!({ "request_id": decision.request_id, "completed_stage": completed_stage, "next_stage": next_stage, "next_required_role": next_required_role, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
+                    AuditSeverity::Info,
+                ).await;
+            }
+            ApprovalOutcome::QuorumProgress { stage, approvals_so_far, approvals_required } => {
+                let _ = self.audit.append(
+                    None, &decision.request_id.to_string(), "approval_quorum_progress", actor,
+                    &serde_json::json!({ "request_id": decision.request_id, "stage": stage, "approvals_so_far": approvals_so_far, "approvals_required": approvals_required, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
+                    AuditSeverity::Info,
+                ).await;
+            }
+            _ => {}
+        }
+
+        // Terminal outcomes: additional audit + events.
         if let Some(ref request) = maybe_request {
-            let session_str = request.session_id.to_string();
-            let request_id  = decision.request_id.to_string();
-
             let (audit_event, audit_severity) = if decision.approved {
                 ("human_approved", AuditSeverity::Info)
             } else {
                 ("human_rejected", AuditSeverity::Warning)
             };
-
             let _ = self.audit.append(
-                Some(&session_str),
-                &request_id,
-                audit_event,
-                "operator",
-                &serde_json::json!({
-                    "request_id":     decision.request_id,
-                    "transaction_id": request.transaction_id,
-                    "approved":       decision.approved,
-                    "note":           decision.note,
-                }),
+                Some(&request.session_id.to_string()), &decision.request_id.to_string(),
+                audit_event, actor,
+                &serde_json::json!({ "request_id": decision.request_id, "transaction_id": request.transaction_id, "approved": decision.approved, "note": decision.note, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
                 audit_severity,
             ).await;
 
-            let signaled = self.pending_signing.signal(decision.request_id, decision.approved);
-            if !signaled {
-                info!(
-                    request_id = %decision.request_id,
-                    "no parked signing task for this approval request (non-signing flow or already resolved)"
-                );
-            }
-
-            let event = GatewayEvent::ApprovalReceived(ApprovalLifecycleEvent {
+            self.event_bus.publish(GatewayEvent::ApprovalReceived(ApprovalLifecycleEvent {
                 header:         EventHeader::new(Some(request.session_id.clone())),
                 session_id:     request.session_id.clone(),
                 request_id:     request.id,
                 transaction_id: request.transaction_id,
                 approved:       Some(decision.approved),
-            });
-            self.event_bus.publish(event);
+            }));
         }
+
+        // ── Signal routing + alerts: delegated to extracted, tested function ─
+        crate::approval_routing::route_approval_outcome(
+            &outcome,
+            decision.request_id,
+            &self.pending_signing,
+            &self.alerts,
+            maybe_request.as_ref(),
+        );
 
         (outcome, maybe_request)
     }
@@ -1083,6 +1306,7 @@ struct GatewayWalletSignatureHandler {
     rpc_client:       ClawRpcClient,
     tracker:          Arc<claw_solana_core::tracker::TransactionTracker>,
     tracking_repo:    claw_state_store::TransactionTrackingRepository,
+    metrics:          Arc<claw_observability::metrics::MetricsRegistry>,
 }
 
 impl WalletSignatureHandler for GatewayWalletSignatureHandler {
@@ -1286,6 +1510,8 @@ impl GatewayWalletSignatureHandler {
                     .await
                 {
                     Ok(tx_sig) => {
+                        self.metrics.transactions_sent.increment();
+                        self.metrics.rpc_calls_total.increment();
                         info!(
                             session = %session_str,
                             request_id = %request_id,
@@ -1344,6 +1570,7 @@ impl GatewayWalletSignatureHandler {
                                         expected_signer.clone(),
                                         last_valid_block_height,
                                         submission_block_height,
+                                        Some(signed_tx_bytes.clone()),
                                     );
                                 }
                                 Err(e) => {
@@ -1401,6 +1628,8 @@ impl GatewayWalletSignatureHandler {
                         (Some(tx_sig), true, None)
                     }
                     Err(e) => {
+                        self.metrics.rpc_calls_total.increment();
+                        self.metrics.rpc_calls_failed.increment();
                         let reason = e.to_string();
                         warn!(
                             session = %session_str,
@@ -1520,6 +1749,86 @@ impl EventSubscriber for GatewayEventSubscriber {
 }
 
 // ── WalletChallengeHandler adapter ────────────────────────────────────────
+
+// ── TransactionProposer adapter ─────────────────────────────────────────
+
+struct GatewayTransactionProposer {
+    signing_tool: Arc<crate::tools::SubmitForSigningTool>,
+    #[allow(dead_code)]
+    rpc_client:   ClawRpcClient,
+}
+
+use claw_tool_system::tool::Tool as ToolTrait;
+
+impl TransactionProposer for GatewayTransactionProposer {
+    fn propose_transfer(
+        &self,
+        session_id: &SessionId,
+        from: &str,
+        to: &str,
+        lamports: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<ProposeTransferResult, String>> + Send + '_>> {
+        let session_id = session_id.clone();
+        let from = from.to_string();
+        let to = to.to_string();
+        Box::pin(async move {
+            use solana_sdk::{message::Message, system_instruction, transaction::Transaction};
+            use base64::Engine;
+
+            // 1. Build the unsigned SOL transfer transaction
+            let from_pk = from.parse::<solana_sdk::pubkey::Pubkey>()
+                .map_err(|e| format!("invalid from pubkey: {e}"))?;
+            let to_pk = to.parse::<solana_sdk::pubkey::Pubkey>()
+                .map_err(|e| format!("invalid to pubkey: {e}"))?;
+
+            let ix = system_instruction::transfer(&from_pk, &to_pk, lamports);
+            let message = Message::new(&[ix], Some(&from_pk));
+            let tx = Transaction::new_unsigned(message);
+
+            let tx_bytes = bincode::serialize(&tx)
+                .map_err(|e| format!("serialize tx: {e}"))?;
+            let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+
+            // 2. Route through the full signing pipeline (simulate → policy → sign/pending)
+            let input = claw_types::tool::ToolInput {
+                tool_name: "submit_for_signing".to_string(),
+                session_id: session_id.clone(),
+                correlation_id: uuid::Uuid::new_v4(),
+                parameters: serde_json::json!({
+                    "transaction_b64": tx_b64,
+                    "description": format!("SOL transfer: {} lamports from {} to {}", lamports, from, to),
+                    "wallet_pubkey": from,
+                }),
+            };
+
+            let output = ToolTrait::execute(self.signing_tool.as_ref(), input).await
+                .map_err(|e| format!("pipeline error: {e}"))?;
+
+            // 3. Convert ToolOutput → ProposeTransferResult
+            let data = output.data.as_ref();
+            let status = data
+                .and_then(|d| d["status"].as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            Ok(ProposeTransferResult {
+                status,
+                wallet_signature_request_id: data
+                    .and_then(|d| d["wallet_signature_request_id"].as_str())
+                    .and_then(|s| s.parse::<uuid::Uuid>().ok()),
+                unsigned_tx_b64: data
+                    .and_then(|d| d["unsigned_tx_b64"].as_str())
+                    .map(|s| s.to_string()),
+                signature: data
+                    .and_then(|d| d["signature"].as_str())
+                    .map(|s| s.to_string()),
+                error: output.error,
+            })
+        })
+    }
+}
+
+// ── WalletChallengeHandler adapter ─────────────────────────────────────
 
 struct GatewayWalletChallengeHandler {
     challenge_service: crate::wallet_challenge::WalletChallengeService,

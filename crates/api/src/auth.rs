@@ -1,11 +1,18 @@
 //! Local bearer-token authentication middleware.
 //!
-//! The API server runs on localhost only. It is protected by a bearer token
-//! that is generated at daemon startup and stored in the state store.
-//! The `claw` CLI reads the token from `~/.config/claw/token` (written
-//! by the daemon at startup).
+//! The API server runs on localhost only. It is protected by bearer tokens.
+//! Each token maps to an `OperatorIdentity` via the `OperatorRegistry`.
 //!
-//! **What belongs here:** token extraction, constant-time comparison,
+//! # Operator resolution
+//!
+//! When `[[operators]]` are configured in TOML, each operator has their own
+//! token and role set. The middleware resolves the token to an identity and
+//! injects it into request extensions, making it available to route handlers.
+//!
+//! When no operators are configured (legacy single-token mode), the fallback
+//! `CLAW_API_TOKEN` creates an anonymous operator with all-role access.
+//!
+//! **What belongs here:** token extraction, identity resolution,
 //! rejection response formatting.
 //!
 //! **What does NOT belong here:** session logic, policy evaluation,
@@ -21,7 +28,12 @@ use axum::{
 use serde_json::json;
 use std::sync::Arc;
 
+use claw_types::operator::OperatorIdentity;
+
 /// The shared auth token state injected into the router.
+///
+/// In legacy mode (no `[[operators]]` config), holds a single shared token.
+/// In operator mode, this is unused — `OperatorRegistry` handles resolution.
 #[derive(Clone)]
 pub struct AuthToken(Arc<String>);
 
@@ -36,18 +48,97 @@ impl AuthToken {
     }
 }
 
-/// Axum middleware that validates the `Authorization: Bearer <token>` header.
+/// Registry mapping bearer tokens to operator identities.
+///
+/// Thread-safe and cheap to clone (Arc-wrapped).
+/// When empty, falls back to `AuthToken` for legacy single-token auth.
+#[derive(Clone, Debug)]
+pub struct OperatorRegistry {
+    /// Token → OperatorIdentity mapping.
+    operators: Arc<Vec<(String, OperatorIdentity)>>,
+}
+
+impl OperatorRegistry {
+    /// Creates an empty registry (legacy mode — falls back to AuthToken).
+    pub fn new() -> Self {
+        Self {
+            operators: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Creates a registry from a list of (token, identity) pairs.
+    pub fn from_operators(operators: Vec<(String, OperatorIdentity)>) -> Self {
+        Self {
+            operators: Arc::new(operators),
+        }
+    }
+
+    /// Returns true if no operators are registered (legacy mode).
+    pub fn is_empty(&self) -> bool {
+        self.operators.is_empty()
+    }
+
+    /// Resolves a bearer token to an operator identity.
+    /// Uses constant-time comparison for each registered token.
+    pub fn resolve(&self, token: &str) -> Option<OperatorIdentity> {
+        self.operators
+            .iter()
+            .find(|(t, _)| constant_time_eq(t, token))
+            .map(|(_, identity)| identity.clone())
+    }
+}
+
+impl Default for OperatorRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Combined auth state for the middleware.
+#[derive(Clone)]
+pub struct AuthState {
+    pub token: AuthToken,
+    pub registry: OperatorRegistry,
+}
+
+/// Axum middleware that validates the bearer token and resolves operator identity.
 ///
 /// Also accepts `?token=<value>` as a query parameter fallback for SSE
 /// endpoints, since `EventSource` does not support custom request headers.
 ///
-/// Requests without a valid token receive `401 Unauthorized`.
-/// The comparison uses constant-time equality to prevent timing attacks.
+/// Resolved `OperatorIdentity` is injected into request extensions.
+/// Route handlers can extract it via `request.extensions().get::<OperatorIdentity>()`.
 pub async fn require_bearer_token(
-    axum::extract::State(expected): axum::extract::State<AuthToken>,
-    request: Request,
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    mut request: Request,
     next: Next,
 ) -> Response {
+    let provided = extract_token(&request);
+
+    // Try operator registry first (if configured).
+    if !auth.registry.is_empty() {
+        if let Some(ref token) = provided {
+            if let Some(identity) = auth.registry.resolve(token) {
+                request.extensions_mut().insert(identity);
+                return next.run(request).await;
+            }
+        }
+        // Token not found in registry — unauthorized.
+        return unauthorized_response();
+    }
+
+    // Legacy fallback: single shared token → anonymous operator.
+    match provided {
+        Some(ref token) if constant_time_eq(token, auth.token.value()) => {
+            request.extensions_mut().insert(OperatorIdentity::anonymous());
+            next.run(request).await
+        }
+        _ => unauthorized_response(),
+    }
+}
+
+/// Extracts the bearer token from the request (header or query param).
+fn extract_token(request: &Request) -> Option<String> {
     // Try Authorization header first (preferred).
     let from_header = request
         .headers()
@@ -66,18 +157,15 @@ pub async fn require_bearer_token(
                 .map(|v| v.to_string())
         });
 
-    let provided = from_header.or(from_query);
+    from_header.or(from_query)
+}
 
-    match provided {
-        Some(ref token) if constant_time_eq(token, expected.value()) => {
-            next.run(request).await
-        }
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "unauthorized", "message": "valid Bearer token required" })),
-        )
-            .into_response(),
-    }
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "unauthorized", "message": "valid Bearer token required" })),
+    )
+        .into_response()
 }
 
 /// Constant-time string comparison to prevent timing side-channels.

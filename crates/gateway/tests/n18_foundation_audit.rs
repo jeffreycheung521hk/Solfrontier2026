@@ -19,14 +19,14 @@ use uuid::Uuid;
 
 use claw_gateway::{
     approval_store::ApprovalStore,
-    completion_metadata::{CompletionMeta, CompletionMetadataStore},
+    completion_metadata::CompletionMetadataStore,
     durable_pending::DurablePendingState,
     event_bus::EventBus,
     external_wallet::ExternalWalletStore,
     orchestrator::SignatureOrchestrator,
     orchestrator::external_adapter::ExternalWalletAdapter,
     orchestrator::local_adapter::LocalWalletAdapter,
-    orchestrator::types::{SignatureOutcome, SignatureRequest, SignatureRequestId},
+    orchestrator::types::{SignatureRequest, SignatureRequestId},
     pending_signing::PendingSigningStore,
     tools::resume_after_approval,
 };
@@ -135,40 +135,44 @@ fn n2_approve_then_approve_again_returns_not_found() {
     let session = SessionId::from(Uuid::new_v4());
     let req = ApprovalRequest::new(
         session, Uuid::new_v4(), "test",
-        PolicyVerdict::RequiresHumanApproval { reason: "test".into(), rule_name: "r".into() },
+        PolicyVerdict::RequiresHumanApproval { reason: "test".into(), rule_name: "r".into(), required_approver_role: None, approval_chain: None },
         fake_simulation(),
     );
     let rid = req.id;
-    store.register(req);
+    let sid = req.session_id.clone();
+    let wf = claw_types::approval::ApprovalWorkflow::single_stage(rid, sid, None);
+    store.register(req, wf);
 
     let d1 = ApprovalDecision::approve(rid, None);
     let (o1, _) = store.decide(&d1);
     assert_eq!(o1, ApprovalOutcome::Approved);
 
-    // Entry is removed after decision; second attempt finds nothing.
+    // Workflow is terminal — second attempt returns AlreadyDecided.
     let d2 = ApprovalDecision::approve(rid, None);
     let (o2, _) = store.decide(&d2);
-    assert_eq!(o2, ApprovalOutcome::NotFound);
+    assert_eq!(o2, ApprovalOutcome::AlreadyDecided);
 }
 
 #[test]
-fn n2_reject_then_approve_returns_not_found() {
+fn n2_reject_then_approve_returns_already_decided() {
     // Cannot flip a rejection.
     let store = ApprovalStore::new();
     let session = SessionId::from(Uuid::new_v4());
     let req = ApprovalRequest::new(
         session, Uuid::new_v4(), "test",
-        PolicyVerdict::RequiresHumanApproval { reason: "test".into(), rule_name: "r".into() },
+        PolicyVerdict::RequiresHumanApproval { reason: "test".into(), rule_name: "r".into(), required_approver_role: None, approval_chain: None },
         fake_simulation(),
     );
     let rid = req.id;
-    store.register(req);
+    let sid = req.session_id.clone();
+    let wf = claw_types::approval::ApprovalWorkflow::single_stage(rid, sid, None);
+    store.register(req, wf);
 
     let (o1, _) = store.decide(&ApprovalDecision::reject(rid, None));
     assert_eq!(o1, ApprovalOutcome::Rejected);
 
     let (o2, _) = store.decide(&ApprovalDecision::approve(rid, None));
-    assert_eq!(o2, ApprovalOutcome::NotFound);
+    assert_eq!(o2, ApprovalOutcome::AlreadyDecided);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -267,7 +271,7 @@ async fn n5_resume_with_durable_local_path() {
     let pending_signing = PendingSigningStore::new();
     let completion_meta = CompletionMetadataStore::new();
 
-    let (_, pubkey, _, keystore, orchestrator) = make_local_setup();
+    let (_, pubkey, _, _keystore, orchestrator) = make_local_setup();
     let session_id = SessionId::from(Uuid::new_v4());
     let tx = make_test_tx(&pubkey);
 
@@ -285,6 +289,8 @@ async fn n5_resume_with_durable_local_path() {
     let sim = fake_simulation();
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "test".into(), rule_name: "r".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
 
     // Park
@@ -308,7 +314,7 @@ async fn n5_resume_with_durable_local_path() {
     });
 
     // Signal approval
-    let signaled = pending_for_signal.signal(request_id, true);
+    let signaled = pending_for_signal.signal(request_id, claw_types::approval::ApprovalWorkflowState::Approved);
     assert!(signaled, "signal must succeed");
 
     tokio::time::timeout(Duration::from_secs(5), resume_handle)
@@ -376,6 +382,8 @@ async fn n5_consumed_durable_approval_not_recoverable_after_restart() {
     let sim = fake_simulation();
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "test".into(), rule_name: "r".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
     let proposal = TransactionProposal {
         id: Uuid::new_v4(), session_id: session_id.clone(),
@@ -391,7 +399,8 @@ async fn n5_consumed_durable_approval_not_recoverable_after_restart() {
         id: request_id, session_id: session_id.clone(),
         transaction_id: proposal.id, description: "test".into(),
         policy_verdict: verdict.clone(), simulation: sim.clone(),
-        requested_at: chrono::Utc::now(), decided: false,
+        requested_at: chrono::Utc::now(), decided:         false,
+        required_approver_role: None,
     };
     let tx_bytes = bincode::serialize(&tx).unwrap();
     durable.persist_approval(
@@ -416,7 +425,7 @@ async fn n5_consumed_durable_approval_not_recoverable_after_restart() {
             Some(durable),
         ).await;
     });
-    pending_for_signal.signal(request_id, true);
+    pending_for_signal.signal(request_id, claw_types::approval::ApprovalWorkflowState::Approved);
     tokio::time::timeout(Duration::from_secs(5), resume_handle)
         .await.expect("timeout").expect("no panic");
 
@@ -595,6 +604,8 @@ async fn n7_rejected_approval_does_not_record_spend() {
     let sim = fake_simulation(); // fee_lamports: Some(5000)
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "test".into(), rule_name: "r".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
 
     let decision_rx = pending_signing.park(
@@ -613,7 +624,7 @@ async fn n7_rejected_approval_does_not_record_spend() {
     });
 
     // REJECT the approval
-    pending_for_signal.signal(request_id, false);
+    pending_for_signal.signal(request_id, claw_types::approval::ApprovalWorkflowState::Rejected);
 
     tokio::time::timeout(Duration::from_secs(5), resume_handle)
         .await.expect("timeout").expect("no panic");
@@ -634,7 +645,7 @@ async fn n7_external_completion_failure_does_not_record_spend() {
     let session_id = SessionId::from(Uuid::new_v4());
     let keypair = Keypair::new();
     let pubkey = keypair.pubkey();
-    let to = Pubkey::new_unique();
+    let _to = Pubkey::new_unique();
     let tx = make_test_tx(&pubkey);
     let proposal_id = Uuid::new_v4();
 
@@ -702,6 +713,8 @@ async fn n7_spend_recorded_exactly_once_on_resume_path() {
     let sim = fake_simulation(); // fee_lamports: Some(5000)
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason: "test".into(), rule_name: "r".into(),
+        required_approver_role: None,
+        approval_chain: None,
     };
 
     let decision_rx = pending_signing.park(
@@ -719,7 +732,7 @@ async fn n7_spend_recorded_exactly_once_on_resume_path() {
         ).await;
     });
 
-    pending_for_signal.signal(request_id, true);
+    pending_for_signal.signal(request_id, claw_types::approval::ApprovalWorkflowState::Approved);
 
     tokio::time::timeout(Duration::from_secs(5), resume_handle)
         .await.expect("timeout").expect("no panic");

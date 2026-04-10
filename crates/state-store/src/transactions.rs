@@ -1,7 +1,7 @@
 //! Transaction lifecycle repository.
 
 use chrono::Utc;
-use serde_json::Value;
+
 use sqlx::{FromRow, SqlitePool};
 use tracing::instrument;
 

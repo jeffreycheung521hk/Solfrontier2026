@@ -24,14 +24,11 @@ use solana_sdk::{
 use uuid::Uuid;
 
 use claw_gateway::{
-    approval_store::ApprovalStore,
-    completion_metadata::CompletionMetadataStore,
     durable_pending::DurablePendingState,
     external_wallet::ExternalWalletStore,
     orchestrator::SignatureOrchestrator,
     orchestrator::external_adapter::ExternalWalletAdapter,
     orchestrator::types::{SignatureError, SignatureOutcome, SignatureRequest, SignatureRequestId},
-    pending_signing::PendingSigningStore,
 };
 use claw_state_store::{
     db::Database,

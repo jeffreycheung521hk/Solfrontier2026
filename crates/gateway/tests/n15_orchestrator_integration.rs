@@ -18,8 +18,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine;
-use serde_json::json;
 use solana_sdk::{
     hash::Hash,
     message::Message,
@@ -32,7 +30,6 @@ use tokio::sync::Barrier;
 use uuid::Uuid;
 
 use claw_gateway::{
-    approval_store::ApprovalStore,
     completion_metadata::{CompletionMeta, CompletionMetadataStore},
     event_bus::EventBus,
     external_wallet::ExternalWalletStore,
@@ -44,12 +41,11 @@ use claw_gateway::{
     tools::resume_after_approval,
 };
 use claw_state_store::{
-    audit::{AuditRepository, AuditSeverity},
+    audit::AuditRepository,
     db::Database,
     spend::SpendRepository,
 };
 use claw_types::{
-    approval::{ApprovalDecision, ApprovalOutcome, ApprovalRequest},
     events::{EventHeader, GatewayEvent, WalletSignatureEvent},
     policy::PolicyVerdict,
     session::SessionId,
@@ -101,7 +97,7 @@ fn make_test_tx(from: &Pubkey, to: &Pubkey) -> Transaction {
 }
 
 struct TestInfra {
-    db: Database,
+    _db: Database,
     audit: AuditRepository,
     spend: SpendRepository,
     event_bus: EventBus,
@@ -115,7 +111,7 @@ impl TestInfra {
         let audit = AuditRepository::new(db.pool().clone());
         let spend = SpendRepository::new(db.pool().clone());
         Self {
-            db,
+            _db: db,
             audit,
             spend,
             event_bus: EventBus::new(),
@@ -126,10 +122,10 @@ impl TestInfra {
 }
 
 struct LocalSignerSetup {
-    keypair: Keypair,
+    _keypair: Keypair,
     pubkey: Pubkey,
-    signer: SignerRef,
-    keystore: SecretKeystore,
+    _signer: SignerRef,
+    _keystore: SecretKeystore,
     orchestrator: SignatureOrchestrator,
 }
 
@@ -145,14 +141,14 @@ impl LocalSignerSetup {
         );
         let local_adapter = Arc::new(LocalWalletAdapter::new(signer.clone(), keystore.clone()));
         let orchestrator = SignatureOrchestrator::new(vec![local_adapter]);
-        Self { keypair, pubkey, signer, keystore, orchestrator }
+        Self { _keypair: keypair, pubkey, _signer: signer, _keystore: keystore, orchestrator }
     }
 }
 
 struct ExternalSignerSetup {
     keypair: Keypair,
     pubkey: Pubkey,
-    external_wallet: ExternalWalletStore,
+    _external_wallet: ExternalWalletStore,
     orchestrator: SignatureOrchestrator,
 }
 
@@ -166,7 +162,7 @@ impl ExternalSignerSetup {
             Arc::new(external_wallet.clone()),
         ));
         let orchestrator = SignatureOrchestrator::new(vec![external_adapter]);
-        Self { keypair, pubkey, external_wallet, orchestrator }
+        Self { keypair, pubkey, _external_wallet: external_wallet, orchestrator }
     }
 }
 
@@ -338,6 +334,8 @@ async fn human_approved_local_signs_via_orchestrator_after_approval() {
         PolicyVerdict::RequiresHumanApproval {
             reason: "test".into(),
             rule_name: "test-rule".into(),
+            required_approver_role: None,
+            approval_chain: None,
         },
         1000,
     ).expect("park should succeed");
@@ -363,7 +361,7 @@ async fn human_approved_local_signs_via_orchestrator_after_approval() {
     });
 
     // Approve
-    infra.pending_signing.signal(request_id, true);
+    infra.pending_signing.signal(request_id, claw_types::approval::ApprovalWorkflowState::Approved);
 
     tokio::time::timeout(Duration::from_secs(5), resume_handle)
         .await
@@ -423,6 +421,8 @@ async fn human_approved_external_pending_then_complete_after_approval() {
         PolicyVerdict::RequiresHumanApproval {
             reason: "high value".into(),
             rule_name: "high-value-guard".into(),
+            required_approver_role: None,
+            approval_chain: None,
         },
         1000,
     ).expect("park");
@@ -446,7 +446,7 @@ async fn human_approved_external_pending_then_complete_after_approval() {
     });
 
     // Approve
-    infra.pending_signing.signal(request_id, true);
+    infra.pending_signing.signal(request_id, claw_types::approval::ApprovalWorkflowState::Approved);
 
     tokio::time::timeout(Duration::from_secs(5), resume_handle)
         .await.expect("timeout").expect("no panic");
