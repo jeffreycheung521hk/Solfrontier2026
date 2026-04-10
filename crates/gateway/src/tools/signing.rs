@@ -1101,8 +1101,7 @@ fn summarize_transaction_instructions(tx: &Transaction) -> Vec<InstructionSummar
                 .get(program_id_index)?
                 .to_string();
 
-            let (program_name, description, transfer_lamports) =
-                decode_instruction(&program_id, &ix.data, &tx.message.account_keys, &ix.accounts);
+            let decoded = decode_instruction(&program_id, &ix.data, &tx.message.account_keys, &ix.accounts);
 
             let accounts = ix
                 .accounts
@@ -1122,27 +1121,40 @@ fn summarize_transaction_instructions(tx: &Transaction) -> Vec<InstructionSummar
 
             Some(InstructionSummary {
                 program_id,
-                program_name,
-                description,
-                transfer_lamports,
+                program_name:    decoded.program_name,
+                description:     decoded.description,
+                transfer_lamports: decoded.transfer_lamports,
+                token_transfer:  decoded.token_transfer,
                 accounts,
             })
         })
         .collect()
 }
 
-/// Decode a single instruction into (program_name, description, transfer_lamports).
+/// Result of decoding an instruction.
+struct DecodedInstruction {
+    program_name: Option<String>,
+    description: String,
+    transfer_lamports: Option<u64>,
+    token_transfer: Option<claw_types::transaction::TokenTransfer>,
+}
+
+/// SPL Token program ID.
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+/// SPL Token-2022 program ID.
+const SPL_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+/// Decode a single instruction.
 fn decode_instruction(
     program_id: &str,
     data: &[u8],
     account_keys: &[Pubkey],
     account_indices: &[u8],
-) -> (Option<String>, String, Option<u64>) {
+) -> DecodedInstruction {
     let system_id = system_program::id().to_string();
     let compute_budget_id = compute_budget::id().to_string();
 
     if program_id == system_id {
-        // Try to decode as a SystemInstruction (bincode-encoded).
         if let Ok(sys_ix) = bincode::deserialize::<SystemInstruction>(data) {
             match sys_ix {
                 SystemInstruction::Transfer { lamports } => {
@@ -1151,47 +1163,147 @@ fn decode_instruction(
                         .and_then(|&i| account_keys.get(i as usize))
                         .map(|pk| pk.to_string())
                         .unwrap_or_else(|| "unknown".to_string());
-                    return (
-                        Some("System Program".to_string()),
-                        format!("Transfer {} lamports to {}", lamports, to),
-                        Some(lamports),
-                    );
+                    return DecodedInstruction {
+                        program_name: Some("System Program".to_string()),
+                        description: format!("Transfer {} lamports to {}", lamports, to),
+                        transfer_lamports: Some(lamports),
+                        token_transfer: None,
+                    };
                 }
                 SystemInstruction::CreateAccount { lamports, space, owner } => {
-                    return (
-                        Some("System Program".to_string()),
-                        format!(
+                    return DecodedInstruction {
+                        program_name: Some("System Program".to_string()),
+                        description: format!(
                             "CreateAccount: {} lamports, {} bytes, owner {}",
                             lamports, space, owner
                         ),
-                        Some(lamports),
-                    );
+                        transfer_lamports: Some(lamports),
+                        token_transfer: None,
+                    };
                 }
                 _ => {
-                    return (
-                        Some("System Program".to_string()),
-                        format!("{:?}", sys_ix),
-                        None,
-                    );
+                    return DecodedInstruction {
+                        program_name: Some("System Program".to_string()),
+                        description: format!("{:?}", sys_ix),
+                        transfer_lamports: None,
+                        token_transfer: None,
+                    };
                 }
             }
         }
     }
 
     if program_id == compute_budget_id {
-        return (
-            Some("Compute Budget".to_string()),
-            "ComputeBudget instruction".to_string(),
-            None,
-        );
+        return DecodedInstruction {
+            program_name: Some("Compute Budget".to_string()),
+            description: "ComputeBudget instruction".to_string(),
+            transfer_lamports: None,
+            token_transfer: None,
+        };
+    }
+
+    // ── SPL Token / Token-2022 decoding ─────────────────────────────────────
+    if program_id == SPL_TOKEN_PROGRAM_ID || program_id == SPL_TOKEN_2022_PROGRAM_ID {
+        if let Some(decoded) = decode_spl_token_instruction(data, account_keys, account_indices) {
+            return decoded;
+        }
+        // Fallback for unrecognized SPL Token instructions.
+        return DecodedInstruction {
+            program_name: Some("SPL Token".to_string()),
+            description: "SPL Token instruction".to_string(),
+            transfer_lamports: None,
+            token_transfer: None,
+        };
     }
 
     // Unknown program — return a generic summary.
-    (
-        None,
-        format!("Instruction for program {}", &program_id[..8.min(program_id.len())]),
-        None,
-    )
+    DecodedInstruction {
+        program_name: None,
+        description: format!("Instruction for program {}", &program_id[..8.min(program_id.len())]),
+        transfer_lamports: None,
+        token_transfer: None,
+    }
+}
+
+/// Decode an SPL Token instruction.
+///
+/// V1 supports `TransferChecked` (instruction tag 12), which carries the mint
+/// directly. Legacy `Transfer` (tag 3) does NOT include the mint in its
+/// accounts and would require an RPC lookup to resolve — not done in V1.
+///
+/// TransferChecked layout:
+/// - data[0] = 12 (instruction tag)
+/// - data[1..9] = amount (u64 little-endian)
+/// - data[9] = decimals (u8)
+///
+/// Accounts:
+/// - [0] source token account
+/// - [1] mint
+/// - [2] destination token account
+/// - [3] authority (signer)
+fn decode_spl_token_instruction(
+    data: &[u8],
+    account_keys: &[Pubkey],
+    account_indices: &[u8],
+) -> Option<DecodedInstruction> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let tag = data[0];
+    match tag {
+        // TransferChecked
+        12 => {
+            if data.len() < 10 || account_indices.len() < 4 {
+                return None;
+            }
+            let amount = u64::from_le_bytes(data[1..9].try_into().ok()?);
+            let decimals = data[9];
+
+            let source = account_keys.get(account_indices[0] as usize)?.to_string();
+            let mint = account_keys.get(account_indices[1] as usize)?.to_string();
+            let destination = account_keys.get(account_indices[2] as usize)?.to_string();
+
+            Some(DecodedInstruction {
+                program_name: Some("SPL Token".to_string()),
+                description: format!(
+                    "TransferChecked: {} (raw units, {} decimals) of mint {} → {}",
+                    amount, decimals, mint, destination
+                ),
+                transfer_lamports: None,
+                token_transfer: Some(claw_types::transaction::TokenTransfer {
+                    mint,
+                    amount,
+                    decimals: Some(decimals),
+                    source,
+                    destination,
+                }),
+            })
+        }
+        // Transfer (legacy, no mint in accounts)
+        3 => {
+            if data.len() < 9 || account_indices.len() < 3 {
+                return None;
+            }
+            let amount = u64::from_le_bytes(data[1..9].try_into().ok()?);
+            let source = account_keys.get(account_indices[0] as usize)?.to_string();
+            let destination = account_keys.get(account_indices[1] as usize)?.to_string();
+
+            // Legacy Transfer: mint is not in accounts, would need RPC lookup.
+            // Document this and return without token_transfer (caller can still
+            // see this is a token transfer from program_name + description).
+            Some(DecodedInstruction {
+                program_name: Some("SPL Token".to_string()),
+                description: format!(
+                    "Transfer (legacy): {} raw units {} → {} (mint not resolved)",
+                    amount, source, destination
+                ),
+                transfer_lamports: None,
+                token_transfer: None,
+            })
+        }
+        _ => None,
+    }
 }
 
 // ── Helper: attach policy metadata to response JSON ──────────────────────────
@@ -1401,6 +1513,81 @@ mod tests {
     }
 
     #[test]
+    fn summarize_spl_token_transfer_checked() {
+        // Build a manual SPL Token TransferChecked instruction:
+        // tag=12, amount=42_000_000 (42 USDC raw), decimals=6
+        // accounts: [source, mint, destination, authority]
+        let source = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let spl_token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse().unwrap();
+
+        let mut data = vec![12u8]; // TransferChecked tag
+        data.extend_from_slice(&42_000_000u64.to_le_bytes()); // amount
+        data.push(6u8); // decimals
+
+        let ix = solana_sdk::instruction::Instruction::new_with_bytes(
+            spl_token_program,
+            &data,
+            vec![
+                solana_sdk::instruction::AccountMeta::new(source, false),
+                solana_sdk::instruction::AccountMeta::new_readonly(mint, false),
+                solana_sdk::instruction::AccountMeta::new(destination, false),
+                solana_sdk::instruction::AccountMeta::new_readonly(authority, true),
+            ],
+        );
+        let msg = Message::new(&[ix], Some(&authority));
+        let tx = Transaction::new_unsigned(msg);
+
+        let summaries = summarize_transaction_instructions(&tx);
+        assert_eq!(summaries.len(), 1);
+
+        let s = &summaries[0];
+        assert_eq!(s.program_name.as_deref(), Some("SPL Token"));
+        assert!(s.transfer_lamports.is_none());
+
+        let tt = s.token_transfer.as_ref().expect("should decode token transfer");
+        assert_eq!(tt.mint, mint.to_string());
+        assert_eq!(tt.amount, 42_000_000);
+        assert_eq!(tt.decimals, Some(6));
+        assert_eq!(tt.source, source.to_string());
+        assert_eq!(tt.destination, destination.to_string());
+    }
+
+    #[test]
+    fn summarize_spl_token_legacy_transfer_returns_no_token_transfer() {
+        // Legacy Transfer (tag 3) — no mint in accounts, V1 doesn't resolve
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let spl_token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse().unwrap();
+
+        let mut data = vec![3u8]; // Transfer tag
+        data.extend_from_slice(&100u64.to_le_bytes());
+
+        let ix = solana_sdk::instruction::Instruction::new_with_bytes(
+            spl_token_program,
+            &data,
+            vec![
+                solana_sdk::instruction::AccountMeta::new(source, false),
+                solana_sdk::instruction::AccountMeta::new(destination, false),
+                solana_sdk::instruction::AccountMeta::new_readonly(authority, true),
+            ],
+        );
+        let msg = Message::new(&[ix], Some(&authority));
+        let tx = Transaction::new_unsigned(msg);
+
+        let summaries = summarize_transaction_instructions(&tx);
+        assert_eq!(summaries.len(), 1);
+
+        let s = &summaries[0];
+        assert_eq!(s.program_name.as_deref(), Some("SPL Token"));
+        assert!(s.token_transfer.is_none(), "legacy Transfer doesn't decode mint in V1");
+        assert!(s.description.contains("legacy"));
+    }
+
+    #[test]
     fn policy_evaluation_audit_captures_full_context() {
         use claw_types::{
             policy::PolicyVerdict,
@@ -1422,6 +1609,7 @@ mod tests {
                 program_name: Some("System Program".to_string()),
                 description: "Transfer 42000000 lamports".to_string(),
                 transfer_lamports: Some(42_000_000),
+                token_transfer: None,
                 accounts: vec![
                     AccountRole {
                         pubkey: "wallet".to_string(),

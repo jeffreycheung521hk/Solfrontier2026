@@ -276,6 +276,30 @@ impl PolicySet {
                 .map(|s| !s.success)
                 .unwrap_or(true), // simulation not run = not passed
 
+            PolicyCondition::TokenAmountExceeds { mint, threshold } => {
+                // Sum all token transfers for the given mint across all instructions.
+                let total: u64 = ctx
+                    .proposal
+                    .instructions_summary
+                    .iter()
+                    .filter_map(|ix| ix.token_transfer.as_ref())
+                    .filter(|tt| &tt.mint == mint)
+                    .map(|tt| tt.amount)
+                    .sum();
+                total >= *threshold
+            }
+
+            PolicyCondition::MintNotInAllowlist { allowed_mints } => {
+                if allowed_mints.is_empty() {
+                    return false; // empty allowlist = check disabled
+                }
+                ctx.proposal
+                    .instructions_summary
+                    .iter()
+                    .filter_map(|ix| ix.token_transfer.as_ref())
+                    .any(|tt| !allowed_mints.contains(&tt.mint))
+            }
+
             PolicyCondition::OutsideAllowedHours {
                 start_hour, end_hour, allowed_days, utc_offset_hours,
             } => {
@@ -374,6 +398,7 @@ mod tests {
                 program_name: Some("test-program".to_string()),
                 description: "test instruction".to_string(),
                 transfer_lamports,
+                token_transfer: None,
                 accounts: vec![
                     AccountRole {
                         pubkey: wallet_pubkey.to_string(),
@@ -1092,5 +1117,314 @@ mod tests {
             result.matched_rule_index == Some(0) || result.matched_rule_index == Some(1),
             "should match either the hours rule or the fallback"
         );
+    }
+
+    // ── USDC / Stablecoin policy tests ──────────────────────────────────
+
+    fn proposal_with_token_transfer(
+        wallet_pubkey: &str,
+        mint: &str,
+        amount: u64,
+        decimals: u8,
+    ) -> TransactionProposal {
+        use claw_types::transaction::TokenTransfer;
+        TransactionProposal {
+            id: Uuid::new_v4(),
+            session_id: SessionId::from(Uuid::new_v4()),
+            wallet_pubkey: wallet_pubkey.to_string(),
+            network: SolanaNetwork::Devnet,
+            description: "USDC test".to_string(),
+            transaction_b64: String::new(),
+            instructions_summary: vec![InstructionSummary {
+                program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                program_name: Some("SPL Token".to_string()),
+                description: format!("TransferChecked {} of {}", amount, mint),
+                transfer_lamports: None,
+                token_transfer: Some(TokenTransfer {
+                    mint: mint.to_string(),
+                    amount,
+                    decimals: Some(decimals),
+                    source: "source-token-account".to_string(),
+                    destination: "dest-token-account".to_string(),
+                }),
+                accounts: vec![],
+            }],
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+    const BONK_MINT: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+
+    #[test]
+    fn token_amount_exceeds_fires_for_matching_mint_above_threshold() {
+        let policy = PolicySet::new(
+            vec![
+                PolicyRule {
+                    name: "usdc-cap".to_string(),
+                    description: "USDC >= 100".to_string(),
+                    condition: PolicyCondition::TokenAmountExceeds {
+                        mint: USDC_MINT.to_string(),
+                        threshold: 100_000_000, // 100 USDC
+                    },
+                    action: PolicyAction::Reject {
+                        reason: "USDC cap exceeded".to_string(),
+                    },
+                },
+                PolicyRule {
+                    name: "fallback".to_string(),
+                    description: "approve".to_string(),
+                    condition: PolicyCondition::Always,
+                    action: PolicyAction::Approve,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+
+        // 150 USDC → should fire
+        let proposal = proposal_with_token_transfer("wallet", USDC_MINT, 150_000_000, 6);
+        let result = policy.evaluate(&context(&proposal));
+        assert_eq!(
+            result.verdict,
+            PolicyVerdict::Rejected {
+                reason: "USDC cap exceeded".to_string(),
+                rule_name: "usdc-cap".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn token_amount_exceeds_does_not_fire_below_threshold() {
+        let policy = PolicySet::new(
+            vec![
+                PolicyRule {
+                    name: "usdc-cap".to_string(),
+                    description: "USDC >= 100".to_string(),
+                    condition: PolicyCondition::TokenAmountExceeds {
+                        mint: USDC_MINT.to_string(),
+                        threshold: 100_000_000,
+                    },
+                    action: PolicyAction::Reject {
+                        reason: "USDC cap exceeded".to_string(),
+                    },
+                },
+                PolicyRule {
+                    name: "fallback".to_string(),
+                    description: "approve".to_string(),
+                    condition: PolicyCondition::Always,
+                    action: PolicyAction::Approve,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+
+        // 50 USDC → should NOT fire
+        let proposal = proposal_with_token_transfer("wallet", USDC_MINT, 50_000_000, 6);
+        let result = policy.evaluate(&context(&proposal));
+        assert_eq!(result.verdict, PolicyVerdict::Approved { rule_name: "fallback".to_string() });
+    }
+
+    #[test]
+    fn token_amount_exceeds_ignores_other_mints() {
+        let policy = PolicySet::new(
+            vec![
+                PolicyRule {
+                    name: "usdc-only-cap".to_string(),
+                    description: "Only check USDC".to_string(),
+                    condition: PolicyCondition::TokenAmountExceeds {
+                        mint: USDC_MINT.to_string(),
+                        threshold: 100_000_000,
+                    },
+                    action: PolicyAction::Reject { reason: "USDC cap".to_string() },
+                },
+                PolicyRule {
+                    name: "fallback".to_string(),
+                    description: "approve".to_string(),
+                    condition: PolicyCondition::Always,
+                    action: PolicyAction::Approve,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+
+        // 1 BILLION BONK transferred — but the USDC rule should not fire
+        let proposal = proposal_with_token_transfer("wallet", BONK_MINT, 1_000_000_000_000, 5);
+        let result = policy.evaluate(&context(&proposal));
+        assert_eq!(
+            result.verdict,
+            PolicyVerdict::Approved { rule_name: "fallback".to_string() },
+            "non-USDC transfer should not trigger USDC cap"
+        );
+    }
+
+    #[test]
+    fn mint_not_in_allowlist_fires_for_unlisted_mint() {
+        let policy = PolicySet::new(
+            vec![
+                PolicyRule {
+                    name: "stablecoin-only".to_string(),
+                    description: "Only USDC and USDT".to_string(),
+                    condition: PolicyCondition::MintNotInAllowlist {
+                        allowed_mints: vec![USDC_MINT.to_string(), USDT_MINT.to_string()],
+                    },
+                    action: PolicyAction::Reject {
+                        reason: "non-stablecoin token".to_string(),
+                    },
+                },
+                PolicyRule {
+                    name: "fallback".to_string(),
+                    description: "approve".to_string(),
+                    condition: PolicyCondition::Always,
+                    action: PolicyAction::Approve,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+
+        // BONK is not in the stablecoin allowlist
+        let proposal = proposal_with_token_transfer("wallet", BONK_MINT, 1000, 5);
+        let result = policy.evaluate(&context(&proposal));
+        assert_eq!(
+            result.verdict,
+            PolicyVerdict::Rejected {
+                reason: "non-stablecoin token".to_string(),
+                rule_name: "stablecoin-only".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn mint_not_in_allowlist_passes_for_listed_mint() {
+        let policy = PolicySet::new(
+            vec![
+                PolicyRule {
+                    name: "stablecoin-only".to_string(),
+                    description: "Only USDC and USDT".to_string(),
+                    condition: PolicyCondition::MintNotInAllowlist {
+                        allowed_mints: vec![USDC_MINT.to_string(), USDT_MINT.to_string()],
+                    },
+                    action: PolicyAction::Reject {
+                        reason: "non-stablecoin".to_string(),
+                    },
+                },
+                PolicyRule {
+                    name: "fallback".to_string(),
+                    description: "approve".to_string(),
+                    condition: PolicyCondition::Always,
+                    action: PolicyAction::Approve,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+
+        let proposal = proposal_with_token_transfer("wallet", USDC_MINT, 1_000_000, 6);
+        let result = policy.evaluate(&context(&proposal));
+        assert_eq!(result.verdict, PolicyVerdict::Approved { rule_name: "fallback".to_string() });
+    }
+
+    #[test]
+    fn mint_not_in_allowlist_empty_list_disables_check() {
+        let policy = PolicySet::new(
+            vec![
+                PolicyRule {
+                    name: "noop-allowlist".to_string(),
+                    description: "Empty list = no enforcement".to_string(),
+                    condition: PolicyCondition::MintNotInAllowlist {
+                        allowed_mints: vec![],
+                    },
+                    action: PolicyAction::Reject { reason: "should not fire".to_string() },
+                },
+                PolicyRule {
+                    name: "fallback".to_string(),
+                    description: "approve".to_string(),
+                    condition: PolicyCondition::Always,
+                    action: PolicyAction::Approve,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+
+        let proposal = proposal_with_token_transfer("wallet", BONK_MINT, 999, 5);
+        let result = policy.evaluate(&context(&proposal));
+        assert_eq!(
+            result.verdict,
+            PolicyVerdict::Approved { rule_name: "fallback".to_string() },
+            "empty allowlist should not block any mint"
+        );
+    }
+
+    #[test]
+    fn token_amount_exceeds_sums_multiple_instructions() {
+        // Two USDC transfers in one tx, each below threshold but sum is above.
+        use claw_types::transaction::TokenTransfer;
+
+        let proposal = TransactionProposal {
+            id: Uuid::new_v4(),
+            session_id: SessionId::from(Uuid::new_v4()),
+            wallet_pubkey: "wallet".to_string(),
+            network: SolanaNetwork::Devnet,
+            description: "split USDC".to_string(),
+            transaction_b64: String::new(),
+            instructions_summary: vec![
+                InstructionSummary {
+                    program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                    program_name: Some("SPL Token".to_string()),
+                    description: "transfer 1".to_string(),
+                    transfer_lamports: None,
+                    token_transfer: Some(TokenTransfer {
+                        mint: USDC_MINT.to_string(),
+                        amount: 60_000_000, // 60 USDC
+                        decimals: Some(6),
+                        source: "src1".to_string(),
+                        destination: "dst1".to_string(),
+                    }),
+                    accounts: vec![],
+                },
+                InstructionSummary {
+                    program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                    program_name: Some("SPL Token".to_string()),
+                    description: "transfer 2".to_string(),
+                    transfer_lamports: None,
+                    token_transfer: Some(TokenTransfer {
+                        mint: USDC_MINT.to_string(),
+                        amount: 50_000_000, // 50 USDC
+                        decimals: Some(6),
+                        source: "src2".to_string(),
+                        destination: "dst2".to_string(),
+                    }),
+                    accounts: vec![],
+                },
+            ],
+            created_at: chrono::Utc::now(),
+        };
+
+        let policy = PolicySet::new(
+            vec![
+                PolicyRule {
+                    name: "usdc-100-cap".to_string(),
+                    description: "USDC sum >= 100".to_string(),
+                    condition: PolicyCondition::TokenAmountExceeds {
+                        mint: USDC_MINT.to_string(),
+                        threshold: 100_000_000,
+                    },
+                    action: PolicyAction::Reject { reason: "split exceeds cap".to_string() },
+                },
+            ],
+            vec![],
+            vec![],
+        );
+
+        let result = policy.evaluate(&context(&proposal));
+        // Sum is 110 USDC, exceeds 100 threshold
+        assert!(result.verdict.is_blocked() || result.verdict.requires_human() ||
+            matches!(&result.verdict, PolicyVerdict::Rejected { .. }),
+            "split transfer that sums above threshold should fire");
     }
 }

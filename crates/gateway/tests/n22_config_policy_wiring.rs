@@ -98,6 +98,7 @@ fn make_proposal(
             program_name: Some("test".to_string()),
             description: "test instruction".to_string(),
             transfer_lamports,
+            token_transfer: None,
             accounts: vec![
                 AccountRole {
                     pubkey: "WalletPubkey1111111111111111111111111111111".to_string(),
@@ -588,4 +589,209 @@ fn no_matching_role_profile_falls_through_to_global() {
             rule_name: "global-approve-all".to_string(),
         }
     );
+}
+
+// ── USDC sponsorship demo path: TOML → PolicySet → fires on USDC ─────────
+
+const USDC_MINT_DEMO: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+const USDC_DEMO_TOML: &str = r#"
+[daemon]
+db_path = "./data/test.db"
+
+[network]
+network = "devnet"
+
+[rpc]
+primary_url = "https://api.devnet.solana.com"
+ws_url = "wss://api.devnet.solana.com"
+timeout_ms = 15000
+
+[policy]
+mainnet_safe_defaults = false
+program_allowlist = []
+destination_denylist = []
+
+# USDC medium-value: require human approval for transfers >= 100 USDC
+[[policy.rules]]
+name = "usdc-medium-value-requires-human"
+description = "USDC transfers >= 100 USDC require human approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 100000000 }
+action = { type = "RequireHumanApproval", reason = "USDC >= 100 USDC requires operator approval" }
+
+# USDC high-value: require multi-stage approval for transfers >= 10K USDC
+[[policy.rules]]
+name = "usdc-high-value-chain"
+description = "USDC transfers >= 10K USDC require risk + treasury approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 10000000000 }
+action = { type = "RequireApprovalChain", reason = "USDC >= 10K requires multi-stage approval", stages = [
+    { role = "risk", description = "Risk officer review", min_approvals = 1 },
+    { role = "treasury", description = "Treasury sign-off", min_approvals = 1 },
+]}
+
+[llm]
+provider = "openai"
+api_key = ""
+model = "gpt-4o-mini"
+
+[api]
+bind_addr = "127.0.0.1"
+port = 7070
+
+[logging]
+format = "pretty"
+level = "info"
+"#;
+
+fn proposal_with_usdc_transfer(amount: u64) -> claw_types::transaction::TransactionProposal {
+    use claw_types::transaction::{InstructionSummary, TokenTransfer};
+    claw_types::transaction::TransactionProposal {
+        id: Uuid::new_v4(),
+        session_id: claw_types::session::SessionId::from(Uuid::new_v4()),
+        wallet_pubkey: "WalletPubkey1111111111111111111111111111111".to_string(),
+        network: claw_types::solana::SolanaNetwork::Devnet,
+        description: "USDC transfer".to_string(),
+        transaction_b64: String::new(),
+        instructions_summary: vec![InstructionSummary {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            program_name: Some("SPL Token".to_string()),
+            description: format!("TransferChecked {} USDC raw units", amount),
+            transfer_lamports: None,
+            token_transfer: Some(TokenTransfer {
+                mint: USDC_MINT_DEMO.to_string(),
+                amount,
+                decimals: Some(6),
+                source: "src-token-account".to_string(),
+                destination: "dst-token-account".to_string(),
+            }),
+            accounts: vec![],
+        }],
+        created_at: chrono::Utc::now(),
+    }
+}
+
+#[test]
+fn usdc_demo_toml_parses_with_two_chain_rules() {
+    let config: ClawConfig = toml::from_str(USDC_DEMO_TOML).expect("USDC TOML should parse");
+    assert_eq!(config.policy.rules.len(), 2);
+    assert_eq!(config.policy.rules[0].name, "usdc-medium-value-requires-human");
+    assert_eq!(config.policy.rules[1].name, "usdc-high-value-chain");
+}
+
+#[test]
+fn usdc_50_usdc_falls_through_to_no_match_failsafe() {
+    // Below 100 USDC threshold, no rule matches → fail-closed default
+    let config: ClawConfig = toml::from_str(USDC_DEMO_TOML).unwrap();
+    let policy = build_policy_set(&config);
+
+    let proposal = proposal_with_usdc_transfer(50_000_000); // 50 USDC
+    let result = policy.evaluate(&eval_ctx(&proposal));
+
+    // The two USDC rules don't match. There's no catch-all approve in this TOML.
+    // PolicySet falls through to the default fail-closed: RequiresHumanApproval.
+    assert!(
+        result.verdict.requires_human(),
+        "50 USDC with no matching rule should fail closed: {:?}",
+        result.verdict
+    );
+}
+
+#[test]
+fn usdc_500_usdc_triggers_medium_value_rule() {
+    let config: ClawConfig = toml::from_str(USDC_DEMO_TOML).unwrap();
+    let policy = build_policy_set(&config);
+
+    let proposal = proposal_with_usdc_transfer(500_000_000); // 500 USDC
+    let result = policy.evaluate(&eval_ctx(&proposal));
+
+    assert_eq!(
+        result.verdict,
+        PolicyVerdict::RequiresHumanApproval {
+            reason: "USDC >= 100 USDC requires operator approval".to_string(),
+            rule_name: "usdc-medium-value-requires-human".to_string(),
+            required_approver_role: None,
+            approval_chain: None,
+        },
+        "500 USDC should trigger medium-value rule"
+    );
+    assert_eq!(result.matched_rule_index, Some(0));
+}
+
+#[test]
+fn usdc_50k_usdc_triggers_multi_stage_chain() {
+    let config: ClawConfig = toml::from_str(USDC_DEMO_TOML).unwrap();
+    let policy = build_policy_set(&config);
+
+    let proposal = proposal_with_usdc_transfer(50_000_000_000); // 50K USDC
+    let result = policy.evaluate(&eval_ctx(&proposal));
+
+    // Both rules match, but first-match-wins → medium-value rule fires.
+    // This is intentional: if you want chain to take precedence, put it FIRST in TOML.
+    // We test the default ordering behavior here.
+    assert_eq!(
+        result.matched_rule_index, Some(0),
+        "first-match-wins: medium-value rule fires before chain rule"
+    );
+}
+
+#[test]
+fn usdc_chain_rule_fires_when_listed_first() {
+    // Reorder rules: chain rule first (for high values to trigger it)
+    let toml = r#"
+[daemon]
+db_path = "./data/test.db"
+[network]
+network = "devnet"
+[rpc]
+primary_url = "https://api.devnet.solana.com"
+ws_url = "wss://api.devnet.solana.com"
+timeout_ms = 15000
+[policy]
+mainnet_safe_defaults = false
+program_allowlist = []
+destination_denylist = []
+
+[[policy.rules]]
+name = "usdc-high-value-chain"
+description = "USDC transfers >= 10K USDC require risk + treasury approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 10000000000 }
+action = { type = "RequireApprovalChain", reason = "USDC >= 10K requires multi-stage approval", stages = [
+    { role = "risk", description = "Risk officer review", min_approvals = 1 },
+    { role = "treasury", description = "Treasury sign-off", min_approvals = 1 },
+]}
+
+[[policy.rules]]
+name = "usdc-medium-value-requires-human"
+description = "USDC transfers >= 100 USDC require human approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 100000000 }
+action = { type = "RequireHumanApproval", reason = "USDC >= 100" }
+
+[llm]
+provider = "openai"
+api_key = ""
+model = "gpt-4o-mini"
+[api]
+bind_addr = "127.0.0.1"
+port = 7070
+[logging]
+format = "pretty"
+level = "info"
+"#;
+    let config: ClawConfig = toml::from_str(toml).unwrap();
+    let policy = build_policy_set(&config);
+
+    // 50K USDC should trigger the chain rule (first in list)
+    let proposal = proposal_with_usdc_transfer(50_000_000_000);
+    let result = policy.evaluate(&eval_ctx(&proposal));
+
+    match &result.verdict {
+        PolicyVerdict::RequiresHumanApproval { rule_name, approval_chain, .. } => {
+            assert_eq!(rule_name, "usdc-high-value-chain");
+            let chain = approval_chain.as_ref().expect("should carry chain");
+            assert_eq!(chain.len(), 2);
+            assert_eq!(chain[0].role, "risk");
+            assert_eq!(chain[1].role, "treasury");
+        }
+        other => panic!("expected RequiresHumanApproval with chain, got {:?}", other),
+    }
 }

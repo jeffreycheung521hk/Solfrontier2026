@@ -156,6 +156,22 @@ pub enum PolicyCondition {
     /// Matches if simulation was not run successfully.
     SimulationNotPassed,
 
+    /// Matches if any SPL Token transfer of the given mint exceeds the threshold.
+    /// Use this to enforce per-token spend caps (e.g., "block USDC transfers >= 1000 USDC").
+    /// The threshold is in raw token units (multiply by 10^decimals to convert from human-readable).
+    /// For USDC (6 decimals): 1 USDC = 1_000_000 raw units.
+    TokenAmountExceeds {
+        mint: String,
+        threshold: u64,
+    },
+
+    /// Matches if any SPL Token transfer references a mint NOT in the allowlist.
+    /// Use this to whitelist accepted stablecoins (e.g., only USDC and USDT).
+    /// Empty allowlist disables the check (does not match).
+    MintNotInAllowlist {
+        allowed_mints: Vec<String>,
+    },
+
     /// Matches if the current time is outside the allowed window.
     /// Use this to restrict transactions to business hours.
     OutsideAllowedHours {
@@ -224,6 +240,15 @@ enum PolicyConditionTagged {
     DestinationInDenylist,
     #[serde(alias = "simulation_not_passed")]
     SimulationNotPassed,
+    #[serde(alias = "token_amount_exceeds")]
+    TokenAmountExceeds {
+        mint: String,
+        threshold: u64,
+    },
+    #[serde(alias = "mint_not_in_allowlist")]
+    MintNotInAllowlist {
+        allowed_mints: Vec<String>,
+    },
     #[serde(alias = "outside_allowed_hours")]
     OutsideAllowedHours {
         start_hour: u8,
@@ -272,6 +297,17 @@ impl Serialize for PolicyCondition {
             PolicyCondition::SimulationNotPassed => {
                 PolicyConditionWire::Unit("SimulationNotPassed".to_string())
             }
+            PolicyCondition::TokenAmountExceeds { mint, threshold } => {
+                PolicyConditionWire::Tagged(PolicyConditionTagged::TokenAmountExceeds {
+                    mint: mint.clone(),
+                    threshold: *threshold,
+                })
+            }
+            PolicyCondition::MintNotInAllowlist { allowed_mints } => {
+                PolicyConditionWire::Tagged(PolicyConditionTagged::MintNotInAllowlist {
+                    allowed_mints: allowed_mints.clone(),
+                })
+            }
             PolicyCondition::OutsideAllowedHours { start_hour, end_hour, allowed_days, utc_offset_hours } => {
                 PolicyConditionWire::Tagged(PolicyConditionTagged::OutsideAllowedHours {
                     start_hour: *start_hour,
@@ -308,6 +344,12 @@ impl<'de> Deserialize<'de> for PolicyCondition {
                     PolicyCondition::AmountExceedsLamports(threshold)
                 }
                 PolicyConditionTagged::SimulationNotPassed => PolicyCondition::SimulationNotPassed,
+                PolicyConditionTagged::TokenAmountExceeds { mint, threshold } => {
+                    PolicyCondition::TokenAmountExceeds { mint, threshold }
+                }
+                PolicyConditionTagged::MintNotInAllowlist { allowed_mints } => {
+                    PolicyCondition::MintNotInAllowlist { allowed_mints }
+                }
                 PolicyConditionTagged::OutsideAllowedHours { start_hour, end_hour, allowed_days, utc_offset_hours } => {
                     PolicyCondition::OutsideAllowedHours { start_hour, end_hour, allowed_days, utc_offset_hours }
                 }
@@ -512,5 +554,72 @@ action = { type = "Reject", reason = "outside hours" }
                 utc_offset_hours: 0,
             }
         );
+    }
+
+    // ── USDC / Stablecoin condition tests ─────────────────────────────────
+
+    #[test]
+    fn policy_rule_deserializes_token_amount_exceeds() {
+        let rule: PolicyRule = toml::from_str(
+            r#"
+name = "usdc-cap"
+description = "USDC transfers >= 100 USDC require approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 100000000 }
+action = { type = "RequireHumanApproval", reason = "USDC >= 100" }
+"#,
+        )
+        .expect("TokenAmountExceeds should deserialize");
+
+        assert_eq!(
+            rule.condition,
+            PolicyCondition::TokenAmountExceeds {
+                mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                threshold: 100_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn policy_rule_deserializes_mint_not_in_allowlist() {
+        let rule: PolicyRule = toml::from_str(
+            r#"
+name = "stablecoin-only"
+description = "Only USDC and USDT allowed"
+condition = { type = "MintNotInAllowlist", allowed_mints = ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"] }
+action = { type = "Reject", reason = "non-stablecoin token" }
+"#,
+        )
+        .expect("MintNotInAllowlist should deserialize");
+
+        assert_eq!(
+            rule.condition,
+            PolicyCondition::MintNotInAllowlist {
+                allowed_mints: vec![
+                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".to_string(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn token_amount_exceeds_round_trips_through_serde() {
+        let original = PolicyCondition::TokenAmountExceeds {
+            mint: "test-mint".to_string(),
+            threshold: 12345,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: PolicyCondition = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn mint_not_in_allowlist_round_trips_through_serde() {
+        let original = PolicyCondition::MintNotInAllowlist {
+            allowed_mints: vec!["mint-a".into(), "mint-b".into()],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: PolicyCondition = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, parsed);
     }
 }

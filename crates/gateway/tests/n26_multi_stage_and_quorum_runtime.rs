@@ -33,6 +33,7 @@ fn make_proposal(wallet: &str, transfer_lamports: u64) -> TransactionProposal {
             program_name: Some("system".to_string()),
             description: "SOL transfer".to_string(),
             transfer_lamports: Some(transfer_lamports),
+            token_transfer: None,
             accounts: vec![
                 AccountRole {
                     pubkey: wallet.to_string(),

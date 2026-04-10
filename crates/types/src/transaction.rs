@@ -47,9 +47,34 @@ pub struct InstructionSummary {
     pub program_id:  String,
     pub program_name: Option<String>,
     pub description: String,
+    /// SOL transfer amount in lamports (System Program transfer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_lamports: Option<u64>,
+    /// SPL Token transfer details (mint, amount, accounts) if this is a token transfer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_transfer: Option<TokenTransfer>,
     pub accounts:    Vec<AccountRole>,
+}
+
+/// Decoded SPL Token transfer details.
+///
+/// Populated when an instruction is an SPL Token `Transfer` or `TransferChecked`.
+/// The mint is only directly available for `TransferChecked`; for legacy
+/// `Transfer` it must be looked up via the source account (V1 limitation:
+/// we only decode `TransferChecked` and Transfer with mint pre-resolved).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenTransfer {
+    /// The token mint address (e.g., USDC mint pubkey).
+    pub mint: String,
+    /// The raw token amount (in smallest units; for USDC, multiply by 10^-decimals).
+    pub amount: u64,
+    /// Token decimals if known (TransferChecked carries this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimals: Option<u8>,
+    /// Source token account.
+    pub source: String,
+    /// Destination token account.
+    pub destination: String,
 }
 
 /// An account referenced by an instruction, with its role.

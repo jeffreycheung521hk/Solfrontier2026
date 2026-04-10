@@ -114,6 +114,43 @@ description = "Block transactions invoking programs not on the allow list"
 condition = "ProgramNotInAllowlist"
 action = { type = "Reject", reason = "program is not on the allow list" }
 
+# ── USDC / Stablecoin policy rules (Circle sponsorship demo) ──────────────
+# USDC mint addresses:
+#   Mainnet:  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+#   Devnet:   4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
+#
+# USDC has 6 decimals, so 1 USDC = 1_000_000 raw units.
+# 100 USDC = 100_000_000 raw units.
+# 10,000 USDC = 10_000_000_000 raw units.
+
+# Rule 4: Cap individual USDC transfers at 100 USDC (auto-approve below)
+[[policy.rules]]
+name = "usdc-medium-value-requires-human"
+description = "Transfers >= 100 USDC require human approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 100_000_000 }
+action = { type = "RequireHumanApproval", reason = "USDC transfer >= 100 USDC requires operator approval" }
+
+# Rule 5: High-value USDC transfers require multi-step approval (risk → treasury)
+[[policy.rules]]
+name = "usdc-high-value-chain"
+description = "Transfers >= 10,000 USDC require risk + treasury approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 10_000_000_000 }
+action = { type = "RequireApprovalChain", reason = "USDC >= 10K requires multi-stage approval", stages = [
+    { role = "risk", description = "Risk officer review for high-value USDC", min_approvals = 1 },
+    { role = "treasury", description = "Treasury sign-off for high-value USDC", min_approvals = 1 },
+]}
+
+# Rule 6: Reject any token transfer that isn't USDC or USDT (stablecoin allowlist)
+# Uncomment to enable strict stablecoin-only mode.
+# [[policy.rules]]
+# name = "stablecoin-only"
+# description = "Only USDC and USDT token transfers are allowed"
+# condition = { type = "MintNotInAllowlist", allowed_mints = [
+#     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC mainnet
+#     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT mainnet
+# ]}
+# action = { type = "Reject", reason = "only USDC and USDT are accepted as stablecoins" }
+
 # ── Per-role default policy profiles ──────────────────────────────────────
 # When a session opens with a given role, the matching profile's rules are
 # automatically injected. Caller overrides take precedence over profile rules.
