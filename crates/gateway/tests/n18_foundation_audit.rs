@@ -310,6 +310,7 @@ async fn n5_resume_with_durable_local_path() {
             pending_signing, audit, spend, event_bus,
             session_id.clone(), pubkey.to_string(), completion_meta,
             Some(durable),
+            300,
         ).await;
     });
 
@@ -423,6 +424,7 @@ async fn n5_consumed_durable_approval_not_recoverable_after_restart() {
             pending_signing, audit, spend, event_bus,
             session_id, pubkey.to_string(), completion_meta,
             Some(durable),
+            300,
         ).await;
     });
     pending_for_signal.signal(request_id, claw_types::approval::ApprovalWorkflowState::Approved);
@@ -620,6 +622,7 @@ async fn n7_rejected_approval_does_not_record_spend() {
             pending_signing, audit, spend, event_bus,
             session_id, pubkey.to_string(), completion_meta,
             None,
+            300,
         ).await;
     });
 
@@ -729,6 +732,7 @@ async fn n7_spend_recorded_exactly_once_on_resume_path() {
             pending_signing, audit, spend, event_bus,
             session_id, pubkey.to_string(), completion_meta,
             None,
+            300,
         ).await;
     });
 

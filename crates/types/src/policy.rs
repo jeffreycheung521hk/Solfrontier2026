@@ -172,6 +172,13 @@ pub enum PolicyCondition {
         allowed_mints: Vec<String>,
     },
 
+    /// Matches if any instruction is a legacy SPL Token `Transfer` (tag 3).
+    /// Legacy Transfer does NOT include the mint in its accounts, so token-aware
+    /// policies (`TokenAmountExceeds`, `MintNotInAllowlist`) cannot enforce
+    /// per-mint rules against it. Use this condition to REJECT legacy transfers
+    /// entirely when token policy is in effect, closing the bypass.
+    LegacyTokenTransferPresent,
+
     /// Matches if the current time is outside the allowed window.
     /// Use this to restrict transactions to business hours.
     OutsideAllowedHours {
@@ -297,6 +304,9 @@ impl Serialize for PolicyCondition {
             PolicyCondition::SimulationNotPassed => {
                 PolicyConditionWire::Unit("SimulationNotPassed".to_string())
             }
+            PolicyCondition::LegacyTokenTransferPresent => {
+                PolicyConditionWire::Unit("LegacyTokenTransferPresent".to_string())
+            }
             PolicyCondition::TokenAmountExceeds { mint, threshold } => {
                 PolicyConditionWire::Tagged(PolicyConditionTagged::TokenAmountExceeds {
                     mint: mint.clone(),
@@ -371,6 +381,9 @@ fn parse_policy_condition_unit(name: &str) -> Option<PolicyCondition> {
             Some(PolicyCondition::SimulationNotPassed)
         }
         "Always" | "always" => Some(PolicyCondition::Always),
+        "LegacyTokenTransferPresent" | "legacy_token_transfer_present" => {
+            Some(PolicyCondition::LegacyTokenTransferPresent)
+        }
         _ => None,
     }
 }
@@ -618,6 +631,29 @@ action = { type = "Reject", reason = "non-stablecoin token" }
         let original = PolicyCondition::MintNotInAllowlist {
             allowed_mints: vec!["mint-a".into(), "mint-b".into()],
         };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: PolicyCondition = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn policy_rule_deserializes_legacy_token_transfer_present() {
+        let rule: PolicyRule = toml::from_str(
+            r#"
+name = "block-legacy"
+description = "Block legacy SPL Token Transfer"
+condition = "LegacyTokenTransferPresent"
+action = { type = "Reject", reason = "use TransferChecked" }
+"#,
+        )
+        .expect("LegacyTokenTransferPresent should deserialize as unit variant");
+
+        assert_eq!(rule.condition, PolicyCondition::LegacyTokenTransferPresent);
+    }
+
+    #[test]
+    fn legacy_token_transfer_present_round_trips_through_serde() {
+        let original = PolicyCondition::LegacyTokenTransferPresent;
         let json = serde_json::to_string(&original).unwrap();
         let parsed: PolicyCondition = serde_json::from_str(&json).unwrap();
         assert_eq!(original, parsed);

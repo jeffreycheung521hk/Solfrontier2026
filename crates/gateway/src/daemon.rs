@@ -456,11 +456,13 @@ impl GatewayDaemon {
                 let cm_c           = completion_meta.clone();
                 let dur_c          = Some(durable_state.clone());
 
+                let lease_seconds = config.policy.approval_lease_seconds;
                 tokio::spawn(async move {
                     crate::tools::resume_after_approval(
                         decision_rx, entry, proposal, orchestrator_c,
                         pending_c, audit_c, spend_c, event_bus_c,
                         session_c, wallet_pubkey, cm_c, dur_c,
+                        lease_seconds,
                     ).await;
                 });
             }
@@ -1250,30 +1252,54 @@ impl GatewayApprovalHandler {
                     AuditSeverity::Info,
                 ).await;
             }
+            ApprovalOutcome::Expired => {
+                // Audit the lease expiry explicitly — this is NOT a real decision.
+                warn!(
+                    request_id = %decision.request_id,
+                    "late decision rejected: approval workflow lease expired"
+                );
+                let _ = self.audit.append(
+                    None, &decision.request_id.to_string(), "approval_lease_expired", actor,
+                    &serde_json::json!({
+                        "request_id":  decision.request_id,
+                        "operator_id": decision.operator_id,
+                        "reason":      "late decision arrived after lease expiry",
+                    }),
+                    AuditSeverity::Warning,
+                ).await;
+            }
             _ => {}
         }
 
-        // Terminal outcomes: additional audit + events.
-        if let Some(ref request) = maybe_request {
-            let (audit_event, audit_severity) = if decision.approved {
-                ("human_approved", AuditSeverity::Info)
-            } else {
-                ("human_rejected", AuditSeverity::Warning)
-            };
-            let _ = self.audit.append(
-                Some(&request.session_id.to_string()), &decision.request_id.to_string(),
-                audit_event, actor,
-                &serde_json::json!({ "request_id": decision.request_id, "transaction_id": request.transaction_id, "approved": decision.approved, "note": decision.note, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
-                audit_severity,
-            ).await;
+        // Terminal decision audit + events — ONLY fire on a real Approved or Rejected.
+        // Expired/NotFound/AlreadyDecided/RoleMismatch/DuplicateOperator/*Progress
+        // must NOT write a human_approved/human_rejected audit row.
+        let is_real_decision = matches!(
+            outcome,
+            ApprovalOutcome::Approved | ApprovalOutcome::Rejected
+        );
+        if is_real_decision {
+            if let Some(ref request) = maybe_request {
+                let (audit_event, audit_severity) = if decision.approved {
+                    ("human_approved", AuditSeverity::Info)
+                } else {
+                    ("human_rejected", AuditSeverity::Warning)
+                };
+                let _ = self.audit.append(
+                    Some(&request.session_id.to_string()), &decision.request_id.to_string(),
+                    audit_event, actor,
+                    &serde_json::json!({ "request_id": decision.request_id, "transaction_id": request.transaction_id, "approved": decision.approved, "note": decision.note, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
+                    audit_severity,
+                ).await;
 
-            self.event_bus.publish(GatewayEvent::ApprovalReceived(ApprovalLifecycleEvent {
-                header:         EventHeader::new(Some(request.session_id.clone())),
-                session_id:     request.session_id.clone(),
-                request_id:     request.id,
-                transaction_id: request.transaction_id,
-                approved:       Some(decision.approved),
-            }));
+                self.event_bus.publish(GatewayEvent::ApprovalReceived(ApprovalLifecycleEvent {
+                    header:         EventHeader::new(Some(request.session_id.clone())),
+                    session_id:     request.session_id.clone(),
+                    request_id:     request.id,
+                    transaction_id: request.transaction_id,
+                    approved:       Some(decision.approved),
+                }));
+            }
         }
 
         // ── Signal routing + alerts: delegated to extracted, tested function ─

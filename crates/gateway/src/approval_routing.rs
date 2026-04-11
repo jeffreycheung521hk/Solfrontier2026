@@ -65,6 +65,14 @@ pub fn route_approval_outcome(
 
         ApprovalOutcome::AlreadyDecided | ApprovalOutcome::NotFound => RoutingAction::Rejected,
 
+        ApprovalOutcome::Expired => {
+            // Lease expired — signal PendingSigningStore with Expired so the
+            // resume task wakes up and cleans up. This is the only way a late
+            // operator decision path can wake a parked signing task after expiry.
+            pending_signing.signal(request_id, ApprovalWorkflowState::Expired);
+            RoutingAction::Signaled(ApprovalWorkflowState::Expired)
+        }
+
         ApprovalOutcome::Approved => {
             pending_signing.signal(request_id, ApprovalWorkflowState::Approved);
             RoutingAction::Signaled(ApprovalWorkflowState::Approved)
@@ -239,6 +247,25 @@ mod tests {
         let alerts = AlertDispatcher::default();
         let action = route_approval_outcome(&ApprovalOutcome::NotFound, Uuid::new_v4(), &pending, &alerts, None);
         assert_eq!(action, RoutingAction::Rejected);
+    }
+
+    #[tokio::test]
+    async fn expired_signals_pending_store_with_expired_state() {
+        // Lease expiry must wake the parked signing task with the Expired
+        // state, not Approved/Rejected. This prevents false audit rows and
+        // ensures the signing resume task cleans up correctly.
+        let pending = PendingSigningStore::new();
+        let alerts = AlertDispatcher::default();
+        let rid = Uuid::new_v4();
+        let decision_rx = park_dummy(&pending, rid);
+
+        let action = route_approval_outcome(&ApprovalOutcome::Expired, rid, &pending, &alerts, None);
+        assert_eq!(action, RoutingAction::Signaled(ApprovalWorkflowState::Expired));
+
+        // Parked signing task receives Expired through the oneshot.
+        let state = decision_rx.await.expect("should receive expired signal");
+        assert_eq!(state, ApprovalWorkflowState::Expired);
+        assert!(!state.is_approved(), "expired is not approved");
     }
 
     #[test]

@@ -526,6 +526,7 @@ impl Tool for SubmitForSigningTool {
                 let completion_meta = self.completion_meta.clone();
                 let durable         = self.durable.clone();
 
+                let lease_seconds = self.approval_lease_seconds;
                 tokio::spawn(async move {
                     resume_after_approval(
                         decision_rx,
@@ -540,6 +541,7 @@ impl Tool for SubmitForSigningTool {
                         wallet_pubkey2,
                         completion_meta,
                         durable,
+                        lease_seconds,
                     ).await;
                 });
             }
@@ -815,16 +817,28 @@ pub async fn resume_after_approval(
     wallet_pubkey:   String,
     completion_meta: CompletionMetadataStore,
     durable:         Option<DurablePendingState>,
+    lease_seconds:   u64,
 ) {
     use claw_types::approval::ApprovalWorkflowState;
 
     let session_str = session_id.to_string();
 
-    // Wait for the workflow to reach a terminal state.
-    let workflow_state = match decision_rx.await {
-        Ok(state) => state,
-        Err(_) => {
-            // Sender dropped (e.g., daemon shutting down).
+    // Wait for the workflow to reach a terminal state, bounded by the lease.
+    // This ensures the parked signing task is actively reaped when no operator
+    // action arrives within the lease window — otherwise the oneshot would
+    // hang forever and approval_lease_seconds would be dead config.
+    let lease_duration = if lease_seconds > 0 {
+        std::time::Duration::from_secs(lease_seconds)
+    } else {
+        // 0 = no explicit lease; use a generous 24-hour fallback so the task
+        // still eventually wakes if the operator never responds.
+        std::time::Duration::from_secs(86_400)
+    };
+
+    let workflow_state = match tokio::time::timeout(lease_duration, decision_rx).await {
+        Ok(Ok(state)) => state,
+        Ok(Err(_)) => {
+            // Sender dropped (daemon shutting down).
             warn!(
                 session = %session_str,
                 request_id = %request_id,
@@ -834,6 +848,53 @@ pub async fn resume_after_approval(
                 durable.mark_approval_terminal(request_id, "expired", Some("channel dropped")).await;
             }
             pending_signing.remove(&request_id);
+            let _ = audit.append(
+                Some(&session_str),
+                &request_id.to_string(),
+                "approval_channel_dropped",
+                "system",
+                &serde_json::json!({ "request_id": request_id }),
+                AuditSeverity::Warning,
+            ).await;
+            return;
+        }
+        Err(_) => {
+            // Lease timeout: no operator action within the lease window.
+            // This is the active expiry enforcement path — without it,
+            // approval_lease_seconds would only be checked on operator-initiated
+            // decide() and would never fire if the operator simply walked away.
+            warn!(
+                session = %session_str,
+                request_id = %request_id,
+                lease_seconds = lease_seconds,
+                "approval lease expired without operator action — auto-expiring"
+            );
+            if let Some(ref durable) = durable {
+                durable.mark_approval_terminal(request_id, "expired", Some("lease timeout")).await;
+            }
+            pending_signing.remove(&request_id);
+            let _ = audit.append(
+                Some(&session_str),
+                &request_id.to_string(),
+                "approval_lease_expired_no_action",
+                "system",
+                &serde_json::json!({
+                    "request_id":    request_id,
+                    "lease_seconds": lease_seconds,
+                    "reason":        "no operator decision within lease window",
+                }),
+                AuditSeverity::Warning,
+            ).await;
+            event_bus.publish(GatewayEvent::TransactionFailed(
+                TransactionFailedEvent {
+                    header:         EventHeader::new(Some(session_id.clone())),
+                    session_id:     session_id.clone(),
+                    transaction_id: proposal.id,
+                    wallet_pubkey:  wallet_pubkey.clone(),
+                    error:          "approval lease expired".to_string(),
+                    at_stage:       TransactionStatus::AwaitingApproval,
+                },
+            ));
             return;
         }
     };
@@ -1125,6 +1186,7 @@ fn summarize_transaction_instructions(tx: &Transaction) -> Vec<InstructionSummar
                 description:     decoded.description,
                 transfer_lamports: decoded.transfer_lamports,
                 token_transfer:  decoded.token_transfer,
+                is_legacy_token_transfer: decoded.is_legacy_token_transfer,
                 accounts,
             })
         })
@@ -1137,6 +1199,7 @@ struct DecodedInstruction {
     description: String,
     transfer_lamports: Option<u64>,
     token_transfer: Option<claw_types::transaction::TokenTransfer>,
+    is_legacy_token_transfer: bool,
 }
 
 /// SPL Token program ID.
@@ -1168,6 +1231,7 @@ fn decode_instruction(
                         description: format!("Transfer {} lamports to {}", lamports, to),
                         transfer_lamports: Some(lamports),
                         token_transfer: None,
+                        is_legacy_token_transfer: false,
                     };
                 }
                 SystemInstruction::CreateAccount { lamports, space, owner } => {
@@ -1179,6 +1243,7 @@ fn decode_instruction(
                         ),
                         transfer_lamports: Some(lamports),
                         token_transfer: None,
+                        is_legacy_token_transfer: false,
                     };
                 }
                 _ => {
@@ -1187,6 +1252,7 @@ fn decode_instruction(
                         description: format!("{:?}", sys_ix),
                         transfer_lamports: None,
                         token_transfer: None,
+                        is_legacy_token_transfer: false,
                     };
                 }
             }
@@ -1199,6 +1265,7 @@ fn decode_instruction(
             description: "ComputeBudget instruction".to_string(),
             transfer_lamports: None,
             token_transfer: None,
+            is_legacy_token_transfer: false,
         };
     }
 
@@ -1213,6 +1280,7 @@ fn decode_instruction(
             description: "SPL Token instruction".to_string(),
             transfer_lamports: None,
             token_transfer: None,
+            is_legacy_token_transfer: false,
         };
     }
 
@@ -1222,6 +1290,7 @@ fn decode_instruction(
         description: format!("Instruction for program {}", &program_id[..8.min(program_id.len())]),
         transfer_lamports: None,
         token_transfer: None,
+        is_legacy_token_transfer: false,
     }
 }
 
@@ -1278,6 +1347,7 @@ fn decode_spl_token_instruction(
                     source,
                     destination,
                 }),
+                is_legacy_token_transfer: false,
             })
         }
         // Transfer (legacy, no mint in accounts)
@@ -1300,6 +1370,7 @@ fn decode_spl_token_instruction(
                 ),
                 transfer_lamports: None,
                 token_transfer: None,
+                is_legacy_token_transfer: true,
             })
         }
         _ => None,
@@ -1584,7 +1655,43 @@ mod tests {
         let s = &summaries[0];
         assert_eq!(s.program_name.as_deref(), Some("SPL Token"));
         assert!(s.token_transfer.is_none(), "legacy Transfer doesn't decode mint in V1");
+        assert!(s.is_legacy_token_transfer, "legacy Transfer flag must be set for policy to detect bypass attempts");
         assert!(s.description.contains("legacy"));
+    }
+
+    #[test]
+    fn summarize_transfer_checked_is_not_marked_legacy() {
+        // TransferChecked must NOT be marked as legacy, otherwise the
+        // LegacyTokenTransferPresent condition would false-positive and
+        // block all token transfers.
+        let source = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let spl_token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse().unwrap();
+
+        let mut data = vec![12u8]; // TransferChecked tag
+        data.extend_from_slice(&1_000u64.to_le_bytes());
+        data.push(6u8); // decimals
+
+        let ix = solana_sdk::instruction::Instruction::new_with_bytes(
+            spl_token_program,
+            &data,
+            vec![
+                solana_sdk::instruction::AccountMeta::new(source, false),
+                solana_sdk::instruction::AccountMeta::new_readonly(mint, false),
+                solana_sdk::instruction::AccountMeta::new(destination, false),
+                solana_sdk::instruction::AccountMeta::new_readonly(authority, true),
+            ],
+        );
+        let msg = Message::new(&[ix], Some(&authority));
+        let tx = Transaction::new_unsigned(msg);
+        let summaries = summarize_transaction_instructions(&tx);
+
+        assert!(!summaries[0].is_legacy_token_transfer,
+            "TransferChecked must NOT be flagged as legacy");
+        assert!(summaries[0].token_transfer.is_some(),
+            "TransferChecked must produce a token_transfer");
     }
 
     #[test]
@@ -1610,6 +1717,7 @@ mod tests {
                 description: "Transfer 42000000 lamports".to_string(),
                 transfer_lamports: Some(42_000_000),
                 token_transfer: None,
+                is_legacy_token_transfer: false,
                 accounts: vec![
                     AccountRole {
                         pubkey: "wallet".to_string(),

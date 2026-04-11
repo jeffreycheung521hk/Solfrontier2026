@@ -32,6 +32,7 @@ fn make_proposal(wallet_pubkey: &str, transfer_lamports: u64) -> TransactionProp
             description: "SOL transfer".to_string(),
             transfer_lamports: Some(transfer_lamports),
             token_transfer: None,
+            is_legacy_token_transfer: false,
             accounts: vec![
                 AccountRole {
                     pubkey: wallet_pubkey.to_string(),
@@ -257,15 +258,20 @@ fn expired_signing_lease_rejects_late_approval() {
     let d = ApprovalDecision::approve(request_id, Some("too late".into()));
     let (outcome, maybe_req) = store.decide(&d);
 
-    // The store treats expired workflows as "gone" (NotFound).
+    // Expired workflows return ApprovalOutcome::Expired (NOT NotFound).
+    // This is load-bearing: daemon uses this to distinguish lease expiry
+    // from real approval/rejection and avoid writing false audit rows.
     assert_eq!(
         outcome,
-        ApprovalOutcome::NotFound,
-        "expired workflow should reject the approval"
+        ApprovalOutcome::Expired,
+        "expired workflow should return Expired, not NotFound"
     );
-    // The request should be consumed/removed since the workflow expired.
-    assert!(maybe_req.is_some(), "expired request should be returned for cleanup");
-    assert_eq!(store.pending_count(), 0, "expired request should be removed");
+    // The request is NOT returned — expiry is not a decision.
+    assert!(
+        maybe_req.is_none(),
+        "expired request must NOT be returned: daemon would write false audit if it were"
+    );
+    assert_eq!(store.pending_count(), 0, "expired request should be removed from pending");
 }
 
 #[tokio::test]
@@ -348,7 +354,7 @@ async fn expired_lease_blocks_pending_signing_signal() {
     let store = ApprovalStore::new();
     store.register(req, wf);
 
-    // Try to approve — should detect expiry and return NotFound.
+    // Try to approve — should detect expiry and return Expired outcome.
     let decision = claw_types::approval::ApprovalDecision::approve_as(
         request_id,
         None,
@@ -357,12 +363,13 @@ async fn expired_lease_blocks_pending_signing_signal() {
     let (outcome, expired_req) = store.decide(&decision);
     assert_eq!(
         outcome,
-        claw_types::approval::ApprovalOutcome::NotFound,
-        "expired workflow should reject the approval"
+        claw_types::approval::ApprovalOutcome::Expired,
+        "expired workflow should return Expired outcome"
     );
-    assert!(expired_req.is_some(), "expired request should be returned for cleanup");
+    assert!(expired_req.is_none(), "expired request must NOT be returned as a real decision");
 
     // Replicate daemon wiring: on expiry detection, signal PendingSigningStore with Expired.
+    // (In production this happens via route_approval_outcome's Expired arm.)
     let signaled = pending.signal(request_id, ApprovalWorkflowState::Expired);
     assert!(signaled, "PendingSigningStore should accept the expired signal");
 

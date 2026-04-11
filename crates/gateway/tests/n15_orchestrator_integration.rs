@@ -356,7 +356,7 @@ async fn human_approved_local_signs_via_orchestrator_after_approval() {
     let resume_handle = tokio::spawn(async move {
         resume_after_approval(
             decision_rx, request_id, prop, orchestrator,
-            pending, audit, spend, event_bus, session, wpk, cm, None,
+            pending, audit, spend, event_bus, session, wpk, cm, None, 300,
         ).await;
     });
 
@@ -441,7 +441,7 @@ async fn human_approved_external_pending_then_complete_after_approval() {
     let resume_handle = tokio::spawn(async move {
         resume_after_approval(
             decision_rx, request_id, prop, orchestrator,
-            pending, audit, spend, event_bus, session, wpk, cm, None,
+            pending, audit, spend, event_bus, session, wpk, cm, None, 300,
         ).await;
     });
 

@@ -154,6 +154,10 @@ pub enum ApprovalOutcome {
         operator_id: String,
         stage: usize,
     },
+    /// The workflow's lease expired before this decision arrived.
+    /// The decision is rejected; the workflow is now terminal Expired.
+    /// NOT a real approval/rejection — audit/events must reflect expiry.
+    Expired,
 }
 
 /// A stage definition in a multi-step approval chain (from policy config).

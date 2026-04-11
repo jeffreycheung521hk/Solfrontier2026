@@ -98,6 +98,10 @@ impl ApprovalStore {
         }
 
         // ── Check lease expiry ───────────────────────────────────────────────
+        // If the workflow has expired, mark it terminal Expired and return
+        // the Expired outcome. We intentionally return `None` for the request
+        // so the daemon cannot accidentally write a human_approved/human_rejected
+        // audit row for a workflow that was never actually decided.
         if workflow.is_expired() {
             workflow.expire();
             drop(workflow_entry);
@@ -105,8 +109,9 @@ impl ApprovalStore {
             if let Some(mut req) = self.pending.get_mut(&decision.request_id) {
                 req.decided = true;
             }
-            let request = self.pending.remove(&decision.request_id).map(|(_, r)| r);
-            return (ApprovalOutcome::NotFound, request); // Expired → treat as gone
+            // Remove from pending but don't return the request — expiry is not a decision.
+            self.pending.remove(&decision.request_id);
+            return (ApprovalOutcome::Expired, None);
         }
 
         // ── Find the current pending stage ───────────────────────────────────

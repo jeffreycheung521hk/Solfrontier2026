@@ -300,6 +300,17 @@ impl PolicySet {
                     .any(|tt| !allowed_mints.contains(&tt.mint))
             }
 
+            PolicyCondition::LegacyTokenTransferPresent => {
+                // Fires if ANY instruction is a legacy SPL Token Transfer.
+                // Legacy Transfer (tag 3) doesn't include the mint in its
+                // accounts, so it bypasses TokenAmountExceeds / MintNotInAllowlist.
+                // This condition closes that bypass.
+                ctx.proposal
+                    .instructions_summary
+                    .iter()
+                    .any(|ix| ix.is_legacy_token_transfer)
+            }
+
             PolicyCondition::OutsideAllowedHours {
                 start_hour, end_hour, allowed_days, utc_offset_hours,
             } => {
@@ -399,6 +410,7 @@ mod tests {
                 description: "test instruction".to_string(),
                 transfer_lamports,
                 token_transfer: None,
+                is_legacy_token_transfer: false,
                 accounts: vec![
                     AccountRole {
                         pubkey: wallet_pubkey.to_string(),
@@ -1147,6 +1159,7 @@ mod tests {
                     source: "source-token-account".to_string(),
                     destination: "dest-token-account".to_string(),
                 }),
+                is_legacy_token_transfer: false,
                 accounts: vec![],
             }],
             created_at: chrono::Utc::now(),
@@ -1385,6 +1398,7 @@ mod tests {
                         source: "src1".to_string(),
                         destination: "dst1".to_string(),
                     }),
+                    is_legacy_token_transfer: false,
                     accounts: vec![],
                 },
                 InstructionSummary {
@@ -1399,6 +1413,7 @@ mod tests {
                         source: "src2".to_string(),
                         destination: "dst2".to_string(),
                     }),
+                    is_legacy_token_transfer: false,
                     accounts: vec![],
                 },
             ],
@@ -1426,5 +1441,170 @@ mod tests {
         assert!(result.verdict.is_blocked() || result.verdict.requires_human() ||
             matches!(&result.verdict, PolicyVerdict::Rejected { .. }),
             "split transfer that sums above threshold should fire");
+    }
+
+    // ── Legacy Token Transfer bypass guard tests ────────────────────────
+
+    fn proposal_with_legacy_transfer(wallet_pubkey: &str) -> TransactionProposal {
+        TransactionProposal {
+            id: Uuid::new_v4(),
+            session_id: SessionId::from(Uuid::new_v4()),
+            wallet_pubkey: wallet_pubkey.to_string(),
+            network: SolanaNetwork::Devnet,
+            description: "legacy transfer test".to_string(),
+            transaction_b64: String::new(),
+            instructions_summary: vec![InstructionSummary {
+                program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                program_name: Some("SPL Token".to_string()),
+                description: "Transfer (legacy): 999 raw units".to_string(),
+                transfer_lamports: None,
+                // Legacy Transfer: token_transfer is None because mint
+                // is not in accounts and we don't RPC-lookup in V1.
+                token_transfer: None,
+                is_legacy_token_transfer: true,
+                accounts: vec![],
+            }],
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn legacy_token_transfer_present_fires_for_legacy_transfer() {
+        let policy = PolicySet::new(
+            vec![
+                PolicyRule {
+                    name: "block-legacy".to_string(),
+                    description: "reject legacy token transfers".to_string(),
+                    condition: PolicyCondition::LegacyTokenTransferPresent,
+                    action: PolicyAction::Reject {
+                        reason: "use TransferChecked".to_string(),
+                    },
+                },
+                PolicyRule {
+                    name: "fallback-approve".to_string(),
+                    description: "approve otherwise".to_string(),
+                    condition: PolicyCondition::Always,
+                    action: PolicyAction::Approve,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+
+        let proposal = proposal_with_legacy_transfer("wallet");
+        let result = policy.evaluate(&context(&proposal));
+
+        assert_eq!(
+            result.verdict,
+            PolicyVerdict::Rejected {
+                reason: "use TransferChecked".to_string(),
+                rule_name: "block-legacy".to_string(),
+            },
+            "legacy SPL Token Transfer must be rejected"
+        );
+    }
+
+    #[test]
+    fn legacy_token_transfer_present_does_not_fire_for_transfer_checked() {
+        use claw_types::transaction::TokenTransfer;
+
+        let proposal = TransactionProposal {
+            id: Uuid::new_v4(),
+            session_id: SessionId::from(Uuid::new_v4()),
+            wallet_pubkey: "wallet".to_string(),
+            network: SolanaNetwork::Devnet,
+            description: "TransferChecked test".to_string(),
+            transaction_b64: String::new(),
+            instructions_summary: vec![InstructionSummary {
+                program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                program_name: Some("SPL Token".to_string()),
+                description: "TransferChecked".to_string(),
+                transfer_lamports: None,
+                token_transfer: Some(TokenTransfer {
+                    mint: USDC_MINT.to_string(),
+                    amount: 1_000_000,
+                    decimals: Some(6),
+                    source: "src".to_string(),
+                    destination: "dst".to_string(),
+                }),
+                is_legacy_token_transfer: false,
+                accounts: vec![],
+            }],
+            created_at: chrono::Utc::now(),
+        };
+
+        let policy = PolicySet::new(
+            vec![
+                PolicyRule {
+                    name: "block-legacy".to_string(),
+                    description: "reject legacy only".to_string(),
+                    condition: PolicyCondition::LegacyTokenTransferPresent,
+                    action: PolicyAction::Reject {
+                        reason: "use TransferChecked".to_string(),
+                    },
+                },
+                PolicyRule {
+                    name: "fallback-approve".to_string(),
+                    description: "approve TransferChecked".to_string(),
+                    condition: PolicyCondition::Always,
+                    action: PolicyAction::Approve,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+
+        let result = policy.evaluate(&context(&proposal));
+        assert_eq!(
+            result.verdict,
+            PolicyVerdict::Approved { rule_name: "fallback-approve".to_string() },
+            "TransferChecked must NOT trigger the legacy guard"
+        );
+    }
+
+    #[test]
+    fn legacy_token_transfer_guard_before_token_amount_closes_bypass() {
+        // Regression: before the legacy guard, an attacker could send a legacy
+        // Transfer with amount=999999 USDC and it would bypass TokenAmountExceeds
+        // (which only checks TransferChecked token_transfer). With the guard
+        // rule listed FIRST, legacy transfers are blocked before the amount
+        // rule is even reached.
+        let policy = PolicySet::new(
+            vec![
+                PolicyRule {
+                    name: "block-legacy".to_string(),
+                    description: "legacy guard".to_string(),
+                    condition: PolicyCondition::LegacyTokenTransferPresent,
+                    action: PolicyAction::Reject { reason: "legacy not allowed".to_string() },
+                },
+                PolicyRule {
+                    name: "usdc-cap".to_string(),
+                    description: "USDC cap".to_string(),
+                    condition: PolicyCondition::TokenAmountExceeds {
+                        mint: USDC_MINT.to_string(),
+                        threshold: 100_000_000,
+                    },
+                    action: PolicyAction::RequireHumanApproval {
+                        reason: "USDC cap".to_string(),
+                        required_approver_role: None,
+                    },
+                },
+                PolicyRule {
+                    name: "fallback-approve".to_string(),
+                    description: "approve".to_string(),
+                    condition: PolicyCondition::Always,
+                    action: PolicyAction::Approve,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+
+        // Legacy transfer (attacker bypass attempt) — blocked by guard at index 0.
+        let legacy_proposal = proposal_with_legacy_transfer("attacker");
+        let legacy_result = policy.evaluate(&context(&legacy_proposal));
+        assert_eq!(legacy_result.matched_rule_index, Some(0),
+            "legacy guard must fire before the per-mint rule could be bypassed");
+        assert!(matches!(&legacy_result.verdict, PolicyVerdict::Rejected { .. }));
     }
 }

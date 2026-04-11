@@ -238,6 +238,7 @@ async fn external_wallet_full_e2e_challenge_bind_approve_sign_complete() {
             resume_wpk,
             resume_cm,
             None, // no durable for this test
+            300,  // lease_seconds
         )
         .await;
     });

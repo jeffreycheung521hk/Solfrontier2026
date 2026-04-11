@@ -50,9 +50,17 @@ pub struct InstructionSummary {
     /// SOL transfer amount in lamports (System Program transfer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_lamports: Option<u64>,
-    /// SPL Token transfer details (mint, amount, accounts) if this is a token transfer.
+    /// SPL Token transfer details (mint, amount, accounts) if this is a
+    /// `TransferChecked` instruction. `None` for legacy `Transfer` because
+    /// V1 does not resolve the mint via RPC lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_transfer: Option<TokenTransfer>,
+    /// Set to true if this instruction is a legacy SPL Token `Transfer`
+    /// (tag 3), which does NOT include the mint in its accounts. This flag
+    /// exists so token-aware policies can block legacy transfers explicitly
+    /// rather than silently letting them bypass mint/amount checks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_legacy_token_transfer: bool,
     pub accounts:    Vec<AccountRole>,
 }
 

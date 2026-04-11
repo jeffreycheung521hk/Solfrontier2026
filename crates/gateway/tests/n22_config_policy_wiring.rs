@@ -99,6 +99,7 @@ fn make_proposal(
             description: "test instruction".to_string(),
             transfer_lamports,
             token_transfer: None,
+            is_legacy_token_transfer: false,
             accounts: vec![
                 AccountRole {
                     pubkey: "WalletPubkey1111111111111111111111111111111".to_string(),
@@ -612,13 +613,7 @@ mainnet_safe_defaults = false
 program_allowlist = []
 destination_denylist = []
 
-# USDC medium-value: require human approval for transfers >= 100 USDC
-[[policy.rules]]
-name = "usdc-medium-value-requires-human"
-description = "USDC transfers >= 100 USDC require human approval"
-condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 100000000 }
-action = { type = "RequireHumanApproval", reason = "USDC >= 100 USDC requires operator approval" }
-
+# High-value chain rule MUST come before medium-value rule (first-match-wins).
 # USDC high-value: require multi-stage approval for transfers >= 10K USDC
 [[policy.rules]]
 name = "usdc-high-value-chain"
@@ -628,6 +623,13 @@ action = { type = "RequireApprovalChain", reason = "USDC >= 10K requires multi-s
     { role = "risk", description = "Risk officer review", min_approvals = 1 },
     { role = "treasury", description = "Treasury sign-off", min_approvals = 1 },
 ]}
+
+# USDC medium-value: require human approval for transfers >= 100 USDC (< 10K).
+[[policy.rules]]
+name = "usdc-medium-value-requires-human"
+description = "USDC transfers >= 100 USDC require human approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 100000000 }
+action = { type = "RequireHumanApproval", reason = "USDC >= 100 USDC requires operator approval" }
 
 [llm]
 provider = "openai"
@@ -664,6 +666,7 @@ fn proposal_with_usdc_transfer(amount: u64) -> claw_types::transaction::Transact
                 source: "src-token-account".to_string(),
                 destination: "dst-token-account".to_string(),
             }),
+            is_legacy_token_transfer: false,
             accounts: vec![],
         }],
         created_at: chrono::Utc::now(),
@@ -674,8 +677,9 @@ fn proposal_with_usdc_transfer(amount: u64) -> claw_types::transaction::Transact
 fn usdc_demo_toml_parses_with_two_chain_rules() {
     let config: ClawConfig = toml::from_str(USDC_DEMO_TOML).expect("USDC TOML should parse");
     assert_eq!(config.policy.rules.len(), 2);
-    assert_eq!(config.policy.rules[0].name, "usdc-medium-value-requires-human");
-    assert_eq!(config.policy.rules[1].name, "usdc-high-value-chain");
+    // High-value chain MUST come first (first-match-wins correctness).
+    assert_eq!(config.policy.rules[0].name, "usdc-high-value-chain");
+    assert_eq!(config.policy.rules[1].name, "usdc-medium-value-requires-human");
 }
 
 #[test]
@@ -704,6 +708,8 @@ fn usdc_500_usdc_triggers_medium_value_rule() {
     let proposal = proposal_with_usdc_transfer(500_000_000); // 500 USDC
     let result = policy.evaluate(&eval_ctx(&proposal));
 
+    // 500 USDC is below the 10K chain threshold, so chain rule (index 0) does not fire.
+    // Falls through to medium-value rule (index 1).
     assert_eq!(
         result.verdict,
         PolicyVerdict::RequiresHumanApproval {
@@ -714,30 +720,50 @@ fn usdc_500_usdc_triggers_medium_value_rule() {
         },
         "500 USDC should trigger medium-value rule"
     );
-    assert_eq!(result.matched_rule_index, Some(0));
+    assert_eq!(result.matched_rule_index, Some(1), "medium-value rule is at index 1");
 }
 
 #[test]
 fn usdc_50k_usdc_triggers_multi_stage_chain() {
+    // This is the critical correctness test for PR narrative:
+    // "50K USDC should trigger the risk + treasury chain."
+    // With correct rule ordering (chain first), this should fire the chain rule.
     let config: ClawConfig = toml::from_str(USDC_DEMO_TOML).unwrap();
     let policy = build_policy_set(&config);
 
     let proposal = proposal_with_usdc_transfer(50_000_000_000); // 50K USDC
     let result = policy.evaluate(&eval_ctx(&proposal));
 
-    // Both rules match, but first-match-wins → medium-value rule fires.
-    // This is intentional: if you want chain to take precedence, put it FIRST in TOML.
-    // We test the default ordering behavior here.
+    // Chain rule is at index 0 and matches → multi-stage chain fires.
     assert_eq!(
         result.matched_rule_index, Some(0),
-        "first-match-wins: medium-value rule fires before chain rule"
+        "50K USDC must hit the chain rule (index 0), not fall through to medium-value"
     );
+
+    // Verify the verdict actually carries the approval_chain with both stages.
+    match &result.verdict {
+        PolicyVerdict::RequiresHumanApproval { rule_name, approval_chain, .. } => {
+            assert_eq!(rule_name, "usdc-high-value-chain");
+            let chain = approval_chain.as_ref().expect("should carry multi-stage chain");
+            assert_eq!(chain.len(), 2, "chain must have risk + treasury");
+            assert_eq!(chain[0].role, "risk");
+            assert_eq!(chain[1].role, "treasury");
+        }
+        other => panic!("50K USDC must trigger multi-stage chain, got {:?}", other),
+    }
 }
 
 #[test]
-fn usdc_chain_rule_fires_when_listed_first() {
-    // Reorder rules: chain rule first (for high values to trigger it)
-    let toml = r#"
+fn wrong_rule_ordering_downgrades_high_value_to_single_approver_regression() {
+    // REGRESSION GUARD: this test documents the INCORRECT behavior that
+    // happens when the medium-value rule is placed BEFORE the chain rule.
+    // With first-match-wins, 50K USDC would hit the medium-value rule and
+    // never reach the chain rule — a policy correctness bug.
+    //
+    // The main USDC_DEMO_TOML fixture has the correct ordering (chain first).
+    // This test uses a deliberately wrong ordering to prove the ordering
+    // decision is load-bearing.
+    let wrong_order_toml = r#"
 [daemon]
 db_path = "./data/test.db"
 [network]
@@ -751,20 +777,21 @@ mainnet_safe_defaults = false
 program_allowlist = []
 destination_denylist = []
 
-[[policy.rules]]
-name = "usdc-high-value-chain"
-description = "USDC transfers >= 10K USDC require risk + treasury approval"
-condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 10000000000 }
-action = { type = "RequireApprovalChain", reason = "USDC >= 10K requires multi-stage approval", stages = [
-    { role = "risk", description = "Risk officer review", min_approvals = 1 },
-    { role = "treasury", description = "Treasury sign-off", min_approvals = 1 },
-]}
-
+# WRONG ORDERING (medium before chain) — this is what NOT to do.
 [[policy.rules]]
 name = "usdc-medium-value-requires-human"
 description = "USDC transfers >= 100 USDC require human approval"
 condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 100000000 }
 action = { type = "RequireHumanApproval", reason = "USDC >= 100" }
+
+[[policy.rules]]
+name = "usdc-high-value-chain"
+description = "USDC transfers >= 10K USDC require risk + treasury approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 10000000000 }
+action = { type = "RequireApprovalChain", reason = "USDC >= 10K", stages = [
+    { role = "risk", description = "Risk", min_approvals = 1 },
+    { role = "treasury", description = "Treasury", min_approvals = 1 },
+]}
 
 [llm]
 provider = "openai"
@@ -777,21 +804,28 @@ port = 7070
 format = "pretty"
 level = "info"
 "#;
-    let config: ClawConfig = toml::from_str(toml).unwrap();
+    let config: ClawConfig = toml::from_str(wrong_order_toml).unwrap();
     let policy = build_policy_set(&config);
 
-    // 50K USDC should trigger the chain rule (first in list)
+    // 50K USDC SHOULD hit chain, but wrong ordering makes it hit medium-value.
+    // This test exists to make the failure mode explicit and prevent regression
+    // in reviewers' mental models: if someone reorders rules and this test
+    // changes behavior, they know why.
     let proposal = proposal_with_usdc_transfer(50_000_000_000);
     let result = policy.evaluate(&eval_ctx(&proposal));
 
+    // Wrong-ordered config: medium-value fires first, chain never reached.
+    assert_eq!(
+        result.matched_rule_index, Some(0),
+        "wrong ordering: medium-value rule (index 0) hijacks high-value transfer"
+    );
     match &result.verdict {
         PolicyVerdict::RequiresHumanApproval { rule_name, approval_chain, .. } => {
-            assert_eq!(rule_name, "usdc-high-value-chain");
-            let chain = approval_chain.as_ref().expect("should carry chain");
-            assert_eq!(chain.len(), 2);
-            assert_eq!(chain[0].role, "risk");
-            assert_eq!(chain[1].role, "treasury");
+            assert_eq!(rule_name, "usdc-medium-value-requires-human",
+                "wrong ordering causes downgrade to single-operator approval");
+            assert!(approval_chain.is_none(),
+                "wrong ordering loses the multi-stage chain entirely");
         }
-        other => panic!("expected RequiresHumanApproval with chain, got {:?}", other),
+        other => panic!("expected RequiresHumanApproval, got {:?}", other),
     }
 }

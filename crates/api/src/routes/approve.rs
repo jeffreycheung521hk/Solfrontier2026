@@ -245,6 +245,16 @@ pub async fn submit_approval(
                 ),
             })),
         ).into_response(),
+
+        ApprovalOutcome::Expired => (
+            StatusCode::GONE,
+            Json(json!({
+                "error":        "lease_expired",
+                "request_id":   req.request_id,
+                "message":      "This approval request's lease has expired. \
+                                 The transaction was not approved. Re-submit a fresh proposal if still needed.",
+            })),
+        ).into_response(),
     }
 }
 

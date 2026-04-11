@@ -34,6 +34,7 @@ fn make_proposal(wallet: &str, transfer_lamports: u64) -> TransactionProposal {
             description: "SOL transfer".to_string(),
             transfer_lamports: Some(transfer_lamports),
             token_transfer: None,
+            is_legacy_token_transfer: false,
             accounts: vec![
                 AccountRole {
                     pubkey: wallet.to_string(),

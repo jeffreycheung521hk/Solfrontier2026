@@ -243,6 +243,7 @@ async fn approve_signs_and_emits_events() {
             wallet_pubkey_for_resume,
             completion_meta,
             None,
+            300,
         ).await;
     });
 
@@ -401,6 +402,7 @@ async fn reject_emits_failure_event_no_signing() {
             wallet_pubkey_for_resume,
             completion_meta,
             None,
+            300,
         ).await;
     });
 
