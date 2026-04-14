@@ -11,7 +11,7 @@ export default async function DashboardPage() {
 
   const pendingCount = snap.pending.length;
   const chainCount = snap.pending.filter(
-    (p) => p.request.policy_verdict.type === "RequiresHumanApproval" && p.request.policy_verdict.approval_chain,
+    (p) => p.request.policy_verdict.verdict === "requires_human_approval" && p.request.policy_verdict.approval_chain,
   ).length;
   const expiringSoon = snap.expiring_soon.length;
 
@@ -35,9 +35,9 @@ export default async function DashboardPage() {
         <div className="space-y-2">
           {snap.pending.map((p) => {
             const verdict = p.request.policy_verdict;
-            const isChain = verdict.type === "RequiresHumanApproval" && !!verdict.approval_chain;
-            const riskLabel = isChain ? "chain" : verdict.type === "RequiresHumanApproval" ? "single" : "unknown";
-            const rule = verdict.type === "RequiresHumanApproval" ? verdict.rule_name : "";
+            const isChain = verdict.verdict === "requires_human_approval" && !!verdict.approval_chain;
+            const riskLabel = isChain ? "chain" : verdict.verdict === "requires_human_approval" ? "single" : "unknown";
+            const rule = verdict.verdict === "requires_human_approval" ? verdict.rule_name : "";
             const expiring = snap.expiring_soon.find((e) => e.request_id === p.request.id);
             return (
               <Link

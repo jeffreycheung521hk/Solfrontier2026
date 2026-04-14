@@ -16,12 +16,13 @@ export default async function ApprovalChainPage({
 }) {
   const { id } = await params;
   const { request, workflow, proposal } = await fetchApproval(id);
+  const title = proposal?.description ?? request.description;
 
   return (
     <div className="space-y-8">
       <header className="space-y-1">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Approval chain</div>
-        <h1 className="text-2xl font-semibold tracking-tight">{proposal.description}</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
         <div className="flex items-center gap-3 text-sm text-muted-foreground">
           <code className="text-xs">{shortPubkey(request.id, 6)}</code>
           <span>·</span>

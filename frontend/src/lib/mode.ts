@@ -12,5 +12,11 @@ export const MODE: Mode =
 export const GATEWAY_URL: string =
   process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://127.0.0.1:8787";
 
+/// Bearer token used by live mode. Must match the daemon's `--api-token`
+/// (or the `CLAWSOLANA_API_TOKEN` env var the daemon reads). Empty in
+/// showcase mode.
+export const GATEWAY_TOKEN: string =
+  process.env.NEXT_PUBLIC_GATEWAY_TOKEN ?? "";
+
 export const IS_SHOWCASE = MODE === "showcase";
 export const IS_LIVE = MODE === "live";

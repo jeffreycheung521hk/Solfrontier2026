@@ -74,6 +74,21 @@ pub struct PolicySet {
 }
 
 impl PolicySet {
+    /// Returns the compiled rule list (evaluation order).
+    pub fn rules(&self) -> &[PolicyRule] {
+        &self.rules
+    }
+
+    /// Returns the program allowlist backing the `ProgramNotInAllowlist` check.
+    pub fn program_allowlist(&self) -> &[String] {
+        &self.program_allowlist
+    }
+
+    /// Returns the destination denylist.
+    pub fn destination_denylist(&self) -> &[String] {
+        &self.destination_denylist
+    }
+
     pub fn new(
         rules: Vec<PolicyRule>,
         program_allowlist: Vec<String>,

@@ -73,6 +73,23 @@ impl ApprovalStore {
         results
     }
 
+    /// Returns every pending request across every session paired with its workflow,
+    /// sorted by `requested_at` ascending. Used by the dashboard read endpoint.
+    pub fn all_pending_with_workflow(&self) -> Vec<(ApprovalRequest, ApprovalWorkflow)> {
+        let mut results: Vec<(ApprovalRequest, ApprovalWorkflow)> = self
+            .pending
+            .iter()
+            .filter(|entry| !entry.decided)
+            .filter_map(|entry| {
+                self.workflows
+                    .get(&entry.id)
+                    .map(|wf| (entry.clone(), wf.clone()))
+            })
+            .collect();
+        results.sort_by_key(|(r, _)| r.requested_at);
+        results
+    }
+
     /// Applies an operator decision to the approval workflow.
     ///
     /// # Outcomes

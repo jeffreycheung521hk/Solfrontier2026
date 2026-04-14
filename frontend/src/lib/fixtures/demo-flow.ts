@@ -85,7 +85,7 @@ const baseRequest: ApprovalRequest = {
   transaction_id: TRANSACTION_ID,
   description: "50,000 USDC transfer (exceeds 25k chain threshold)",
   policy_verdict: {
-    type: "RequiresHumanApproval",
+    verdict: "requires_human_approval",
     reason: "USDC transfer amount 50,000 exceeds chain threshold 25,000",
     rule_name: "usdc-high-value-chain",
     required_approver_role: "risk",
@@ -185,7 +185,7 @@ const otherPending: PendingApprovalView[] = [
       transaction_id: "b1111111-0000-4000-8000-000000000002",
       description: "250 SOL transfer from treasury hot wallet",
       policy_verdict: {
-        type: "RequiresHumanApproval",
+        verdict: "requires_human_approval",
         reason: "Amount 250 SOL exceeds 100 SOL cap",
         rule_name: "treasury-high-value",
         required_approver_role: "treasury",
@@ -227,25 +227,23 @@ export const wallets: WalletSummary[] = [
   {
     pubkey: MM_WALLET,
     label: "Market maker hot",
-    signer_type: "External",
+    signer_type: "external",
     daily_spend_lamports: 72_500_000_000,
     policy: {
       max_amount_lamports: 1_000_000_000_000,
       program_allowlist: [TOKEN_PROGRAM, "11111111111111111111111111111111"],
       required_approver_role: "risk",
-      rules: [],
     },
   },
   {
     pubkey: TREASURY_WALLET,
     label: "Treasury hot",
-    signer_type: "External",
+    signer_type: "external",
     daily_spend_lamports: 310_000_000_000,
     policy: {
       max_amount_lamports: 100_000_000_000,
       program_allowlist: [],
       required_approver_role: "treasury",
-      rules: [],
     },
   },
 ];

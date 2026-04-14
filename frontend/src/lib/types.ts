@@ -92,18 +92,21 @@ export interface PolicyRule {
   action: PolicyAction;
 }
 
+// PolicyVerdict uses `#[serde(tag = "verdict", rename_all = "snake_case")]`
+// on the Rust side, so the discriminator is `verdict` (not `type`) and
+// variant names are snake_case.
 export type PolicyVerdict =
-  | { type: "Approved"; rule_name: string }
+  | { verdict: "approved"; rule_name: string }
   | {
-      type: "RequiresHumanApproval";
+      verdict: "requires_human_approval";
       reason: string;
       rule_name: string;
       required_approver_role?: string | null;
       approval_chain?: ApprovalChainStage[] | null;
     }
-  | { type: "Rejected"; reason: string; rule_name: string }
-  | { type: "SimulationRequired" }
-  | { type: "SimulationFailed"; simulation_error: string };
+  | { verdict: "rejected"; reason: string; rule_name: string }
+  | { verdict: "simulation_required" }
+  | { verdict: "simulation_failed"; simulation_error: string };
 
 // ── Approval workflow ────────────────────────────────────────────────────────
 
@@ -183,11 +186,21 @@ export interface WalletPolicyConfig {
   rules: PolicyRule[];
 }
 
+// Matches Rust SignerType serde output (rename_all = "snake_case").
+export type SignerType = "local_keypair" | "ledger" | "external" | "read_only";
+
+/// Matches WalletPolicySummaryDto returned by GET /wallets.
+export interface WalletPolicySummary {
+  max_amount_lamports?: Lamports | null;
+  program_allowlist: string[];
+  required_approver_role?: string | null;
+}
+
 export interface WalletSummary {
   pubkey: string;
   label: string;
-  signer_type: "Internal" | "External";
-  policy?: WalletPolicyConfig | null;
+  signer_type: SignerType;
+  policy?: WalletPolicySummary | null;
   daily_spend_lamports: number;
 }
 

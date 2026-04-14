@@ -52,7 +52,7 @@ timeout_ms = 15000
 label = "devnet-hot-wallet"
 signer_type = "local_keypair"
 # keypair_path = "~/.config/solana/devnet.json"  # Rust does NOT expand ~; use absolute path
-keypair_path = "/Users/YOUR_USERNAME/.config/solana/devnet.json"
+keypair_path = "data/devnet.json"
 
 # Example: load from base58 (for testing only — never commit real keys)
 # [[wallets]]

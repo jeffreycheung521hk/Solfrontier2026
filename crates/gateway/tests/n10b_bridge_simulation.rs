@@ -40,6 +40,7 @@ use claw_api::{
     WalletChallengeHandler, WalletChallengeHandlerRef, WalletChallengeInfo,
     WalletSignatureHandler, WalletSignatureHandlerRef, WalletSignatureOutcome,
     PendingWalletSignatureInfo,
+    state::{AuditReaderRef, PolicyReaderRef, WalletDirectoryRef},
 };
 use claw_gateway::ExternalWalletStore;
 use claw_observability::HealthRegistry;
@@ -280,6 +281,10 @@ fn setup() -> TestHarness {
         propose: None,
         rate_limiter: None,
         operator_registry: claw_api::auth::OperatorRegistry::new(),
+        policy: PolicyReaderRef::noop(),
+        audit: AuditReaderRef::noop(),
+        wallets: WalletDirectoryRef::noop(),
+        demo_seeder: None,
     };
 
     let health = HealthRegistry::new();

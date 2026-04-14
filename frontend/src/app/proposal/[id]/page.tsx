@@ -20,11 +20,20 @@ export default async function ProposalReviewPage({
     <div className="space-y-8">
       <header className="space-y-1">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Proposal review</div>
-        <h1 className="text-2xl font-semibold tracking-tight">{proposal.description}</h1>
-        <p className="text-sm text-muted-foreground">
-          wallet <code>{shortPubkey(proposal.wallet_pubkey)}</code> · network{" "}
-          <Badge variant="outline" className="uppercase">{proposal.network}</Badge>
-        </p>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          {proposal?.description ?? request.description}
+        </h1>
+        {proposal ? (
+          <p className="text-sm text-muted-foreground">
+            wallet <code>{shortPubkey(proposal.wallet_pubkey)}</code> · network{" "}
+            <Badge variant="outline" className="uppercase">{proposal.network}</Badge>
+          </p>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            full proposal details are not exposed by the live gateway yet — showing
+            approval-request data only.
+          </p>
+        )}
       </header>
 
       {/* Why this was escalated */}
@@ -66,7 +75,13 @@ export default async function ProposalReviewPage({
           <CardTitle className="text-base">Instructions &amp; token flow</CardTitle>
         </CardHeader>
         <CardContent className="space-y-5">
-          {proposal.instructions_summary.map((ix, i) => {
+          {!proposal && (
+            <div className="text-sm text-muted-foreground">
+              Instruction detail is not returned by the current gateway endpoints.
+              This pane will populate once <code>GET /approvals/:id</code> is wired.
+            </div>
+          )}
+          {(proposal?.instructions_summary ?? []).map((ix, i) => {
             const tt = ix.token_transfer;
             const tokenAmount = tt?.amount != null && tt.decimals != null
               ? formatToken(tt.amount, tt.decimals, mintSymbol(tt.mint))
@@ -128,7 +143,7 @@ export default async function ProposalReviewPage({
 }
 
 function VerdictBanner({ verdict }: { verdict: Awaited<ReturnType<typeof fetchApproval>>["request"]["policy_verdict"] }) {
-  if (verdict.type === "Approved") {
+  if (verdict.verdict === "approved") {
     return (
       <Alert>
         <AlertTitle>Auto-approved</AlertTitle>
@@ -138,7 +153,7 @@ function VerdictBanner({ verdict }: { verdict: Awaited<ReturnType<typeof fetchAp
       </Alert>
     );
   }
-  if (verdict.type === "Rejected") {
+  if (verdict.verdict === "rejected") {
     return (
       <Alert variant="destructive">
         <AlertTitle>Rejected by policy</AlertTitle>
@@ -148,7 +163,7 @@ function VerdictBanner({ verdict }: { verdict: Awaited<ReturnType<typeof fetchAp
       </Alert>
     );
   }
-  if (verdict.type === "RequiresHumanApproval") {
+  if (verdict.verdict === "requires_human_approval") {
     const chain = verdict.approval_chain;
     return (
       <Alert className="border-amber-500/40">

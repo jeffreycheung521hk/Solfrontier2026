@@ -18,10 +18,11 @@ use serde::{Deserialize, Serialize};
 
 use claw_types::{
     agent::{AgentCommand, AgentResponse, AgentRole},
-    approval::{ApprovalDecision, ApprovalOutcome, ApprovalRequest},
+    approval::{ApprovalDecision, ApprovalOutcome, ApprovalRequest, ApprovalWorkflow},
     events::GatewayEvent,
     policy::PolicyRule,
     session::SessionId,
+    wallet::SignerType,
 };
 
 use crate::auth::AuthToken;
@@ -60,6 +61,15 @@ pub trait ApprovalHandler: Send + Sync + 'static {
     /// Returns all pending approval requests for the given session.
     fn pending_for_session(&self, session_id: &SessionId) -> Vec<ApprovalRequest>;
 
+    /// Returns every pending approval across every session, with its workflow.
+    /// Ordered by `requested_at` ascending.
+    ///
+    /// Default returns empty — suitable for tests using stub handlers that
+    /// don't need to surface cross-session listings.
+    fn all_pending(&self) -> Vec<PendingApprovalItem> {
+        Vec::new()
+    }
+
     /// Peek at which session owns a pending request (P0-3: session-request binding).
     fn session_for_request(&self, request_id: uuid::Uuid) -> Option<SessionId>;
 
@@ -73,6 +83,13 @@ pub trait ApprovalHandler: Send + Sync + 'static {
         &self,
         decision: ApprovalDecision,
     ) -> Pin<Box<dyn Future<Output = (ApprovalOutcome, Option<ApprovalRequest>)> + Send + '_>>;
+}
+
+/// A pending approval plus its workflow, as returned by `/pending-approvals`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApprovalItem {
+    pub request:  ApprovalRequest,
+    pub workflow: ApprovalWorkflow,
 }
 
 /// Event subscription interface — hands the caller a broadcast receiver for
@@ -244,6 +261,11 @@ impl ApprovalHandlerRef {
         self.0.pending_for_session(session_id)
     }
 
+    /// Returns every pending approval across every session.
+    pub fn all_pending(&self) -> Vec<PendingApprovalItem> {
+        self.0.all_pending()
+    }
+
     /// Peek at which session owns a pending request (P0-3).
     pub fn session_for_request(&self, request_id: uuid::Uuid) -> Option<SessionId> {
         self.0.session_for_request(request_id)
@@ -390,6 +412,163 @@ impl TransactionProposerRef {
     }
 }
 
+// ── Read-only surfaces for the showcase / dashboard routes ──────────────────
+//
+// These traits expose a flat, UI-friendly snapshot of data that lives in
+// claw-gateway / claw-state-store / claw-risk-engine. claw-api must not
+// depend on those crates directly; adapters in `claw-gateway/daemon.rs`
+// implement the traits.
+
+/// Read the currently-loaded global policy rules.
+pub trait PolicyReader: Send + Sync + 'static {
+    fn rules(&self) -> Vec<PolicyRule>;
+}
+
+/// Cloneable reference to a `PolicyReader` implementation.
+#[derive(Clone)]
+pub struct PolicyReaderRef(pub Arc<dyn PolicyReader>);
+
+impl PolicyReaderRef {
+    pub fn new(inner: Arc<dyn PolicyReader>) -> Self { Self(inner) }
+    pub fn rules(&self) -> Vec<PolicyRule> { self.0.rules() }
+    /// No-op reader returning an empty rule list — useful for tests and
+    /// bring-up paths where no policy is loaded.
+    pub fn noop() -> Self {
+        struct Noop;
+        impl PolicyReader for Noop {
+            fn rules(&self) -> Vec<PolicyRule> { Vec::new() }
+        }
+        Self(Arc::new(Noop))
+    }
+}
+
+/// Read audit rows (paged, most-recent first).
+pub trait AuditReader: Send + Sync + 'static {
+    fn list(
+        &self,
+        limit:  i64,
+        offset: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRowDto>, String>> + Send + '_>>;
+}
+
+/// Cloneable reference to an `AuditReader` implementation.
+#[derive(Clone)]
+pub struct AuditReaderRef(pub Arc<dyn AuditReader>);
+
+impl AuditReaderRef {
+    pub fn new(inner: Arc<dyn AuditReader>) -> Self { Self(inner) }
+    pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<AuditRowDto>, String> {
+        self.0.list(limit, offset).await
+    }
+    /// No-op reader that always returns an empty list — useful for tests.
+    pub fn noop() -> Self {
+        struct Noop;
+        impl AuditReader for Noop {
+            fn list(
+                &self,
+                _limit:  i64,
+                _offset: i64,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRowDto>, String>> + Send + '_>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+        Self(Arc::new(Noop))
+    }
+}
+
+/// Wire shape for a single audit row — matches the `audit_events` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditRowDto {
+    pub id:             String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id:     Option<String>,
+    pub correlation_id: String,
+    /// Unix milliseconds.
+    pub occurred_at:    i64,
+    pub event_type:     String,
+    pub actor:          String,
+    /// JSON-encoded event-specific payload.
+    pub payload:        String,
+    pub severity:       String,
+}
+
+/// List configured wallets with their current-day spend.
+pub trait WalletDirectory: Send + Sync + 'static {
+    fn list(&self) -> Pin<Box<dyn Future<Output = Vec<WalletSummaryDto>> + Send + '_>>;
+}
+
+/// Cloneable reference to a `WalletDirectory` implementation.
+#[derive(Clone)]
+pub struct WalletDirectoryRef(pub Arc<dyn WalletDirectory>);
+
+impl WalletDirectoryRef {
+    pub fn new(inner: Arc<dyn WalletDirectory>) -> Self { Self(inner) }
+    pub async fn list(&self) -> Vec<WalletSummaryDto> { self.0.list().await }
+    /// No-op directory that lists no wallets — useful for tests.
+    pub fn noop() -> Self {
+        struct Noop;
+        impl WalletDirectory for Noop {
+            fn list(&self) -> Pin<Box<dyn Future<Output = Vec<WalletSummaryDto>> + Send + '_>> {
+                Box::pin(async { Vec::new() })
+            }
+        }
+        Self(Arc::new(Noop))
+    }
+}
+
+/// Wire shape for a configured wallet plus its policy snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletSummaryDto {
+    pub pubkey:               String,
+    pub label:                String,
+    pub signer_type:          SignerType,
+    pub daily_spend_lamports: u64,
+    /// Per-wallet policy overrides, if configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy:               Option<WalletPolicySummaryDto>,
+}
+
+/// Wire shape for per-wallet policy overrides (subset of `WalletPolicyConfig`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletPolicySummaryDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_amount_lamports:     Option<u64>,
+    #[serde(default)]
+    pub program_allowlist:       Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_approver_role:  Option<String>,
+}
+
+// ── Demo seed (development-only) ────────────────────────────────────────────
+//
+// Used by the showcase frontend to populate the dashboard with a realistic set
+// of pending approvals, audit events, and wallet spend without having to run a
+// real agent against devnet. The daemon only wires an implementation when
+// `CLAW_ENABLE_DEMO_SEED=1` is set at startup; otherwise the route returns
+// 503 and the trait ref stays `None`.
+
+/// Seed a synthetic-but-realistic snapshot into the running daemon.
+pub trait DemoSeeder: Send + Sync + 'static {
+    fn seed(&self) -> Pin<Box<dyn Future<Output = Result<DemoSeedReport, String>> + Send + '_>>;
+}
+
+/// Summary of what was created by `POST /debug/seed-demo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemoSeedReport {
+    pub approvals_created: usize,
+    pub audit_rows_written: usize,
+    pub wallets_spend_bumped: usize,
+}
+
+/// Cloneable reference to a `DemoSeeder` implementation.
+#[derive(Clone)]
+pub struct DemoSeederRef(pub Arc<dyn DemoSeeder>);
+
+impl DemoSeederRef {
+    pub fn new(inner: Arc<dyn DemoSeeder>) -> Self { Self(inner) }
+    pub async fn seed(&self) -> Result<DemoSeedReport, String> { self.0.seed().await }
+}
+
 /// The shared state injected into every route handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -415,4 +594,13 @@ pub struct AppState {
     pub propose:             Option<TransactionProposerRef>,
     /// Per-token sliding-window rate limiter (None = disabled).
     pub rate_limiter:        Option<crate::rate_limit::RateLimiter>,
+    /// Read-only view of the currently loaded global policy.
+    pub policy:              PolicyReaderRef,
+    /// Paged view of the audit_events table.
+    pub audit:               AuditReaderRef,
+    /// Wallet directory with today's per-wallet spend.
+    pub wallets:             WalletDirectoryRef,
+    /// Development-only demo seeder. `None` unless the daemon was started with
+    /// `CLAW_ENABLE_DEMO_SEED=1`. Gates `POST /debug/seed-demo`.
+    pub demo_seeder:         Option<DemoSeederRef>,
 }
