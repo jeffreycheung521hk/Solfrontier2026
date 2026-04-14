@@ -1,0 +1,222 @@
+// Wire-compatible TypeScript types mirroring the Rust serde shapes in
+// crates/types/src/{approval,policy,transaction,session}.rs.
+// Field names match serde output so fixtures work unchanged against the live API.
+
+export type Uuid = string;
+export type IsoDate = string; // RFC3339 / chrono::DateTime<Utc>
+export type Lamports = number;
+export type SessionId = string;
+
+export type SolanaNetwork = "mainnet-beta" | "devnet" | "testnet" | "localnet";
+
+// ── Transaction ──────────────────────────────────────────────────────────────
+
+export interface AccountRole {
+  pubkey: string;
+  label?: string | null;
+  is_signer: boolean;
+  is_writable: boolean;
+}
+
+export interface TokenTransfer {
+  mint?: string | null;
+  from?: string | null;
+  to?: string | null;
+  amount?: number | null;
+  decimals?: number | null;
+}
+
+export interface InstructionSummary {
+  program_id: string;
+  program_name?: string | null;
+  description: string;
+  transfer_lamports?: Lamports | null;
+  token_transfer?: TokenTransfer | null;
+  is_legacy_token_transfer?: boolean;
+  accounts: AccountRole[];
+}
+
+export interface AccountDiff {
+  pubkey: string;
+  lamports_before?: Lamports | null;
+  lamports_after?: Lamports | null;
+  data_changed: boolean;
+}
+
+export interface SimulationResult {
+  success: boolean;
+  error?: string | null;
+  compute_units_used?: number | null;
+  logs: string[];
+  return_data?: string | null;
+  account_diffs: AccountDiff[];
+  fee_lamports?: Lamports | null;
+}
+
+export interface TransactionProposal {
+  id: Uuid;
+  session_id: SessionId;
+  wallet_pubkey: string;
+  network: SolanaNetwork;
+  description: string;
+  transaction_b64: string;
+  instructions_summary: InstructionSummary[];
+  created_at: IsoDate;
+}
+
+// ── Policy ───────────────────────────────────────────────────────────────────
+
+export type PolicyCondition =
+  | { type: "Always" }
+  | { type: "NetworkIn"; networks: SolanaNetwork[] }
+  | { type: "ProgramNotInAllowlist"; allowed_programs: string[] }
+  | { type: "DestinationInDenylist"; denied: string[] }
+  | { type: "AmountExceedsLamports"; threshold: Lamports }
+  | { type: "CostExceedsSol"; sol: number }
+  | { type: "DailySpendExceedsSol"; sol: number }
+  | { type: "SimulationNotPassed" }
+  | { type: "TokenAmountExceeds"; mint: string; threshold: number }
+  | { type: "MintNotInAllowlist"; allowed_mints: string[] }
+  | { type: "LegacyTokenTransferPresent" };
+
+export type PolicyAction =
+  | { type: "Approve" }
+  | { type: "RequireHumanApproval"; reason: string; required_approver_role?: string | null }
+  | { type: "RequireApprovalChain"; reason: string; stages: ApprovalChainStage[] }
+  | { type: "Reject"; reason: string };
+
+export interface PolicyRule {
+  name: string;
+  description: string;
+  condition: PolicyCondition;
+  action: PolicyAction;
+}
+
+export type PolicyVerdict =
+  | { type: "Approved"; rule_name: string }
+  | {
+      type: "RequiresHumanApproval";
+      reason: string;
+      rule_name: string;
+      required_approver_role?: string | null;
+      approval_chain?: ApprovalChainStage[] | null;
+    }
+  | { type: "Rejected"; reason: string; rule_name: string }
+  | { type: "SimulationRequired" }
+  | { type: "SimulationFailed"; simulation_error: string };
+
+// ── Approval workflow ────────────────────────────────────────────────────────
+
+export interface ApprovalChainStage {
+  role: string;
+  description?: string;
+  min_approvals: number;
+}
+
+export type ApprovalWorkflowState = "pending" | "approved" | "rejected" | "expired";
+
+export interface StageDecision {
+  approved: boolean;
+  operator_id?: string | null;
+  approver_role?: string | null;
+  decided_at: IsoDate;
+}
+
+export interface ApprovalStage {
+  index: number;
+  allowed_roles: string[];
+  min_approvals: number;
+  decisions: StageDecision[];
+}
+
+export interface ApprovalWorkflow {
+  request_id: Uuid;
+  session_id: SessionId;
+  state: ApprovalWorkflowState;
+  stages: ApprovalStage[];
+  created_at: IsoDate;
+  updated_at: IsoDate;
+  expires_at?: IsoDate | null;
+}
+
+export interface ApprovalRequest {
+  id: Uuid;
+  session_id: SessionId;
+  transaction_id: Uuid;
+  description: string;
+  policy_verdict: PolicyVerdict;
+  simulation: SimulationResult;
+  requested_at: IsoDate;
+  decided: boolean;
+  required_approver_role?: string | null;
+}
+
+export type ApprovalOutcome =
+  | "approved"
+  | "rejected"
+  | "already_decided"
+  | "not_found"
+  | "expired"
+  | { role_mismatch: { required: string; provided?: string | null } }
+  | {
+      stage_advanced: {
+        completed_stage: number;
+        next_stage: number;
+        next_required_role?: string | null;
+      };
+    }
+  | {
+      quorum_progress: {
+        stage: number;
+        approvals_so_far: number;
+        approvals_required: number;
+      };
+    }
+  | { duplicate_operator: { operator_id: string; stage: number } };
+
+// ── Wallet config / per-wallet policy ────────────────────────────────────────
+
+export interface WalletPolicyConfig {
+  max_amount_lamports?: Lamports | null;
+  program_allowlist: string[];
+  required_approver_role?: string | null;
+  rules: PolicyRule[];
+}
+
+export interface WalletSummary {
+  pubkey: string;
+  label: string;
+  signer_type: "Internal" | "External";
+  policy?: WalletPolicyConfig | null;
+  daily_spend_lamports: number;
+}
+
+// ── Audit ────────────────────────────────────────────────────────────────────
+
+export type AuditSeverity = "info" | "warning" | "error" | "critical";
+
+export interface AuditRow {
+  id: Uuid;
+  session_id?: string | null;
+  correlation_id: Uuid;
+  occurred_at: number; // unix millis
+  event_type: string; // policy_rejected | human_rejected | approval_lease_expired | ...
+  actor: string; // "operator" | "system" | "agent" | operator_id
+  payload: string; // JSON-encoded string
+  severity: AuditSeverity;
+}
+
+// ── Composite view models used by showcase pages ─────────────────────────────
+
+export interface PendingApprovalView {
+  request: ApprovalRequest;
+  workflow: ApprovalWorkflow;
+  proposal: TransactionProposal;
+}
+
+export interface DashboardSnapshot {
+  pending: PendingApprovalView[];
+  wallets: WalletSummary[];
+  recent_audit: AuditRow[];
+  expiring_soon: Array<{ request_id: Uuid; expires_at: IsoDate; seconds_remaining: number }>;
+}
