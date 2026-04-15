@@ -71,6 +71,8 @@ correctness**, and vice versa.
 | **Full-pipeline in-memory** | End-to-end through the real production code path, but without touching RPC or a real browser | `n20_external_wallet_e2e.rs : external_wallet_full_e2e_challenge_bind_approve_sign_complete` |
 | **Devnet on-chain** | Real Solana devnet RPC, real keypair signing, real submitted transaction | `crates/solana-core/tests/devnet_orca_swap_e2e.rs` |
 | **UI E2E (Playwright)** | Real browser against the real gateway (or against fixtures in `showcase` mode) | `frontend/tests/e2e/dashboard.live.spec.ts` |
+| **Property** | Generated inputs asserting an invariant across a random sample of the space; caught a real bug on first sweep | `crates/risk-engine/tests/p4_policy_proptest.rs : evaluate_never_panics` |
+| **Race** | Multi-thread `tokio::spawn` hammering the same in-memory state from N tasks; proves dedup / per-key lock invariants hold under genuine concurrency, not single-threaded interleaving | `crates/gateway/tests/p3_quorum_concurrent.rs : quorum_3_of_5_concurrent_decisions_are_correct` |
 
 ---
 
@@ -172,6 +174,27 @@ Supporting infrastructure (non-test but required):
 - [`frontend/playwright.config.ts`](../frontend/playwright.config.ts) — two-project split
 - [`frontend/tests/e2e/global-setup.ts`](../frontend/tests/e2e/global-setup.ts) — starts daemon + seeds + builds + serves two Next instances, with a `.next-e2e-<port>/BUILD_ID` cache skip (`CLAW_E2E_FORCE_BUILD=1` to force rebuild)
 - [`frontend/tests/e2e/global-teardown.ts`](../frontend/tests/e2e/global-teardown.ts) — kills PIDs recorded progressively by `recordSpawned`, plus `taskkill /IM clawd.exe` backstop on Windows
+
+### Phase 4 — Property-based + concurrent robustness
+
+Two test files added alongside Phase 1–3 correctness coverage to probe the
+two highest-value layers that `#[test]` cases don't naturally reach:
+input-space exhaustion and genuine thread-level concurrency.
+
+| File | Kind | Tests |
+|---|---|---|
+| [`crates/risk-engine/tests/p4_policy_proptest.rs`](../crates/risk-engine/tests/p4_policy_proptest.rs) | *property* (proptest) | 3 (`evaluate_never_panics`, `first_match_wins`, `human_approval_verdict_has_legitimate_origin`) — 512 generated cases total |
+| [`crates/gateway/tests/p3_quorum_concurrent.rs`](../crates/gateway/tests/p3_quorum_concurrent.rs) | *race* (`tokio::spawn`, multi-thread flavour) | 3 (quorum 3-of-5, duplicate-operator spam, approve+reject interleave × 16) |
+
+These are additive to the 368-test baseline — aggregate is now **374 tests,
+0 failing** (see [`TEST_RESULTS.md § Phase 4`](./TEST_RESULTS.md)).
+
+The proptest sweep caught a real u64 overflow bug at
+[`crates/risk-engine/src/policy.rs`](../crates/risk-engine/src/policy.rs)
+`transfer_amount_lamports` on its first meaningful run. The fix (saturating
+sum) landed in the same commit as the test — without the test, this was
+latent in `cargo test --release` (which skips arithmetic overflow checks)
+and would surface only under attacker-chosen multi-instruction transfers.
 
 ---
 

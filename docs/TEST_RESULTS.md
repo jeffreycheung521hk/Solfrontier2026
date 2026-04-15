@@ -83,6 +83,11 @@ cargo test -p claw-types -p claw-risk-engine -p claw-state-store \
 `p2_api_blackbox.rs`): **368 tests across 30 binaries** as enumerated in
 [`docs/artifacts/2026-04-15T08-45-59Z/test-inventory.txt`](./artifacts/2026-04-15T08-45-59Z/test-inventory.txt).
 
+**Post-Phase-4 inventory** (adds proptest fuzzer + concurrent quorum
+tests — see the new "Phase 4" section below): **374 tests across 32
+binaries** as enumerated in
+[`docs/artifacts/2026-04-15T14-32-51Z/test-inventory.txt`](./artifacts/2026-04-15T14-32-51Z/test-inventory.txt).
+
 No production code was changed in this phase — the only fix-ups were to
 three test imports (`c1_rate_limit_runtime.rs`, `n10b_bridge_simulation.rs`,
 `n23_operator_authz_runtime.rs`) after earlier phases extended `AppState`
@@ -125,6 +130,59 @@ session):
 stdout captured in the working session. To reproduce, run the commands
 above — the build cache under `.next-e2e-3000/` and `.next-e2e-3001/` is
 already warm.
+
+---
+
+## Phase 4 — Property-based + concurrent robustness
+
+**Scope**: 6 tests in 2 new integration files, covering the two test
+categories flagged as genuinely new signal (proptest fuzzing for Policy
+Engine panic/ordering invariants, concurrent race for quorum dedup).
+
+**New test files added in this phase**:
+- [`crates/risk-engine/tests/p4_policy_proptest.rs`](../crates/risk-engine/tests/p4_policy_proptest.rs)
+  — 3 `proptest!` blocks (256 + 128 + 128 cases each):
+  1. `evaluate_never_panics` — random rule sets × random proposals, assert
+     `PolicySet::evaluate` returns for every input
+  2. `first_match_wins` — `matched_rule_index = Some(k)` implies no rule at
+     index `< k` matches (ordering invariant)
+  3. `human_approval_verdict_has_legitimate_origin` — `RequiresHumanApproval`
+     verdict must come from a `RequireHumanApproval` action or the
+     fail-closed default
+- [`crates/gateway/tests/p3_quorum_concurrent.rs`](../crates/gateway/tests/p3_quorum_concurrent.rs)
+  — 3 `#[tokio::test(flavor = "multi_thread")]` tests hammering
+  `ApprovalStore::decide`:
+  1. 3-of-5 quorum race → exactly 3 progress, 2 `AlreadyDecided`, state
+     `Approved`, stage records exactly 3 distinct operators
+  2. Same-operator-id spam (5×) → exactly 1 accepted, 4 `DuplicateOperator`,
+     workflow stays `Pending`
+  3. Concurrent approve + reject × 16 iterations → final state is never
+     `Approved` (only `Rejected` or `Pending`)
+
+**Production-code change driven by this phase** (non-trivial):
+[`crates/risk-engine/src/policy.rs`](../crates/risk-engine/src/policy.rs)
+`transfer_amount_lamports` was summing `Vec<u64>` with `.sum()` which
+panics in debug builds on u64 overflow. Proptest found this on its first
+serious sweep. Fixed to `fold(0u64, saturating_add)` — semantically
+correct because an overflowing total still exceeds any sane
+`AmountExceedsLamports` threshold, so `fire-when-high` rules still fire.
+
+**Last observed result**: all 6 tests pass locally.
+
+**Aggregated workspace result at end of Phase 4**:
+```
+cargo test -p claw-types -p claw-risk-engine -p claw-state-store \
+           -p claw-api -p claw-gateway
+# → 374 passed, 0 failed
+```
+
+**Out of scope for Phase 4** (documented as current non-closures):
+- Hurl/Newman HTTP scripts — Rust `p2_api_blackbox.rs` already covers
+  the same contracts at the route layer; a `.hurl` lane would duplicate
+  without new signal. Flagged as deliberate non-work.
+- Wallet-adapter mocking in Playwright, visual-regression screenshots,
+  Toxiproxy/RPC chaos, simulate-OK-but-broadcast-fail end-to-end — all
+  listed as C6 in the risk table below.
 
 ---
 
@@ -186,6 +244,7 @@ for the exact wording. Summary of the three:
 | C3 | **Invalid-token path on `/sessions/:id/approve` is not independently asserted.** | **Closed.** `p2_api_blackbox.rs` gained `approve_route_without_token_returns_401` and `approve_route_with_wrong_token_returns_401`. Both pass in the local run (17 tests in the file now). |
 | C4 | **Inline `#[cfg(test)]` counts per module are not inventoried.** | **Closed.** `docs/artifacts/2026-04-15T08-45-59Z/test-inventory.txt` captures the per-binary inventory from `cargo test -- --list`. Headline **368 tests across 30 binaries** — matches the 366-passed baseline plus the 2 new C3 approve-route tests. Regenerate by re-running the enumeration steps in the artifact's `README.md`. |
 | C5 | **Devnet E2E cannot run on a fresh clone** (deliberate — no funded wallet). The only durable evidence is the three signatures in `DEVNET_PROOF.md`. | **Accepted as nightly / manual job.** If a CI lane is added later, either pre-fund a test wallet via secret injection, or gate the job on a repository variable. |
+| C6 | **Web3 E2E + chaos layer is missing.** No wallet-adapter mocking in Playwright (Phantom flow is manual-only), no visual-regression screenshots, no Toxiproxy-based RPC chaos tests, no simulate-OK-but-broadcast-fail → Dashboard-status end-to-end test. | **Open, scoped for future sprint.** Biggest ROI first: (a) wallet-adapter mock in Playwright so the sign path can be run headlessly; (b) one test asserting `TransactionFailed` → Dashboard status mapping when broadcast fails post-approval. Toxiproxy and visual-regression are nice-to-have after (a)+(b). |
 
 ---
 

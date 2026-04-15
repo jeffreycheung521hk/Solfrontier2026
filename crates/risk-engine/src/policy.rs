@@ -345,7 +345,15 @@ impl PolicySet {
             .collect();
 
         if !proposal_amounts.is_empty() {
-            return Some(proposal_amounts.into_iter().sum());
+            // Saturating sum: a malicious or malformed proposal with many
+            // huge transfer values would otherwise panic on u64 overflow
+            // in debug builds. Saturation is the right semantics for
+            // policy: an overflowing total still "exceeds" any sane
+            // threshold, so AmountExceedsLamports rules fire correctly.
+            let total = proposal_amounts
+                .into_iter()
+                .fold(0u64, |acc, v| acc.saturating_add(v));
+            return Some(total);
         }
 
         let simulation = ctx.simulation_result?;
