@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 
+pub mod approval_audit;
 pub mod approval_routing;
 pub mod approval_store;
 pub mod completion_metadata;

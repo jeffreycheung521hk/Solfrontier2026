@@ -129,8 +129,9 @@ export default async function DashboardPage() {
 }
 
 function StatCard({ label, value, hint, tone }: { label: string; value: string; hint?: string; tone?: "warn" }) {
+  const testId = `stat-${label.toLowerCase().replace(/\s+/g, "-")}`;
   return (
-    <Card className={tone === "warn" ? "border-amber-500/40" : undefined}>
+    <Card className={tone === "warn" ? "border-amber-500/40" : undefined} data-testid={testId}>
       <CardContent className="py-6">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">{label}</div>
         <div className="mt-2 text-3xl font-semibold tracking-tight">{value}</div>

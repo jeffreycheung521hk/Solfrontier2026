@@ -1295,72 +1295,24 @@ impl GatewayApprovalHandler {
         decision: ApprovalDecision,
     ) -> (ApprovalOutcome, Option<ApprovalRequest>) {
         let (outcome, maybe_request) = self.store.decide(&decision);
-        let actor = decision.operator_id.as_deref().unwrap_or("operator");
 
-        // ── Audit logging per outcome type ──────────────────────────────────
-        match &outcome {
-            ApprovalOutcome::RoleMismatch { required, provided } => {
-                warn!(request_id = %decision.request_id, %required, ?provided, "role mismatch");
-                let _ = self.audit.append(
-                    None, &decision.request_id.to_string(), "approval_role_mismatch", "operator",
-                    &serde_json::json!({ "request_id": decision.request_id, "required_role": required, "provided_role": provided }),
-                    AuditSeverity::Warning,
-                ).await;
-            }
-            ApprovalOutcome::StageAdvanced { completed_stage, next_stage, next_required_role } => {
-                let _ = self.audit.append(
-                    None, &decision.request_id.to_string(), "approval_stage_advanced", actor,
-                    &serde_json::json!({ "request_id": decision.request_id, "completed_stage": completed_stage, "next_stage": next_stage, "next_required_role": next_required_role, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
-                    AuditSeverity::Info,
-                ).await;
-            }
-            ApprovalOutcome::QuorumProgress { stage, approvals_so_far, approvals_required } => {
-                let _ = self.audit.append(
-                    None, &decision.request_id.to_string(), "approval_quorum_progress", actor,
-                    &serde_json::json!({ "request_id": decision.request_id, "stage": stage, "approvals_so_far": approvals_so_far, "approvals_required": approvals_required, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
-                    AuditSeverity::Info,
-                ).await;
-            }
-            ApprovalOutcome::Expired => {
-                // Audit the lease expiry explicitly — this is NOT a real decision.
-                warn!(
-                    request_id = %decision.request_id,
-                    "late decision rejected: approval workflow lease expired"
-                );
-                let _ = self.audit.append(
-                    None, &decision.request_id.to_string(), "approval_lease_expired", actor,
-                    &serde_json::json!({
-                        "request_id":  decision.request_id,
-                        "operator_id": decision.operator_id,
-                        "reason":      "late decision arrived after lease expiry",
-                    }),
-                    AuditSeverity::Warning,
-                ).await;
-            }
-            _ => {}
-        }
+        // Audit side-effects extracted into a pure-ish function so they can
+        // be tested without spinning up the whole daemon.
+        crate::approval_audit::emit_decide_audit(
+            &self.audit,
+            &decision,
+            &outcome,
+            maybe_request.as_ref(),
+        ).await;
 
-        // Terminal decision audit + events — ONLY fire on a real Approved or Rejected.
-        // Expired/NotFound/AlreadyDecided/RoleMismatch/DuplicateOperator/*Progress
-        // must NOT write a human_approved/human_rejected audit row.
+        // Event publication stays inline because it touches the broadcast bus
+        // that only the daemon owns.
         let is_real_decision = matches!(
             outcome,
             ApprovalOutcome::Approved | ApprovalOutcome::Rejected
         );
         if is_real_decision {
             if let Some(ref request) = maybe_request {
-                let (audit_event, audit_severity) = if decision.approved {
-                    ("human_approved", AuditSeverity::Info)
-                } else {
-                    ("human_rejected", AuditSeverity::Warning)
-                };
-                let _ = self.audit.append(
-                    Some(&request.session_id.to_string()), &decision.request_id.to_string(),
-                    audit_event, actor,
-                    &serde_json::json!({ "request_id": decision.request_id, "transaction_id": request.transaction_id, "approved": decision.approved, "note": decision.note, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
-                    audit_severity,
-                ).await;
-
                 self.event_bus.publish(GatewayEvent::ApprovalReceived(ApprovalLifecycleEvent {
                     header:         EventHeader::new(Some(request.session_id.clone())),
                     session_id:     request.session_id.clone(),

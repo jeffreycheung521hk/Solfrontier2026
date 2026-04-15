@@ -1,0 +1,30 @@
+# cargo-nextest profiles for ClawSolana.
+#
+# Install (one-time):
+#   cargo install cargo-nextest --locked
+#
+# Default profile for day-to-day development — matches `cargo test` behaviour.
+# The `ci` profile emits a JUnit XML report suitable for archival / GitHub
+# Actions upload and is the artifact referenced by docs/TEST_RESULTS.md.
+
+[profile.default]
+# Match cargo test stdout capture so local runs feel the same.
+failure-output = "immediate"
+success-output = "never"
+fail-fast = false
+
+[profile.ci]
+# Keep the same pass/fail semantics but emit a JUnit report under
+# target/nextest/ci/junit.xml that CI can upload.
+failure-output = "immediate-final"
+success-output = "never"
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
+# Include each module/test name fully so downstream graders can correlate
+# with source files.
+report-name = "claw-solana-nextest"
+# Store stdout/stderr for failing tests so artifact uploads carry context.
+store-failure-output = true
+store-success-output = false
