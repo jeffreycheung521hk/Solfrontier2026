@@ -1,0 +1,433 @@
+# Test inventory — cargo test --list (terse)
+# Generated: 2026-04-15T08-45-59Z
+# Packages: claw-types, claw-risk-engine, claw-state-store, claw-api, claw-gateway
+
+## c1_rate_limit_runtime — 4 tests
+health_endpoint_not_rate_limited: test
+metrics_endpoint_shows_rate_limit_hits: test
+rate_limit_429_after_exceeded: test
+rate_limit_independent_tokens: test
+
+## claw_api — 3 tests
+rate_limit::tests::burst_extends_limit: test
+rate_limit::tests::different_tokens_independent: test
+rate_limit::tests::sliding_window_eviction: test
+
+## claw_gateway — 65 tests
+approval_routing::tests::already_decided_does_not_signal: test
+approval_routing::tests::approved_signals_pending_store: test
+approval_routing::tests::duplicate_operator_does_not_signal: test
+approval_routing::tests::expired_signals_pending_store_with_expired_state: test
+approval_routing::tests::not_found_does_not_signal: test
+approval_routing::tests::quorum_progress_does_not_signal: test
+approval_routing::tests::rejected_signals_pending_store_with_alert: test
+approval_routing::tests::rejection_alert_payload_has_full_context: test
+approval_routing::tests::role_mismatch_does_not_signal: test
+approval_routing::tests::stage_advanced_does_not_signal: test
+approval_store::tests::approve_pending_request: test
+approval_store::tests::correct_role_then_approve_succeeds: test
+approval_store::tests::duplicate_decision_is_rejected: test
+approval_store::tests::missing_role_on_required_request_is_rejected: test
+approval_store::tests::multi_stage_all_approvals_completes_workflow: test
+approval_store::tests::multi_stage_first_approval_advances_stage: test
+approval_store::tests::multi_stage_rejection_at_any_stage_is_terminal: test
+approval_store::tests::multi_stage_workflow_state_visible_via_get_workflow: test
+approval_store::tests::multi_stage_wrong_role_at_stage_is_rejected: test
+approval_store::tests::no_required_role_accepts_any_approver: test
+approval_store::tests::pending_for_session_filters_correctly: test
+approval_store::tests::quorum_anonymous_operator_not_deduped: test
+approval_store::tests::quorum_duplicate_operator_rejected: test
+approval_store::tests::quorum_first_approval_returns_progress: test
+approval_store::tests::quorum_met_after_second_approval: test
+approval_store::tests::quorum_rejection_is_terminal_even_mid_quorum: test
+approval_store::tests::reject_pending_request: test
+approval_store::tests::role_match_allows_approval: test
+approval_store::tests::role_mismatch_rejects_decision: test
+approval_store::tests::unknown_request_id_returns_not_found: test
+orchestrator::tests::adapter_ordering_prefers_external_over_local: test
+orchestrator::tests::complete_on_nonexistent_request_returns_not_found: test
+orchestrator::tests::complete_with_tampered_message_fails_and_consumes: test
+orchestrator::tests::complete_with_valid_signature_succeeds: test
+orchestrator::tests::duplicate_request_id_rejected: test
+orchestrator::tests::expire_after_complete_returns_not_found: test
+orchestrator::tests::expire_removes_pending_entry: test
+orchestrator::tests::expired_candidates_returns_old_entries: test
+orchestrator::tests::external_adapter_routes_to_pending: test
+orchestrator::tests::local_adapter_routes_and_signs_synchronously: test
+orchestrator::tests::no_adapter_returns_error: test
+orchestrator::tests::pending_for_session_filters_correctly: test
+policy_alerting::tests::alert_dispatcher_disabled_is_noop: test
+policy_alerting::tests::disabled_by_default: test
+policy_alerting::tests::disabled_when_no_url: test
+policy_alerting::tests::enabled_with_url: test
+policy_alerting::tests::payload_serializes_correctly: test
+session_policy::tests::empty_overrides_not_stored: test
+session_policy::tests::load_persisted_recovers_from_sqlite: test
+session_policy::tests::load_persisted_skips_corrupt_rows: test
+session_policy::tests::remove_cleans_up: test
+session_policy::tests::remove_deletes_from_sqlite: test
+session_policy::tests::sessions_are_isolated: test
+session_policy::tests::set_and_get_overrides: test
+session_policy::tests::write_through_persists_to_sqlite: test
+tools::signing::tests::policy_evaluation_audit_approved_has_no_reason: test
+tools::signing::tests::policy_evaluation_audit_captures_full_context: test
+tools::signing::tests::summarize_compute_budget_instruction: test
+tools::signing::tests::summarize_create_account: test
+tools::signing::tests::summarize_multiple_instructions: test
+tools::signing::tests::summarize_spl_token_legacy_transfer_returns_no_token_transfer: test
+tools::signing::tests::summarize_spl_token_transfer_checked: test
+tools::signing::tests::summarize_system_transfer: test
+tools::signing::tests::summarize_transfer_checked_is_not_marked_legacy: test
+tools::signing::tests::summarize_unknown_program_fallback: test
+
+## claw_risk_engine — 33 tests
+policy::tests::amount_threshold_matches_transfer_amount: test
+policy::tests::destination_denylist_rule_blocks_denied_pubkey: test
+policy::tests::fallback_fail_closed_reports_all_rules_evaluated: test
+policy::tests::is_outside_allowed_hours_basic_range: test
+policy::tests::is_outside_allowed_hours_day_check: test
+policy::tests::is_outside_allowed_hours_empty_days_allows_all: test
+policy::tests::is_outside_allowed_hours_wrapping_range: test
+policy::tests::legacy_token_transfer_guard_before_token_amount_closes_bypass: test
+policy::tests::legacy_token_transfer_present_does_not_fire_for_transfer_checked: test
+policy::tests::legacy_token_transfer_present_fires_for_legacy_transfer: test
+policy::tests::maintenance_window_rule_takes_priority_over_normal_allow_rule: test
+policy::tests::maintenance_window_takes_priority_deterministic: test
+policy::tests::mint_not_in_allowlist_empty_list_disables_check: test
+policy::tests::mint_not_in_allowlist_fires_for_unlisted_mint: test
+policy::tests::mint_not_in_allowlist_passes_for_listed_mint: test
+policy::tests::outside_allowed_hours_condition_fires_in_policy_deterministic: test
+policy::tests::outside_allowed_hours_live_clock_sanity: test
+policy::tests::precedence_is_caller_override_then_role_profile_then_global_then_defaults: test
+policy::tests::program_allowlist_rule_blocks_unlisted_program: test
+policy::tests::rule_priority_is_first_match_wins: test
+policy::tests::time_based_rule_allows_inside_window_and_blocks_outside_window: test
+policy::tests::token_amount_exceeds_does_not_fire_below_threshold: test
+policy::tests::token_amount_exceeds_fires_for_matching_mint_above_threshold: test
+policy::tests::token_amount_exceeds_ignores_other_mints: test
+policy::tests::token_amount_exceeds_sums_multiple_instructions: test
+policy::tests::with_session_rules_inherits_allowlist_denylist: test
+policy::tests::with_session_rules_prepends_and_matches_first: test
+rules::allowlist::tests::allowlist_blocks_unknown: test
+rules::allowlist::tests::denylist_blocks_known_bad: test
+rules::allowlist::tests::empty_allowlist_allows_all: test
+rules::spend_cap::tests::cap_exceeded: test
+rules::spend_cap::tests::cap_not_exceeded: test
+rules::spend_cap::tests::overflow_safe: test
+
+## claw_state_store — 16 tests
+approval_workflow::tests::create_and_load: test
+approval_workflow::tests::create_is_idempotent: test
+approval_workflow::tests::load_by_state_filters_correctly: test
+approval_workflow::tests::load_nonexistent_returns_none: test
+approval_workflow::tests::update_transitions_state: test
+session_policy::tests::delete_nonexistent_returns_zero: test
+session_policy::tests::delete_session_removes_row: test
+session_policy::tests::load_all_returns_all_rows: test
+session_policy::tests::load_nonexistent_returns_none: test
+session_policy::tests::save_and_load: test
+session_policy::tests::save_is_idempotent_replaces: test
+wallet_bindings::tests::bind_and_load: test
+wallet_bindings::tests::bind_is_idempotent: test
+wallet_bindings::tests::empty_session_returns_empty_vec: test
+wallet_bindings::tests::load_all_returns_all_bindings: test
+wallet_bindings::tests::unbind_session_removes_all: test
+
+## claw_types — 10 tests
+policy::tests::legacy_token_transfer_present_round_trips_through_serde: test
+policy::tests::mint_not_in_allowlist_round_trips_through_serde: test
+policy::tests::policy_rule_deserializes_demo_toml_shapes: test
+policy::tests::policy_rule_deserializes_legacy_token_transfer_present: test
+policy::tests::policy_rule_deserializes_mint_not_in_allowlist: test
+policy::tests::policy_rule_deserializes_outside_allowed_hours: test
+policy::tests::policy_rule_deserializes_outside_allowed_hours_defaults: test
+policy::tests::policy_rule_deserializes_string_unit_variants: test
+policy::tests::policy_rule_deserializes_token_amount_exceeds: test
+policy::tests::token_amount_exceeds_round_trips_through_serde: test
+
+## n10a_external_wallet — 18 tests
+changed_blockhash_rejected: test
+compute_budget_tampering_rejected: test
+double_complete_rejected: test
+expected_signer_retrieval: test
+get_parked_tx_bytes: test
+happy_path_external_signer_roundtrip: test
+message_bytes_match_accepted: test
+modified_instructions_rejected: test
+multiple_wallets_per_session: test
+park_complete_lifecycle: test
+park_reject_lifecycle: test
+pending_for_session_returns_matching: test
+reject_on_invalid_signature: test
+reject_on_message_mismatch: test
+reject_on_signer_mismatch: test
+session_wallet_binding: test
+verify_signed_tx_happy_path: test
+wrong_wallet_signature_rejected: test
+
+## n10b_bridge_simulation — 3 tests
+bridge_reject_tampered_message: test
+bridge_reject_wrong_signer: test
+bridge_roundtrip_happy_path: test
+
+## n10c_store_hardening — 23 tests
+adv_empty_bytes: test
+adv_fabricated_request_id_returns_not_found: test
+adv_garbage_bytes: test
+adv_late_submit_after_rejection: test
+adv_replay_after_accept_returns_not_found: test
+architectural_complete_take_gap_is_safe: test
+binding_concurrent_bind: test
+binding_session_isolation: test
+conc_complete_vs_reject_race: test
+conc_duplicate_submit_signed_transaction: test
+conc_race_to_complete_exactly_one_wins: test
+conc_race_to_reject_exactly_one_wins: test
+conc_stress_1000_park_submit: test
+invariant_concurrent_random_park_submit_clean_state: test
+invariant_random_operations_no_panic: test
+sm_complete_take_removes_entry: test
+sm_complete_then_complete_returns_false: test
+sm_complete_then_reject_returns_false: test
+sm_operations_on_nonexistent_id: test
+sm_reject_remove_removes_entry: test
+sm_reject_then_complete_returns_false: test
+sm_reject_then_reject_returns_false: test
+sm_rx_dropped_before_complete_does_not_panic: test
+
+## n10d_daemon_integration — 3 tests
+concurrent_submit_race_exactly_once_side_effects: test
+full_approval_then_external_sign_flow: test
+restart_resilience_submit_after_store_reset: test
+
+## n15_orchestrator_integration — 13 tests
+auto_approved_external_pending_then_complete: test
+auto_approved_local_signs_synchronously_via_orchestrator: test
+complete_unknown_request_returns_not_found: test
+completion_meta_cleaned_on_expiry: test
+completion_meta_cleaned_on_verification_failure: test
+completion_meta_consumed_on_success: test
+completion_meta_not_found_does_not_leak: test
+concurrent_double_complete_race_exactly_one_succeeds: test
+duplicate_request_id_rejected: test
+expiry_reaper_expires_old_requests: test
+human_approved_external_pending_then_complete_after_approval: test
+human_approved_local_signs_via_orchestrator_after_approval: test
+tampered_completion_fails_and_consumes_entry: test
+
+## n16_durability — 9 tests
+completion_metadata_survives_restart: test
+consumed_request_not_reloaded: test
+duplicate_completion_after_restart_fails_closed: test
+multi_stage_chain_recovered_from_durable_state: test
+pending_approval_survives_restart: test
+pending_external_signature_survives_restart: test
+recovery_does_not_create_orphans: test
+stale_recovered_request_fails_closed: test
+startup_with_corrupt_record_fails_closed: test
+
+## n16b_durability_hardening — 8 tests
+consumed_approval_not_recovered: test
+consumed_completion_meta_not_recovered: test
+consumed_signature_not_resurrected_on_second_restart: test
+expired_signature_not_recovered: test
+mark_terminal_is_idempotent: test
+persist_approval_returns_result: test
+purge_terminal_cleans_old_rows: test
+rejected_signature_not_recovered: test
+
+## n16c_durable_first — 6 tests
+atomic_persist_creates_both_rows: test
+atomic_persist_survives_restart: test
+durable_first_happy_path_external_pending: test
+no_half_state_on_recovery: test
+purge_terminal_preserves_pending_rows: test
+rollback_via_abort_pending_cleans_in_memory: test
+
+## n17_semantic_cleanup — 7 tests
+abort_and_expire_are_distinct_paths: test
+abort_pending_removes_in_memory_entry: test
+abort_pending_unknown_returns_not_found: test
+expire_still_works_for_natural_ttl: test
+purge_never_removes_pending_rows: test
+purge_with_retention_preserves_recent_terminal: test
+purge_with_zero_retention_removes_all_terminal: test
+
+## n18_foundation_audit — 38 tests
+n1_execution_role_cannot_sign_or_send: test
+n1_no_role_grants_sign_transaction: test
+n1_research_role_is_read_only: test
+n2_approve_then_approve_again_returns_not_found: test
+n2_reject_then_approve_returns_already_decided: test
+n3_event_ordering_preserved_within_session: test
+n3_event_serializes_with_event_type_tag: test
+n3_lagged_consumer_gets_lagged_error_not_panic: test
+n3_late_subscriber_does_not_see_past_events: test
+n3_multiple_subscribers_all_receive_same_events: test
+n3_newer_event_variants_do_not_break_subscriber: test
+n3_session_scoped_filtering_only_delivers_matching_events: test
+n3_system_events_not_forwarded_to_session_stream: test
+n4_all_three_load_paths_produce_same_result: test
+n4_debug_output_does_not_leak_key_material: test
+n4_duplicate_key_loading_overwrites_cleanly: test
+n4_get_nonexistent_key_returns_error: test
+n4_keystore_load_from_json_bytes_roundtrip: test
+n4_keystore_rejects_invalid_json: test
+n4_keystore_rejects_wrong_length_bytes: test
+n4_load_from_base58_rejects_invalid_encoding: test
+n4_load_from_base58_rejects_short_key: test
+n4_load_from_base58_roundtrip: test
+n4_load_from_bytes_rejects_wrong_length: test
+n4_load_from_bytes_roundtrip: test
+n4_multiple_distinct_wallets_isolated: test
+n5_consumed_durable_approval_not_recoverable_after_restart: test
+n5_resume_with_durable_local_path: test
+n6_capability_check_blocks_sign_transaction: test
+n6_capability_check_blocks_unknown_capability_fail_closed: test
+n6_later_orchestrator_wiring_did_not_widen_propose_signing: test
+n7_external_completion_failure_does_not_record_spend: test
+n7_rejected_approval_does_not_record_spend: test
+n7_spend_dedup_on_transaction_id: test
+n7_spend_recorded_exactly_once_on_resume_path: test
+n8_content_block_roundtrip_preserves_structure: test
+n8_content_block_serializes_as_tagged_union: test
+n8_llm_message_with_tool_results_is_user_role: test
+
+## n19_wallet_challenge — 9 tests
+challenge_message_is_canonical: test
+cross_session_hijack_rejected: test
+expired_challenge_rejected: test
+invalid_signature_format_rejected: test
+pubkey_mismatch_rejected: test
+reused_challenge_rejected: test
+unknown_challenge_not_found: test
+valid_signature_binds_wallet: test
+wrong_signature_rejected: test
+
+## n20_external_wallet_e2e — 3 tests
+external_wallet_e2e_auto_approved_direct_pending: test
+external_wallet_e2e_tampered_tx_rejected: test
+external_wallet_full_e2e_challenge_bind_approve_sign_complete: test
+
+## n21_submission_invariants — 11 tests
+bincode_vs_wire_format_comparison: test
+durable_first_db_insert_required_before_tracker: test
+exactly_once_consume_on_attempt: test
+fallback_submission_height_avoids_zero: test
+happy_path_tracking_persisted_and_recoverable: test
+idempotent_insert_does_not_error: test
+real_submission_height_avoids_premature_dropped: test
+restart_recovery_preserves_submission_block_height: test
+rpc_failure_no_tracking_row_no_memory: test
+signed_bytes_immutability_through_orchestrator: test
+submission_height_zero_causes_premature_dropped: test
+
+## n22_config_policy_wiring — 19 tests
+caller_overrides_take_priority_over_role_profile: test
+denied_destination_is_rejected: test
+large_transfer_triggers_human_approval: test
+no_matching_role_profile_falls_through_to_global: test
+no_session_override_uses_global_only: test
+research_role_profile_blocks_everything: test
+role_profile_rules_merged_with_global_produce_correct_verdicts: test
+role_profiles_parse_from_toml: test
+session_override_falls_through_to_global: test
+session_override_takes_priority_over_global: test
+small_transfer_to_allowed_program_falls_through: test
+toml_parses_into_config_with_custom_rules: test
+unlisted_program_is_rejected: test
+usdc_500_usdc_triggers_medium_value_rule: test
+usdc_50_usdc_falls_through_to_no_match_failsafe: test
+usdc_50k_usdc_triggers_multi_stage_chain: test
+usdc_demo_toml_parses_with_two_chain_rules: test
+verdict_json_carries_rule_name_and_reason: test
+wrong_rule_ordering_downgrades_high_value_to_single_approver_regression: test
+
+## n23_operator_authz_runtime — 4 tests
+multi_role_operator_uses_first_role_when_body_omits_role: test
+operator_with_correct_role_passes_role_check: test
+self_claimed_higher_role_is_rejected: test
+token_mapped_role_can_approve_required_role_request: test
+
+## n24_session_policy_lifecycle — 7 tests
+caller_overrides_alone_are_stored_even_without_profile: test
+closing_session_removes_persisted_overrides: test
+corrupt_persisted_policy_row_is_skipped_without_crash: test
+no_profile_match_stores_nothing: test
+precedence_is_caller_then_profile: test
+role_profile_is_auto_applied_when_session_has_no_overrides: test
+session_policy_overrides_are_persisted_and_recovered_after_restart: test
+
+## n25_approval_workflow_restart — 4 tests
+approval_workflow_state_survives_restart_mid_process: test
+durable_workflow_recovered_from_db_can_be_decided: test
+out_of_state_decision_does_not_mutate_workflow: test
+terminal_approval_state_is_idempotent_after_restart: test
+
+## n26_multi_stage_and_quorum_runtime — 7 tests
+duplicate_approval_from_same_operator_counts_once: test
+later_stage_cannot_approve_before_earlier_stage: test
+multi_stage_chain_signals_pending_store_only_on_terminal: test
+multi_step_chain_happy_path_completes_signing: test
+quorum_stage_completes_only_after_n_unique_approvals: test
+rejection_at_first_stage_is_terminal: test
+small_amount_below_threshold_is_auto_approved: test
+
+## n27_wallet_policy_and_leases — 6 tests
+expired_lease_blocks_pending_signing_signal: test
+expired_signing_lease_rejects_late_approval: test
+wallet_from_config_builds_store_correctly: test
+wallet_required_approver_role_propagates: test
+wallet_specific_policy_overrides_global_policy: test
+wallet_without_policy_has_no_rules: test
+
+## n28_policy_alerting_runtime — 6 tests
+alert_delivery_failure_does_not_break_caller: test
+alert_delivery_failure_does_not_break_policy_enforcement: test
+alert_dispatcher_active_delivers: test
+alert_dispatcher_disabled_is_noop: test
+policy_rejection_emits_alert_with_rule_and_context: test
+production_policy_reject_triggers_alert_with_full_context: test
+
+## n6_signing_smoke — 7 tests
+approve_signs_and_emits_events: test
+audit_persistence_queryable: test
+capability_model_execution_propose_not_sign: test
+duplicate_decision_rejected: test
+event_bus_multiple_subscribers: test
+reject_emits_failure_event_no_signing: test
+typestate_integrity_preserved: test
+
+## n7_spend_tracking — 7 tests
+cap_check_blocks_above_cap: test
+cap_check_passes_below_cap: test
+daily_accumulation: test
+multi_tx_stability: test
+no_double_count_on_duplicate_tx_id: test
+spend_recorded_correctly: test
+spend_starts_at_zero: test
+
+## p1_core_correctness — 4 tests
+expired_decide_writes_lease_expired_audit_not_human_decision: test
+propose_transfer_failure_returns_422_with_no_pending_approval: test
+propose_transfer_success_surfaces_approval_in_pending_list: test
+usdc_10k_triggers_chain_and_completes_through_risk_and_treasury: test
+
+## p2_api_blackbox — 15 tests
+approve_route_with_wrong_token_returns_401: test
+approve_route_without_token_returns_401: test
+case10_audit_rows_survive_restart_via_fresh_repository: test
+case1_policy_rules_preserve_config_order: test
+case2_pending_approvals_are_cross_session_and_include_workflow: test
+case3_wallets_include_daily_spend: test
+case4_audit_pagination_limit_and_offset: test
+case5_health_public_metrics_auth_gated: test
+case6a_seed_demo_disabled_returns_503: test
+case6b_seed_demo_accumulates_each_call: test
+case7a_role_mismatch_returns_403: test
+case7b_role_not_held_returns_403: test
+case7c_duplicate_operator_returns_409: test
+case7d_expired_returns_410_gone: test
+case8_dashboard_composite_matches_across_endpoints: test
+
+# TOTAL: 368 tests

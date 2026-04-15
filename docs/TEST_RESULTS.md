@@ -20,10 +20,13 @@ observed in a local run; it is **not** produced by CI.
 > - `npx playwright test` → `frontend/playwright-report/` (HTML + JSON)
 > - `bash scripts/capture-run.sh` → `docs/artifacts/<timestamp>/`
 >
-> Both output paths are gitignored except for `docs/artifacts/.gitkeep`,
-> so a reviewer who wants to pin a specific run can force-add that
-> snapshot. Numbers in this document remain the last *observed* values
-> until a capture-run lands in `docs/artifacts/`.
+> A pinned inventory snapshot has been committed at
+> [`docs/artifacts/2026-04-15T08-45-59Z/`](./artifacts/2026-04-15T08-45-59Z/)
+> closing C4. Future full capture-runs (`rust-nextest.log`,
+> `rust-junit.xml`, `playwright-report/`) are run-specific and reviewers
+> can force-add additional timestamp dirs if they want to pin a
+> particular session's outputs. Numbers in this document are
+> cross-checkable against the committed inventory.
 
 ---
 
@@ -75,6 +78,10 @@ cargo test -p claw-types -p claw-risk-engine -p claw-state-store \
            -p claw-api -p claw-gateway
 # → 366 passed, 0 failed
 ```
+
+**Post-C3 inventory** (adds 2 approve-route / 401 tests in
+`p2_api_blackbox.rs`): **368 tests across 30 binaries** as enumerated in
+[`docs/artifacts/2026-04-15T08-45-59Z/test-inventory.txt`](./artifacts/2026-04-15T08-45-59Z/test-inventory.txt).
 
 No production code was changed in this phase — the only fix-ups were to
 three test imports (`c1_rate_limit_runtime.rs`, `n10b_bridge_simulation.rs`,
@@ -177,7 +184,7 @@ for the exact wording. Summary of the three:
 | C1 | **No run artifact persisted.** `frontend/test-results/` is empty at rest; `cargo test` stdout is not saved anywhere. | **Closed.** Playwright now writes `html` + `json` reports to `frontend/playwright-report/`; `.config/nextest.toml` emits `target/nextest/ci/junit.xml`; `scripts/capture-run.sh` snapshots both into `docs/artifacts/<timestamp>/`. |
 | C2 | **No CI.** | **Closed.** `.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy`, and `cargo nextest run --profile ci`, uploading `junit.xml` as a workflow artifact. Playwright and devnet E2E remain opt-in (see `capture-run.sh`). |
 | C3 | **Invalid-token path on `/sessions/:id/approve` is not independently asserted.** | **Closed.** `p2_api_blackbox.rs` gained `approve_route_without_token_returns_401` and `approve_route_with_wrong_token_returns_401`. Both pass in the local run (17 tests in the file now). |
-| C4 | **Inline `#[cfg(test)]` counts per module are not inventoried.** | **Still open.** Recommendation: `cargo nextest list --profile ci > docs/artifacts/nextest-inventory.txt` on a known-good commit, or adopt `cargo-llvm-cov` so coverage replaces raw counts as the headline number. |
+| C4 | **Inline `#[cfg(test)]` counts per module are not inventoried.** | **Closed.** `docs/artifacts/2026-04-15T08-45-59Z/test-inventory.txt` captures the per-binary inventory from `cargo test -- --list`. Headline **368 tests across 30 binaries** — matches the 366-passed baseline plus the 2 new C3 approve-route tests. Regenerate by re-running the enumeration steps in the artifact's `README.md`. |
 | C5 | **Devnet E2E cannot run on a fresh clone** (deliberate — no funded wallet). The only durable evidence is the three signatures in `DEVNET_PROOF.md`. | **Accepted as nightly / manual job.** If a CI lane is added later, either pre-fund a test wallet via secret injection, or gate the job on a repository variable. |
 
 ---
