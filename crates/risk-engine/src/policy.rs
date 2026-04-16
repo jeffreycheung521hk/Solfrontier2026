@@ -74,6 +74,21 @@ pub struct PolicySet {
 }
 
 impl PolicySet {
+    /// Returns the compiled rule list (evaluation order).
+    pub fn rules(&self) -> &[PolicyRule] {
+        &self.rules
+    }
+
+    /// Returns the program allowlist backing the `ProgramNotInAllowlist` check.
+    pub fn program_allowlist(&self) -> &[String] {
+        &self.program_allowlist
+    }
+
+    /// Returns the destination denylist.
+    pub fn destination_denylist(&self) -> &[String] {
+        &self.destination_denylist
+    }
+
     pub fn new(
         rules: Vec<PolicyRule>,
         program_allowlist: Vec<String>,
@@ -330,7 +345,15 @@ impl PolicySet {
             .collect();
 
         if !proposal_amounts.is_empty() {
-            return Some(proposal_amounts.into_iter().sum());
+            // Saturating sum: a malicious or malformed proposal with many
+            // huge transfer values would otherwise panic on u64 overflow
+            // in debug builds. Saturation is the right semantics for
+            // policy: an overflowing total still "exceeds" any sane
+            // threshold, so AmountExceedsLamports rules fire correctly.
+            let total = proposal_amounts
+                .into_iter()
+                .fold(0u64, |acc, v| acc.saturating_add(v));
+            return Some(total);
         }
 
         let simulation = ctx.simulation_result?;

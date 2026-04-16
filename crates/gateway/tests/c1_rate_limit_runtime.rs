@@ -28,6 +28,7 @@ use claw_api::{
     WalletChallengeHandler, WalletChallengeHandlerRef, WalletChallengeInfo,
     WalletSignatureHandler, WalletSignatureHandlerRef, WalletSignatureOutcome,
     PendingWalletSignatureInfo,
+    state::{AuditReaderRef, PolicyReaderRef, WalletDirectoryRef},
 };
 use claw_observability::HealthRegistry;
 use claw_types::{
@@ -119,6 +120,10 @@ fn build_router(
         propose: None,
         rate_limiter,
         operator_registry: claw_api::auth::OperatorRegistry::new(),
+        policy: PolicyReaderRef::noop(),
+        audit: AuditReaderRef::noop(),
+        wallets: WalletDirectoryRef::noop(),
+        demo_seeder: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());
@@ -208,6 +213,10 @@ async fn rate_limit_independent_tokens() {
         propose: None,
         rate_limiter: Some(limiter),
         operator_registry: claw_api::auth::OperatorRegistry::new(),
+        policy: PolicyReaderRef::noop(),
+        audit: AuditReaderRef::noop(),
+        wallets: WalletDirectoryRef::noop(),
+        demo_seeder: None,
     };
     let router = claw_api::create_router(state, HealthRegistry::new());
 

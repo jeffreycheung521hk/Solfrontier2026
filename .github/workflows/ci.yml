@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+# Minimal lane that gates every PR. Deliberately excludes:
+# - devnet_orca_* tests (require a funded keypair)
+# - Playwright E2E (live mode needs a running daemon + real wallet config;
+#   enable later when a headless orchestrator harness lands in CI)
+#
+# Both excluded lanes have dedicated capture paths in scripts/capture-run.sh
+# and docs/DEVNET_PROOF.md.
+
+jobs:
+  rust:
+    name: rust — fmt / clippy / nextest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: claw-ci
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo nextest run (ci profile)
+        run: |
+          cargo nextest run --profile ci \
+            -p claw-types -p claw-risk-engine -p claw-state-store \
+            -p claw-api -p claw-gateway
+
+      - name: Upload junit.xml
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 30

@@ -43,12 +43,17 @@ use crate::{
     errors::ApiError,
     routes::{
         approve::{list_approvals, submit_approval},
+        audit::list_audit,
+        debug_seed::seed_demo,
         events::session_events,
         health::health_handler,
         messages::send_message,
         metrics::metrics_handler,
+        pending_approvals::list_pending_approvals,
+        policy_rules::list_policy_rules,
         propose::propose_transfer,
         sessions::{close_session, list_sessions, open_session},
+        wallets::list_wallets,
         wallet_challenges::{create_wallet_challenge, confirm_wallet_challenge},
         wallet_signatures::{bind_wallet, list_wallet_signatures, submit_wallet_signature},
     },
@@ -89,7 +94,14 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         // Operational metrics
         .route("/metrics", get(metrics_handler))
         // Direct transaction proposal (bypasses LLM agent)
-        .route("/sessions/:id/propose-transfer", post(propose_transfer));
+        .route("/sessions/:id/propose-transfer", post(propose_transfer))
+        // Showcase / dashboard read surfaces
+        .route("/policy/rules", get(list_policy_rules))
+        .route("/pending-approvals", get(list_pending_approvals))
+        .route("/wallets", get(list_wallets))
+        .route("/audit", get(list_audit))
+        // Development-only — returns 503 unless CLAW_ENABLE_DEMO_SEED=1
+        .route("/debug/seed-demo", post(seed_demo));
 
     // Rate limiting layer — applied after auth, before handlers.
     if let Some(ref limiter) = state.rate_limiter {

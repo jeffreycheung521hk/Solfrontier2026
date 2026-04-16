@@ -36,11 +36,14 @@ const DEV_USDC_MINT: &str = "BRjpCHtyQLNCo8gqRUr8jtdAj5AjPYQaoqbvcZiHok1k";
 const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 const MIN_SQRT_PRICE: u128 = 4295048016;
 const TICK_ARRAY_SIZE: i32 = 88;
-const KEYPAIR_PATH: &str = "C:/Users/jeffr/Downloads/New/testingcrypto2/data/devnet.json";
+/// Relative to repo root (cargo test cwd). Override with CLAW_DEVNET_KEYPAIR.
+const DEFAULT_KEYPAIR_PATH: &str = "data/devnet.json";
 
 fn load_keypair() -> Keypair {
-    let data = std::fs::read_to_string(KEYPAIR_PATH)
-        .expect("cannot read keypair file");
+    let path = std::env::var("CLAW_DEVNET_KEYPAIR")
+        .unwrap_or_else(|_| DEFAULT_KEYPAIR_PATH.to_string());
+    let data = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read keypair file {}: {}", path, e));
     let bytes: Vec<u8> = serde_json::from_str(&data)
         .expect("keypair file is not valid JSON array");
     Keypair::from_bytes(&bytes)

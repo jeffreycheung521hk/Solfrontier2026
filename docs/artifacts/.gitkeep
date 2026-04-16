@@ -1,0 +1,3 @@
+# Run outputs from scripts/capture-run.sh land in sibling dated folders.
+# This file keeps the directory tracked so capture-run.sh never has to
+# worry about mkdir races or missing parents.

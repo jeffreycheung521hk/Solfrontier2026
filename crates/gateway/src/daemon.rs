@@ -48,6 +48,12 @@ use claw_api::{
     WalletSignatureHandler, WalletSignatureHandlerRef, WalletSignatureOutcome,
     PendingWalletSignatureInfo,
     auth::OperatorRegistry,
+    state::{
+        AuditReader, AuditReaderRef, AuditRowDto,
+        DemoSeeder, DemoSeederRef, DemoSeedReport,
+        PolicyReader, PolicyReaderRef,
+        WalletDirectory, WalletDirectoryRef, WalletPolicySummaryDto, WalletSummaryDto,
+    },
 };
 use claw_observability::HealthRegistry;
 use claw_risk_engine::PolicySet;
@@ -582,6 +588,57 @@ impl GatewayDaemon {
             None
         };
 
+        // Dashboard read surfaces — expose the already-constructed policy,
+        // audit, and wallet directory behind the claw-api read traits.
+        let policy_reader_ref = PolicyReaderRef::new(Arc::new(GatewayPolicyReader {
+            policy_set: policy_set.clone(),
+        }));
+        let audit_reader_ref = AuditReaderRef::new(Arc::new(GatewayAuditReader {
+            audit: audit_repo.clone(),
+        }));
+        let wallet_directory_entries: Vec<(
+            String,
+            String,
+            claw_types::wallet::SignerType,
+            Option<WalletPolicySummaryDto>,
+        )> = config
+            .wallets
+            .iter()
+            .filter_map(|w| {
+                let pubkey = w.pubkey.clone().or_else(|| {
+                    loaded_wallets.iter().find_map(|(label, pk)| {
+                        if label == &w.label { Some(pk.clone()) } else { None }
+                    })
+                })?;
+                let policy = w.policy.as_ref().map(|p| WalletPolicySummaryDto {
+                    max_amount_lamports:    p.max_amount_lamports,
+                    program_allowlist:      p.program_allowlist.clone(),
+                    required_approver_role: p.required_approver_role.clone(),
+                });
+                Some((w.label.clone(), pubkey, w.signer_type, policy))
+            })
+            .collect();
+        let wallet_dir_ref = WalletDirectoryRef::new(Arc::new(GatewayWalletDirectory {
+            wallets:    wallet_directory_entries,
+            spend_repo: spend_repo.clone(),
+        }));
+
+        // Development-only demo seeder. Gated behind an env var so the endpoint
+        // is 503 in a normal daemon. When enabled, `POST /debug/seed-demo`
+        // injects a realistic snapshot for the showcase frontend.
+        let demo_seeder_ref: Option<DemoSeederRef> =
+            if std::env::var("CLAW_ENABLE_DEMO_SEED").ok().as_deref() == Some("1") {
+                let default_wallet = loaded_wallets.first().map(|(_, pk)| pk.clone());
+                Some(DemoSeederRef::new(Arc::new(GatewayDemoSeeder {
+                    approval_store: approval_store.clone(),
+                    audit:          audit_repo.clone(),
+                    spend_repo:     spend_repo.clone(),
+                    default_wallet,
+                })))
+            } else {
+                None
+            };
+
         let app_state = AppState {
             session_mgr:       session_ref,
             message_handler:   message_handler_ref,
@@ -594,6 +651,10 @@ impl GatewayDaemon {
             metrics:           metrics.clone(),
             propose:           proposer,
             rate_limiter,
+            policy:            policy_reader_ref,
+            audit:             audit_reader_ref,
+            wallets:           wallet_dir_ref,
+            demo_seeder:       demo_seeder_ref,
         };
 
         let api_handle = claw_api::start(
@@ -1208,6 +1269,14 @@ impl ApprovalHandler for GatewayApprovalHandler {
         self.store.pending_for_session(session_id)
     }
 
+    fn all_pending(&self) -> Vec<claw_api::state::PendingApprovalItem> {
+        self.store
+            .all_pending_with_workflow()
+            .into_iter()
+            .map(|(request, workflow)| claw_api::state::PendingApprovalItem { request, workflow })
+            .collect()
+    }
+
     fn session_for_request(&self, request_id: uuid::Uuid) -> Option<SessionId> {
         self.store.session_for_request(request_id)
     }
@@ -1226,72 +1295,24 @@ impl GatewayApprovalHandler {
         decision: ApprovalDecision,
     ) -> (ApprovalOutcome, Option<ApprovalRequest>) {
         let (outcome, maybe_request) = self.store.decide(&decision);
-        let actor = decision.operator_id.as_deref().unwrap_or("operator");
 
-        // ── Audit logging per outcome type ──────────────────────────────────
-        match &outcome {
-            ApprovalOutcome::RoleMismatch { required, provided } => {
-                warn!(request_id = %decision.request_id, %required, ?provided, "role mismatch");
-                let _ = self.audit.append(
-                    None, &decision.request_id.to_string(), "approval_role_mismatch", "operator",
-                    &serde_json::json!({ "request_id": decision.request_id, "required_role": required, "provided_role": provided }),
-                    AuditSeverity::Warning,
-                ).await;
-            }
-            ApprovalOutcome::StageAdvanced { completed_stage, next_stage, next_required_role } => {
-                let _ = self.audit.append(
-                    None, &decision.request_id.to_string(), "approval_stage_advanced", actor,
-                    &serde_json::json!({ "request_id": decision.request_id, "completed_stage": completed_stage, "next_stage": next_stage, "next_required_role": next_required_role, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
-                    AuditSeverity::Info,
-                ).await;
-            }
-            ApprovalOutcome::QuorumProgress { stage, approvals_so_far, approvals_required } => {
-                let _ = self.audit.append(
-                    None, &decision.request_id.to_string(), "approval_quorum_progress", actor,
-                    &serde_json::json!({ "request_id": decision.request_id, "stage": stage, "approvals_so_far": approvals_so_far, "approvals_required": approvals_required, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
-                    AuditSeverity::Info,
-                ).await;
-            }
-            ApprovalOutcome::Expired => {
-                // Audit the lease expiry explicitly — this is NOT a real decision.
-                warn!(
-                    request_id = %decision.request_id,
-                    "late decision rejected: approval workflow lease expired"
-                );
-                let _ = self.audit.append(
-                    None, &decision.request_id.to_string(), "approval_lease_expired", actor,
-                    &serde_json::json!({
-                        "request_id":  decision.request_id,
-                        "operator_id": decision.operator_id,
-                        "reason":      "late decision arrived after lease expiry",
-                    }),
-                    AuditSeverity::Warning,
-                ).await;
-            }
-            _ => {}
-        }
+        // Audit side-effects extracted into a pure-ish function so they can
+        // be tested without spinning up the whole daemon.
+        crate::approval_audit::emit_decide_audit(
+            &self.audit,
+            &decision,
+            &outcome,
+            maybe_request.as_ref(),
+        ).await;
 
-        // Terminal decision audit + events — ONLY fire on a real Approved or Rejected.
-        // Expired/NotFound/AlreadyDecided/RoleMismatch/DuplicateOperator/*Progress
-        // must NOT write a human_approved/human_rejected audit row.
+        // Event publication stays inline because it touches the broadcast bus
+        // that only the daemon owns.
         let is_real_decision = matches!(
             outcome,
             ApprovalOutcome::Approved | ApprovalOutcome::Rejected
         );
         if is_real_decision {
             if let Some(ref request) = maybe_request {
-                let (audit_event, audit_severity) = if decision.approved {
-                    ("human_approved", AuditSeverity::Info)
-                } else {
-                    ("human_rejected", AuditSeverity::Warning)
-                };
-                let _ = self.audit.append(
-                    Some(&request.session_id.to_string()), &decision.request_id.to_string(),
-                    audit_event, actor,
-                    &serde_json::json!({ "request_id": decision.request_id, "transaction_id": request.transaction_id, "approved": decision.approved, "note": decision.note, "operator_id": decision.operator_id, "approver_role": decision.approver_role }),
-                    audit_severity,
-                ).await;
-
                 self.event_bus.publish(GatewayEvent::ApprovalReceived(ApprovalLifecycleEvent {
                     header:         EventHeader::new(Some(request.session_id.clone())),
                     session_id:     request.session_id.clone(),
@@ -1771,6 +1792,276 @@ struct GatewayEventSubscriber {
 impl EventSubscriber for GatewayEventSubscriber {
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<GatewayEvent> {
         self.event_bus.subscribe()
+    }
+}
+
+// ── PolicyReader adapter ──────────────────────────────────────────────────
+
+struct GatewayPolicyReader {
+    policy_set: Arc<PolicySet>,
+}
+
+impl PolicyReader for GatewayPolicyReader {
+    fn rules(&self) -> Vec<claw_types::policy::PolicyRule> {
+        self.policy_set.rules().to_vec()
+    }
+}
+
+// ── AuditReader adapter ───────────────────────────────────────────────────
+
+struct GatewayAuditReader {
+    audit: AuditRepository,
+}
+
+impl AuditReader for GatewayAuditReader {
+    fn list(
+        &self,
+        limit:  i64,
+        offset: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRowDto>, String>> + Send + '_>> {
+        Box::pin(async move {
+            let rows = self
+                .audit
+                .list_all(limit, offset)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(rows
+                .into_iter()
+                .map(|r| AuditRowDto {
+                    id:             r.id,
+                    session_id:     r.session_id,
+                    correlation_id: r.correlation_id,
+                    occurred_at:    r.occurred_at,
+                    event_type:     r.event_type,
+                    actor:          r.actor,
+                    payload:        r.payload,
+                    severity:       r.severity,
+                })
+                .collect())
+        })
+    }
+}
+
+// ── DemoSeeder adapter ────────────────────────────────────────────────────
+
+struct GatewayDemoSeeder {
+    approval_store: crate::approval_store::ApprovalStore,
+    audit:          AuditRepository,
+    spend_repo:     claw_state_store::SpendRepository,
+    default_wallet: Option<String>,
+}
+
+impl DemoSeeder for GatewayDemoSeeder {
+    fn seed(&self) -> Pin<Box<dyn Future<Output = Result<DemoSeedReport, String>> + Send + '_>> {
+        Box::pin(async move {
+            use claw_types::{
+                approval::{
+                    ApprovalChainStage, ApprovalRequest, ApprovalStage, ApprovalWorkflow,
+                    ApprovalWorkflowState,
+                },
+                policy::PolicyVerdict,
+                session::SessionId,
+                transaction::SimulationResult,
+            };
+            use claw_state_store::audit::AuditSeverity;
+            use chrono::Duration;
+            use uuid::Uuid;
+
+            let session_id = SessionId::from(Uuid::new_v4());
+            let now = chrono::Utc::now();
+
+            let sim_ok = SimulationResult {
+                success: true,
+                error: None,
+                compute_units_used: Some(12_450),
+                logs: vec![
+                    "Program 11111111111111111111111111111111 invoke [1]".into(),
+                    "Program 11111111111111111111111111111111 success".into(),
+                ],
+                return_data: None,
+                account_diffs: vec![],
+                fee_lamports: Some(5_000),
+            };
+
+            let mut approvals_created = 0;
+
+            // (1) Multi-stage USDC chain: risk → treasury
+            let chain = vec![
+                ApprovalChainStage {
+                    role: "risk".into(),
+                    description: "Risk officer review for high-value USDC".into(),
+                    min_approvals: 1,
+                },
+                ApprovalChainStage {
+                    role: "treasury".into(),
+                    description: "Treasury sign-off for high-value USDC".into(),
+                    min_approvals: 1,
+                },
+            ];
+            let chain_verdict = PolicyVerdict::RequiresHumanApproval {
+                reason: "USDC >= 10K requires multi-stage approval".into(),
+                rule_name: "usdc-high-value-chain".into(),
+                required_approver_role: Some("risk".into()),
+                approval_chain: Some(chain.clone()),
+            };
+            let chain_req = ApprovalRequest::new(
+                session_id.clone(),
+                Uuid::new_v4(),
+                "50,000 USDC transfer (seed demo)",
+                chain_verdict,
+                sim_ok.clone(),
+            );
+            let chain_req_id = chain_req.id;
+            let chain_wf = ApprovalWorkflow {
+                request_id: chain_req_id,
+                session_id: session_id.clone(),
+                state: ApprovalWorkflowState::Pending,
+                stages: chain
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| ApprovalStage {
+                        index: i,
+                        allowed_roles: vec![s.role.clone()],
+                        min_approvals: s.min_approvals,
+                        decisions: vec![],
+                    })
+                    .collect(),
+                created_at: now,
+                updated_at: now,
+                expires_at: Some(now + Duration::minutes(5)),
+            };
+            self.approval_store.register(chain_req, chain_wf);
+            approvals_created += 1;
+
+            // (2) Single-stage human-approval for a large SOL transfer
+            let single_verdict = PolicyVerdict::RequiresHumanApproval {
+                reason: "transfer amount exceeds 0.01 SOL threshold".into(),
+                rule_name: "large-transfer-requires-human".into(),
+                required_approver_role: None,
+                approval_chain: None,
+            };
+            let single_req = ApprovalRequest::new(
+                session_id.clone(),
+                Uuid::new_v4(),
+                "0.25 SOL transfer to counterparty (seed demo)",
+                single_verdict,
+                sim_ok.clone(),
+            );
+            let single_req_id = single_req.id;
+            let single_wf = ApprovalWorkflow::single_stage(single_req_id, session_id.clone(), None)
+                .with_lease_seconds(180);
+            self.approval_store.register(single_req, single_wf);
+            approvals_created += 1;
+
+            // (3) Audit rows — one terminal approval, one expired lease, one policy rejection
+            let completed_id = Uuid::new_v4();
+            let expired_id   = Uuid::new_v4();
+            let rejected_id  = Uuid::new_v4();
+
+            let mut audit_rows_written = 0;
+
+            self.audit
+                .append(
+                    Some(session_id.to_string().as_str()),
+                    &completed_id.to_string(),
+                    "human_approved",
+                    "op_cfo_demo",
+                    &serde_json::json!({
+                        "rule": "usdc-high-value-chain",
+                        "stage": 1,
+                        "role": "treasury",
+                        "request_id": completed_id,
+                    }),
+                    AuditSeverity::Info,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            audit_rows_written += 1;
+
+            self.audit
+                .append(
+                    Some(session_id.to_string().as_str()),
+                    &expired_id.to_string(),
+                    "approval_lease_expired",
+                    "system",
+                    &serde_json::json!({
+                        "rule": "usdc-medium-value-requires-human",
+                        "lease_seconds": 300,
+                        "request_id": expired_id,
+                    }),
+                    AuditSeverity::Warning,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            audit_rows_written += 1;
+
+            self.audit
+                .append(
+                    Some(session_id.to_string().as_str()),
+                    &rejected_id.to_string(),
+                    "policy_rejected",
+                    "system",
+                    &serde_json::json!({
+                        "rule": "block-legacy-token-transfer",
+                        "reason": "legacy SPL Token Transfer is not allowed",
+                        "request_id": rejected_id,
+                    }),
+                    AuditSeverity::Warning,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            audit_rows_written += 1;
+
+            // (4) Bump daily spend for the default wallet so the progress bar shows something.
+            let mut wallets_spend_bumped = 0;
+            if let Some(pubkey) = &self.default_wallet {
+                let sid_str = session_id.to_string();
+                let tx_id = Uuid::new_v4().to_string();
+                self.spend_repo
+                    .record_spend(pubkey, &sid_str, &tx_id, 72_500_000_000)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                wallets_spend_bumped = 1;
+            }
+
+            Ok(DemoSeedReport {
+                approvals_created,
+                audit_rows_written,
+                wallets_spend_bumped,
+            })
+        })
+    }
+}
+
+// ── WalletDirectory adapter ───────────────────────────────────────────────
+
+struct GatewayWalletDirectory {
+    /// Entries are (label, pubkey, signer_type, wallet_policy_snapshot).
+    wallets:    Vec<(String, String, claw_types::wallet::SignerType, Option<WalletPolicySummaryDto>)>,
+    spend_repo: claw_state_store::SpendRepository,
+}
+
+impl WalletDirectory for GatewayWalletDirectory {
+    fn list(&self) -> Pin<Box<dyn Future<Output = Vec<WalletSummaryDto>> + Send + '_>> {
+        Box::pin(async move {
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let mut out = Vec::with_capacity(self.wallets.len());
+            for (label, pubkey, signer_type, policy) in &self.wallets {
+                let daily = self
+                    .spend_repo
+                    .wallet_daily_spend(pubkey, &today)
+                    .await
+                    .unwrap_or(0);
+                out.push(WalletSummaryDto {
+                    pubkey:               pubkey.clone(),
+                    label:                label.clone(),
+                    signer_type:          *signer_type,
+                    daily_spend_lamports: daily,
+                    policy:               policy.clone(),
+                });
+            }
+            out
+        })
     }
 }
 

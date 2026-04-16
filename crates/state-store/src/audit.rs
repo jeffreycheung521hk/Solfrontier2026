@@ -97,6 +97,24 @@ impl AuditRepository {
         Ok(rows)
     }
 
+    /// Returns audit events across all sessions in reverse chronological order.
+    ///
+    /// Intended for the dashboard read endpoint. Caller should clamp `limit`
+    /// to a sensible upper bound (the HTTP layer caps at 1000).
+    pub async fn list_all(&self, limit: i64, offset: i64) -> Result<Vec<AuditRow>, StoreError> {
+        let rows = sqlx::query_as::<_, AuditRow>(
+            "SELECT id, session_id, correlation_id, occurred_at, event_type, actor, payload, severity
+             FROM audit_events
+             ORDER BY occurred_at DESC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Returns recent security-relevant audit events.
     pub async fn list_security_events(&self, limit: i64) -> Result<Vec<AuditRow>, StoreError> {
         let rows = sqlx::query_as::<_, AuditRow>(
