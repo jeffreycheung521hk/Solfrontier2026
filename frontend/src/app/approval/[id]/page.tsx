@@ -60,7 +60,7 @@ export default async function ApprovalChainPage({
 
       <div className="flex gap-3">
         <Link
-          href={`/proposal/${request.transaction_id}`}
+          href={`/proposal/${request.id}`}
           className="inline-flex items-center rounded-md border px-4 py-2 text-sm hover:bg-accent"
         >
           ← Back to proposal review

@@ -66,17 +66,22 @@ export interface TransactionProposal {
 
 // ── Policy ───────────────────────────────────────────────────────────────────
 
+// Rust serializes unit-variant conditions as bare strings (e.g. "Always")
+// and tagged variants as objects (e.g. { type: "NetworkIn", networks: [...] }).
+// Use normalizePolicyRule() in api.ts to coerce bare strings into { type }.
+// Field names match the Rust serde output — note `threshold` not `sol`.
 export type PolicyCondition =
   | { type: "Always" }
   | { type: "NetworkIn"; networks: SolanaNetwork[] }
-  | { type: "ProgramNotInAllowlist"; allowed_programs: string[] }
-  | { type: "DestinationInDenylist"; denied: string[] }
+  | { type: "ProgramNotInAllowlist" }
+  | { type: "DestinationInDenylist" }
   | { type: "AmountExceedsLamports"; threshold: Lamports }
-  | { type: "CostExceedsSol"; sol: number }
-  | { type: "DailySpendExceedsSol"; sol: number }
+  | { type: "CostExceedsSol"; threshold: number }
+  | { type: "DailySpendExceedsSol"; threshold: number }
   | { type: "SimulationNotPassed" }
   | { type: "TokenAmountExceeds"; mint: string; threshold: number }
   | { type: "MintNotInAllowlist"; allowed_mints: string[] }
+  | { type: "OutsideAllowedHours"; start_hour: number; end_hour: number; allowed_days: number[]; utc_offset_hours: number }
   | { type: "LegacyTokenTransferPresent" };
 
 export type PolicyAction =

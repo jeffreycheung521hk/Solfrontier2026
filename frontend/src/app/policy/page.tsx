@@ -130,15 +130,15 @@ function ConditionLine({ c }: { c: PolicyCondition }) {
     case "NetworkIn":
       return <Detail>network in [{c.networks.join(", ")}]</Detail>;
     case "ProgramNotInAllowlist":
-      return <Detail>program ∉ allowlist ({c.allowed_programs.length} allowed)</Detail>;
+      return <Detail>program ∉ allowlist</Detail>;
     case "DestinationInDenylist":
-      return <Detail>destination in denylist ({c.denied.length})</Detail>;
+      return <Detail>destination in denylist</Detail>;
     case "AmountExceedsLamports":
       return <Detail>amount &gt; {formatSol(c.threshold)}</Detail>;
     case "CostExceedsSol":
-      return <Detail>cost &gt; {c.sol} SOL</Detail>;
+      return <Detail>cost &gt; {c.threshold} SOL</Detail>;
     case "DailySpendExceedsSol":
-      return <Detail>daily spend &gt; {c.sol} SOL</Detail>;
+      return <Detail>daily spend &gt; {c.threshold} SOL</Detail>;
     case "SimulationNotPassed":
       return <Detail>simulation failed</Detail>;
     case "TokenAmountExceeds":
@@ -149,8 +149,12 @@ function ConditionLine({ c }: { c: PolicyCondition }) {
       );
     case "MintNotInAllowlist":
       return <Detail>mint ∉ allowlist ({c.allowed_mints.length} allowed)</Detail>;
+    case "OutsideAllowedHours":
+      return <Detail>outside allowed hours ({c.start_hour}:00–{c.end_hour}:00, UTC{c.utc_offset_hours >= 0 ? "+" : ""}{c.utc_offset_hours})</Detail>;
     case "LegacyTokenTransferPresent":
       return <Detail>legacy SPL Token Transfer detected</Detail>;
+    default:
+      return <Detail>{(c as { type: string }).type}</Detail>;
   }
 }
 

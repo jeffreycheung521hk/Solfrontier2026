@@ -43,6 +43,29 @@ async function live<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// ── Wire normalization ──────────────────────────────────────────────────────
+// Rust serializes unit-variant PolicyConditions and PolicyActions as bare JSON
+// strings (e.g. "Always", "Approve") while the TS types expect { type: "..." }.
+
+function normalizeCondition(raw: unknown): import("@/lib/types").PolicyCondition {
+  if (typeof raw === "string") return { type: raw } as import("@/lib/types").PolicyCondition;
+  return raw as import("@/lib/types").PolicyCondition;
+}
+
+function normalizeAction(raw: unknown): import("@/lib/types").PolicyAction {
+  if (typeof raw === "string") return { type: raw } as import("@/lib/types").PolicyAction;
+  return raw as import("@/lib/types").PolicyAction;
+}
+
+function normalizePolicyRule(raw: { name: string; description: string; condition: unknown; action: unknown }): import("@/lib/types").PolicyRule {
+  return {
+    name: raw.name,
+    description: raw.description,
+    condition: normalizeCondition(raw.condition),
+    action: normalizeAction(raw.action),
+  };
+}
+
 // ── Wire shapes (mirror Rust DTOs) ───────────────────────────────────────────
 
 interface PolicyRulesResponse { rules: PolicyRule[] }
@@ -56,8 +79,8 @@ interface AuditResponse { rows: AuditRow[]; limit: number; offset: number }
 
 export async function fetchPolicyRules(): Promise<PolicyRule[]> {
   if (IS_SHOWCASE) return policyRules;
-  const data = await live<PolicyRulesResponse>("/policy/rules");
-  return data.rules;
+  const data = await live<{ rules: Array<{ name: string; description: string; condition: unknown; action: unknown }> }>("/policy/rules");
+  return data.rules.map(normalizePolicyRule);
 }
 
 export async function fetchAuditTrail(limit = 100): Promise<AuditRow[]> {
