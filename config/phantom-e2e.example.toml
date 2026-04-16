@@ -1,0 +1,55 @@
+# ClawSolana — A4 devnet E2E configuration
+#
+# External Phantom wallet for end-to-end validation.
+# SECURITY: No private keys in this file. Only the pubkey is declared.
+
+# ── Daemon ─────────────────────────────────────────────────────────────────
+[daemon]
+db_path = "./data/claw.db"
+terminal_retention_days = 14
+terminal_purge_interval_hours = 6
+
+# ── Network ────────────────────────────────────────────────────────────────
+[network]
+network = "devnet"
+
+# ── RPC ────────────────────────────────────────────────────────────────────
+[rpc]
+primary_url = "https://api.devnet.solana.com"
+fallback_urls = []
+ws_url = "wss://api.devnet.solana.com"
+timeout_ms = 15000
+
+# ── Wallets ────────────────────────────────────────────────────────────────
+# A3: External wallet (Phantom) — pubkey only, no key material.
+[[wallets]]
+label = "phantom-devnet"
+signer_type = "external"
+pubkey = "ByZH6oQ7kZ5h32t5dJsbayLGAyKK8YetWvoLTHqzdkma"
+
+# ── Policy ─────────────────────────────────────────────────────────────────
+[policy]
+mainnet_safe_defaults = true
+# Allow System Program for SOL transfers on devnet
+program_allowlist = []
+destination_denylist = []
+
+# ── LLM ────────────────────────────────────────────────────────────────────
+[llm]
+provider = "openai"
+api_key = ""
+model = "gpt-4o-mini"
+
+# ── API ────────────────────────────────────────────────────────────────────
+[api]
+bind_addr = "127.0.0.1"
+port = 7070
+
+# ── Retry / Rebroadcast ───────────────────────────────────────────────────
+[retry]
+max_retries = 3
+
+# ── Logging ────────────────────────────────────────────────────────────────
+[logging]
+format = "pretty"
+level = "info,claw_gateway=debug,claw_solana_core=debug"
