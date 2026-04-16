@@ -48,8 +48,8 @@ const proposal: TransactionProposal = {
       is_legacy_token_transfer: false,
       token_transfer: {
         mint: USDC_MINT,
-        from: MM_WALLET,
-        to: COUNTERPARTY,
+        source: MM_WALLET,
+        destination: COUNTERPARTY,
         amount: 50_000_000_000, // 50,000 * 10^6
         decimals: 6,
       },

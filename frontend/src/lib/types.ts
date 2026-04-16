@@ -19,11 +19,11 @@ export interface AccountRole {
 }
 
 export interface TokenTransfer {
-  mint?: string | null;
-  from?: string | null;
-  to?: string | null;
-  amount?: number | null;
+  mint: string;
+  amount: number;
   decimals?: number | null;
+  source: string;
+  destination: string;
 }
 
 export interface InstructionSummary {

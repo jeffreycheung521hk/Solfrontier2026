@@ -100,8 +100,8 @@ export default async function ProposalReviewPage({
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs bg-muted/50 rounded-md p-3">
                     <FieldLine label="Mint" value={tt.mint ? `${mintSymbol(tt.mint)} · ${shortPubkey(tt.mint)}` : "—"} />
                     <FieldLine label="Amount" value={tokenAmount ?? "—"} />
-                    <FieldLine label="From" value={tt.from ? shortPubkey(tt.from) : "—"} />
-                    <FieldLine label="To" value={tt.to ? shortPubkey(tt.to) : "—"} />
+                    <FieldLine label="From" value={tt.source ? shortPubkey(tt.source) : "—"} />
+                    <FieldLine label="To" value={tt.destination ? shortPubkey(tt.destination) : "—"} />
                   </div>
                 )}
                 {ix.transfer_lamports != null && (
