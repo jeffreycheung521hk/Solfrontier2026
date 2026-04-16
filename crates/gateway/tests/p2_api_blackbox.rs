@@ -105,6 +105,11 @@ impl ApprovalHandler for StoreBackedApproval {
             .map(|(request, workflow)| claw_api::state::PendingApprovalItem { request, workflow })
             .collect()
     }
+    fn get_by_id(&self, rid: Uuid) -> Option<claw_api::state::PendingApprovalItem> {
+        let request = self.store.get(rid)?;
+        let workflow = self.store.get_workflow(rid)?;
+        Some(claw_api::state::PendingApprovalItem { request, workflow })
+    }
     fn session_for_request(&self, rid: Uuid) -> Option<SessionId> {
         self.store.session_for_request(rid)
     }
