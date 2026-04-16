@@ -1269,6 +1269,12 @@ impl ApprovalHandler for GatewayApprovalHandler {
         self.store.pending_for_session(session_id)
     }
 
+    fn get_by_id(&self, request_id: uuid::Uuid) -> Option<claw_api::state::PendingApprovalItem> {
+        let request = self.store.get(request_id)?;
+        let workflow = self.store.get_workflow(request_id)?;
+        Some(claw_api::state::PendingApprovalItem { request, workflow })
+    }
+
     fn all_pending(&self) -> Vec<claw_api::state::PendingApprovalItem> {
         self.store
             .all_pending_with_workflow()

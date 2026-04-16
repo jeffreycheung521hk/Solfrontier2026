@@ -49,6 +49,7 @@ use crate::{
         health::health_handler,
         messages::send_message,
         metrics::metrics_handler,
+        get_approval::get_approval,
         pending_approvals::list_pending_approvals,
         policy_rules::list_policy_rules,
         propose::propose_transfer,
@@ -98,6 +99,7 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         // Showcase / dashboard read surfaces
         .route("/policy/rules", get(list_policy_rules))
         .route("/pending-approvals", get(list_pending_approvals))
+        .route("/approvals/:id", get(get_approval))
         .route("/wallets", get(list_wallets))
         .route("/audit", get(list_audit))
         // Development-only — returns 503 unless CLAW_ENABLE_DEMO_SEED=1

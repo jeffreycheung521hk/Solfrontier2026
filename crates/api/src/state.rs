@@ -70,6 +70,12 @@ pub trait ApprovalHandler: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Returns a single approval request with its workflow, or `None` if the ID
+    /// is unknown. Covers both pending and already-decided requests.
+    fn get_by_id(&self, request_id: uuid::Uuid) -> Option<PendingApprovalItem> {
+        None
+    }
+
     /// Peek at which session owns a pending request (P0-3: session-request binding).
     fn session_for_request(&self, request_id: uuid::Uuid) -> Option<SessionId>;
 
@@ -264,6 +270,11 @@ impl ApprovalHandlerRef {
     /// Returns every pending approval across every session.
     pub fn all_pending(&self) -> Vec<PendingApprovalItem> {
         self.0.all_pending()
+    }
+
+    /// Returns a single approval by ID, with its workflow.
+    pub fn get_by_id(&self, request_id: uuid::Uuid) -> Option<PendingApprovalItem> {
+        self.0.get_by_id(request_id)
     }
 
     /// Peek at which session owns a pending request (P0-3).

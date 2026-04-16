@@ -115,12 +115,10 @@ export async function fetchApproval(
       proposal: pendingView.proposal,
     };
   }
-  // There is no single-request endpoint yet; filter from the list.
-  // Once GET /approvals/:id exists, swap in the direct call.
-  const { items } = await live<PendingApprovalsResponse>("/pending-approvals");
-  const match = items.find((it) => it.request.id === requestId);
-  if (!match) throw new Error(`approval ${requestId} not found`);
-  return { request: match.request, workflow: match.workflow, proposal: null };
+  const item = await live<{ request: ApprovalRequest; workflow: ApprovalWorkflow }>(
+    `/approvals/${requestId}`,
+  );
+  return { request: item.request, workflow: item.workflow, proposal: null };
 }
 
 /// Dashboard snapshot is composed client-side in live mode. The gateway does

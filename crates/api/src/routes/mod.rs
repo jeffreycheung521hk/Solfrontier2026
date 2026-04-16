@@ -2,6 +2,7 @@
 
 pub mod approve;
 pub mod audit;
+pub mod get_approval;
 pub mod debug_seed;
 pub mod events;
 pub mod health;
