@@ -95,7 +95,7 @@ Default deny. If no policy rule matches → `RequiresHumanApproval`. If a check 
 | `claw-agent-runtime` | ReAct loop, LLM clients (Anthropic + OpenAI), context management |
 | `claw-channels` | Channel adapters (CLI) |
 | `claw-api` | Axum HTTP server, auth, route handlers, rate limiting |
-| `claw-gateway` | Control plane daemon, session/policy/approval management, signature orchestrator |
+| `claw-gateway` | Control plane daemon, session/policy/approval management, signature orchestrator, Jupiter JIT + `submit_jupiter_swap` |
 | `clawd` | Daemon binary |
 | `claw` | CLI client binary |
 
@@ -233,3 +233,36 @@ Bearer token auth is sufficient for localhost. Remote access is operator-managed
 
 ### ADR-004: Four-Plane Architecture
 Intent → Control → Execution → Observer planes with explicit contracts. Observer cannot sign. Intent cannot bypass control.
+
+---
+
+## 7. Module Placement Principles
+
+Guidance for *where* new code belongs. Applies to every PR; does not require a reorg to take effect. Areas that do not yet conform are tracked in [DEBT.md](DEBT.md) with migration triggers.
+
+### 7.1 Builders vs Executors
+
+Every tool or protocol integration falls into one of two categories. The classification is mechanical, not stylistic:
+
+| Test question | If yes |
+|---------------|--------|
+| Can this module, removed from `claw-gateway`, still produce a valid artifact (unsigned tx, intent preview) from pure inputs? | **Builder** — lives in `claw-tool-system` or a stateless module |
+| Does this module need `approval_store`, `park_store`, blockhash tracking, or JIT rebuild on resume? | **Executor** — lives in `claw-gateway`, private to the control plane |
+
+Builders are protocol-specific. Executors are control-plane-aware. Jupiter's intent + JIT flow is the reference shape for executors.
+
+### 7.2 Target-Shape Over Current-Shape
+
+Directory layout should reflect the shape the system is evolving toward, not the shape it happens to have today. If a module does not yet fit its target location, record the gap in DEBT.md with a migration trigger — do not invent a directory to legitimize the current state.
+
+### 7.3 Module Doc on Every Subdirectory
+
+Each new subdirectory's `mod.rs` MUST include a module-level doc comment (`//! …`) stating:
+- What this module owns
+- What belongs here and what does not
+
+Directory names describe *what* the module is. Module doc describes *why* the contents are grouped and what should not be added. `cargo doc` and `rust-analyzer` surface it automatically.
+
+### 7.4 Migration Exceptions Are Explicit
+
+Areas not yet conforming to these principles live in [DEBT.md](DEBT.md), each with current state, target shape, and the trigger that will force migration. This lets new code follow the principles immediately without waiting for a repo-wide reorg.

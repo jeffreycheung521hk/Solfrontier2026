@@ -166,10 +166,26 @@ The control plane is the product core. These phases define the progression from 
 - [ ] `TransactionComposer` — combine multiple actions into atomic bundles
 - [ ] Pool state analysis tools (tick distribution, IL, PnL)
 
+### Jupiter (aggregator — Phase 1 intent-first JIT)
+
+**Current:** `submit_jupiter_swap` tool with intent-first policy + approval + JIT V0 build.
+See [docs/JUPITER_JIT_PHASE1.md](docs/JUPITER_JIT_PHASE1.md) and
+[docs/integration-architecture.md](docs/integration-architecture.md).
+
+| Capability | Status |
+|------------|--------|
+| `submit_jupiter_swap` (intent submission) | ✅ Live |
+| Swap policy (mint allowlist, amount cap, slippage cap) | ✅ Live |
+| JIT V0 build + ALT assembly + simulate | ✅ Live |
+| Local-signer execution path | ✅ Live |
+| External-wallet (Phantom) V0 completion + strict blockhash mode | ✅ Live |
+| `rebuild_required` retry signal on wallet blockhash modification | ✅ Live |
+| Phantom blockhash-refresh compatibility mode | ⏳ Deferred (needs interop evidence) |
+| Trigger / Limit / `/order` (DCA, scheduled) | ⏳ Future milestone |
+
 ### Future Protocol Adapters
 
 - [ ] Solend (lending: deposit, withdraw, borrow, repay, health factor monitoring)
-- [ ] Jupiter (swap aggregation: best route across all DEXs)
 - [ ] Cross-protocol risk engine (net exposure, health factor simulation, rebalancing planner)
 
 ### Future Extensions
