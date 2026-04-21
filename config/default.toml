@@ -247,3 +247,49 @@ enabled = false
 format = "pretty"
 # RUST_LOG compatible filter string
 level = "info,claw_gateway=debug,claw_agent_runtime=debug"
+
+# ── Jupiter Swap Integration ──────────────────────────────────────────────────
+# Policy-gated JIT (Just-In-Time) token swap routing via the Jupiter Aggregator.
+#
+# Design: ClawSolana stores a SwapIntent BEFORE any transaction is built.
+# The transaction is assembled JIT only AFTER human approval, using a fresh
+# Jupiter /swap/v2/build response. This guarantees the operator approves the
+# *intent* (which tokens, how much, max slippage) rather than frozen bytes.
+#
+# Set enabled = true and configure swap_policy before using this integration.
+[jupiter]
+# Master switch. When false, the submit_jupiter_swap tool is not registered
+# and no Jupiter API calls are made. Safe default: false.
+enabled = false
+
+# Jupiter API base URL.
+# Production: https://api.jup.ag
+# Override with CLAW_JUPITER_BASE_URL env var.
+base_url = "https://api.jup.ag"
+
+# ── Swap intent policy ────────────────────────────────────────────────────────
+# These rules are evaluated BEFORE the approval workflow.
+# A rejected intent never reaches JIT build.
+[jupiter.swap_policy]
+# Mint addresses that may be used as input (source token).
+# Empty list = allow any input mint.
+# Example: allowed_input_mints = ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]
+allowed_input_mints = []
+
+# Mint addresses that may be used as output (destination token).
+# Empty list = allow any output mint.
+allowed_output_mints = []
+
+# Maximum input amount in base token units (e.g., lamports for SOL, 1e-6 for USDC).
+# 0 = no cap. Recommended for production: set to your daily risk limit.
+max_input_amount = 0
+
+# Maximum slippage tolerance in basis points (1 bps = 0.01%).
+# 0 = no cap. 50 = 0.5%, 100 = 1%, 500 = 5%.
+# Recommended for production: set to your acceptable execution risk.
+max_slippage_bps = 0
+
+# Operator role required to approve swap intents.
+# "" = any authenticated operator may approve.
+# Example: required_approver_role = "treasury"
+required_approver_role = ""

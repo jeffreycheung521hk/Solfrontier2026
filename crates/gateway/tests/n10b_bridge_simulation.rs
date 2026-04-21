@@ -160,6 +160,7 @@ impl WalletSignatureHandler for TestWalletSignatureHandler {
                         tx_signature: None,
                         submitted: false,
                         error: Some(format!("invalid base64: {e}")),
+                        rebuild_required: false,
                     };
                 }
             };
@@ -174,6 +175,7 @@ impl WalletSignatureHandler for TestWalletSignatureHandler {
                         tx_signature: None,
                         submitted: false,
                         error: None,
+                        rebuild_required: false,
                     }
                 }
                 Err(e) => {
@@ -184,6 +186,7 @@ impl WalletSignatureHandler for TestWalletSignatureHandler {
                         tx_signature: None,
                         submitted: false,
                         error: Some(e.to_string()),
+                        rebuild_required: false,
                     }
                 }
             }

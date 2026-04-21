@@ -92,6 +92,7 @@ impl WalletSignatureHandler for StubWalletSig {
             WalletSignatureOutcome {
                 request_id: Uuid::nil(), accepted: false, signature: None,
                 tx_signature: None, submitted: false, error: Some("stub".into()),
+                rebuild_required: false,
             }
         })
     }

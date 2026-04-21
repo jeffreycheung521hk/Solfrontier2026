@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use solana_sdk::{
     pubkey::Pubkey,
     signature::Signature,
-    transaction::Transaction,
+    transaction::{Transaction, VersionedTransaction},
 };
 use std::sync::Arc;
 
@@ -23,6 +23,21 @@ pub trait Signer: Send + Sync {
     /// Signs the given transaction in-place.
     /// The transaction's `recent_blockhash` must be set before calling this.
     async fn sign_transaction(&self, tx: &mut Transaction) -> Result<Signature, WalletError>;
+
+    /// Signs the given V0 `VersionedTransaction` and returns the signature
+    /// slot assigned to this signer's pubkey.
+    ///
+    /// Default impl returns `Unsupported` — override in backends that support V0.
+    /// Used by the Jupiter JIT path where the transaction contains address
+    /// lookup tables and cannot be expressed as a legacy `Transaction`.
+    async fn sign_versioned(
+        &self,
+        _tx: &mut VersionedTransaction,
+    ) -> Result<Signature, WalletError> {
+        Err(WalletError::SigningFailed(
+            "this signer does not support V0 versioned transactions".to_string(),
+        ))
+    }
 
     /// Returns a human-readable description of this signer (for audit logs).
     fn description(&self) -> String;

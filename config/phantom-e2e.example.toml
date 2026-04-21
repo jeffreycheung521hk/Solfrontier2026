@@ -53,3 +53,17 @@ max_retries = 3
 [logging]
 format = "pretty"
 level = "info,claw_gateway=debug,claw_solana_core=debug"
+
+# ── Jupiter Swap (external wallet E2E) ────────────────────────────────────────
+# Enable Jupiter for this E2E scenario. The Phantom wallet above is the signer.
+[jupiter]
+enabled = true
+base_url = "https://api.jup.ag"
+
+[jupiter.swap_policy]
+# Restrict to USDC → SOL swaps only on devnet
+allowed_input_mints  = ["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"]  # USDC devnet
+allowed_output_mints = ["So11111111111111111111111111111111111111112"]      # wSOL
+max_input_amount     = 10_000_000   # 10 USDC (6 decimals)
+max_slippage_bps     = 100          # 1% max slippage
+required_approver_role = "treasury"

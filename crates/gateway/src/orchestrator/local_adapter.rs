@@ -15,7 +15,7 @@
 //! - Emit audit or events
 
 use async_trait::async_trait;
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::{Transaction, VersionedTransaction};
 use tracing::{info, instrument};
 
 use claw_wallet_engine::keystore::SecretKeystore;
@@ -79,10 +79,15 @@ impl WalletAdapter for LocalWalletAdapter {
 
     /// Signs the finalized transaction synchronously.
     ///
-    /// 1. Deserializes `finalized_tx_bytes` into a `Transaction`
-    /// 2. Calls `signer.sign_transaction(&mut tx)`
-    /// 3. Serializes the signed `Transaction`
-    /// 4. Returns `SignatureOutcome::Signed`
+    /// Supports both legacy `Transaction` and V0 `VersionedTransaction` formats.
+    /// The format is detected by trying V0 deserialize first — V0 has a version
+    /// prefix byte (high bit set on the first byte of the serialized message)
+    /// that makes it unambiguously distinguishable from legacy.
+    ///
+    /// 1. Try bincode-deserialize as V0 → sign via `sign_versioned`
+    /// 2. Fallback: bincode-deserialize as legacy `Transaction` → sign via `sign_transaction`
+    /// 3. Serialize the signed transaction back to bytes
+    /// 4. Return `SignatureOutcome::Signed`
     ///
     /// Never returns `Pending`. Never inspects `ApprovalMode`.
     #[instrument(skip(self, request), fields(request_id = %request.id))]
@@ -90,15 +95,54 @@ impl WalletAdapter for LocalWalletAdapter {
         &self,
         request: &SignatureRequest,
     ) -> Result<SignatureOutcome, SignatureError> {
-        // 1. Deserialize the finalized transaction.
+        // Try V0 first. If the bytes are a VersionedTransaction, this succeeds.
+        // If they are legacy, this fails (bincode enum discriminant mismatch)
+        // and we fall through to the legacy path.
+        if let Ok(mut v0_tx) = bincode::deserialize::<VersionedTransaction>(
+            &request.finalized_tx_bytes,
+        ) {
+            // Only accept if this is actually V0 (not legacy-wrapped).
+            // Legacy messages MAY deserialize into a VersionedTransaction with
+            // a Legacy message — in that case we want to delegate to the legacy
+            // path so we keep using the existing `sign_transaction` API.
+            use solana_sdk::message::VersionedMessage;
+            if matches!(v0_tx.message, VersionedMessage::V0(_)) {
+                let signature = self
+                    .signer
+                    .sign_versioned(&mut v0_tx)
+                    .await
+                    .map_err(|e| SignatureError::SigningFailed(e.to_string()))?;
+
+                let signed_tx_bytes = bincode::serialize(&v0_tx).map_err(|e| {
+                    SignatureError::SigningFailed(format!(
+                        "failed to serialize signed v0 tx: {e}"
+                    ))
+                })?;
+                let sig_str = signature.to_string();
+                info!(
+                    request_id = %request.id,
+                    signature = %sig_str,
+                    format = "v0",
+                    "local adapter: v0 transaction signed"
+                );
+                return Ok(SignatureOutcome::Signed {
+                    request_id: request.id,
+                    signature: sig_str,
+                    signed_tx_bytes,
+                    adapter_type: self.adapter_type().to_string(),
+                    transaction_id: request.transaction_id,
+                    expected_signer: request.expected_signer.to_string(),
+                });
+            }
+        }
+
+        // Legacy path (unchanged behavior).
         let mut tx: Transaction = bincode::deserialize(&request.finalized_tx_bytes)
             .map_err(|e| SignatureError::InvalidTransaction(e.to_string()))?;
 
-        // 2. Sign directly — no pipeline.sign(), no ApprovalMode, no AwaitingApproval.
         let signature = self.signer.sign_transaction(&mut tx).await
             .map_err(|e| SignatureError::SigningFailed(e.to_string()))?;
 
-        // 3. Serialize the signed transaction.
         let signed_tx_bytes = bincode::serialize(&tx)
             .map_err(|e| SignatureError::SigningFailed(
                 format!("failed to serialize signed tx: {e}"),
@@ -108,10 +152,10 @@ impl WalletAdapter for LocalWalletAdapter {
         info!(
             request_id = %request.id,
             signature = %sig_str,
-            "local adapter: transaction signed"
+            format = "legacy",
+            "local adapter: legacy transaction signed"
         );
 
-        // 4. Return Signed — always synchronous, never Pending.
         Ok(SignatureOutcome::Signed {
             request_id: request.id,
             signature: sig_str,

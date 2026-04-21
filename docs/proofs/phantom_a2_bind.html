@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>A2-Execute — bind Phantom</title>
+<style>
+body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; color: #222; }
+.panel { border: 1px solid #ccc; border-radius: 8px; padding: 16px; margin: 16px 0; }
+button { font-size: 1.05em; padding: 10px 20px; cursor: pointer; }
+code { word-break: break-all; background:#f4f4f4; padding:2px 4px; border-radius:3px; }
+pre  { background:#f4f4f4; padding:12px; border-radius:4px; white-space:pre-wrap; word-break:break-all; }
+</style></head>
+<body>
+<h1>A2-Execute step 1 / 2 — bind Phantom to session</h1>
+<div class="panel">
+ <p><b>Wallet expected:</b> <code>C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW</code></p>
+ <p><b>Message Phantom will sign (plain text, ownership proof, NOT a transaction):</b></p>
+ <pre>ClawSolana wallet ownership proof
+Session: dc4550f3-a44b-4def-8a05-e8e817a7fc07
+Wallet: C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW
+Nonce: 0ea4ba6730f1c62389f82672221b0082</pre>
+</div>
+<div class="panel">
+ <button id="go">Connect Phantom &amp; sign challenge</button>
+ <p id="status">Idle.</p>
+</div>
+<script>
+const EXPECTED = "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW";
+const CHALLENGE_ID = "5775d71f-f854-4b6f-9cd5-65fe5a99f6e1";
+const MESSAGE = "ClawSolana wallet ownership proof\nSession: dc4550f3-a44b-4def-8a05-e8e817a7fc07\nWallet: C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW\nNonce: 0ea4ba6730f1c62389f82672221b0082";
+const DAEMON = "http://127.0.0.1:7072";
+const SESSION = "dc4550f3-a44b-4def-8a05-e8e817a7fc07";
+const TOKEN = "a2-execute-local-only";
+const status = document.getElementById("status");
+document.getElementById("go").addEventListener("click", async () => {
+  try {
+    const p = window.phantom?.solana;
+    if (!p?.isPhantom) throw new Error("Phantom not detected");
+    await p.connect();
+    if (p.publicKey.toString() !== EXPECTED) {
+      status.innerHTML = '<span style="color:#b00">Connected as ' + p.publicKey.toString() + ', expected ' + EXPECTED + '</span>';
+      return;
+    }
+    status.textContent = "Signing challenge…";
+    const enc = new TextEncoder();
+    const { signature } = await p.signMessage(enc.encode(MESSAGE), "utf8");
+    let binary = ""; for (const b of signature) binary += String.fromCharCode(b);
+    const sigB64 = btoa(binary);
+    status.textContent = "POSTing bind-confirm…";
+    const r = await fetch(DAEMON + "/sessions/" + SESSION + "/wallet-bind-confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + TOKEN },
+      body: JSON.stringify({ challenge_id: CHALLENGE_ID, pubkey: EXPECTED, signature_b64: sigB64 }),
+    });
+    const body = await r.text();
+    if (r.ok) { status.innerHTML = '<span style="color:#080">Bound ✓ ' + body + '</span>'; }
+    else { status.innerHTML = '<span style="color:#b00">Bind failed (' + r.status + '): ' + body + '</span>'; }
+  } catch (e) { status.innerHTML = '<span style="color:#b00">Error: ' + (e?.message || e) + '</span>'; }
+});
+</script>
+</body></html>

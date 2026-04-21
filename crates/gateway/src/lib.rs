@@ -6,6 +6,7 @@
 pub mod approval_audit;
 pub mod approval_routing;
 pub mod approval_store;
+pub mod integrations;
 pub mod completion_metadata;
 pub mod config;
 pub mod daemon;

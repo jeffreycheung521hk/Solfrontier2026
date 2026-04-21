@@ -12,6 +12,7 @@ use std::path::Path;
 use claw_types::{
     policy::PolicyRule,
     solana::SolanaNetwork,
+    swap::SwapPolicyConfig,
     wallet::SignerType,
 };
 
@@ -42,6 +43,48 @@ pub struct ClawConfig {
     /// When empty, falls back to single `CLAW_API_TOKEN` with anonymous identity.
     #[serde(default)]
     pub operators: Vec<OperatorConfig>,
+    /// Jupiter swap integration. Disabled by default.
+    /// When enabled, the `submit_jupiter_swap` tool is registered and the
+    /// production JIT executor is constructed.
+    #[serde(default)]
+    pub jupiter: JupiterConfig,
+}
+
+/// Jupiter swap integration configuration.
+///
+/// Controls registration of the `submit_jupiter_swap` tool and the
+/// configuration of the intent-level swap policy.
+///
+/// # Feature flag
+///
+/// `enabled = false` (default) means the tool is NOT registered. The daemon
+/// runs without any Jupiter-related surface. This is the safe default for
+/// mainnet until policy caps are explicitly configured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JupiterConfig {
+    /// Master switch. When false, the tool is not registered.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL for the Jupiter API. Hosts both `/v6/quote` and `/swap/v2/build`.
+    #[serde(default = "default_jupiter_base_url")]
+    pub base_url: String,
+    /// Intent-level swap policy (mint allowlists, amount caps, slippage caps).
+    #[serde(default)]
+    pub swap_policy: SwapPolicyConfig,
+}
+
+impl Default for JupiterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_jupiter_base_url(),
+            swap_policy: SwapPolicyConfig::default(),
+        }
+    }
+}
+
+fn default_jupiter_base_url() -> String {
+    "https://api.jup.ag".to_string()
 }
 
 /// An operator declaration with token and role assignments.
@@ -415,6 +458,7 @@ impl ClawConfig {
             rate_limit: RateLimitConfig::default(),
             alerting:   AlertingConfig::default(),
             operators:  vec![],
+            jupiter:    JupiterConfig::default(),
         }
     }
 
@@ -431,5 +475,74 @@ impl ClawConfig {
             );
         }
         warnings
+    }
+}
+
+#[cfg(test)]
+mod jupiter_config_tests {
+    use super::*;
+
+    #[test]
+    fn jupiter_disabled_by_default() {
+        let config = JupiterConfig::default();
+        assert!(!config.enabled, "Jupiter must be disabled by default");
+        assert_eq!(config.base_url, "https://api.jup.ag");
+    }
+
+    #[test]
+    fn jupiter_defaults_off_with_canonical_url() {
+        let cfg = JupiterConfig::default();
+        assert!(!cfg.enabled, "Jupiter MUST default to disabled");
+        assert_eq!(cfg.base_url, "https://api.jup.ag");
+        // Empty swap policy = approves everything; this is paired with enabled=false.
+        assert!(cfg.swap_policy.allowed_input_mints.is_empty());
+        assert!(cfg.swap_policy.allowed_output_mints.is_empty());
+    }
+
+    #[test]
+    fn parses_full_jupiter_section() {
+        let toml_str = r#"
+enabled = true
+base_url = "https://api.jup.ag"
+
+[swap_policy]
+allowed_input_mints = ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]
+allowed_output_mints = ["So11111111111111111111111111111111111111112"]
+max_input_amount = 100000000
+max_slippage_bps = 100
+required_approver_role = "treasury"
+"#;
+        let cfg: JupiterConfig = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.base_url, "https://api.jup.ag");
+        assert_eq!(cfg.swap_policy.allowed_input_mints.len(), 1);
+        assert_eq!(cfg.swap_policy.allowed_output_mints.len(), 1);
+        assert_eq!(cfg.swap_policy.max_input_amount, Some(100_000_000));
+        assert_eq!(cfg.swap_policy.max_slippage_bps, Some(100));
+        assert_eq!(cfg.swap_policy.required_approver_role.as_deref(), Some("treasury"));
+    }
+
+    #[test]
+    fn claw_config_default_dev_has_jupiter_disabled() {
+        // Guard: the default dev config must not silently turn on Jupiter.
+        let cfg = ClawConfig::default_dev();
+        assert!(!cfg.jupiter.enabled);
+    }
+
+    #[test]
+    fn jupiter_field_is_serde_default_when_absent() {
+        // Verify the `#[serde(default)]` attribute on the `jupiter` field is
+        // in effect — existing configs without a `[jupiter]` section must
+        // keep loading. We do this without building a full ClawConfig TOML
+        // (which requires many unrelated required fields) by parsing a
+        // stand-alone document that only has the jupiter field declaration.
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            #[serde(default)]
+            jupiter: JupiterConfig,
+        }
+        let probe: Probe = toml::from_str("").expect("empty doc parses");
+        assert!(!probe.jupiter.enabled);
+        assert_eq!(probe.jupiter.base_url, "https://api.jup.ag");
     }
 }

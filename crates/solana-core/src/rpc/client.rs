@@ -272,4 +272,84 @@ impl ClawRpcClient {
     pub fn pool(&self) -> &RpcPool {
         &self.pool
     }
+
+    /// Simulate a V0 `VersionedTransaction`. Used by the Jupiter JIT path.
+    ///
+    /// Returns (success, Option<error_string>, Option<compute_units>).
+    ///
+    /// Unlike the legacy `SimulationClient::simulate`, this does NOT use
+    /// `replace_recent_blockhash = true` — V0 transactions depend on the
+    /// build-time blockhash for ALT resolution.
+    #[instrument(skip(self, tx))]
+    pub async fn simulate_v0_transaction(
+        &self,
+        tx: &solana_sdk::transaction::VersionedTransaction,
+    ) -> Result<(bool, Option<String>, Option<u64>), SolanaError> {
+        use solana_client::rpc_config::RpcSimulateTransactionConfig;
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        let client = self.pool.read_client()?;
+        let config = RpcSimulateTransactionConfig {
+            sig_verify: false,
+            replace_recent_blockhash: false,
+            commitment: Some(CommitmentConfig::confirmed()),
+            encoding: Some(UiTransactionEncoding::Base64),
+            accounts: None,
+            min_context_slot: None,
+            inner_instructions: false,
+        };
+        let resp = client
+            .simulate_transaction_with_config(tx, config)
+            .await
+            .map_err(|e| SolanaError::Client(format!("simulateTransaction (v0): {e}")))?;
+        let value = resp.value;
+        let success = value.err.is_none();
+        let error = value.err.as_ref().map(|e| format!("{:?}", e));
+
+        let logs = value.logs.unwrap_or_default();
+        let compute_units = logs.iter().rev().find_map(|log| {
+            if log.contains("consumed") && log.contains("compute units") {
+                let parts: Vec<&str> = log.split_whitespace().collect();
+                parts.iter()
+                    .position(|&p| p == "consumed")
+                    .and_then(|i| parts.get(i + 1))
+                    .and_then(|s| s.parse::<u64>().ok())
+            } else {
+                None
+            }
+        });
+        Ok((success, error, compute_units))
+    }
+
+    /// Submit signed V0 `VersionedTransaction` bytes. Used by the Jupiter JIT path.
+    ///
+    /// Expects `signed_tx_bytes` to be bincode-serialized `VersionedTransaction`.
+    /// Uses `skip_preflight = true` because simulation has already run upstream.
+    #[instrument(skip(self, signed_tx_bytes), fields(tx_bytes_len = signed_tx_bytes.len()))]
+    pub async fn send_raw_v0_transaction(
+        &self,
+        signed_tx_bytes: &[u8],
+    ) -> Result<String, SolanaError> {
+        use solana_client::rpc_config::RpcSendTransactionConfig;
+        use solana_sdk::transaction::VersionedTransaction;
+
+        let tx: VersionedTransaction = bincode::deserialize(signed_tx_bytes)
+            .map_err(|e| SolanaError::Serialization(format!("deserialize v0 signed tx: {e}")))?;
+
+        let client = self.pool.write_client()?;
+        let config = RpcSendTransactionConfig {
+            skip_preflight: true,
+            max_retries: Some(0),
+            ..Default::default()
+        };
+        let signature = client
+            .send_transaction_with_config(&tx, config)
+            .await
+            .map_err(|e| {
+                self.pool.record_failure(&client.url());
+                SolanaError::Client(format!("sendTransaction (v0): {e}"))
+            })?;
+        self.pool.record_success(&client.url());
+        Ok(signature.to_string())
+    }
 }

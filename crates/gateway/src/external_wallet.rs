@@ -483,3 +483,12 @@ impl crate::orchestrator::adapter::ExternalWalletBindings for ExternalWalletStor
         self.is_external_wallet(session_id, pubkey)
     }
 }
+
+// Bridge into the Jupiter tool's session-wallet-lookup seam.
+// Picks the first bound wallet for the session; callers that need a
+// specific wallet among many should still pass `wallet_pubkey` explicitly.
+impl crate::tools::jupiter_swap::SessionBoundWallet for ExternalWalletStore {
+    fn session_wallet_pubkey(&self, session_id: &SessionId) -> Option<String> {
+        self.wallets_for_session(session_id).into_iter().next()
+    }
+}

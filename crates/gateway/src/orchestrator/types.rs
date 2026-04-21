@@ -199,6 +199,18 @@ pub enum SignatureError {
     /// A retry requires a new `SignatureRequest` from the Control Plane.
     VerificationFailed(String),
 
+    /// The external wallet modified the transaction's `recent_blockhash`.
+    ///
+    /// In strict V0 mode (the default), Claw approves a specific JIT-built artifact.
+    /// Allowing the wallet to change the blockhash would let an external party alter
+    /// the effective validity window of an approved transaction without re-approval.
+    /// In V0+ALT contexts the blockhash also anchors the ALT resolution slot.
+    ///
+    /// This error is a **retry signal**: the caller should trigger a fresh JIT build
+    /// from the original `SwapIntent` and re-send the new tx for signing.
+    /// The pending entry has been consumed (same as `VerificationFailed`).
+    BlockhashModified,
+
     /// No pending request exists with this ID.
     /// Either the request was already completed, expired, or never existed.
     /// The orchestrator is pending-only: completed requests are not retained.
@@ -218,6 +230,11 @@ impl fmt::Display for SignatureError {
             Self::VerificationFailed(e) => write!(f, "verification failed: {e}"),
             Self::RequestNotFound => write!(f, "no pending request with this ID"),
             Self::InvalidTransaction(e) => write!(f, "invalid transaction bytes: {e}"),
+            Self::BlockhashModified => write!(
+                f,
+                "wallet modified blockhash; rebuild required — \
+                 resubmit a fresh JIT build from the approved intent"
+            ),
         }
     }
 }

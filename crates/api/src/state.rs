@@ -121,6 +121,13 @@ pub struct WalletSignatureOutcome {
     pub submitted: bool,
     /// Error message if verification or submission failed.
     pub error: Option<String>,
+    /// `true` when the wallet modified the transaction's `recent_blockhash`.
+    ///
+    /// This is a retry signal: the caller should request a fresh JIT build from the
+    /// original approved `SwapIntent` and re-send the new transaction for signing.
+    /// All other verification failures leave this `false`.
+    #[serde(default)]
+    pub rebuild_required: bool,
 }
 
 /// Handles signed transactions submitted by external wallets.

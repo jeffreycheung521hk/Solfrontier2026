@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>A1-Execute — sign V0, POST to daemon</title>
+<style>
+body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 760px;
+        margin: 32px auto; padding: 0 16px; color: #222; }
+.panel { border: 1px solid #ccc; border-radius: 8px; padding: 16px; margin: 16px 0; }
+.panel.warn { border-color: #e99; background: #fff6f6; }
+table { border-collapse: collapse; width: 100%; }
+td { padding: 6px 8px; border-bottom: 1px solid #eee; font-family: ui-monospace, monospace; font-size: 0.95em; }
+td.k { color:#666; width:220px; }
+button { font-size: 1.05em; padding: 10px 20px; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+#result { font-family: ui-monospace, monospace; word-break: break-all;
+           background: #f4f4f4; padding: 8px; border-radius: 4px; }
+</style></head>
+<body>
+<h1>A1-Execute step 2 / 2 — sign V0 and let daemon broadcast</h1>
+
+<div class="panel warn">
+ <b>Real mainnet swap.</b> Phantom will <code>signTransaction</code> (NOT
+ <code>signAndSendTransaction</code>) — the signed bytes go to the local
+ daemon, which runs <code>complete_v0</code> + <code>send_raw_v0_transaction</code>
+ and returns the on-chain signature.
+</div>
+
+<div class="panel">
+ <table>
+  <tr><td class="k">signer (expected)</td><td>C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW</td></tr>
+  <tr><td class="k">swap</td><td>0.001 SOL (wSOL) → USDC mainnet</td></tr>
+  <tr><td class="k">slippage</td><td>1 %</td></tr>
+  <tr><td class="k">quoted out</td><td>0 µUSDC</td></tr>
+  <tr><td class="k">min accepted out</td><td>0 µUSDC</td></tr>
+  <tr><td class="k">route</td><td>Jupiter V6 aggregator (route selected at build time)</td></tr>
+  <tr><td class="k">simulate</td><td><span style="color:#080;font-weight:600">✓ mainnet simulate: success</span></td></tr>
+  <tr><td class="k">request_id</td><td>668fd9cd-805c-4ebc-bb0b-30f57ce5b70b</td></tr>
+ </table>
+</div>
+
+<div class="panel">
+ <button id="go">Connect Phantom &amp; sign V0 + broadcast via daemon</button>
+ <p id="status">Idle.</p>
+</div>
+<div class="panel" id="resultPanel" style="display:none;">
+ <h2>Result</h2>
+ <div id="result"></div>
+ <div id="explorer"></div>
+</div>
+
+<script type="module">
+import * as web3 from "https://esm.sh/@solana/web3.js@1.95.4";
+
+const BASE64_TX = "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAQAHDaRPxIOU+HPCWbdgqMSZu+21o8XsoMvgSTI2CyxARlefFLFJDCVb14dZqYzjh06LdmzTF9xcEnJUiFKRAQdV2tY1VpGXjfDbFge9GJYBH7MvcaGkseVvJuopUagbx0Qg/ZTUq+N/x81eo3nqBYw07dYcqFGsSki9q438U2U1ner2uxuhZVNGWGyU7sM2jUFS0U6Fnl3Rr3unLwIYcFpUuCvAmXbP26QoUw279iZJuNZh5LtI0cqgxeCS4syQP/Uj0gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwZGb+UhFzL/7K26csOb57yM5bvF9xJrLEObOkAAAAAEedVb8jHAbu50xW7OaBUH/bGy3qP0jlECsc2iVrwTjwbd9uHXZaGT2cvhRs7reawctIXtX1s3kTqM9YV+/wCpjJclj04kifG7PRApFI4NgwtaE5na/xCEBI572Nvp+FmkYxc4DkxZfbMEnQbN99JTCf45xZqDb2QkK6kowNtpQrQ/+if11/ZKdMCbHylYed5LCas238ndUUsyGqezjOXoHONT1R1Z9tjLDzmel8/TPwBrxkZBx3nBV/6xdVbYvm8HBwAFAiRsAQAHAAkDqvUCAAAAAAAKBgABABIGCQEBBgIAAQwCAAAAQEIPAAAAAAAJAQEBEQgdCQABAggUCAwIERALDg8BAhIUDREACQkTEQMFBAgj5RfLl3rjrSoBAAAAJmQAAUBCDwAAAAAA+VkBAAAAAABkAAAJAwEAAAEJAVyh4LtT5YtSxa/rZ2y1U2zL0ZqEjQlmryMFOH8LsftKBGlnbGoEPD4/Yw==";
+const EXPECTED = "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW";
+const REQUEST_ID = "668fd9cd-805c-4ebc-bb0b-30f57ce5b70b";
+const DAEMON = "http://127.0.0.1:7071";
+const SESSION = "ba0ff66b-3c62-4480-b01b-97958973dd9b";
+const TOKEN = "a1-execute-local-only";
+
+const status = document.getElementById("status");
+const go = document.getElementById("go");
+const resultPanel = document.getElementById("resultPanel");
+const resultEl = document.getElementById("result");
+const explorerEl = document.getElementById("explorer");
+
+go.addEventListener("click", async () => {
+  go.disabled = true;
+  try {
+    const p = window.phantom?.solana;
+    if (!p?.isPhantom) throw new Error("Phantom not detected");
+    await p.connect();
+    if (p.publicKey.toString() !== EXPECTED) {
+      throw new Error("Connected as " + p.publicKey.toString() + ", expected " + EXPECTED);
+    }
+    status.textContent = "Deserializing V0 tx…";
+    const bin = atob(BASE64_TX);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const tx = web3.VersionedTransaction.deserialize(bytes);
+
+    status.textContent = "Asking Phantom to sign the V0 transaction…";
+    const signedTx = await p.signTransaction(tx);
+    const signedBytes = signedTx.serialize();
+    let bStr = ""; for (const b of signedBytes) bStr += String.fromCharCode(b);
+    const signedB64 = btoa(bStr);
+
+    status.textContent = "POSTing signed bytes to daemon wallet-signatures…";
+    const r = await fetch(DAEMON + "/sessions/" + SESSION + "/wallet-signatures", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + TOKEN },
+      body: JSON.stringify({ request_id: REQUEST_ID, signed_tx_b64: signedB64 }),
+    });
+    const body = await r.json();
+    resultPanel.style.display = "block";
+    resultEl.textContent = JSON.stringify(body, null, 2);
+    if (body.tx_signature) {
+      const url = "https://explorer.solana.com/tx/" + body.tx_signature;
+      explorerEl.innerHTML = '<a href="' + url + '" target="_blank" rel="noopener">Solana Explorer →</a>';
+      status.innerHTML = '<span style="color:#080">Broadcast by daemon ✓</span>';
+    } else if (body.rebuild_required) {
+      status.innerHTML = '<span style="color:#b00">rebuild_required: ' + (body.error || '') + '</span>';
+    } else {
+      status.innerHTML = '<span style="color:#b00">Completion failed: ' + (body.error || '') + '</span>';
+    }
+  } catch (e) {
+    status.innerHTML = '<span style="color:#b00">Error: ' + (e?.message || e) + '</span>';
+  } finally {
+    go.disabled = false;
+  }
+});
+</script>
+</body></html>

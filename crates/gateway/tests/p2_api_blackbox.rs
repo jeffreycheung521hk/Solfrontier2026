@@ -135,7 +135,7 @@ impl WalletSignatureHandler for StubWalletSig {
         &self, _s: &SessionId, rid: Uuid, _b: String,
     ) -> Pin<Box<dyn Future<Output = WalletSignatureOutcome> + Send + '_>> {
         Box::pin(async move {
-            WalletSignatureOutcome { request_id: rid, accepted: false, signature: None, tx_signature: None, submitted: false, error: Some("stub".into()) }
+            WalletSignatureOutcome { request_id: rid, accepted: false, signature: None, tx_signature: None, submitted: false, error: Some("stub".into()), rebuild_required: false }
         })
     }
     fn pending_for_session(&self, _s: &SessionId) -> Vec<PendingWalletSignatureInfo> { vec![] }

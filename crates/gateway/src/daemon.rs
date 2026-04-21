@@ -288,6 +288,7 @@ impl GatewayDaemon {
         // ── 10. Pipeline + SignatureOrchestrator + SubmitForSigningTool (STEP 5) ──
         let approval_store    = ApprovalStore::new();
         let pending_signing   = PendingSigningStore::new();
+        let pending_jupiter_park = crate::integrations::jupiter_park::PendingJupiterParkStore::new();
         // C4: Create binding repo and wire into ExternalWalletStore for
         // durable session-wallet binding persistence across restarts.
         let binding_repo = claw_state_store::WalletBindingRepository::new(db.pool().clone());
@@ -408,6 +409,62 @@ impl GatewayDaemon {
             (registry, None)
         };
 
+        // ── 10a. Jupiter swap tool (feature-flagged) ────────────────────────
+        // Registered only when `[jupiter] enabled = true`. Safe default is off.
+        let registry = if config.jupiter.enabled {
+            use crate::integrations::jupiter::HttpJupiterClient;
+            use crate::integrations::jupiter_production::{
+                ClawAltFetcher, ClawV0Rpc, HttpJupiterJitExecutor,
+            };
+            use crate::tools::jupiter_swap::SubmitJupiterSwapTool;
+            use claw_state_store::pending_jupiter::PendingJupiterRepository;
+
+            let jupiter_client = Arc::new(HttpJupiterClient::with_base_url(
+                config.jupiter.base_url.clone(),
+            ));
+            let v0_rpc = Arc::new(ClawV0Rpc::new(rpc_client.clone()));
+            let alt_fetcher = Arc::new(ClawAltFetcher::new(rpc_client.clone()));
+
+            let jit_executor = Arc::new(HttpJupiterJitExecutor::new(
+                jupiter_client,
+                v0_rpc,
+                alt_fetcher,
+                main_orchestrator.clone(),
+            ));
+
+            let pending_jupiter_repo =
+                PendingJupiterRepository::new(db.pool().clone());
+
+            let jupiter_tool = Arc::new(
+                SubmitJupiterSwapTool::new(
+                    pending_jupiter_repo,
+                    approval_store.clone(),
+                    event_bus.clone(),
+                    audit_repo.clone(),
+                    config.jupiter.swap_policy.clone(),
+                    config.network.network,
+                    config.policy.approval_lease_seconds,
+                    alert_dispatcher.clone(),
+                    metrics.clone(),
+                    jit_executor,
+                    pending_jupiter_park.clone(),
+                )
+                .with_session_wallet_lookup(
+                    Arc::new(external_wallet.clone())
+                        as Arc<dyn crate::tools::jupiter_swap::SessionBoundWallet>,
+                ),
+            );
+
+            info!(
+                base_url = %config.jupiter.base_url,
+                "submit_jupiter_swap tool active"
+            );
+            registry.with_tool(jupiter_tool)
+        } else {
+            info!("jupiter integration disabled — submit_jupiter_swap tool not registered");
+            registry
+        };
+
         info!(
             tool_count = registry.names().len(),
             "final tool registry ready"
@@ -495,6 +552,36 @@ impl GatewayDaemon {
             }
         }
 
+        // ── 10d. Startup expiry of stuck Jupiter intents ─────────────────
+        // On restart, intents stuck in `approved_waiting_jit` or `jit_building`
+        // have no in-memory resume task and will never advance on their own.
+        // Mark them expired immediately so callers see a clear terminal state
+        // rather than a silent hang.
+        if config.jupiter.enabled {
+            use claw_state_store::pending_jupiter::PendingJupiterRepository;
+            use claw_state_store::pending_jupiter::state;
+            let jupiter_startup_repo = PendingJupiterRepository::new(db.pool().clone());
+            match jupiter_startup_repo.expire_stuck(
+                &[state::APPROVED_WAITING_JIT, state::JIT_BUILDING],
+                "daemon restart",
+            ).await {
+                Ok(count) if count > 0 => {
+                    info!(
+                        count,
+                        "expired stuck Jupiter intents on startup \
+                         (states: approved_waiting_jit, jit_building)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "failed to expire stuck Jupiter intents on startup — continuing"
+                    );
+                }
+            }
+        }
+
         // ── 11. Health registry ───────────────────────────────────────────
         let health_registry = HealthRegistry::new();
 
@@ -533,12 +620,13 @@ impl GatewayDaemon {
         }));
 
         let approval_handler_ref = ApprovalHandlerRef::new(Arc::new(GatewayApprovalHandler {
-            store:           approval_store.clone(),
-            pending_signing: pending_signing.clone(),
-            event_bus:       event_bus.clone(),
-            audit:           audit_repo.clone(),
-            _durable:        durable_state.clone(),
-            alerts:          alert_dispatcher.clone(),
+            store:                approval_store.clone(),
+            pending_signing:      pending_signing.clone(),
+            pending_jupiter_park: pending_jupiter_park.clone(),
+            event_bus:            event_bus.clone(),
+            audit:                audit_repo.clone(),
+            _durable:             durable_state.clone(),
+            alerts:               alert_dispatcher.clone(),
         }));
 
         let event_subscriber_ref = EventSubscriberRef::new(Arc::new(GatewayEventSubscriber {
@@ -1256,12 +1344,13 @@ impl GatewayMessageHandler {
 // ── ApprovalHandler adapter ────────────────────────────────────────────────
 
 struct GatewayApprovalHandler {
-    store:           ApprovalStore,
-    pending_signing: PendingSigningStore,
-    event_bus:       EventBus,
-    audit:           AuditRepository,
-    _durable:        DurablePendingState,
-    alerts:          crate::policy_alerting::AlertDispatcher,
+    store:                ApprovalStore,
+    pending_signing:      PendingSigningStore,
+    pending_jupiter_park: crate::integrations::jupiter_park::PendingJupiterParkStore,
+    event_bus:            EventBus,
+    audit:                AuditRepository,
+    _durable:             DurablePendingState,
+    alerts:               crate::policy_alerting::AlertDispatcher,
 }
 
 impl ApprovalHandler for GatewayApprovalHandler {
@@ -1334,6 +1423,7 @@ impl GatewayApprovalHandler {
             &outcome,
             decision.request_id,
             &self.pending_signing,
+            &self.pending_jupiter_park,
             &self.alerts,
             maybe_request.as_ref(),
         );
@@ -1436,6 +1526,7 @@ impl GatewayWalletSignatureHandler {
                     tx_signature: None,
                     submitted: false,
                     error: Some(format!("invalid base64: {e}")),
+                    rebuild_required: false,
                 };
             }
         };
@@ -1464,6 +1555,7 @@ impl GatewayWalletSignatureHandler {
                     tx_signature: None,
                     submitted: false,
                     error: Some("request not found for this session".into()),
+                    rebuild_required: false,
                 };
             }
             None => {
@@ -1474,6 +1566,7 @@ impl GatewayWalletSignatureHandler {
                     tx_signature: None,
                     submitted: false,
                     error: Some("no pending request with this ID".into()),
+                    rebuild_required: false,
                 };
             }
             Some(_) => {} // session matches — proceed
@@ -1558,9 +1651,20 @@ impl GatewayWalletSignatureHandler {
                 // If RPC submission fails, the request remains consumed (terminal).
                 // We do NOT put it back in the pending queue. The verification was
                 // valid; only the broadcast failed.
-                let (tx_signature, submitted, send_error) = match self.rpc_client
-                    .send_raw_transaction(&signed_tx_bytes)
-                    .await
+                //
+                // Dispatch: detect V0 (Jupiter JIT external wallet path) vs legacy.
+                // The classifier is a pure function whose contract is locked by
+                // unit tests in `orchestrator::signed_tx_kind` — see A1-Execute
+                // test 6 "Daemon V0 Submit Contract".
+                let rpc_send_result = match crate::orchestrator::classify_signed_tx_kind(&signed_tx_bytes) {
+                    crate::orchestrator::SignedTxKind::V0 => {
+                        self.rpc_client.send_raw_v0_transaction(&signed_tx_bytes).await
+                    }
+                    crate::orchestrator::SignedTxKind::Legacy => {
+                        self.rpc_client.send_raw_transaction(&signed_tx_bytes).await
+                    }
+                };
+                let (tx_signature, submitted, send_error) = match rpc_send_result
                 {
                     Ok(tx_sig) => {
                         self.metrics.transactions_sent.increment();
@@ -1716,6 +1820,7 @@ impl GatewayWalletSignatureHandler {
                     tx_signature,
                     submitted,
                     error: send_error,
+                    rebuild_required: false,
                 }
             }
 
@@ -1732,35 +1837,48 @@ impl GatewayWalletSignatureHandler {
                     tx_signature: None,
                     submitted: false,
                     error: Some("internal error: unexpected pending state".to_string()),
+                    rebuild_required: false,
                 }
             }
 
             Err(e) => {
+                use crate::orchestrator::types::SignatureError;
+
+                // BlockhashModified is a retry signal, not a hard failure.
+                // Surface it separately so callers can trigger a fresh JIT rebuild.
+                let rebuild_required = matches!(e, SignatureError::BlockhashModified);
+
                 let reason = e.to_string();
                 warn!(
                     session = %session_str,
                     request_id = %request_id,
+                    rebuild_required,
                     "wallet signature rejected by orchestrator: {reason}"
                 );
 
                 // P1-1 hardening: mark terminal BEFORE in-memory cleanup.
-                self.durable.mark_signature_terminal(&sig_request_id, "rejected", Some(&reason)).await;
-                self.durable.mark_completion_meta_terminal(request_id, "rejected").await;
+                let terminal_reason = if rebuild_required { "blockhash_modified" } else { "rejected" };
+                self.durable.mark_signature_terminal(&sig_request_id, terminal_reason, Some(&reason)).await;
+                self.durable.mark_completion_meta_terminal(request_id, terminal_reason).await;
 
                 // Clean up completion metadata on rejection.
                 self.completion_meta.remove(&request_id);
 
-                // The orchestrator already consumed the pending entry (consume-on-attempt).
-                // We use the request_id for audit correlation — transaction_id and wallet_pubkey
-                // are not available after consumption on the error path.
+                let audit_event = if rebuild_required {
+                    "wallet_blockhash_modified_rebuild_required"
+                } else {
+                    "wallet_signature_rejected"
+                };
+
                 let _ = self.audit.append(
                     Some(&session_str),
                     &request_id.to_string(),
-                    "wallet_signature_rejected",
+                    audit_event,
                     "external_wallet",
                     &json!({
-                        "request_id": request_id,
-                        "reason":     reason,
+                        "request_id":      request_id,
+                        "reason":          reason,
+                        "rebuild_required": rebuild_required,
                     }),
                     AuditSeverity::Warning,
                 ).await;
@@ -1783,6 +1901,7 @@ impl GatewayWalletSignatureHandler {
                     tx_signature: None,
                     submitted: false,
                     error: Some(reason),
+                    rebuild_required,
                 }
             }
         }

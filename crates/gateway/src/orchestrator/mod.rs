@@ -28,9 +28,12 @@ pub mod adapter;
 pub mod types;
 pub mod local_adapter;
 pub mod external_adapter;
+pub mod signed_tx_kind;
 
 #[cfg(test)]
 mod tests;
+
+pub use signed_tx_kind::{classify_signed_tx_kind, SignedTxKind};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

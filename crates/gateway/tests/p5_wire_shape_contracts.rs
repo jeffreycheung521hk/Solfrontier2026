@@ -85,7 +85,7 @@ struct StubWalletSig;
 impl WalletSignatureHandler for StubWalletSig {
     fn submit_signed_tx(&self, _: &SessionId, rid: Uuid, _: String)
         -> Pin<Box<dyn Future<Output = WalletSignatureOutcome> + Send + '_>>
-    { Box::pin(async move { WalletSignatureOutcome { request_id: rid, accepted: false, signature: None, tx_signature: None, submitted: false, error: Some("stub".into()) } }) }
+    { Box::pin(async move { WalletSignatureOutcome { request_id: rid, accepted: false, signature: None, tx_signature: None, submitted: false, error: Some("stub".into()), rebuild_required: false } }) }
     fn pending_for_session(&self, _: &SessionId) -> Vec<PendingWalletSignatureInfo> { vec![] }
     fn bind_wallet(&self, _: &SessionId, _: &str) {}
     fn wallets_for_session(&self, _: &SessionId) -> Vec<String> { vec![] }

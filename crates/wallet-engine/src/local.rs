@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use solana_sdk::{
     pubkey::Pubkey,
     signature::Signature,
-    transaction::Transaction,
+    signer::Signer as SolanaSignerTrait,
+    transaction::{Transaction, VersionedTransaction},
 };
 use tracing::instrument;
 
@@ -55,6 +56,47 @@ impl Signer for LocalKeypairSigner {
             })?;
 
         Ok(tx.signatures[sig_idx])
+    }
+
+    #[instrument(skip(self, tx), fields(pubkey = %self.pubkey))]
+    async fn sign_versioned(
+        &self,
+        tx: &mut VersionedTransaction,
+    ) -> Result<Signature, WalletError> {
+        let keypair = self.keystore.get(&self.pubkey)?;
+
+        // Static account keys (the first-class accounts in the V0 message,
+        // excluding lookup-table-resolved accounts). The signer MUST appear
+        // in this section for its signature to be verifiable.
+        let static_keys = tx.message.static_account_keys();
+        let sig_idx = static_keys
+            .iter()
+            .position(|k| k == &self.pubkey)
+            .ok_or_else(|| {
+                WalletError::SigningFailed(format!(
+                    "pubkey {} not found in static account keys",
+                    self.pubkey
+                ))
+            })?;
+
+        // Sign the message serialization. For VersionedMessage, this includes
+        // the version prefix, so the signature binds to V0 semantics.
+        let message_bytes = tx.message.serialize();
+        let signature = keypair.inner().sign_message(&message_bytes);
+
+        // Ensure signatures vector is sized correctly.
+        let required_sigs = tx.message.header().num_required_signatures as usize;
+        if tx.signatures.len() < required_sigs {
+            tx.signatures.resize(required_sigs, Signature::default());
+        }
+        if sig_idx >= tx.signatures.len() {
+            return Err(WalletError::SigningFailed(format!(
+                "signer index {sig_idx} exceeds signatures vec length {}",
+                tx.signatures.len()
+            )));
+        }
+        tx.signatures[sig_idx] = signature;
+        Ok(signature)
     }
 
     fn description(&self) -> String {

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>A2-Execute — sign V0 via daemon</title>
+<style>
+body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 760px; margin: 32px auto; padding: 0 16px; color: #222; }
+.panel { border: 1px solid #ccc; border-radius: 8px; padding: 16px; margin: 16px 0; }
+.panel.warn { border-color: #e99; background: #fff6f6; }
+table { border-collapse: collapse; width: 100%; }
+td { padding: 6px 8px; border-bottom: 1px solid #eee; font-family: ui-monospace, monospace; font-size: 0.95em; }
+td.k { color:#666; width:220px; }
+button { font-size: 1.05em; padding: 10px 20px; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+#result { font-family: ui-monospace, monospace; word-break: break-all; background: #f4f4f4; padding: 8px; border-radius: 4px; }
+</style></head>
+<body>
+<h1>A2-Execute step 2 / 2 — sign V0, daemon broadcasts</h1>
+<div class="panel warn">
+ <b>Real mainnet swap.</b> Phantom will <code>signTransaction</code> (NOT
+ signAndSendTransaction) — signed bytes go to the local daemon, which
+ runs <code>complete_v0</code> + <code>send_raw_v0_transaction</code>.
+</div>
+<div class="panel">
+ <table>
+  <tr><td class="k">triggered by message</td><td>Swap 0.001 SOL to USDC with 1% slippage.</td></tr>
+  <tr><td class="k">signer</td><td>C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW</td></tr>
+  <tr><td class="k">pair</td><td>wSOL → USDC (mainnet)</td></tr>
+  <tr><td class="k">request_id</td><td>698b1d06-9035-4fd8-b012-43e35751425c</td></tr>
+ </table>
+</div>
+<div class="panel">
+ <button id="go">Connect Phantom &amp; sign V0 + broadcast via daemon</button>
+ <p id="status">Idle.</p>
+</div>
+<div class="panel" id="resultPanel" style="display:none;">
+ <h2>Result</h2>
+ <div id="result"></div>
+ <div id="explorer"></div>
+</div>
+<script type="module">
+import * as web3 from "https://esm.sh/@solana/web3.js@1.95.4";
+const BASE64_TX = "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAQAHCqRPxIOU+HPCWbdgqMSZu+21o8XsoMvgSTI2CyxARlefFLFJDCVb14dZqYzjh06LdmzTF9xcEnJUiFKRAQdV2tY1VpGXjfDbFge9GJYBH7MvcaGkseVvJuopUagbx0Qg/QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwZGb+UhFzL/7K26csOb57yM5bvF9xJrLEObOkAAAAAEedVb8jHAbu50xW7OaBUH/bGy3qP0jlECsc2iVrwTjwbd9uHXZaGT2cvhRs7reawctIXtX1s3kTqM9YV+/wCpjJclj04kifG7PRApFI4NgwtaE5na/xCEBI572Nvp+Fm0P/on9df2SnTAmx8pWHneSwmrNt/J3VFLMhqns4zl6MoqoyxGunhcSQJGc3QzAacp7dCP3EXzI8hP4MLYBB6kNHaZA5EnTg4pxnd+LbiU9cF45vjsR5iG8t5cZakjTuQHBAAFAtR9AQAEAAkDvv0KAAAAAAAHBgABAA0DBgEBAwIAAQwCAAAAQEIPAAAAAAAGAQEBEQUZBgABAgURBQgFEAAKDAsBAg8GBg4NEQkSBSzlF8uXeuOtKgEAAAB2azbfEDq6tccBZAABQEIPAAAAAABOUwEAAAAAAGQAAAYDAQAAAQkBfEf3WvqJ/6bMDNtI69dEl4r4hMrpAHc3WtQ+KSSsSsMDqqWsBhSmqagBow==";
+const EXPECTED = "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW";
+const REQUEST_ID = "698b1d06-9035-4fd8-b012-43e35751425c";
+const DAEMON = "http://127.0.0.1:7072";
+const SESSION = "dc4550f3-a44b-4def-8a05-e8e817a7fc07";
+const TOKEN = "a2-execute-local-only";
+const status = document.getElementById("status");
+const go = document.getElementById("go");
+const resultPanel = document.getElementById("resultPanel");
+const resultEl = document.getElementById("result");
+const explorerEl = document.getElementById("explorer");
+go.addEventListener("click", async () => {
+  go.disabled = true;
+  try {
+    const p = window.phantom?.solana;
+    if (!p?.isPhantom) throw new Error("Phantom not detected");
+    await p.connect();
+    if (p.publicKey.toString() !== EXPECTED) throw new Error("Connected as " + p.publicKey.toString() + ", expected " + EXPECTED);
+    const bin = atob(BASE64_TX);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const tx = web3.VersionedTransaction.deserialize(bytes);
+    status.textContent = "Asking Phantom to sign…";
+    const signedTx = await p.signTransaction(tx);
+    const signedBytes = signedTx.serialize();
+    let bStr = ""; for (const b of signedBytes) bStr += String.fromCharCode(b);
+    const signedB64 = btoa(bStr);
+    status.textContent = "POSTing signed bytes to daemon wallet-signatures…";
+    const r = await fetch(DAEMON + "/sessions/" + SESSION + "/wallet-signatures", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + TOKEN },
+      body: JSON.stringify({ request_id: REQUEST_ID, signed_tx_b64: signedB64 }),
+    });
+    const body = await r.json();
+    resultPanel.style.display = "block";
+    resultEl.textContent = JSON.stringify(body, null, 2);
+    if (body.tx_signature) {
+      const url = "https://explorer.solana.com/tx/" + body.tx_signature;
+      explorerEl.innerHTML = '<a href="' + url + '" target="_blank" rel="noopener">Solana Explorer →</a>';
+      status.innerHTML = '<span style="color:#080">Broadcast by daemon ✓</span>';
+    } else if (body.rebuild_required) {
+      status.innerHTML = '<span style="color:#b00">rebuild_required: ' + (body.error || '') + '</span>';
+    } else {
+      status.innerHTML = '<span style="color:#b00">Failed: ' + (body.error || '') + '</span>';
+    }
+  } catch (e) { status.innerHTML = '<span style="color:#b00">Error: ' + (e?.message || e) + '</span>'; go.disabled = false; }
+});
+</script>
+</body></html>

@@ -405,6 +405,7 @@ impl WalletSignatureHandler for StubWalletSig {
                 tx_signature: None,
                 submitted:  false,
                 error:      Some("stub".into()),
+                rebuild_required: false,
             }
         })
     }

@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ClawSolana — Jupiter JIT Phase 1 mainnet sign + broadcast</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 760px;
+            margin: 32px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 1.4em; }
+    .panel { border: 1px solid #ccc; border-radius: 8px; padding: 16px;
+              margin: 16px 0; }
+    .panel.warn { border-color: #e99; background: #fff6f6; }
+    .panel.ok   { border-color: #3a3; background: #f6fff6; }
+    table { border-collapse: collapse; width: 100%; }
+    td { padding: 6px 8px; border-bottom: 1px solid #eee; font-family: ui-monospace, monospace; font-size: 0.95em; }
+    td.k { color: #666; width: 240px; }
+    button { font-size: 1.05em; padding: 10px 20px; margin: 4px 0; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #sig { font-family: ui-monospace, monospace; word-break: break-all;
+            background: #f4f4f4; padding: 8px; border-radius: 4px; }
+    .ok { color: #080; font-weight: 600; }
+    .fail { color: #b00; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>ClawSolana — Jupiter JIT Phase 1 mainnet handoff</h1>
+
+  <div class="panel warn">
+    <strong>Real mainnet transaction.</strong>
+    Clicking "Sign &amp; Send" will spend real SOL. Base fee + Jupiter route
+    cost only — no amount beyond this page's quote will be moved.
+  </div>
+
+  <div class="panel">
+    <h2>Swap details (from live Jupiter)</h2>
+    <table>
+      <tr><td class="k">signer (expected)</td><td>C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW</td></tr>
+      <tr><td class="k">input mint</td><td>So11111111111111111111111111111111111111112 (wSOL)</td></tr>
+      <tr><td class="k">output mint</td><td>EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v (USDC)</td></tr>
+      <tr><td class="k">input amount</td><td>1000000 lamports (0.001 SOL)</td></tr>
+      <tr><td class="k">slippage</td><td>100 bps (1.00%)</td></tr>
+      <tr><td class="k">quoted out</td><td>88618 µUSDC</td></tr>
+      <tr><td class="k">min accepted out</td><td>87732 µUSDC</td></tr>
+      <tr><td class="k">route</td><td>Raydium CLMM</td></tr>
+      <tr><td class="k">ALTs resolved</td><td>1</td></tr>
+      <tr><td class="k">blockhash</td><td>DKx8jo3tv67DrGi5sk46rzPaq4GBT1YCvqcC3yNJZCje</td></tr>
+      <tr><td class="k">last valid block height</td><td>392070316</td></tr>
+      <tr><td class="k">simulate</td><td><span class="ok">✓ mainnet simulate: success</span></td></tr>
+      <tr><td class="k"></td><td>compute units (simulate): 2915</td></tr>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Phantom</h2>
+    <div id="status">Not connected.</div>
+    <button id="connect">Connect Phantom</button>
+    <button id="send" disabled>Sign &amp; Send (mainnet)</button>
+  </div>
+
+  <div class="panel" id="result-panel" style="display:none;">
+    <h2>Result</h2>
+    <div id="sig"></div>
+    <div id="explorer"></div>
+  </div>
+
+  <script type="module">
+    import * as web3 from "https://esm.sh/@solana/web3.js@1.95.4";
+
+    const BASE64_TX = "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAQAGCqRPxIOU+HPCWbdgqMSZu+21o8XsoMvgSTI2CyxARlefFLFJDCVb14dZqYzjh06LdmzTF9xcEnJUiFKRAQdV2tY1VpGXjfDbFge9GJYBH7MvcaGkseVvJuopUagbx0Qg/U/IePkxuR0MkiLLQWlu1fXxF0LWh5hM7CrZfiXFMJ5KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADBkZv5SEXMv/srbpyw5vnvIzlu8X3EmssQ5s6QAAAAAR51VvyMcBu7nTFbs5oFQf9sbLeo/SOUQKxzaJWvBOPBt324ddloZPZy+FGzut5rBy0he1fWzeROoz1hX7/AKmMlyWPTiSJ8bs9ECkUjg2DC1oTmdr/EIQEjnvY2+n4WbQ/+if11/ZKdMCbHylYed5LCas238ndUUsyGqezjOXotycJh6NcVeIv26szCm0h1c7U/NtXQ62Jms6hcs91J2UHBQAFAuLnAQAFAAkDEkAAAAAAAAAIBgABAA8EBwEBBAIAAQwCAAAAQEIPAAAAAAAHAQEBEQYWBwABAgYSBgkGEQAQDQECDgoMBwMLBiPlF8uXeuOtKgEAAAAaZAABQEIPAAAAAAAqWgEAAAAAAGQAAAcDAQAAAQkB9MUR9D662ZgB3hs2GfMAeJnJTIO12qz41STp8LyxFeoFz9LO1NEEAULWkQ==";
+    const EXPECTED_WALLET = "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW";
+
+    const statusEl = document.getElementById("status");
+    const connectBtn = document.getElementById("connect");
+    const sendBtn = document.getElementById("send");
+    const resultPanel = document.getElementById("result-panel");
+    const sigEl = document.getElementById("sig");
+    const explorerEl = document.getElementById("explorer");
+
+    let provider = null;
+
+    function decodeTx() {
+      const bin = atob(BASE64_TX);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return web3.VersionedTransaction.deserialize(bytes);
+    }
+
+    connectBtn.addEventListener("click", async () => {
+      try {
+        provider = window.phantom?.solana;
+        if (!provider?.isPhantom) throw new Error("Phantom not detected");
+        const resp = await provider.connect();
+        const pk = resp.publicKey.toString();
+        if (pk !== EXPECTED_WALLET) {
+          statusEl.innerHTML = '<span class="fail">Connected as ' + pk +
+            ', but this handoff is for ' + EXPECTED_WALLET +
+            '. Switch accounts in Phantom and retry.</span>';
+          return;
+        }
+        statusEl.innerHTML = '<span class="ok">Connected: ' + pk + '</span>';
+        sendBtn.disabled = false;
+      } catch (e) {
+        statusEl.innerHTML = '<span class="fail">Connect failed: ' + e.message + '</span>';
+      }
+    });
+
+    sendBtn.addEventListener("click", async () => {
+      sendBtn.disabled = true;
+      statusEl.innerHTML = "Sending to Phantom…";
+      try {
+        const tx = decodeTx();
+        const { signature } = await provider.signAndSendTransaction(tx);
+        resultPanel.style.display = "block";
+        sigEl.textContent = signature;
+        const url = "https://explorer.solana.com/tx/" + signature;
+        explorerEl.innerHTML =
+          '<a href="' + url + '" target="_blank" rel="noopener">Solana Explorer →</a>';
+        statusEl.innerHTML = '<span class="ok">Broadcast submitted.</span>';
+      } catch (e) {
+        statusEl.innerHTML = '<span class="fail">Sign/send failed: ' + (e?.message || e) + '</span>';
+        sendBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

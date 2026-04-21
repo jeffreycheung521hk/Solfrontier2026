@@ -80,6 +80,7 @@ impl WalletSignatureHandler for StubWalletSig {
         Box::pin(async { WalletSignatureOutcome {
             request_id: uuid::Uuid::nil(), accepted: false, signature: None,
             tx_signature: None, submitted: false, error: Some("stub".into()),
+            rebuild_required: false,
         }})
     }
     fn pending_for_session(&self, _: &SessionId) -> Vec<PendingWalletSignatureInfo> { vec![] }

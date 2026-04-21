@@ -48,6 +48,17 @@ pub struct SubmitWalletSignatureResponse {
     pub submitted: bool,
     /// Error message if rejected or submission failed.
     pub error: Option<String>,
+    /// `true` when the wallet modified `recent_blockhash` (strict-mode rejection).
+    ///
+    /// This is a **retry signal**, not a verification failure:
+    /// - The signed bytes were rejected because the V0 blockhash was altered.
+    /// - The original approved `SwapIntent` is still valid.
+    /// - The caller should trigger a fresh JIT build (e.g. by calling
+    ///   `submit_jupiter_swap` again with the same parameters) and resubmit
+    ///   the new transaction for signing.
+    ///
+    /// For any other verification failure, this field is `false`.
+    pub rebuild_required: bool,
 }
 
 /// Request body for `POST /sessions/:id/bind-wallet`.
@@ -93,6 +104,7 @@ pub async fn submit_wallet_signature(
             tx_signature: outcome.tx_signature,
             submitted: outcome.submitted,
             error: outcome.error,
+            rebuild_required: outcome.rebuild_required,
         }),
     )
         .into_response()
@@ -149,4 +161,85 @@ pub async fn bind_wallet(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wire-shape contract tests for `POST /sessions/:id/wallet-signatures`.
+    //!
+    //! These tests lock the public response shape. The frontend / SDK depends on
+    //! the exact field names and the backward-compatible default for
+    //! `rebuild_required`. A breaking change here must update BOTH sides.
+    use super::*;
+    use serde_json::Value;
+
+    fn base_response(rebuild_required: bool) -> SubmitWalletSignatureResponse {
+        SubmitWalletSignatureResponse {
+            request_id: Uuid::nil(),
+            accepted: false,
+            signature: None,
+            tx_signature: None,
+            submitted: false,
+            error: Some("wallet modified blockhash; rebuild required".into()),
+            rebuild_required,
+        }
+    }
+
+    #[test]
+    fn response_shape_contains_rebuild_required_field() {
+        let v: Value = serde_json::to_value(base_response(true)).unwrap();
+        let obj = v.as_object().expect("response must serialize to an object");
+
+        for field in [
+            "request_id",
+            "accepted",
+            "signature",
+            "tx_signature",
+            "submitted",
+            "error",
+            "rebuild_required",
+        ] {
+            assert!(
+                obj.contains_key(field),
+                "SubmitWalletSignatureResponse missing wire field `{field}`"
+            );
+        }
+        assert_eq!(v["rebuild_required"], Value::Bool(true));
+    }
+
+    #[test]
+    fn blockhash_modified_response_shape_is_retry_signal_not_accepted() {
+        // Lock the exact combination: accepted=false + rebuild_required=true.
+        // This is the semantic the persona and docs instruct clients to detect.
+        let v: Value = serde_json::to_value(base_response(true)).unwrap();
+        assert_eq!(v["accepted"], Value::Bool(false));
+        assert_eq!(v["rebuild_required"], Value::Bool(true));
+        assert_eq!(v["submitted"], Value::Bool(false));
+    }
+
+    #[test]
+    fn generic_verification_failure_has_rebuild_required_false() {
+        let v: Value = serde_json::to_value(base_response(false)).unwrap();
+        assert_eq!(v["accepted"], Value::Bool(false));
+        assert_eq!(v["rebuild_required"], Value::Bool(false));
+    }
+
+    #[test]
+    fn legacy_client_payload_without_rebuild_required_deserializes() {
+        // The gateway's `WalletSignatureOutcome` has `#[serde(default)]` on
+        // `rebuild_required`. This test locks that guarantee so that an older
+        // client response shape does not break deserialization in callers that
+        // consume the outcome directly.
+        use crate::state::WalletSignatureOutcome;
+        let legacy = serde_json::json!({
+            "request_id":   Uuid::nil(),
+            "accepted":     true,
+            "signature":    "sig",
+            "tx_signature": null,
+            "submitted":    true,
+            "error":        null,
+        });
+        let outcome: WalletSignatureOutcome = serde_json::from_value(legacy).unwrap();
+        assert!(!outcome.rebuild_required, "missing field must default to false");
+    }
 }
