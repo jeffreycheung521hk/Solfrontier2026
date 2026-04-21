@@ -9,3 +9,4 @@ pub mod jupiter_jit;
 pub mod jupiter_park;
 pub mod jupiter_production;
 pub mod jupiter_tx;
+pub mod solend;
