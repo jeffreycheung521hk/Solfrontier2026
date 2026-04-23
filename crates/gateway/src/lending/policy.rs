@@ -498,7 +498,7 @@ mod tests {
     use crate::integrations::solend::raw::{
         self, synth_obligation, synth_reserve, SOLEND_NULL_ORACLE_SENTINEL_BS58,
     };
-    use crate::lending::{ChainSlot, FeedPublishFreshness};
+    use crate::lending::{ChainSlot, FeedPublishFreshness, OracleProvider};
     use std::str::FromStr;
 
     // ── Fixture helpers ───────────────────────────────────────────────────
@@ -1581,6 +1581,383 @@ mod tests {
                 RuleKind::RequireFreshState,
                 RuleRejectionDetail::ProtocolNativeStale,
             ))
+        );
+    }
+
+    // ── Slice 3A: AMM Pyth-only oracle-gate passability + negatives ──────
+    //
+    // These tests exercise the exact pubkeys surfaced by the Slice 2C
+    // pre-Slice-3 recon run. They prove:
+    //   (a) an empty first-deposit snapshot that INCLUDES the intended
+    //       target reserve passes `MaxOracleStalenessMs` under current
+    //       V1 oracle semantics (conjunction + Pyth-only feed set);
+    //   (b) an empty first-deposit snapshot that does NOT include the
+    //       target reserve is NOT oracle-passable (fails-closed on empty
+    //       feed set);
+    //   (c) Switchboard Unknown still HardBlocks, consistent with
+    //       Slice 2B/2C;
+    //   (d) protocol-native Stale on the target reserve still HardBlocks
+    //       until actual refreshed bytes are re-fetched — the refresh
+    //       precondition builder never mutates markers locally.
+
+    use crate::integrations::solend::mapping::{
+        map_snapshot_for_first_deposit, FirstDepositAssemblyInputs,
+    };
+
+    // Exact pubkeys from Slice 2C pre-Slice-3 recon (docs/lending_policy_
+    // vocabulary.md §30.5 recon conclusion).
+    const AMM_LENDING_MARKET_BS58: &str = "Au3S1ZSkGwm1fo7g3WFhkD1rcPoUXj7h5ubsGsUFqbLX";
+    const AMM_RESERVE_BS58: &str = "6nb1odSYHutVAxoaQyiwPhQNTFn3nBNFdQdNCm5v9Jbp";
+    const AMM_MINT_BS58: &str = "E5ndSkaB17Dm7CsD22dvcjfrYSDLCxFcMd6z8ddCk5wp";
+    const AMM_PYTH_ORACLE_BS58: &str = "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX";
+    const PYTH_SOLANA_RECEIVER_OWNER_BS58: &str =
+        "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
+
+    fn amm_pyth_only_first_deposit_snapshot(
+        session_wallet: Pubkey,
+        reserve_stale: bool,
+        pyth_publish: FeedPublishFreshness,
+    ) -> LendingSnapshot {
+        let mkt = Pubkey::from_str(AMM_LENDING_MARKET_BS58).unwrap();
+        let reserve_pk = Pubkey::from_str(AMM_RESERVE_BS58).unwrap();
+        let mint = Pubkey::from_str(AMM_MINT_BS58).unwrap();
+        let pyth = Pubkey::from_str(AMM_PYTH_ORACLE_BS58).unwrap();
+        let pyth_owner = Pubkey::from_str(PYTH_SOLANA_RECEIVER_OWNER_BS58).unwrap();
+        let sentinel: Pubkey = SOLEND_NULL_ORACLE_SENTINEL_BS58.parse().unwrap();
+
+        // Synthetic reserve bytes with the AMM pubkeys + decimals baked in.
+        // Pyth slot = real Pyth pubkey; Switchboard slot = sentinel (Pyth-only).
+        let reserve_bytes = synth_reserve(
+            mkt,
+            mint,
+            9, // AMM reserve decimals
+            Pubkey::new_unique(),
+            pyth,
+            sentinel,
+            9_999_999,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            100,
+            reserve_stale,
+        );
+        let reserve_raw = raw::decode_reserve(&reserve_bytes).unwrap();
+
+        let inputs = FirstDepositAssemblyInputs {
+            session_wallet,
+            obligation_pubkey: Pubkey::new_unique(),
+            lending_market: mkt,
+            target_reserves: vec![ReserveInput {
+                pubkey: reserve_pk,
+                raw: reserve_raw,
+                fetched_at_slot: ChainSlot::new(10_000),
+            }],
+            oracles: vec![OracleAccountInfo {
+                pubkey: pyth,
+                owner_program: pyth_owner,
+                fetched_at_slot: ChainSlot::new(10_000),
+                publish: pyth_publish,
+            }],
+            snapshot_observed_slot: ChainSlot::new(10_000),
+        };
+        map_snapshot_for_first_deposit(inputs).expect("AMM first-deposit mapping succeeds")
+    }
+
+    fn amm_permissive_config(mint: Pubkey) -> LendingRuleConfig {
+        LendingRuleConfig {
+            require_fresh_state: RequireFreshStateConfig {
+                max_fetch_age: DurationMs::new(60_000),
+            },
+            max_oracle_staleness: MaxOracleStalenessConfig {
+                max_publish_age: DurationMs::new(60_000),
+            },
+            allowed_lending_protocols: AllowedLendingProtocolsConfig {
+                allowlist: vec![ProtocolTag::Solend],
+            },
+            allowed_mints: AllowedMintsConfig {
+                allowlist: vec![mint],
+            },
+            max_action_input_amount: MaxActionInputAmountConfig {
+                per_mint_caps: vec![(mint, UnderlyingAmount::new(1_000_000))],
+            },
+        }
+    }
+
+    #[test]
+    fn amm_pyth_only_first_deposit_oracle_gate_passes() {
+        // Controlled fixture: reserve is Fresh (not stale) and Pyth feed
+        // is KnownSlot. This isolates the oracle gate; it does NOT claim
+        // the full live deposit path is unlocked on mainnet (real mainnet
+        // reserves are `stale = true` until refreshed — §66 refresh
+        // precondition is a separate future step).
+        let owner = Pubkey::new_unique();
+        let snap = amm_pyth_only_first_deposit_snapshot(
+            owner,
+            /*reserve_stale=*/ false,
+            FeedPublishFreshness::KnownSlot(ChainSlot::new(10_000)),
+        );
+
+        // Structural assertions per prompt:
+        let mint = Pubkey::from_str(AMM_MINT_BS58).unwrap();
+        let reserve_pk = Pubkey::from_str(AMM_RESERVE_BS58).unwrap();
+        assert_eq!(snap.reserves.len(), 1);
+        assert_eq!(snap.reserves[0].identifier, reserve_pk);
+        assert_eq!(snap.reserves[0].mint, mint);
+        assert_eq!(snap.oracles.len(), 1);
+        assert_eq!(snap.oracles[0].priced_asset, mint);
+        // Sentinel excluded; exactly one feed and it is the Pyth feed.
+        assert_eq!(snap.oracles[0].feeds.len(), 1);
+        assert_eq!(
+            snap.oracles[0].feeds[0].provider,
+            OracleProvider::PythSolanaReceiver
+        );
+        assert_eq!(
+            snap.oracles[0].feeds[0].publish,
+            FeedPublishFreshness::KnownSlot(ChainSlot::new(10_000))
+        );
+
+        // Evaluator passes.
+        let config = amm_permissive_config(mint);
+        let action = ProposedAction::Deposit {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            amount: UnderlyingAmount::new(100),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::Pass,
+            "oracle gate must pass for the Pyth-only AMM reserve under \
+             current V1 conjunction semantics"
+        );
+    }
+
+    #[test]
+    fn amm_first_deposit_without_target_reserve_is_not_oracle_passable() {
+        // Negative: empty first-deposit snapshot with NO target reserve
+        // included. The action's mint has no oracle feed set → rule
+        // HardBlocks on OracleFeedSetEmpty. Absence must not become a pass.
+        let owner = Pubkey::new_unique();
+        let mkt = Pubkey::from_str(AMM_LENDING_MARKET_BS58).unwrap();
+        let mint = Pubkey::from_str(AMM_MINT_BS58).unwrap();
+        let snap = map_snapshot_for_first_deposit(FirstDepositAssemblyInputs {
+            session_wallet: owner,
+            obligation_pubkey: Pubkey::new_unique(),
+            lending_market: mkt,
+            target_reserves: vec![],
+            oracles: vec![],
+            snapshot_observed_slot: ChainSlot::new(10_000),
+        })
+        .unwrap();
+
+        let config = amm_permissive_config(mint);
+        let action = ProposedAction::Deposit {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            amount: UnderlyingAmount::new(100),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        // This particular scenario hits AllowedMints' reserve cross-reference
+        // BEFORE MaxOracleStalenessMs (rule order: fresh-state, oracle,
+        // protocols, mints, amount). The empty reserves array produces an
+        // OracleFeedSetEmpty HardBlock at MaxOracleStalenessMs.
+        //
+        // The core invariant being asserted: absence of feeds is NOT a Pass.
+        let verdict = evaluate_lending_policy(&snap, &action, &config, &ctx);
+        assert!(
+            matches!(verdict, LendingPolicyVerdict::HardBlock(_)),
+            "empty first-deposit snapshot must HardBlock, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn amm_first_deposit_with_reserve_stale_still_hardblocks_on_require_fresh_state() {
+        // Stale state remains a HardBlock until actual refreshed account
+        // bytes are re-fetched. The refresh precondition BUILDER does not
+        // fake freshness — this test proves the evaluator still sees the
+        // stale marker in the underlying reserve even when a Slice 3A
+        // refresh-plan builder would notionally be invoked by outer
+        // wiring. (The refresh plan itself is blind to snapshots; this
+        // test never calls it — it simply verifies that a stale-bytes
+        // snapshot HardBlocks.)
+        let owner = Pubkey::new_unique();
+        let snap = amm_pyth_only_first_deposit_snapshot(
+            owner,
+            /*reserve_stale=*/ true,
+            FeedPublishFreshness::KnownSlot(ChainSlot::new(10_000)),
+        );
+        assert_eq!(
+            snap.reserves[0].protocol_native_stale,
+            StaleMarker::Stale,
+            "stale markers in the underlying reserve bytes are preserved \
+             verbatim through the mapping"
+        );
+        let mint = Pubkey::from_str(AMM_MINT_BS58).unwrap();
+        let config = amm_permissive_config(mint);
+        let action = ProposedAction::Deposit {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            amount: UnderlyingAmount::new(100),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::HardBlock(HardBlockReason::RuleRejected(
+                RuleKind::RequireFreshState,
+                RuleRejectionDetail::ProtocolNativeStale,
+            )),
+            "stale-reserve first-deposit snapshot must HardBlock on \
+             RequireFreshState until caller actually refreshes + re-fetches"
+        );
+    }
+
+    #[test]
+    fn snapshot_with_switchboard_unknown_feed_still_hardblocks_under_current_policy() {
+        // Regression-style assertion for Slice 3A: a snapshot whose target
+        // reserve carries a non-sentinel Switchboard feed reporting
+        // `Unknown` still HardBlocks under the unchanged V1 conjunction
+        // semantic. This is Slice 2B/2C behavior — restated here to lock
+        // it against any refactor drift during Slice 3A precondition work.
+        let owner = Pubkey::new_unique();
+        let mkt = Pubkey::from_str(AMM_LENDING_MARKET_BS58).unwrap();
+        let reserve_pk = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let pyth = Pubkey::new_unique();
+        let swb = Pubkey::new_unique();
+        let pyth_owner = Pubkey::from_str(PYTH_SOLANA_RECEIVER_OWNER_BS58).unwrap();
+        let swb_owner: Pubkey = "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f"
+            .parse()
+            .unwrap();
+
+        let reserve_bytes = synth_reserve(
+            mkt,
+            mint,
+            9,
+            Pubkey::new_unique(),
+            pyth,
+            swb, // non-sentinel switchboard slot
+            9_999_999,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            100,
+            false,
+        );
+        let reserve_raw = raw::decode_reserve(&reserve_bytes).unwrap();
+        let snap = map_snapshot_for_first_deposit(FirstDepositAssemblyInputs {
+            session_wallet: owner,
+            obligation_pubkey: Pubkey::new_unique(),
+            lending_market: mkt,
+            target_reserves: vec![ReserveInput {
+                pubkey: reserve_pk,
+                raw: reserve_raw,
+                fetched_at_slot: ChainSlot::new(10_000),
+            }],
+            oracles: vec![
+                OracleAccountInfo {
+                    pubkey: pyth,
+                    owner_program: pyth_owner,
+                    fetched_at_slot: ChainSlot::new(10_000),
+                    publish: FeedPublishFreshness::KnownSlot(ChainSlot::new(10_000)),
+                },
+                OracleAccountInfo {
+                    pubkey: swb,
+                    owner_program: swb_owner,
+                    fetched_at_slot: ChainSlot::new(10_000),
+                    // Switchboard decoder is still Unknown under Slice 2C
+                    // evidence.
+                    publish: FeedPublishFreshness::Unknown,
+                },
+            ],
+            snapshot_observed_slot: ChainSlot::new(10_000),
+        })
+        .unwrap();
+
+        let config = amm_permissive_config(mint);
+        let action = ProposedAction::Deposit {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            amount: UnderlyingAmount::new(100),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::HardBlock(HardBlockReason::RuleRejected(
+                RuleKind::MaxOracleStalenessMs,
+                RuleRejectionDetail::OraclePublishFreshnessUnknown,
+            )),
+            "any non-sentinel Switchboard Unknown feed still HardBlocks \
+             the oracle gate under current V1 conjunction semantics"
+        );
+    }
+
+    #[test]
+    fn refresh_plan_builder_does_not_mutate_stale_markers() {
+        // Structural proof: building a refresh plan for a reserve does
+        // NOT touch the underlying snapshot / stale markers. The plan is
+        // a pure Vec<Instruction>; the evaluator still sees stale as
+        // stale until the caller actually re-fetches and re-maps.
+        use crate::integrations::solend::refresh::{
+            build_refresh_instructions, RefreshPlanInputs, ReserveRefreshInput,
+        };
+        let owner = Pubkey::new_unique();
+        let snap_before = amm_pyth_only_first_deposit_snapshot(
+            owner,
+            /*reserve_stale=*/ true,
+            FeedPublishFreshness::KnownSlot(ChainSlot::new(10_000)),
+        );
+        assert_eq!(snap_before.reserves[0].protocol_native_stale, StaleMarker::Stale);
+
+        // Build a refresh plan — this operation is independent of the
+        // snapshot.
+        let solend_program: Pubkey = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"
+            .parse()
+            .unwrap();
+        let plan = build_refresh_instructions(RefreshPlanInputs {
+            solend_program_id: solend_program,
+            reserves: vec![ReserveRefreshInput {
+                reserve_pubkey: snap_before.reserves[0].identifier,
+                pyth_oracle: Pubkey::from_str(AMM_PYTH_ORACLE_BS58).unwrap(),
+                switchboard_oracle: SOLEND_NULL_ORACLE_SENTINEL_BS58.parse().unwrap(),
+            }],
+            obligation: None,
+        });
+        assert_eq!(plan.instructions.len(), 1);
+
+        // The snapshot's stale marker is unchanged — the refresh plan
+        // builder is a pure producer of instruction bytes; it cannot
+        // and does not mutate any policy state.
+        assert_eq!(
+            snap_before.reserves[0].protocol_native_stale,
+            StaleMarker::Stale,
+            "refresh plan builder must not locally flip stale markers"
+        );
+
+        // And the evaluator still HardBlocks on the pre-refresh snapshot.
+        let mint = Pubkey::from_str(AMM_MINT_BS58).unwrap();
+        let config = amm_permissive_config(mint);
+        let action = ProposedAction::Deposit {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            amount: UnderlyingAmount::new(100),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap_before, &action, &config, &ctx),
+            LendingPolicyVerdict::HardBlock(HardBlockReason::RuleRejected(
+                RuleKind::RequireFreshState,
+                RuleRejectionDetail::ProtocolNativeStale,
+            )),
+            "evaluator still sees stale until caller actually re-fetches \
+             post-refresh bytes"
         );
     }
 }

@@ -38,9 +38,29 @@
 //!
 //! These restrictions match Part 5A §40.4 and Part 6B §62.3 verbatim.
 
+pub mod ata;
+pub mod deposit;
+pub mod init_obligation;
 pub mod mapping;
 pub mod oracle_decoder;
 pub mod raw;
+pub mod refresh;
 
-pub use mapping::{MappingError, map_snapshot, OracleAccountInfo, SolendAssemblyInputs};
+pub use ata::{build_create_ata_idempotent_instruction, derive_associated_token_address};
+pub use deposit::{
+    build_deposit_reserve_liquidity_and_obligation_collateral_instruction,
+    DepositBuildError, DepositInstructionInputs,
+};
+pub use init_obligation::{
+    build_create_obligation_account_instruction, build_init_obligation_instruction,
+    CreateObligationAccountInputs, InitObligationInputs,
+};
+pub use mapping::{
+    map_snapshot, map_snapshot_for_first_deposit, FirstDepositAssemblyInputs, MappingError,
+    OracleAccountInfo, SolendAssemblyInputs,
+};
 pub use oracle_decoder::extract_publish_freshness;
+pub use refresh::{
+    build_refresh_instructions, ObligationRefreshInput, RefreshPlan, RefreshPlanInputs,
+    ReserveRefreshInput,
+};

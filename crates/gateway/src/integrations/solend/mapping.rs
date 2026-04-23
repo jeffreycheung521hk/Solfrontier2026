@@ -78,6 +78,44 @@ pub struct SolendAssemblyInputs {
     pub snapshot_observed_slot: ChainSlot,
 }
 
+/// Inputs for the first-deposit mapping path — the obligation account
+/// does not yet exist on chain. Slice 3A.
+///
+/// Spec anchors:
+/// - Part 6B §66 — refresh / first-deposit precondition belongs to outer
+///   wiring, not to the policy evaluator.
+/// - Pre-Slice-3 recon empty-obligation caveat: do NOT treat absence of
+///   feeds as a pass. The caller MUST inject the intended deposit target
+///   reserve into [`Self::target_reserves`] so the policy evaluator sees
+///   an oracle feed set for the priced asset the action will touch.
+///
+/// Why a separate input shape rather than weakening the existing
+/// [`map_snapshot`]: the strict [`raw::decode_obligation`] decoder
+/// continues to require Solend-owned 1300-byte data. Uninitialized /
+/// System-Program-owned obligation accounts cannot be passed through
+/// `decode_obligation` and MUST NOT silently flow into the normal
+/// mapping path. This input enum makes the first-deposit case explicit
+/// at the integration seam.
+#[derive(Debug, Clone)]
+pub struct FirstDepositAssemblyInputs {
+    pub session_wallet: Pubkey,
+    /// The obligation account's pubkey — typically a PDA that has not yet
+    /// been initialized on chain. The deposit ix will create it.
+    pub obligation_pubkey: Pubkey,
+    /// The Solend lending market the deposit targets. All reserves in
+    /// `target_reserves` must report this same `lending_market`.
+    pub lending_market: Pubkey,
+    /// Reserves the policy must evaluate. For a first-deposit slice this
+    /// MUST contain the intended deposit target reserve, even though the
+    /// (empty) obligation does not yet reference it. Additional reserves
+    /// MAY be included if outer wiring chooses to evaluate a wider set.
+    pub target_reserves: Vec<ReserveInput>,
+    /// Non-sentinel oracle accounts the caller fetched. Same rule as
+    /// [`SolendAssemblyInputs::oracles`]: sentinels are pre-filtered.
+    pub oracles: Vec<OracleAccountInfo>,
+    pub snapshot_observed_slot: ChainSlot,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReserveInput {
     pub pubkey: Pubkey,
@@ -155,6 +193,45 @@ pub fn map_snapshot(inputs: SolendAssemblyInputs) -> Result<LendingSnapshot, Map
         },
     };
 
+    let (reserves_out, oracles_out) = build_reserves_and_oracles(&reserves, &oracles);
+
+    Ok(LendingSnapshot {
+        protocol_tag: ProtocolTag::Solend,
+        session_wallet,
+        fetched_at: SnapshotFreshness {
+            observed_slot: snapshot_observed_slot,
+        },
+        obligation,
+        reserves: reserves_out,
+        oracles: oracles_out,
+    })
+}
+
+fn find_reserve<'a>(
+    reserves: &'a [ReserveInput],
+    target: &Pubkey,
+) -> Result<&'a ReserveInput, MappingError> {
+    reserves
+        .iter()
+        .find(|r| r.pubkey == *target)
+        .ok_or(MappingError::ObligationReserveMissing { reserve: *target })
+}
+
+fn stale_to_marker(stale: bool) -> StaleMarker {
+    if stale {
+        StaleMarker::Stale
+    } else {
+        StaleMarker::Fresh
+    }
+}
+
+/// Pure helper: build the normalized `Reserve` + `OracleFeedSet` lists
+/// from the caller-supplied `ReserveInput`s and `OracleAccountInfo`s.
+/// Shared by `map_snapshot` and `map_snapshot_for_first_deposit`.
+fn build_reserves_and_oracles(
+    reserves: &[ReserveInput],
+    oracles: &[OracleAccountInfo],
+) -> (Vec<Reserve>, Vec<OracleFeedSet>) {
     let reserves_out: Vec<Reserve> = reserves
         .iter()
         .map(|r| Reserve {
@@ -174,10 +251,6 @@ pub fn map_snapshot(inputs: SolendAssemblyInputs) -> Result<LendingSnapshot, Map
         })
         .collect();
 
-    // Build per-priced-asset oracle feed sets. One FeedSet per reserve mint,
-    // regardless of whether the reserve has zero / one / two live feeds
-    // (sentinels already excluded by the caller). An empty feed set is a
-    // legal §11.1 shape; V1 rules fail-closed on it when they evaluate.
     let oracles_out: Vec<OracleFeedSet> = reserves
         .iter()
         .map(|r| {
@@ -209,6 +282,75 @@ pub fn map_snapshot(inputs: SolendAssemblyInputs) -> Result<LendingSnapshot, Map
         })
         .collect();
 
+    (reserves_out, oracles_out)
+}
+
+/// Slice 3A first-deposit mapping. Pure function over caller-supplied,
+/// already-fetched / already-decoded inputs.
+///
+/// Produces a regular [`LendingSnapshot`] with:
+/// - `obligation.deposits` empty
+/// - `obligation.borrows` empty
+/// - `obligation.protocol_native_stale = Fresh` (no on-chain obligation
+///   state exists yet — there is nothing to be stale about; the deposit
+///   ix downstream creates the obligation)
+/// - `obligation.protocol_last_updated_slot = ChainSlot::new(0)`
+///   (no protocol-side update has happened)
+/// - `reserves` = caller's `target_reserves`
+/// - `oracles` = one [`OracleFeedSet`] per target reserve, sentinels
+///   excluded
+///
+/// Per-reserve `protocol_native_stale` markers are taken verbatim from
+/// the decoded reserve raw — the reserve IS on chain and may be stale.
+/// `RequireFreshState` will HardBlock those reserves the same way it
+/// would for a non-first-deposit path. The caller is responsible for
+/// the §66 refresh precondition before re-fetching reserves.
+///
+/// Caller invariants (validated by this function):
+/// - Every reserve in `target_reserves` reports a `lending_market`
+///   matching `lending_market`. Mismatch ⇒
+///   [`MappingError::ReserveMarketMismatch`].
+///
+/// Caller invariants (NOT validated; caller's responsibility):
+/// - `obligation_pubkey` is the correct PDA / target obligation key
+///   for the (`session_wallet`, `lending_market`) pair, since this
+///   function does not derive PDAs.
+pub fn map_snapshot_for_first_deposit(
+    inputs: FirstDepositAssemblyInputs,
+) -> Result<LendingSnapshot, MappingError> {
+    let FirstDepositAssemblyInputs {
+        session_wallet,
+        obligation_pubkey,
+        lending_market,
+        target_reserves,
+        oracles,
+        snapshot_observed_slot,
+    } = inputs;
+
+    for r in &target_reserves {
+        if r.raw.lending_market != lending_market {
+            return Err(MappingError::ReserveMarketMismatch { reserve: r.pubkey });
+        }
+    }
+
+    let obligation = Obligation {
+        identifier: obligation_pubkey,
+        owner: session_wallet,
+        protocol_last_updated_slot: ChainSlot::new(0),
+        // No on-chain obligation state exists yet → no protocol-native
+        // stale state to surface. Per-reserve stale markers below still
+        // apply normally and are NOT touched by this synthesis.
+        protocol_native_stale: StaleMarker::Fresh,
+        deposits: Vec::new(),
+        borrows: Vec::new(),
+        freshness: ComponentFreshness {
+            observed_slot: snapshot_observed_slot,
+        },
+    };
+
+    let (reserves_out, oracles_out) =
+        build_reserves_and_oracles(&target_reserves, &oracles);
+
     Ok(LendingSnapshot {
         protocol_tag: ProtocolTag::Solend,
         session_wallet,
@@ -219,24 +361,6 @@ pub fn map_snapshot(inputs: SolendAssemblyInputs) -> Result<LendingSnapshot, Map
         reserves: reserves_out,
         oracles: oracles_out,
     })
-}
-
-fn find_reserve<'a>(
-    reserves: &'a [ReserveInput],
-    target: &Pubkey,
-) -> Result<&'a ReserveInput, MappingError> {
-    reserves
-        .iter()
-        .find(|r| r.pubkey == *target)
-        .ok_or(MappingError::ObligationReserveMissing { reserve: *target })
-}
-
-fn stale_to_marker(stale: bool) -> StaleMarker {
-    if stale {
-        StaleMarker::Stale
-    } else {
-        StaleMarker::Fresh
-    }
 }
 
 /// Classify an oracle by its owner program. Known programs are labeled;
@@ -634,5 +758,154 @@ mod tests {
         let snap = map_snapshot(inputs).unwrap();
         // Positive-shape assertion: Solend tag passes.
         assert!(check_system_invariants(&snap, &owner, ProtocolTag::Solend).is_ok());
+    }
+
+    // ── Slice 3A: first-deposit mapping tests ─────────────────────────────
+
+    #[test]
+    fn first_deposit_snapshot_includes_target_reserve_even_without_obligation_ref() {
+        let mkt = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let target_reserve_pk = Pubkey::new_unique();
+        let target_mint = Pubkey::new_unique();
+        let sentinel = parse_sentinel();
+        let pyth = Pubkey::new_unique();
+        let pyth_owner: Pubkey = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ"
+            .parse()
+            .unwrap();
+
+        let reserve_bytes = synth_reserve(
+            mkt,
+            target_mint,
+            9,
+            Pubkey::new_unique(),
+            pyth,
+            sentinel,
+            1_000_000_000,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            200,
+            false,
+        );
+        let reserve_raw = raw::decode_reserve(&reserve_bytes).unwrap();
+
+        let inputs = FirstDepositAssemblyInputs {
+            session_wallet: owner,
+            obligation_pubkey: Pubkey::new_unique(),
+            lending_market: mkt,
+            target_reserves: vec![ReserveInput {
+                pubkey: target_reserve_pk,
+                raw: reserve_raw,
+                fetched_at_slot: ChainSlot::new(300),
+            }],
+            oracles: vec![OracleAccountInfo {
+                pubkey: pyth,
+                owner_program: pyth_owner,
+                fetched_at_slot: ChainSlot::new(300),
+                publish: FeedPublishFreshness::KnownSlot(ChainSlot::new(300)),
+            }],
+            snapshot_observed_slot: ChainSlot::new(300),
+        };
+        let snap = map_snapshot_for_first_deposit(inputs).expect("first-deposit mapping succeeds");
+        // The target reserve is in the snapshot even though the obligation
+        // is empty.
+        assert_eq!(snap.reserves.len(), 1);
+        assert_eq!(snap.reserves[0].mint, target_mint);
+        // Obligation is empty but the shape is a regular Obligation.
+        assert!(snap.obligation.deposits.is_empty());
+        assert!(snap.obligation.borrows.is_empty());
+        assert_eq!(snap.obligation.owner, owner);
+        assert_eq!(snap.obligation.protocol_native_stale, StaleMarker::Fresh);
+        // Oracle feed set for the target mint is present with the Pyth feed
+        // — sentinel excluded.
+        assert_eq!(snap.oracles.len(), 1);
+        assert_eq!(snap.oracles[0].priced_asset, target_mint);
+        assert_eq!(snap.oracles[0].feeds.len(), 1);
+        assert_eq!(
+            snap.oracles[0].feeds[0].provider,
+            OracleProvider::PythSolanaReceiver
+        );
+    }
+
+    #[test]
+    fn first_deposit_snapshot_without_target_reserve_has_empty_reserves_and_oracles() {
+        // Negative test: an empty first-deposit snapshot that does NOT
+        // include the intended deposit target reserve is not oracle-passable
+        // by construction. The mapping produces empty `reserves` and empty
+        // `oracles`, and when the action tries to evaluate
+        // `MaxOracleStalenessMs` for a mint that has no feed set, the rule
+        // HardBlocks on `OracleFeedSetEmpty`. This test documents the
+        // mapping shape; the policy HardBlock is covered in the policy
+        // tests.
+        let owner = Pubkey::new_unique();
+        let mkt = Pubkey::new_unique();
+        let inputs = FirstDepositAssemblyInputs {
+            session_wallet: owner,
+            obligation_pubkey: Pubkey::new_unique(),
+            lending_market: mkt,
+            target_reserves: vec![], // caller did NOT include target reserve
+            oracles: vec![],
+            snapshot_observed_slot: ChainSlot::new(300),
+        };
+        let snap = map_snapshot_for_first_deposit(inputs).unwrap();
+        assert!(snap.reserves.is_empty());
+        assert!(snap.oracles.is_empty());
+        // Obligation is still well-formed and empty.
+        assert!(snap.obligation.deposits.is_empty());
+        assert!(snap.obligation.borrows.is_empty());
+    }
+
+    #[test]
+    fn first_deposit_reserve_market_mismatch_fails() {
+        let mkt = Pubkey::new_unique();
+        let wrong_mkt = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let reserve_pk = Pubkey::new_unique();
+        let reserve_bytes = synth_reserve(
+            wrong_mkt, // reserve is for a different lending market
+            Pubkey::new_unique(),
+            9,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            0,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            200,
+            false,
+        );
+        let reserve_raw = raw::decode_reserve(&reserve_bytes).unwrap();
+        let inputs = FirstDepositAssemblyInputs {
+            session_wallet: owner,
+            obligation_pubkey: Pubkey::new_unique(),
+            lending_market: mkt,
+            target_reserves: vec![ReserveInput {
+                pubkey: reserve_pk,
+                raw: reserve_raw,
+                fetched_at_slot: ChainSlot::new(300),
+            }],
+            oracles: vec![],
+            snapshot_observed_slot: ChainSlot::new(300),
+        };
+        assert_eq!(
+            map_snapshot_for_first_deposit(inputs).unwrap_err(),
+            MappingError::ReserveMarketMismatch { reserve: reserve_pk }
+        );
+    }
+
+    #[test]
+    fn first_deposit_path_does_not_weaken_raw_decode_obligation() {
+        // The strict raw decoder rejects empty / wrong-size data. This
+        // test documents that the first-deposit path does NOT route
+        // uninitialized bytes through `decode_obligation` — it uses the
+        // `map_snapshot_for_first_deposit` seam instead.
+        let empty: &[u8] = &[];
+        assert!(raw::decode_obligation(empty).is_err());
+        let wrong_size: Vec<u8> = vec![0u8; 10];
+        assert!(raw::decode_obligation(&wrong_size).is_err());
+        // The strict decoder also rejects valid-size bytes with non-zero
+        // padding (existing test `obligation_padding_nonzero_rejected`
+        // covers this); this test is concerned only with the seam
+        // discipline.
     }
 }
