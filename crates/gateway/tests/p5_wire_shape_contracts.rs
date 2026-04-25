@@ -154,6 +154,7 @@ async fn setup(rules: Vec<PolicyRule>) -> Ctx {
         approval:          ApprovalHandlerRef::new(Arc::new(StoreBackedApproval(store.clone()))),
         events:            EventSubscriberRef::new(Arc::new(StubEvents(tx))),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(StubWalletSig)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubChallenge)),
         auth_token:        AuthToken::new(TOKEN),
         operator_registry: OperatorRegistry::new(),
@@ -164,6 +165,7 @@ async fn setup(rules: Vec<PolicyRule>) -> Ctx {
         audit:             AuditReaderRef::new(Arc::new(StubAudit)),
         wallets:           WalletDirectoryRef::new(Arc::new(StubWalletDir)),
         demo_seeder:       None,
+        chat:              None,
     };
     let router = claw_api::create_router(state, HealthRegistry::new());
     Ctx { router, store, sid }

@@ -105,3 +105,39 @@ All previously-identified Solend/Save deposit blockers are now sealed end-to-end
 - This is a **controlled test-wallet proof**, not a production-ready deposit flow. Daemon wiring, approval workflow integration, LLM/agent routing, and policy re-evaluation against the post-deposit snapshot are all explicitly out of scope.
 - `raw::decode_obligation` happened to succeed against the post-deposit obligation because the freshly-initialized account's extended mainnet fields are all zero. The latent mainnet `Obligation` Pack-layout padding drift noted in earlier slices is **not yet fixed** — if/when the obligation accrues borrows or non-zero value fields, the padding-check invariant at offsets 138..202 may reject the data. This is documented future-slice decoder work.
 - Policy freshness (`RequireFreshState`) was not re-run against the post-deposit snapshot through the three-layer gate; the proof demonstrates that the on-chain deposit path works, not that a policy-evaluator-driven deposit would have passed.
+
+## Milestone Seal & Phase 4 Readiness
+
+### Audit + decoder status
+- **Slice 3G closeout audit: `VerifiedComplete`.** All three transaction signatures reached `finalized` commitment with `err=null`. On-chain obligation, source USDC ATA, collateral ATA, and reserve state all match the proof-doc claims.
+- **Slice 3H mainnet-Obligation decoder drift fix: completed.** `raw::decode_obligation` now matches the deployed mainnet `Pack` layout (5 extension fields at bytes 138..188, true 14-byte padding at 188..202, strict 0/1 bool decoding). The previously-noted latent padding-check risk is closed with a dedicated regression test.
+
+### Local test matrix (re-run at seal time, network-free)
+- `cargo test -p claw-gateway --lib solend` — **72 passed**
+- `cargo test -p claw-gateway --lib lending` — **38 passed**
+- `cargo test -p claw-gateway --lib` — **288 passed**
+- `live_solend_assembler_smoke` — 1 passed (default skip)
+- `live_solend_recon` — 1 passed (default skip)
+- `live_solend_deposit_dry_sim` — 5 passed (default skip + 4 offline retarget)
+- `live_solend_refresh_proof` — 1 passed (default skip)
+- `live_solend_refresh_recon` — 1 passed (default skip)
+- `live_solend_deposit_execute` — 1 passed (default skip)
+
+All integration tests are opt-in; the default invocation performs zero network calls.
+
+### V1 scope (sealed by this milestone)
+- **Deposit-only.** No Withdraw, no Borrow, no Repay are built or broadcast.
+- **No policy weakening.** The three-layer gate, `RequireFreshState`, and `MaxOracleStalenessMs` are unchanged. Switchboard remains `Unknown`/fail-closed.
+- **No daemon / approval-workflow / LLM-route integration yet.** The entire Solend broadcast flow is confined to opt-in integration tests with a controlled test wallet.
+
+### Known future-scope items (explicitly deferred)
+- **Phase 4 productization** — promote the test-only broadcast sequence into a first-class tool surface (see Phase 4 assumptions below).
+- **Switchboard On-Demand decoder** still absent; blocks the majority of Solend reserves outside the Pyth-Receiver subset.
+- **Classic-Pyth decoder** still absent; not needed for the current Pyth-Receiver USDC target.
+
+### Phase 4 assumptions (to be enforced by Phase 4A-1 prompt)
+- **Assembler placement**: the multi-tx deposit assembler belongs under `crate::integrations::solend::assembler`, not `crate::lending::assembler`. The `lending` module remains protocol-agnostic; Solend-specific orchestration stays inside the Solend subtree (ARCHITECTURE.md §7).
+- **Propose stage does not auto-broadcast refresh.** The propose surface returns a descriptor + unsigned plan only; any broadcast decision is a separate approval-gated step.
+- **Execute stage initially follows the proven Slice 3G multi-tx sequence**: (1) CreateAccount + InitObligation if needed, (2) RefreshReserve, (3) ATA CreateIdempotent + Deposit. Single-tx packing and ALT (Address Lookup Table) optimization are explicitly future work, not first-pass scope.
+- **Session-bound wallet identity.** Signer pubkey comes from the `SessionBoundWallet` seam, never from LLM input (same rule that sealed the A2-Execute LLM-driven proof).
+

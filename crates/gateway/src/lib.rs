@@ -19,6 +19,7 @@ pub mod lifecycle_persister;
 pub mod orchestrator;
 pub mod pending_signing;
 pub mod policy_alerting;
+pub mod runtime;
 pub mod session_mgr;
 pub mod session_policy;
 pub mod supervisor;

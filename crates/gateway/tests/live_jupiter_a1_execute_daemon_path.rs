@@ -832,6 +832,7 @@ async fn a1_execute_daemon_path_reaches_mainnet_confirmed() {
         approval: ApprovalHandlerRef::new(Arc::new(NoopApproval)),
         events: EventSubscriberRef::new(Arc::new(BusEvents(tx))),
         wallet_signatures: WalletSignatureHandlerRef::new(completion_handler),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(challenge_handler),
         auth_token: AuthToken::new(AUTH_TOKEN),
         operator_registry: OperatorRegistry::new(),
@@ -842,6 +843,7 @@ async fn a1_execute_daemon_path_reaches_mainnet_confirmed() {
         audit: AuditReaderRef::new(Arc::new(NoopAudit)),
         wallets: WalletDirectoryRef::new(Arc::new(NoopWalletDir)),
         demo_seeder: None,
+        chat: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

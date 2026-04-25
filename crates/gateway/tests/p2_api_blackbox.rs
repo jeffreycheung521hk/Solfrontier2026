@@ -333,6 +333,7 @@ async fn build_harness(opts: HarnessOptions) -> Harness {
         approval:          ApprovalHandlerRef::new(Arc::new(StoreBackedApproval { store: store.clone() })),
         events:            EventSubscriberRef::new(Arc::new(StubEvents { tx })),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(StubWalletSig)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubChallenge)),
         auth_token:        AuthToken::new(TOKEN),
         operator_registry,
@@ -343,6 +344,7 @@ async fn build_harness(opts: HarnessOptions) -> Harness {
         audit:             AuditReaderRef::new(audit_r),
         wallets:           WalletDirectoryRef::new(wallet_d),
         demo_seeder,
+        chat:              None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

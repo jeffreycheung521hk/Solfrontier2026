@@ -587,6 +587,330 @@ impl DemoSeederRef {
     pub async fn seed(&self) -> Result<DemoSeedReport, String> { self.0.seed().await }
 }
 
+// ── Solend signature handling (Phase 4C-6) ─────────────────────────────────
+//
+// Separate from `WalletSignatureHandler` because the Solend deposit flow
+// has its own parked-artifact shape (`SolendSigningStore`) and its own
+// terminal outcome cache (`SolendSubmissionLifecycleStore`). Conflating
+// the two would either force Solend-specific fields into the generic
+// `WalletSignatureOutcome` or force the Solend lifecycle / signing
+// stores to impersonate the generic `external_wallet::ExternalWalletStore`.
+// Keeping them as parallel trait surfaces matches the broader repo
+// convention of per-protocol integrations.
+
+/// Wire shape for `GET /sessions/:id/solend-signatures/:request_id`.
+///
+/// Phase 4C-7 — the GET endpoint now returns the LATEST lifecycle
+/// state for the signing_request_id. A frontend can poll the same URL
+/// and progress through AwaitingSignature → Submitted → Confirming →
+/// Finalized / Failed / ConfirmationTimeout without changing route.
+///
+/// Variants:
+///
+/// | Variant              | Chain state                  | Terminal | tx_signature |
+/// |----------------------|------------------------------|----------|--------------|
+/// | `Found`              | Awaiting user signature      | No       | — (bytes)    |
+/// | `Submitted`          | Broadcast, no observation    | No       | yes          |
+/// | `Confirming`         | Confirmed supermajority      | No       | yes          |
+/// | `Finalized`          | Block rooted                 | Yes ✓    | yes          |
+/// | `Failed`             | Landed with exec error       | Yes ✗    | yes          |
+/// | `ConfirmationTimeout`| Past last_valid_block_height | Yes ✗    | yes          |
+/// | `Rejected`           | Pre-broadcast verification   | Yes ✗    | —            |
+/// | `BroadcastFailed`    | Verified, RPC send failed    | Yes ✗    | —            |
+/// | `Expired`            | Signing TTL elapsed          | Yes ✗    | —            |
+/// | `NotFound`           | No record / wrong session    | —        | —            |
+///
+/// `Found` is the only variant that includes `unsigned_tx_b64`. After
+/// the user has signed + POSTed the signature back, GET responses no
+/// longer include raw tx bytes — only metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SolendRetrievalResult {
+    /// Parked handoff found, session matches, TTL alive. Frontend can
+    /// now present `unsigned_tx_b64` to the user's wallet for signing.
+    Found {
+        signing_request_id: uuid::Uuid,
+        intent_id: uuid::Uuid,
+        session_wallet: String,
+        /// Base64-encoded bincode-serialized legacy `Transaction`. If
+        /// `obligation_signer_backend_partial` is `true`, this tx is
+        /// already partially signed by the obligation Keypair.
+        unsigned_tx_b64: String,
+        obligation_signer_backend_partial: bool,
+        last_valid_block_height: u64,
+        /// Unix milliseconds.
+        expires_at_unix_ms: i64,
+        verified_slot: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        simulation_slot: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        units_consumed: Option<u64>,
+    },
+    /// Phase 4C-7 — user signed, backend verified and broadcast, but
+    /// no on-chain observation yet. **Non-terminal.**
+    Submitted {
+        signing_request_id: uuid::Uuid,
+        intent_id: uuid::Uuid,
+        tx_signature: String,
+        last_valid_block_height: u64,
+    },
+    /// Phase 4C-7 — `confirmation_status = "confirmed"` observed.
+    /// **Non-terminal**; continue polling for `Finalized`.
+    Confirming {
+        signing_request_id: uuid::Uuid,
+        intent_id: uuid::Uuid,
+        tx_signature: String,
+        slot: u64,
+        last_valid_block_height: u64,
+    },
+    /// Phase 4C-7 — `confirmation_status = "finalized"`. **Terminal
+    /// success.**
+    Finalized {
+        signing_request_id: uuid::Uuid,
+        intent_id: uuid::Uuid,
+        tx_signature: String,
+        slot: u64,
+    },
+    /// Phase 4C-7 — landed on-chain with non-null `err`. **Terminal
+    /// failure.**
+    Failed {
+        signing_request_id: uuid::Uuid,
+        intent_id: uuid::Uuid,
+        tx_signature: String,
+        err: String,
+    },
+    /// Phase 4C-7 — current block height exceeded
+    /// `last_valid_block_height` while unobserved. **Terminal
+    /// failure.** The UI should surface "sign a new transaction" —
+    /// `requires_reproposal` is always `true` for this variant.
+    ConfirmationTimeout {
+        signing_request_id: uuid::Uuid,
+        tx_signature: String,
+        last_valid_block_height: u64,
+        current_block_height: u64,
+        requires_reproposal: bool,
+        reason: String,
+    },
+    /// Pre-confirmation terminal: verification pipeline rejected the
+    /// signed transaction. A new signing handoff is required.
+    Rejected {
+        signing_request_id: uuid::Uuid,
+        error_type: String,
+        message: String,
+    },
+    /// Pre-confirmation terminal: verified but broadcast failed.
+    BroadcastFailed {
+        signing_request_id: uuid::Uuid,
+        error_type: String,
+        message: String,
+    },
+    /// Pre-confirmation terminal: signing TTL elapsed before submit.
+    PreSubmitExpired { reason: String },
+    /// No parked entry for this id, OR the requesting session does not
+    /// own the entry. The two cases are intentionally indistinguishable
+    /// to avoid leaking existence to cross-session probes.
+    NotFound,
+    /// Was parked but the signing TTL elapsed without a submit (4C-6
+    /// original meaning — kept for back-compat when the GET arrives
+    /// purely after TTL sweep and the lifecycle store has no record).
+    Expired,
+}
+
+/// Wire shape for `POST /sessions/:id/solend-signatures/:request_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SolendSubmitResult {
+    /// Verification passed; broadcast accepted. `tx_signature` is the
+    /// base58-encoded on-chain signature string returned by the RPC.
+    Submitted {
+        signing_request_id: uuid::Uuid,
+        intent_id: uuid::Uuid,
+        session_wallet: String,
+        tx_signature: String,
+        verified_slot: u64,
+        last_valid_block_height: u64,
+    },
+    /// The submit path observed an already-terminal record in the
+    /// lifecycle cache (idempotent replay from UX recovery — the user
+    /// lost the previous response and is asking again). Returns the
+    /// ORIGINAL `tx_signature` and `recorded_at_unix_ms` so the UI can
+    /// resume its confirmation-polling timeline without re-broadcasting.
+    Recovered {
+        signing_request_id: uuid::Uuid,
+        tx_signature: String,
+        recorded_at_unix_ms: i64,
+    },
+    /// Parked entry not present AND no lifecycle cache record. Either
+    /// never existed, or TTL swept + cache TTL also expired.
+    NotFound,
+    /// Blockhash / TTL expired before submit.
+    Expired { reason: String },
+    /// Verification steps A–F failed. Typed `error_type` is wire-stable.
+    Rejected { error_type: String, message: String },
+    /// Verification passed; broadcast itself failed (RPC / network).
+    /// Request is already consumed — a new handoff is required to retry.
+    BroadcastFailed {
+        signing_request_id: uuid::Uuid,
+        error_type: String,
+        message: String,
+    },
+}
+
+/// Handler for Solend signature retrieval + submit routes (Phase 4C-6).
+///
+/// The gateway implementation bridges this trait to
+/// `SolendSigningStore::tx_bytes_for_session` (retrieval),
+/// `submit_signed_solend_transaction` (submit), and
+/// `SolendSubmissionLifecycleStore` (idempotent recovery + terminal
+/// caching). Routes call through the trait so `claw-api` remains
+/// gateway-agnostic.
+pub trait SolendSignatureHandler: Send + Sync + 'static {
+    /// Retrieve the parked Solend signing handoff for this session +
+    /// request id. Session-ownership mismatches return `NotFound`.
+    fn retrieve(
+        &self,
+        session_id: &SessionId,
+        signing_request_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = SolendRetrievalResult> + Send + '_>>;
+
+    /// Accept the user-signed transaction, verify, and submit.
+    fn submit(
+        &self,
+        session_id: &SessionId,
+        signing_request_id: uuid::Uuid,
+        signed_tx_b64: String,
+    ) -> Pin<Box<dyn Future<Output = SolendSubmitResult> + Send + '_>>;
+}
+
+/// Cloneable reference to a `SolendSignatureHandler` implementation.
+#[derive(Clone)]
+pub struct SolendSignatureHandlerRef(pub Arc<dyn SolendSignatureHandler>);
+
+impl SolendSignatureHandlerRef {
+    pub fn new(inner: Arc<dyn SolendSignatureHandler>) -> Self {
+        Self(inner)
+    }
+
+    pub async fn retrieve(
+        &self,
+        session_id: &SessionId,
+        signing_request_id: uuid::Uuid,
+    ) -> SolendRetrievalResult {
+        self.0.retrieve(session_id, signing_request_id).await
+    }
+
+    pub async fn submit(
+        &self,
+        session_id: &SessionId,
+        signing_request_id: uuid::Uuid,
+        signed_tx_b64: String,
+    ) -> SolendSubmitResult {
+        self.0.submit(session_id, signing_request_id, signed_tx_b64).await
+    }
+}
+
+// ── Phase 5D.2 — User-facing chat route ─────────────────────────────────────
+//
+// The chat route invokes a strict one-turn conversational handler. The HTTP
+// layer is a "dumb pipe": it parses the path/body, calls `handle_chat`, and
+// maps the typed `ChatRouteOutcome` to an HTTP status + JSON DTO. All
+// LLM provider lookup, capability narrowing, tool dispatch, and sanitation
+// happens behind the trait inside `claw-gateway`.
+//
+// This crate must not depend on `claw-agent-runtime`; the trait is defined
+// here so that route handlers can drive the chat path without importing the
+// runtime crate's `ConversationOutcome` directly.
+
+/// Wire shape of the chat route response body (Phase 5D.2).
+///
+/// The DTO is intentionally minimal. It is derived from
+/// `agent-runtime::ConversationOutcome` by the gateway-side adapter and
+/// stripped of any data the handler does not want exposed to clients —
+/// notably, no raw provider text, no `tx_bytes` / `transaction_base64`,
+/// no signing handoff payload. Only the typed status + the minimized
+/// `ToolOutput` JSON for `tool_dispatched`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ChatResponse {
+    /// The provider returned no tool calls. `assistant_text` is the
+    /// sanitized text the model emitted (if any). `None` is rendered
+    /// to clients as `null`.
+    AssistantText { assistant_text: Option<String> },
+    /// The provider asked for exactly one tool call and the dispatcher
+    /// produced a `ToolOutput`. `output` is the Phase 5A minimized
+    /// `ToolOutput` JSON (no raw bytes, no key material).
+    ToolDispatched {
+        tool_name: String,
+        output: serde_json::Value,
+    },
+    /// 2+ tool calls — entire turn rejected. No tool ran.
+    MultipleToolCallsRejected { count: usize },
+    /// Tool name not in the narrowed registry, or session lacks the
+    /// capability. Two cases collapsed into one wire variant so cross-
+    /// session probes cannot distinguish them.
+    UnknownOrDeniedTool { tool_name: String, reason: String },
+    /// Tool input did not deserialize into the tool's strict-schema
+    /// struct. Dispatch was not attempted.
+    MalformedToolArguments { tool_name: String, reason: String },
+    /// Provider response shape was outside contract. Dispatch was not
+    /// attempted.
+    MalformedProviderOutput { reason: String },
+    /// Tool itself rejected the input (validation, permission, ...).
+    /// Dispatch happened but the tool refused to act.
+    ToolError { tool_name: String, message: String },
+    /// Phase 5A guard: a previous propose-stage tool call for this
+    /// session is already pending operator approval. The chat handler
+    /// refuses to dispatch a second one until the first resolves.
+    PendingActionExists { reason: String },
+}
+
+/// Domain-level outcome returned by `ChatHandler::handle_chat`.
+///
+/// The HTTP route maps these to status codes:
+/// - `Ok(ChatResponse)` → 200 (the inner variant is reflected in the JSON `status`)
+/// - `PendingActionExists` → 409 Conflict (carries a `ChatResponse::PendingActionExists`)
+/// - `BadRequest(reason)` → 400 (e.g., empty message after trim)
+/// - `Disabled` → 503 (no `ChatHandler` was wired, or provider is `Disabled`)
+#[derive(Debug, Clone)]
+pub enum ChatRouteOutcome {
+    Ok(ChatResponse),
+    Conflict(ChatResponse),
+    BadRequest(String),
+    Disabled(String),
+}
+
+/// Handler for the user-facing chat route (Phase 5D.2).
+///
+/// This trait is the only seam the HTTP layer uses to drive a one-turn
+/// conversational LLM call. The gateway's adapter (`GatewayChatHandler`
+/// in `crates/gateway/src/runtime/chat_wiring.rs`) wraps a
+/// `ConversationHandler` and produces the wire DTO.
+pub trait ChatHandler: Send + Sync + 'static {
+    fn handle_chat(
+        &self,
+        session_id: &SessionId,
+        message: String,
+    ) -> Pin<Box<dyn Future<Output = ChatRouteOutcome> + Send + '_>>;
+}
+
+/// Cloneable reference to a `ChatHandler` implementation.
+#[derive(Clone)]
+pub struct ChatHandlerRef(pub Arc<dyn ChatHandler>);
+
+impl ChatHandlerRef {
+    pub fn new(inner: Arc<dyn ChatHandler>) -> Self {
+        Self(inner)
+    }
+
+    pub async fn handle_chat(
+        &self,
+        session_id: &SessionId,
+        message: String,
+    ) -> ChatRouteOutcome {
+        self.0.handle_chat(session_id, message).await
+    }
+}
+
 /// The shared state injected into every route handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -600,6 +924,9 @@ pub struct AppState {
     pub events:              EventSubscriberRef,
     /// External wallet signature handling.
     pub wallet_signatures:   WalletSignatureHandlerRef,
+    /// Solend-specific signing retrieval + submit handler. `None` when
+    /// Solend integration isn't wired (e.g., minimal test harnesses).
+    pub solend_signatures:   Option<SolendSignatureHandlerRef>,
     /// Wallet ownership challenge-response.
     pub wallet_challenges:   WalletChallengeHandlerRef,
     /// Bearer token for API authentication (legacy single-token mode).
@@ -621,4 +948,9 @@ pub struct AppState {
     /// Development-only demo seeder. `None` unless the daemon was started with
     /// `CLAW_ENABLE_DEMO_SEED=1`. Gates `POST /debug/seed-demo`.
     pub demo_seeder:         Option<DemoSeederRef>,
+    /// Phase 5D.2 — strict one-turn chat handler. `None` unless an LLM
+    /// provider is wired (`Disabled`/`Scripted`/`OpenAi`/`Anthropic` is
+    /// chosen by the daemon's provider config). When `None`, the
+    /// `POST /sessions/:id/chat` route returns 503.
+    pub chat:                Option<ChatHandlerRef>,
 }

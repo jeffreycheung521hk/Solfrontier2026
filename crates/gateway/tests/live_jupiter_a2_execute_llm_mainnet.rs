@@ -729,6 +729,7 @@ async fn a2_execute_llm_mainnet_full_daemon_path() {
         approval: ApprovalHandlerRef::new(Arc::new(NoopApproval)),
         events: EventSubscriberRef::new(Arc::new(BusEvents(tx))),
         wallet_signatures: WalletSignatureHandlerRef::new(completion_handler),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(RealChallengeHandler {
             service: challenge_service.clone(),
             store: external_store.clone(),
@@ -742,6 +743,7 @@ async fn a2_execute_llm_mainnet_full_daemon_path() {
         audit: AuditReaderRef::new(Arc::new(NoopAudit)),
         wallets: WalletDirectoryRef::new(Arc::new(NoopWalletDir)),
         demo_seeder: None,
+        chat: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

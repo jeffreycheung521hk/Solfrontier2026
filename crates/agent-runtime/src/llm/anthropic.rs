@@ -13,6 +13,8 @@
 //! This ensures the Anthropic API receives native tool_result blocks
 //! rather than plain text disguised as user messages.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -25,28 +27,61 @@ use crate::errors::AgentError;
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
-const MAX_TOKENS: u32 = 8192;
+const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Anthropic Claude API client.
 #[derive(Clone)]
 pub struct AnthropicClient {
-    http:    Client,
-    api_key: String,
-    model:   String,
+    http:        Client,
+    api_key:     String,
+    model:       String,
+    /// Phase 5E — per-request token cap. Defaults to
+    /// `DEFAULT_MAX_TOKENS` (8192) for back-compat with the existing
+    /// ReAct loop. Chat-route wiring tightens this to 200.
+    max_tokens:  u32,
+    /// Phase 5E — per-request HTTP timeout. `None` preserves pre-5E
+    /// behaviour. Chat-route wiring sets this to 15s.
+    timeout:     Option<Duration>,
 }
 
 impl AnthropicClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            http:    Client::new(),
-            api_key: api_key.into(),
-            model:   DEFAULT_MODEL.to_string(),
+            http:       Client::new(),
+            api_key:    api_key.into(),
+            model:      DEFAULT_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            timeout:    None,
         }
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
+    }
+
+    /// Phase 5E — bound the per-request output length.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Phase 5E — bound the per-request HTTP timeout.
+    pub fn with_timeout(mut self, dur: Duration) -> Self {
+        self.http = Client::builder()
+            .timeout(dur)
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        self.timeout = Some(dur);
+        self
+    }
+
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens
+    }
+
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 }
 
@@ -109,7 +144,7 @@ impl LlmClient for AnthropicClient {
 
         let mut body = json!({
             "model": self.model,
-            "max_tokens": MAX_TOKENS,
+            "max_tokens": self.max_tokens,
             "system": system,
             "messages": api_messages
         });

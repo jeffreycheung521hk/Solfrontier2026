@@ -10,6 +10,7 @@
 use claw_types::approval::{ApprovalOutcome, ApprovalRequest, ApprovalWorkflowState};
 
 use crate::integrations::jupiter_park::PendingJupiterParkStore;
+use crate::integrations::solend_park::SolendParkStore;
 use crate::pending_signing::PendingSigningStore;
 use crate::policy_alerting::AlertDispatcher;
 
@@ -36,6 +37,7 @@ pub fn route_approval_outcome(
     request_id: uuid::Uuid,
     pending_signing: &PendingSigningStore,
     pending_jupiter_park: &PendingJupiterParkStore,
+    pending_solend_park: &SolendParkStore,
     alerts: &AlertDispatcher,
     request: Option<&ApprovalRequest>,
 ) -> RoutingAction {
@@ -68,17 +70,19 @@ pub fn route_approval_outcome(
         ApprovalOutcome::AlreadyDecided | ApprovalOutcome::NotFound => RoutingAction::Rejected,
 
         ApprovalOutcome::Expired => {
-            // Lease expired — signal both stores with Expired so their
+            // Lease expired — signal all stores with Expired so their
             // respective resume tasks wake up and clean up. Each store's
             // signal() is a graceful no-op if the request_id isn't parked there.
             pending_signing.signal(request_id, ApprovalWorkflowState::Expired);
             pending_jupiter_park.signal(request_id, ApprovalWorkflowState::Expired);
+            pending_solend_park.signal(request_id, ApprovalWorkflowState::Expired);
             RoutingAction::Signaled(ApprovalWorkflowState::Expired)
         }
 
         ApprovalOutcome::Approved => {
             pending_signing.signal(request_id, ApprovalWorkflowState::Approved);
             pending_jupiter_park.signal(request_id, ApprovalWorkflowState::Approved);
+            pending_solend_park.signal(request_id, ApprovalWorkflowState::Approved);
             RoutingAction::Signaled(ApprovalWorkflowState::Approved)
         }
 
@@ -101,6 +105,7 @@ pub fn route_approval_outcome(
             }
             pending_signing.signal(request_id, ApprovalWorkflowState::Rejected);
             pending_jupiter_park.signal(request_id, ApprovalWorkflowState::Rejected);
+            pending_solend_park.signal(request_id, ApprovalWorkflowState::Rejected);
             RoutingAction::Signaled(ApprovalWorkflowState::Rejected)
         }
     }
@@ -174,7 +179,7 @@ mod tests {
         let outcome = ApprovalOutcome::StageAdvanced {
             completed_stage: 0, next_stage: 1, next_required_role: Some("treasury".into()),
         };
-        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::NoSignal);
     }
 
@@ -185,7 +190,7 @@ mod tests {
         let outcome = ApprovalOutcome::QuorumProgress {
             stage: 0, approvals_so_far: 1, approvals_required: 2,
         };
-        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::NoSignal);
     }
 
@@ -197,7 +202,7 @@ mod tests {
 
         let decision_rx = park_dummy(&pending, rid);
 
-        let action = route_approval_outcome(&ApprovalOutcome::Approved, rid, &pending, &PendingJupiterParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&ApprovalOutcome::Approved, rid, &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Signaled(ApprovalWorkflowState::Approved));
 
         let state = decision_rx.await.expect("should have received signal");
@@ -212,7 +217,7 @@ mod tests {
         let sid = claw_types::session::SessionId::new();
         let req = fake_request(rid, sid);
 
-        let action = route_approval_outcome(&ApprovalOutcome::Rejected, rid, &pending, &PendingJupiterParkStore::new(), &alerts, Some(&req));
+        let action = route_approval_outcome(&ApprovalOutcome::Rejected, rid, &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, Some(&req));
         assert_eq!(action, RoutingAction::Signaled(ApprovalWorkflowState::Rejected));
     }
 
@@ -223,7 +228,7 @@ mod tests {
         let outcome = ApprovalOutcome::RoleMismatch {
             required: "treasury".into(), provided: Some("risk".into()),
         };
-        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Rejected);
     }
 
@@ -234,7 +239,7 @@ mod tests {
         let outcome = ApprovalOutcome::DuplicateOperator {
             operator_id: "alice".into(), stage: 0,
         };
-        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Rejected);
     }
 
@@ -242,7 +247,7 @@ mod tests {
     fn already_decided_does_not_signal() {
         let pending = PendingSigningStore::new();
         let alerts = AlertDispatcher::default();
-        let action = route_approval_outcome(&ApprovalOutcome::AlreadyDecided, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&ApprovalOutcome::AlreadyDecided, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Rejected);
     }
 
@@ -250,7 +255,7 @@ mod tests {
     fn not_found_does_not_signal() {
         let pending = PendingSigningStore::new();
         let alerts = AlertDispatcher::default();
-        let action = route_approval_outcome(&ApprovalOutcome::NotFound, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&ApprovalOutcome::NotFound, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Rejected);
     }
 
@@ -264,7 +269,7 @@ mod tests {
         let rid = Uuid::new_v4();
         let decision_rx = park_dummy(&pending, rid);
 
-        let action = route_approval_outcome(&ApprovalOutcome::Expired, rid, &pending, &PendingJupiterParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&ApprovalOutcome::Expired, rid, &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Signaled(ApprovalWorkflowState::Expired));
 
         // Parked signing task receives Expired through the oneshot.

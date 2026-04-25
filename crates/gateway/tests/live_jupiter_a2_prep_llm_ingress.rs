@@ -540,6 +540,7 @@ async fn a2_prep_http_messages_ingress_drives_jupiter_tool_to_park() {
         approval: ApprovalHandlerRef::new(Arc::new(NoopApproval)),
         events: EventSubscriberRef::new(Arc::new(BusEvents(tx))),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(NoopSig)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(RealChallengeHandler {
             service: challenge_service,
             store: external_store.clone(),
@@ -553,6 +554,7 @@ async fn a2_prep_http_messages_ingress_drives_jupiter_tool_to_park() {
         audit: AuditReaderRef::new(Arc::new(NoopAudit)),
         wallets: WalletDirectoryRef::new(Arc::new(NoopWalletDir)),
         demo_seeder: None,
+        chat: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

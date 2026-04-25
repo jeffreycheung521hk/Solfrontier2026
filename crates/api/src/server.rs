@@ -26,6 +26,7 @@
 use std::net::SocketAddr;
 
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{delete, get, post},
     Router,
@@ -44,6 +45,7 @@ use crate::{
     routes::{
         approve::{list_approvals, submit_approval},
         audit::list_audit,
+        chat::post_chat,
         debug_seed::seed_demo,
         events::session_events,
         health::health_handler,
@@ -54,6 +56,7 @@ use crate::{
         policy_rules::list_policy_rules,
         propose::propose_transfer,
         sessions::{close_session, list_sessions, open_session},
+        solend_signatures::{get_solend_signature, submit_solend_signature},
         wallets::list_wallets,
         wallet_challenges::{create_wallet_challenge, confirm_wallet_challenge},
         wallet_signatures::{bind_wallet, list_wallet_signatures, submit_wallet_signature},
@@ -87,6 +90,23 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         .route("/sessions/:id/wallet-signatures", post(submit_wallet_signature))
         .route("/sessions/:id/wallet-signatures", get(list_wallet_signatures))
         .route("/sessions/:id/bind-wallet", post(bind_wallet))
+        // Solend-specific signing retrieval + submit (Phase 4C-6)
+        .route(
+            "/sessions/:id/solend-signatures/:request_id",
+            get(get_solend_signature),
+        )
+        .route(
+            "/sessions/:id/solend-signatures/:request_id",
+            post(submit_solend_signature),
+        )
+        // Phase 5D.2 — user-facing chat route. Body limit is enforced
+        // at the framework layer via `DefaultBodyLimit::max(4096)`;
+        // oversize bodies are rejected with 413 BEFORE the handler
+        // runs.
+        .route(
+            "/sessions/:id/chat",
+            post(post_chat).layer(DefaultBodyLimit::max(4096)),
+        )
         // Wallet ownership proof (challenge-response)
         .route("/sessions/:id/wallet-bind-challenge", post(create_wallet_challenge))
         .route("/sessions/:id/wallet-bind-confirm", post(confirm_wallet_challenge))

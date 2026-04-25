@@ -140,6 +140,7 @@ async fn self_claimed_higher_role_is_rejected() {
         approval: ApprovalHandlerRef::new(Arc::new(StubApproval { session_id: sid.clone() })),
         events: EventSubscriberRef::new(Arc::new(StubEvents)),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(StubWalletSig)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubChallenge)),
         auth_token: AuthToken::new("fallback-token"),
         operator_registry: registry,
@@ -150,6 +151,7 @@ async fn self_claimed_higher_role_is_rejected() {
         audit: AuditReaderRef::noop(),
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
+        chat: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());
@@ -208,6 +210,7 @@ async fn operator_with_correct_role_passes_role_check() {
         approval: ApprovalHandlerRef::new(Arc::new(StubApproval { session_id: sid.clone() })),
         events: EventSubscriberRef::new(Arc::new(StubEvents)),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(StubWalletSig)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubChallenge)),
         auth_token: AuthToken::new("fallback-token"),
         operator_registry: registry,
@@ -218,6 +221,7 @@ async fn operator_with_correct_role_passes_role_check() {
         audit: AuditReaderRef::noop(),
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
+        chat: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());
@@ -323,6 +327,7 @@ async fn token_mapped_role_can_approve_required_role_request() {
         approval: ApprovalHandlerRef::new(Arc::new(handler)),
         events: EventSubscriberRef::new(Arc::new(StubEvents)),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(StubWalletSig)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubChallenge)),
         auth_token: AuthToken::new("fallback-token"),
         operator_registry: registry,
@@ -333,6 +338,7 @@ async fn token_mapped_role_can_approve_required_role_request() {
         audit: AuditReaderRef::noop(),
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
+        chat: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());
@@ -401,6 +407,7 @@ async fn multi_role_operator_uses_first_role_when_body_omits_role() {
         approval: ApprovalHandlerRef::new(Arc::new(handler)),
         events: EventSubscriberRef::new(Arc::new(StubEvents)),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(StubWalletSig)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubChallenge)),
         auth_token: AuthToken::new("fallback-token"),
         operator_registry: registry,
@@ -411,6 +418,7 @@ async fn multi_role_operator_uses_first_role_when_body_omits_role() {
         audit: AuditReaderRef::noop(),
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
+        chat: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

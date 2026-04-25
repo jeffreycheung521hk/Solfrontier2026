@@ -50,8 +50,10 @@ use claw_api::{
     auth::OperatorRegistry,
     state::{
         AuditReader, AuditReaderRef, AuditRowDto,
+        ChatHandlerRef,
         DemoSeeder, DemoSeederRef, DemoSeedReport,
         PolicyReader, PolicyReaderRef,
+        SolendSignatureHandlerRef,
         WalletDirectory, WalletDirectoryRef, WalletPolicySummaryDto, WalletSummaryDto,
     },
 };
@@ -289,6 +291,7 @@ impl GatewayDaemon {
         let approval_store    = ApprovalStore::new();
         let pending_signing   = PendingSigningStore::new();
         let pending_jupiter_park = crate::integrations::jupiter_park::PendingJupiterParkStore::new();
+        let pending_solend_park = crate::integrations::solend_park::SolendParkStore::new();
         // C4: Create binding repo and wire into ExternalWalletStore for
         // durable session-wallet binding persistence across restarts.
         let binding_repo = claw_state_store::WalletBindingRepository::new(db.pool().clone());
@@ -465,6 +468,92 @@ impl GatewayDaemon {
             registry
         };
 
+        // ── 10c. Solend deposit intent tool (Phase 4B-2/4B-3/4C-3) ──────────
+        //
+        // The full Solend wiring block (read-only RPC adapter, V1 policy
+        // config, preflight simulator, tool constructor, registry
+        // insertion) lives in `runtime::solend_wiring` per DEBT.md D-2:
+        // integration-specific glue must NOT bloat `daemon.rs`. This
+        // daemon site stays a one-line call so the next integration's
+        // wiring lands in its own sibling module rather than here.
+        // Phase 4C-4 signing handoff: the new SolendSigningStore lives
+        // for the daemon lifetime (same as SolendParkStore). The
+        // BlockhashManager is reused from §3 above — no new background
+        // task, no new route.
+        let pending_solend_signing =
+            crate::integrations::solend_signing::SolendSigningStore::new();
+        // Phase 4C-6 submission-outcome cache. Shares the approval
+        // lease TTL so a submit attempt that arrives just past the
+        // signing window still sees the terminal state for one lease
+        // beyond, giving the UI time to render the final outcome.
+        let pending_solend_lifecycle =
+            crate::integrations::solend_lifecycle::SolendSubmissionLifecycleStore::new(
+                config.policy.approval_lease_seconds,
+            );
+        // Phase 4C-5 audit sink: shared `AuditRepository` wrapped so the
+        // Solend signing + submit lifecycle events land in the
+        // append-only audit table alongside the rest of the daemon's
+        // audit records.
+        let solend_audit_sink: std::sync::Arc<
+            dyn crate::integrations::solend_submit::SolendAuditSink,
+        > = std::sync::Arc::new(
+            crate::integrations::solend_submit::AuditRepositorySink::new(audit_repo.clone()),
+        );
+        let registry = crate::runtime::solend_wiring::wire_solend_deposit_tool(
+            registry,
+            rpc_pool.clone(),
+            external_wallet.clone(),
+            approval_store.clone(),
+            pending_solend_park.clone(),
+            pending_solend_signing.clone(),
+            blockhash_mgr.clone(),
+            solend_audit_sink.clone(),
+            config.policy.approval_lease_seconds,
+        );
+        // Phase 4C-6: Solend submit HTTP handler. Bridges the API trait
+        // to the 4C-5 submit pipeline + 4C-6 lifecycle cache. No new
+        // background task, no new blockhash/signer path — the handler
+        // is called inline by the inbound HTTP request's tokio task.
+        let solend_sig_handler_ref: Option<SolendSignatureHandlerRef> = {
+            let sender: std::sync::Arc<
+                dyn crate::integrations::solend_submit::SolendTransactionSender,
+            > = std::sync::Arc::new(
+                crate::integrations::solend_submit::ClawRpcSolendSender::new(rpc_client.clone()),
+            );
+            let height: std::sync::Arc<
+                dyn crate::integrations::solend_submit::SolendBlockHeightProvider,
+            > = std::sync::Arc::new(
+                crate::integrations::solend_submit::ClawRpcBlockHeightProvider::new(
+                    rpc_client.clone(),
+                ),
+            );
+
+            // Phase 4C-7 — confirmation tracker + background task.
+            // Delegated to `runtime/solend_submit_wiring.rs` per
+            // DEBT.md D-2 (daemon.rs stays wiring-only).
+            let confirmation_tracker =
+                crate::runtime::solend_submit_wiring::wire_solend_confirmation_tracker(
+                    pending_solend_lifecycle.clone(),
+                    std::sync::Arc::new(rpc_pool.clone()),
+                    solend_audit_sink.clone(),
+                    // Matches the shared TransactionTracker's 2-second
+                    // base tick (claw_solana_core::tracker::BASE_TICK)
+                    // so a Solend confirmation is never further behind
+                    // the chain than the non-Solend tracker.
+                    std::time::Duration::from_secs(2),
+                );
+
+            let handler = crate::runtime::solend_submit_wiring::GatewaySolendSignatureHandler::new(
+                pending_solend_signing.clone(),
+                pending_solend_lifecycle.clone(),
+                sender,
+                solend_audit_sink.clone(),
+                height,
+            )
+            .with_confirmation_tracker(confirmation_tracker);
+            Some(SolendSignatureHandlerRef::new(std::sync::Arc::new(handler)))
+        };
+
         info!(
             tool_count = registry.names().len(),
             "final tool registry ready"
@@ -614,7 +703,7 @@ impl GatewayDaemon {
         let message_handler_ref = MessageHandlerRef::new(Arc::new(GatewayMessageHandler {
             agent:        agent.clone(),
             agent_router: agent_router.clone(),
-            registry,
+            registry:     registry.clone(),
             audit:        audit_repo.clone(),
             tool_traces:  tool_traces_repo,
         }));
@@ -623,6 +712,7 @@ impl GatewayDaemon {
             store:                approval_store.clone(),
             pending_signing:      pending_signing.clone(),
             pending_jupiter_park: pending_jupiter_park.clone(),
+            pending_solend_park:  pending_solend_park.clone(),
             event_bus:            event_bus.clone(),
             audit:                audit_repo.clone(),
             _durable:             durable_state.clone(),
@@ -727,12 +817,39 @@ impl GatewayDaemon {
                 None
             };
 
+        // Phase 5E — user-facing chat handler. Real provider is wired
+        // only when `CLAW_CHAT_PROVIDER` is explicitly set to `openai`
+        // or `anthropic` and the matching API key is non-empty. When
+        // any precondition is missing the chat route returns 503; when
+        // the env opts in but the config is broken, daemon startup
+        // surfaces the typed error.
+        let chat_handler_ref: Option<ChatHandlerRef> =
+            match crate::runtime::chat_wiring::wire_chat_handler_from_std_env(&registry) {
+                Ok(opt) => {
+                    if opt.is_some() {
+                        info!("chat route enabled with explicit provider opt-in");
+                    } else {
+                        info!(
+                            "chat route disabled (CLAW_CHAT_PROVIDER unset); \
+                             POST /sessions/:id/chat will return 503"
+                        );
+                    }
+                    opt
+                }
+                Err(e) => {
+                    return Err(GatewayError::Startup(format!(
+                        "chat handler config invalid: {e}"
+                    )));
+                }
+            };
+
         let app_state = AppState {
             session_mgr:       session_ref,
             message_handler:   message_handler_ref,
             approval:          approval_handler_ref,
             events:            event_subscriber_ref,
             wallet_signatures: wallet_sig_handler_ref,
+            solend_signatures: solend_sig_handler_ref,
             wallet_challenges: wallet_challenge_handler_ref,
             auth_token:        AuthToken::new(api_token),
             operator_registry: operator_registry.clone(),
@@ -743,6 +860,7 @@ impl GatewayDaemon {
             audit:             audit_reader_ref,
             wallets:           wallet_dir_ref,
             demo_seeder:       demo_seeder_ref,
+            chat:              chat_handler_ref,
         };
 
         let api_handle = claw_api::start(
@@ -1347,6 +1465,7 @@ struct GatewayApprovalHandler {
     store:                ApprovalStore,
     pending_signing:      PendingSigningStore,
     pending_jupiter_park: crate::integrations::jupiter_park::PendingJupiterParkStore,
+    pending_solend_park:  crate::integrations::solend_park::SolendParkStore,
     event_bus:            EventBus,
     audit:                AuditRepository,
     _durable:             DurablePendingState,
@@ -1424,6 +1543,7 @@ impl GatewayApprovalHandler {
             decision.request_id,
             &self.pending_signing,
             &self.pending_jupiter_park,
+            &self.pending_solend_park,
             &self.alerts,
             maybe_request.as_ref(),
         );

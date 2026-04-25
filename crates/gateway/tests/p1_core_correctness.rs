@@ -494,6 +494,7 @@ fn build_state(
         })),
         events:            EventSubscriberRef::new(Arc::new(StubEvents { tx })),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(StubWalletSig)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubChallenge)),
         auth_token:        AuthToken::new("p1-token"),
         operator_registry: claw_api::auth::OperatorRegistry::new(),
@@ -504,6 +505,7 @@ fn build_state(
         audit:             AuditReaderRef::noop(),
         wallets:           WalletDirectoryRef::noop(),
         demo_seeder:       None,
+        chat:              None,
     }
 }
 

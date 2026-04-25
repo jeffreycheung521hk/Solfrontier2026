@@ -37,6 +37,8 @@ ed25519-dalek = { workspace = true }
 hex           = { workspace = true }
 rand          = { workspace = true }
 solana-sdk    = { workspace = true }
+solana-client = { workspace = true }
+solana-transaction-status = { workspace = true }
 spl-associated-token-account = { workspace = true }
 async-trait = { workspace = true }
 base64      = { workspace = true }

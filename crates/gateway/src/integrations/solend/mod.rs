@@ -38,6 +38,7 @@
 //!
 //! These restrictions match Part 5A §40.4 and Part 6B §62.3 verbatim.
 
+pub mod assembler;
 pub mod ata;
 pub mod deposit;
 pub mod init_obligation;
@@ -46,6 +47,11 @@ pub mod oracle_decoder;
 pub mod raw;
 pub mod refresh;
 
+pub use assembler::{
+    AssembledSolendDepositSnapshot, AtaKind, ClawRpcPoolAccountFetcher, FetchError,
+    SolanaAccountFetcher, SolendAssemblyError, SolendSnapshotAssembler,
+    PYTH_SOLANA_RECEIVER_PROGRAM_BS58, USDC_MINT_BS58, USDC_RESERVE_BS58,
+};
 pub use ata::{build_create_ata_idempotent_instruction, derive_associated_token_address};
 pub use deposit::{
     build_deposit_reserve_liquidity_and_obligation_collateral_instruction,

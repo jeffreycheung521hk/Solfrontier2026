@@ -24,7 +24,9 @@ pub mod state;
 pub use errors::ApiError;
 pub use server::{create_router, start};
 pub use state::{
-    AppState, ApprovalHandler, ApprovalHandlerRef, EventSubscriber, EventSubscriberRef,
+    AppState, ApprovalHandler, ApprovalHandlerRef,
+    ChatHandler, ChatHandlerRef, ChatResponse, ChatRouteOutcome,
+    EventSubscriber, EventSubscriberRef,
     MessageHandler, MessageHandlerRef, SessionManagerRef, SessionOps,
     TransactionProposer, TransactionProposerRef, ProposeTransferResult,
     WalletChallengeHandler, WalletChallengeHandlerRef, WalletChallengeInfo,

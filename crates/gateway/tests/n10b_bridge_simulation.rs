@@ -278,6 +278,7 @@ fn setup() -> TestHarness {
         approval: ApprovalHandlerRef::new(Arc::new(StubApprovalHandler)),
         events: EventSubscriberRef::new(Arc::new(StubEventSubscriber)),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(handler)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubWalletChallengeHandler)),
         auth_token: AuthToken::new(token.clone()),
         metrics: Arc::new(claw_observability::metrics::MetricsRegistry::new()),
@@ -288,6 +289,7 @@ fn setup() -> TestHarness {
         audit: AuditReaderRef::noop(),
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
+        chat: None,
     };
 
     let health = HealthRegistry::new();

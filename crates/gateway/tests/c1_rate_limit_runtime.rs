@@ -115,6 +115,7 @@ fn build_router(
         approval: ApprovalHandlerRef::new(Arc::new(StubApproval)),
         events: EventSubscriberRef::new(Arc::new(StubEvents)),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(StubWalletSig)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubChallenge)),
         auth_token: AuthToken::new(token.clone()),
         metrics,
@@ -125,6 +126,7 @@ fn build_router(
         audit: AuditReaderRef::noop(),
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
+        chat: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());
@@ -208,6 +210,7 @@ async fn rate_limit_independent_tokens() {
         approval: ApprovalHandlerRef::new(Arc::new(StubApproval)),
         events: EventSubscriberRef::new(Arc::new(StubEvents)),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(StubWalletSig)),
+        solend_signatures: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubChallenge)),
         auth_token: AuthToken::new(token.clone()),
         metrics: metrics.clone(),
@@ -218,6 +221,7 @@ async fn rate_limit_independent_tokens() {
         audit: AuditReaderRef::noop(),
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
+        chat: None,
     };
     let router = claw_api::create_router(state, HealthRegistry::new());
 

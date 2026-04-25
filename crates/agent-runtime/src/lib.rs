@@ -4,15 +4,22 @@
 #![allow(missing_docs)]
 
 pub mod agent;
+pub mod conversation;
 pub mod errors;
 pub mod llm;
 pub mod personas;
 pub mod planner;
+pub mod provider;
 pub mod router;
 pub mod session;
 
 pub use agent::Agent;
+pub use conversation::{ConversationHandler, ConversationOutcome, ScriptedLlmProvider};
 pub use errors::AgentError;
 pub use llm::{LlmClient, LlmClientRef};
+pub use provider::{
+    build_llm_provider, disabled_provider, ApiKey, EnvProvider, LlmProviderConfig,
+    LlmProviderConfigError, LlmProviderMode, StdEnvProvider,
+};
 pub use router::AgentRouter;
 pub use session::AgentSession;
