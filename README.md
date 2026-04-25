@@ -6,6 +6,24 @@ ClawSolana is a Rust-native daemon that sits between intent sources (AI agents, 
 
 > **Status: Alpha.** 343 tests, zero warnings, Rust 1.94.0. Full message-driven Orca DeFi swap confirmed on Solana devnet ([swap tx](https://explorer.solana.com/tx/56yYDtW9TNv8GwWtBn8HFDEohcM3a4QcHQkpJoqmcgQ7AzACTQViciWdBBTZicowwm4KZk9dhQEBQ6ac9NCV4ovw?cluster=devnet)). NOT production-ready.
 
+## 🎯 Milestone Achieved — LLM-Guided Solend Mainnet Flow
+
+**Phase 5 LLM-guided mainnet end-to-end flow is complete.**
+
+The system has safely executed an AI-guided DeFi transaction on Solana mainnet: a natural-language user message drove a real OpenAI provider through the strict one-turn `ConversationHandler` and the production Solend pipeline, finalizing a USDC deposit on-chain. The LLM proposes only — approval and wallet signing remain human-controlled at every step.
+
+| Proof | On-chain outcome |
+|---|---|
+| **Phase 5G** — LLM-guided mainnet | tx [`4M4ezLgm…Py3y`](https://solscan.io/tx/4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y) — Finalized at slot 415,571,964 |
+| **Phase 4C** — non-LLM mainnet baseline | tx [`2QqSfDq…pxALs`](https://solscan.io/tx/2QqSfDq53a34WDXVkvZeyW59eFJcxZtkQtjZw25CoUizEmzDjahusKvBT8eNb4XdpKYwrgGcTyBwYXgth5wpxALs) — Finalized at slot 415,475,589 |
+
+Read the full closeout for the security model, fail-closed defense record, and what was deliberately *not* claimed:
+
+- 📄 [Phase 5 Closeout](docs/proofs/PHASE5_CLOSEOUT.md) — milestone seal, security posture, remaining work
+- 📄 [Phase 4C non-LLM mainnet proof](docs/proofs/SOLEND_USDC_DEPOSIT_PHASE4C_E2E.md)
+- 📄 [Phase 5G LLM-guided mainnet proof](docs/proofs/LLM_SOLEND_MAINNET_E2E_PHASE5G.md)
+- 📄 [Phase 5F live chat dry-run proof](docs/proofs/LLM_SOLEND_CHAT_DRY_RUN_PHASE5E.md) (provider-only, no execution rail)
+
 ## Why This Matters
 
 AI agents are getting access to wallets. Most agent-wallet integrations are one of two extremes: the agent holds the private key (zero governance), or a human approves every action (zero autonomy). Neither scales.
