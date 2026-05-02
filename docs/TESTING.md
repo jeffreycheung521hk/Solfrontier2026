@@ -3,7 +3,26 @@
 Index of every test layer in the repo, what it covers, where it lives, and how
 to run it. This file is a **catalogue of what exists** — for the most recent
 known run status, see [`TEST_RESULTS.md`](./TEST_RESULTS.md). For on-chain
-evidence of end-to-end execution, see [`DEVNET_PROOF.md`](./DEVNET_PROOF.md).
+evidence of end-to-end execution, see [`proofs/INDEX.md`](proofs/INDEX.md) and
+[`proofs/PHASE5_CLOSEOUT.md`](proofs/PHASE5_CLOSEOUT.md).
+
+> **Current state (2026-05-02).** The project has reached **Phase 5G — first
+> LLM-guided Solend USDC deposit Finalized on Solana mainnet**. Most recent
+> network-free run reports **977 lib + integration tests passing**, with all
+> live mainnet / live-LLM harnesses default-skipping behind double opt-in env
+> gates. Full milestone seal: [`proofs/PHASE5_CLOSEOUT.md`](proofs/PHASE5_CLOSEOUT.md).
+> Mainnet proof ledger: [`proofs/INDEX.md`](proofs/INDEX.md).
+
+> **Naming note — "Phase" disambiguation.** The "Phase 1 / 2 / 3 / 4" headings
+> below refer to **test-suite tiers** (categories of test methodology — core
+> correctness, API black-box, frontend E2E, property-based / concurrent
+> robustness). They are **not** the same as project-level milestones. The
+> project-level "Phase 4 — Solend Lending Rail" and "Phase 5 — LLM-Guided
+> Solend Flow" are tracked in [`../ROADMAP.md`](../ROADMAP.md) and
+> [`proofs/PHASE5_CLOSEOUT.md`](proofs/PHASE5_CLOSEOUT.md). The two numbering
+> systems coexist; the new live mainnet / live-LLM harnesses landed during
+> project Phases 4–5 are catalogued under "Phase 5 — Live mainnet & live-LLM
+> proof harnesses *(test tier)*" further down this file.
 
 ---
 
@@ -195,6 +214,31 @@ The proptest sweep caught a real u64 overflow bug at
 sum) landed in the same commit as the test — without the test, this was
 latent in `cargo test --release` (which skips arithmetic overflow checks)
 and would surface only under attacker-chosen multi-instruction transfers.
+
+### Phase 5 — Live mainnet & live-LLM proof harnesses *(test tier)*
+
+> Catalogues the harnesses that produced the on-chain artefacts in
+> [`proofs/INDEX.md`](proofs/INDEX.md). Every harness in this tier is
+> **default-skip behind double opt-in env gates** — the standard
+> `cargo test` path performs **zero** network calls, **zero** LLM provider
+> calls, and **zero** broadcasts. CI is safe by construction.
+
+| File | Tier-5 role | What it proves | Default-skip gate(s) |
+|---|---|---|---|
+| [`crates/gateway/tests/live_solend_deposit_e2e.rs`](../crates/gateway/tests/live_solend_deposit_e2e.rs) | Phase 4C non-LLM Solend mainnet baseline | Solend USDC deposit pipeline correct end-to-end on mainnet (no LLM in the loop) — see [`proofs/SOLEND_USDC_DEPOSIT_PHASE4C_E2E.md`](proofs/SOLEND_USDC_DEPOSIT_PHASE4C_E2E.md), tx [`2QqSfDq…pxALs`](https://solscan.io/tx/2QqSfDq53a34WDXVkvZeyW59eFJcxZtkQtjZw25CoUizEmzDjahusKvBT8eNb4XdpKYwrgGcTyBwYXgth5wpxALs) | `CLAW_LIVE_SOLEND_E2E=1` + `CLAW_LIVE_SOLEND_E2E_BROADCAST=1` + RPC URL / keypair / wallet / amount env vars |
+| [`crates/gateway/tests/live_chat_provider_dry_run.rs`](../crates/gateway/tests/live_chat_provider_dry_run.rs) | Phase 5F live OpenAI dry run | Real provider call through `POST /sessions/:id/chat` produces exactly one `solend_deposit_usdc` tool call with strict schema; stops at `awaiting_approval` (stub Solend tool, no execution rail) — see [`proofs/LLM_SOLEND_CHAT_DRY_RUN_PHASE5E.md`](proofs/LLM_SOLEND_CHAT_DRY_RUN_PHASE5E.md) | `CLAW_LIVE_CHAT_DRY_RUN=1` + `CLAW_LIVE_CHAT_DRY_RUN_GO=1` + `CLAW_CHAT_PROVIDER` + matching API key |
+| [`crates/gateway/tests/live_llm_solend_e2e.rs`](../crates/gateway/tests/live_llm_solend_e2e.rs) | Phase 5G LLM-guided Solend mainnet | Full chain — NL → live OpenAI → strict 1-turn handler → production Solend → harness explicit approval → wallet sign → submit → `Finalized` — see [`proofs/LLM_SOLEND_MAINNET_E2E_PHASE5G.md`](proofs/LLM_SOLEND_MAINNET_E2E_PHASE5G.md), tx [`4M4ezLgm…Py3y`](https://solscan.io/tx/4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y) | `CLAW_LIVE_LLM_SOLEND_E2E=1` + `CLAW_LIVE_LLM_SOLEND_E2E_GO=1` + the Phase 4C Solend gates + `CLAW_CHAT_PROVIDER` + key |
+| [`crates/gateway/tests/p5_wire_shape_contracts.rs`](../crates/gateway/tests/p5_wire_shape_contracts.rs) | Wire-shape regression locks | DTO JSON contract between gateway and frontend (PolicyCondition / PolicyAction unit-variant serialisation, approval shape, error envelopes) — protects the frontend from silent backend serde renames | None — runs in default `cargo test`; pure in-memory |
+| [`crates/gateway/tests/p5d2_chat_route.rs`](../crates/gateway/tests/p5d2_chat_route.rs) | Chat route HTTP contract | All 8 `ChatResponse` variants (assistant_text / tool_dispatched / multiple_tool_calls_rejected / unknown_or_denied_tool / malformed_tool_arguments / malformed_provider_output / tool_error / pending_action_exists) plus body-limit, auth, session-not-active, and chat-disabled paths. Uses `ScriptedLlmProvider` so no network. | None — runs in default `cargo test` |
+
+**Operational rules for Tier 5 harnesses:**
+
+- **No automatic retry on any failure path.** A failed live attempt produces a typed failure outcome, not a re-broadcast. The Phase 4C and 5G proof harnesses each enforce a hard wall-clock ceiling (5 minutes for Phase 5G).
+- **Programmatic proof-doc writes only.** Each live harness writes its proof doc to `docs/proofs/` *only* after the success criterion is observed (`Finalized` from the confirmation tracker; the strict-success branch from the live-provider dispatcher). Failure paths do not produce proof docs.
+- **Public chain data only.** Proof docs include public tx signatures, public wallet pubkeys, public approval/signing request ids, and on-chain slot numbers. They never include private keys, API keys, bearer tokens, raw transaction payloads, or HTTP auth headers; each writer runs a final substring scan against a deny-list before writing.
+- **Pre-existing operational rules still apply.** Rule 1 (kill `clawd.exe` before `cargo test`) and Rule 3 (`CLAW_E2E_FORCE_BUILD=1` after frontend edits) remain in force. Rule 2 (devnet keypair) is unrelated to Tier 5.
+
+For the full fail-closed defense record (three documented mainnet incidents, zero funds lost), see [`proofs/PHASE5_CLOSEOUT.md`](proofs/PHASE5_CLOSEOUT.md) §5.
 
 ---
 

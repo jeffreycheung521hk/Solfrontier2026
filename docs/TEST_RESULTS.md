@@ -3,6 +3,25 @@
 Most-recent known state of the test suite. This document records what was
 observed in a local run; it is **not** produced by CI.
 
+> **Current headline (2026-05-02).** The numbers in the Phase 1–4 sections
+> below are accurate as historical session snapshots from 2026-04-04 → 2026-04-15
+> (peak: **374 tests across 32 binaries** at the post-Phase-4 inventory of
+> 2026-04-15T14-32-51Z). Since then the project has reached **Phase 5G — first
+> LLM-guided Solend USDC deposit Finalized on Solana mainnet**.
+>
+> Most-recent network-free run (2026-05-02 push-readiness audit):
+> **977 lib + integration tests passing**, all live mainnet / live-LLM
+> harnesses default-skipping (3/3 + 2/2 + 3/3 in
+> `live_solend_deposit_e2e` / `live_chat_provider_dry_run` /
+> `live_llm_solend_e2e`). Zero network calls in the default test path.
+>
+> The Phase 1–4 narrative below is preserved as a historical baseline for
+> reviewer comparison; it is not re-rewritten because the underlying
+> sessions remain valid evidence. For the full Phase 5 milestone seal,
+> safety model, and three-incident fail-closed defense record see
+> [`proofs/PHASE5_CLOSEOUT.md`](proofs/PHASE5_CLOSEOUT.md). For the
+> mainnet / live-LLM proof ledger see [`proofs/INDEX.md`](proofs/INDEX.md).
+
 ---
 
 ## Sources of truth for this document
