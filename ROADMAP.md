@@ -1,5 +1,7 @@
 # ClawSolana — Roadmap
 
+> **Snapshot note:** This document is an older planning snapshot from 2026-04-04. For the current Phase 5G mainnet-proven state, see [`README.md`](README.md) and [`docs/proofs/PHASE5_CLOSEOUT.md`](docs/proofs/PHASE5_CLOSEOUT.md).
+
 **Product:** Policy-gated transaction control plane for Solana.
 
 **Created:** 2026-03-19 | **Updated:** 2026-04-04

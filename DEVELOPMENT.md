@@ -1,5 +1,7 @@
 # ClawSolana — Development Guide
 
+> **Snapshot note:** This document is an older planning snapshot from 2026-04-04. For the current Phase 5G mainnet-proven state, see [`README.md`](README.md) and [`docs/proofs/PHASE5_CLOSEOUT.md`](docs/proofs/PHASE5_CLOSEOUT.md).
+
 **Updated:** 2026-04-04
 **Build:** `cargo check` PASS, `cargo test` PASS (343 tests, zero failures)
 **Rust:** 1.94.0 stable
