@@ -238,3 +238,55 @@ export interface DashboardSnapshot {
   recent_audit: AuditRow[];
   expiring_soon: Array<{ request_id: Uuid; expires_at: IsoDate; seconds_remaining: number }>;
 }
+
+// ── Chat route wire shapes (Phase 5D.2 + 5E backend) ─────────────────────────
+//
+// Mirror the Rust DTOs in `claw-api::state::{ChatResponse, ChatRouteOutcome}`.
+// Wire shape is tag-on-field: `{ "status": "<variant>", ...fields }`.
+
+export type AgentRole = "research" | "execution" | "risk" | "ops";
+
+export interface OpenSessionRequest {
+  role: AgentRole;
+  channel?: string;
+  policy_overrides?: PolicyRule[];
+}
+
+export interface OpenSessionResponse {
+  session_id: SessionId;
+  role: AgentRole;
+}
+
+export interface ChatRequest {
+  message: string;
+}
+
+/// Discriminated union mirroring Rust's `ChatResponse` enum.
+/// `status` is the discriminant; the runtime guarantees no other shape.
+export type ChatResponse =
+  | { status: "assistant_text"; assistant_text: string | null }
+  | { status: "tool_dispatched"; tool_name: string; output: unknown }
+  | { status: "multiple_tool_calls_rejected"; count: number }
+  | { status: "unknown_or_denied_tool"; tool_name: string; reason: string }
+  | { status: "malformed_tool_arguments"; tool_name: string; reason: string }
+  | { status: "malformed_provider_output"; reason: string }
+  | { status: "tool_error"; tool_name: string; message: string }
+  | { status: "pending_action_exists"; reason: string };
+
+/// HTTP-status-aware envelope used by the chat client.
+/// The chat route maps domain outcomes to: 200 OK, 400 Bad Request,
+/// 404 Not Found, 409 Conflict (PendingActionExists), 503 Service
+/// Unavailable. Anything else (5xx other than 503) is `unexpected`.
+export type ChatRouteResult =
+  | { kind: "ok"; response: ChatResponse }
+  | { kind: "conflict"; response: Extract<ChatResponse, { status: "pending_action_exists" }> }
+  | { kind: "bad_request"; error: string }
+  | { kind: "not_found"; error: string }
+  | { kind: "disabled"; error: string }
+  | { kind: "unexpected"; httpStatus: number; error: string };
+
+/// Local UI message — rendered in the chat history.
+export type ChatMessage =
+  | { id: string; kind: "user"; text: string; sentAt: IsoDate }
+  | { id: string; kind: "assistant"; result: ChatRouteResult; receivedAt: IsoDate }
+  | { id: string; kind: "system"; text: string; at: IsoDate };

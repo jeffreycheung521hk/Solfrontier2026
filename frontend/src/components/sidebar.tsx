@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 
 const NAV = [
   { href: "/", label: "Dashboard" },
+  { href: "/chat", label: "Chat" },
   { href: "/proposal/d3b07384-d9a8-4a52-9f2c-1a2b3c4d5e6f", label: "Proposal review" },
   { href: "/approval/d3b07384-d9a8-4a52-9f2c-1a2b3c4d5e6f", label: "Approval chain" },
   { href: "/audit", label: "Audit trail" },

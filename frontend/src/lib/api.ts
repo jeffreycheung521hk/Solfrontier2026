@@ -6,8 +6,14 @@ import type {
   ApprovalRequest,
   ApprovalWorkflow,
   AuditRow,
+  ChatRequest,
+  ChatResponse,
+  ChatRouteResult,
   DashboardSnapshot,
+  OpenSessionRequest,
+  OpenSessionResponse,
   PolicyRule,
+  SessionId,
   TransactionProposal,
   WalletSummary,
 } from "@/lib/types";
@@ -68,7 +74,6 @@ function normalizePolicyRule(raw: { name: string; description: string; condition
 
 // ── Wire shapes (mirror Rust DTOs) ───────────────────────────────────────────
 
-interface PolicyRulesResponse { rules: PolicyRule[] }
 interface PendingApprovalsResponse {
   items: Array<{ request: ApprovalRequest; workflow: ApprovalWorkflow }>;
 }
@@ -181,3 +186,128 @@ export const showcase = {
   expired: workflowExpired,
   flow: demoFlow,
 };
+
+// ── Chat route client (Phase 5D.2 + 5E backend) ─────────────────────────────
+//
+// The chat surface is the only route that POSTs without a path-id (besides
+// /sessions and signature submits). It needs slightly different fetch
+// handling than the read-only helpers above:
+//
+//  - non-2xx is a domain outcome (400/404/409/503), not an exception
+//  - 200 OK still requires status-string discrimination on the body
+//
+// `postChat` therefore returns a `ChatRouteResult` envelope rather than
+// throwing. Callers branch on `.kind`.
+
+let _liveSessionPromise: Promise<SessionId> | null = null;
+
+/// Showcase-mode fixture: a stable hard-coded session id for fixture flows.
+const SHOWCASE_SESSION_ID: SessionId = "11111111-2222-3333-4444-555555555555";
+
+/// Open a new session. Caches the result for the lifetime of this client
+/// so the chat page does not pile up server-side sessions on every render.
+export async function getOrCreateSession(role: "execution" = "execution"): Promise<SessionId> {
+  if (IS_SHOWCASE) return SHOWCASE_SESSION_ID;
+  if (_liveSessionPromise) return _liveSessionPromise;
+  _liveSessionPromise = (async () => {
+    const body: OpenSessionRequest = { role, channel: "frontend-chat" };
+    const data = await live<OpenSessionResponse>("/sessions", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    return data.session_id;
+  })();
+  return _liveSessionPromise;
+}
+
+/// POST /sessions/:id/chat — strict one-turn LLM dispatch.
+/// Returns a `ChatRouteResult` envelope. Does NOT throw on domain
+/// failures; only network-level / parse failures bubble up.
+export async function postChat(
+  sessionId: SessionId,
+  message: string,
+): Promise<ChatRouteResult> {
+  if (IS_SHOWCASE) {
+    return showcaseChatReply(message);
+  }
+
+  const body: ChatRequest = { message };
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+
+  const res = await fetch(`${GATEWAY_URL}/sessions/${sessionId}/chat`, {
+    method: "POST",
+    headers,
+    cache: "no-store",
+    body: JSON.stringify(body),
+  });
+
+  // 200 OK — body is `ChatResponse`
+  if (res.ok) {
+    const parsed = (await res.json()) as ChatResponse;
+    return { kind: "ok", response: parsed };
+  }
+
+  // 409 — body is `ChatResponse` with status "pending_action_exists"
+  if (res.status === 409) {
+    const parsed = (await res.json()) as ChatResponse;
+    if (parsed.status === "pending_action_exists") {
+      return { kind: "conflict", response: parsed };
+    }
+    return { kind: "unexpected", httpStatus: 409, error: "409 with non-pending body" };
+  }
+
+  // 400 / 404 / 503 — body is `{ "error": "..." }`
+  let errorText = "";
+  try {
+    const errBody = (await res.json()) as { error?: string };
+    errorText = errBody.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+
+  if (res.status === 400) return { kind: "bad_request", error: errorText };
+  if (res.status === 404) return { kind: "not_found", error: errorText };
+  if (res.status === 503) return { kind: "disabled", error: errorText };
+
+  return { kind: "unexpected", httpStatus: res.status, error: errorText };
+}
+
+/// Showcase-mode reply: returns a deterministic ChatRouteResult based on
+/// the message content. The fixture mirrors the safe paths the live
+/// backend would take. No network call.
+function showcaseChatReply(message: string): ChatRouteResult {
+  const lower = message.toLowerCase();
+  if (lower.includes("solend") || lower.includes("usdc")) {
+    return {
+      kind: "ok",
+      response: {
+        status: "tool_dispatched",
+        tool_name: "solend_deposit_usdc",
+        output: {
+          tool_name: "solend_deposit_usdc",
+          success: true,
+          data: {
+            status: "awaiting_approval",
+            protocol: "Solend",
+            asset: "USDC",
+            amount_raw: 1000,
+            approval_request_id: "00000000-0000-0000-0000-000000000000",
+            human_readable_next_step: "review and approve via the operator dashboard",
+          },
+          error: null,
+          duration_ms: 0,
+        },
+      },
+    };
+  }
+  return {
+    kind: "ok",
+    response: {
+      status: "assistant_text",
+      assistant_text:
+        "Showcase mode is rendering a fixture reply. " +
+        "Ask me to deposit USDC into Solend to see the LLM tool-call shape.",
+    },
+  };
+}
