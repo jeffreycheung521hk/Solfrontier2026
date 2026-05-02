@@ -369,3 +369,122 @@ export const demoFlow = {
   workflowApproved,
   workflowExpired,
 };
+
+// ── Solend-deposit approved view (used by /approval/[id] showcase) ───────────
+//
+// The default `pendingView` above narrates the *policy chain* demo (50k USDC
+// transfer, risk → treasury → CFO). That is still rendered on the
+// "Demo flow (showcase)" tab as the four-state walkthrough.
+//
+// `solendApprovedView` is what `fetchApproval()` returns in showcase mode for
+// the "Current workflow" tab. It mirrors the Phase 5G real on-chain proof:
+// 0.001 USDC Solend deposit, single-stage treasury approval already cleared,
+// ready for the SigningFlow component to drive sign + submit + finalized.
+
+const SHOWCASE_SESSION_WALLET = "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L";
+const SOLEND_PROGRAM = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+
+const SOLEND_REQUEST_ID = "5d5d5d5d-0000-4000-8000-00000000501e";
+const SOLEND_TRANSACTION_ID = "5d5d5d5d-0000-4000-8000-0000000050a1";
+const SOLEND_SESSION_ID = "11111111-2222-3333-4444-555555555555";
+// Compute fresh timestamps at module load so the showcase header reads
+// "1m ago" / "Approved <1m ago" instead of a stale absolute date. Frozen
+// for the lifetime of the server process; `npm run dev` re-evaluates on
+// reload so the demo always feels live.
+const _SOLEND_NOW_MS = Date.now();
+const SOLEND_REQUESTED_AT = new Date(_SOLEND_NOW_MS - 90_000).toISOString();
+const SOLEND_APPROVED_AT = new Date(_SOLEND_NOW_MS - 60_000).toISOString();
+
+const solendProposal: TransactionProposal = {
+  id: SOLEND_TRANSACTION_ID,
+  session_id: SOLEND_SESSION_ID,
+  wallet_pubkey: SHOWCASE_SESSION_WALLET,
+  network: "mainnet-beta",
+  description: "Solend deposit: 0.001 USDC",
+  transaction_b64: "(omitted in showcase)",
+  created_at: SOLEND_REQUESTED_AT,
+  instructions_summary: [
+    {
+      program_id: SOLEND_PROGRAM,
+      program_name: "solend",
+      description: "DepositReserveLiquidityAndObligationCollateral 0.001 USDC",
+      is_legacy_token_transfer: false,
+      token_transfer: {
+        mint: USDC_MINT,
+        source: SHOWCASE_SESSION_WALLET,
+        destination: SOLEND_PROGRAM,
+        amount: 1_000, // 0.001 USDC * 10^6
+        decimals: 6,
+      },
+      accounts: [
+        { pubkey: SHOWCASE_SESSION_WALLET, label: "session wallet (signer)", is_signer: true, is_writable: true },
+        { pubkey: SOLEND_PROGRAM, label: "Solend program", is_signer: false, is_writable: false },
+        { pubkey: USDC_MINT, label: "USDC mint", is_signer: false, is_writable: false },
+      ],
+    },
+  ],
+};
+
+const solendSimulation: SimulationResult = {
+  success: true,
+  error: null,
+  compute_units_used: 78_400,
+  logs: [
+    "Program So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo invoke [1]",
+    "Program log: Instruction: DepositReserveLiquidityAndObligationCollateral",
+    "Program So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo success",
+  ],
+  return_data: null,
+  account_diffs: [],
+  fee_lamports: 5_000,
+};
+
+const solendRequest: ApprovalRequest = {
+  id: SOLEND_REQUEST_ID,
+  session_id: SOLEND_SESSION_ID,
+  transaction_id: SOLEND_TRANSACTION_ID,
+  description: "Solend deposit: 0.001 USDC",
+  policy_verdict: {
+    verdict: "requires_human_approval",
+    reason: "Solend deposit requires treasury sign-off",
+    rule_name: "solend-deposit-requires-treasury",
+    required_approver_role: "treasury",
+    approval_chain: [
+      { role: "treasury", description: "treasury sign-off", min_approvals: 1 },
+    ],
+  },
+  simulation: solendSimulation,
+  requested_at: SOLEND_REQUESTED_AT,
+  decided: true,
+  required_approver_role: "treasury",
+};
+
+const solendApprovedWorkflow: ApprovalWorkflow = {
+  request_id: SOLEND_REQUEST_ID,
+  session_id: SOLEND_SESSION_ID,
+  state: "approved",
+  stages: [
+    {
+      index: 0,
+      allowed_roles: ["treasury"],
+      min_approvals: 1,
+      decisions: [
+        {
+          approved: true,
+          operator_id: "op_treasury_bob",
+          approver_role: "treasury",
+          decided_at: SOLEND_APPROVED_AT,
+        },
+      ],
+    },
+  ],
+  created_at: SOLEND_REQUESTED_AT,
+  updated_at: SOLEND_APPROVED_AT,
+  expires_at: null,
+};
+
+export const solendApprovedView: PendingApprovalView = {
+  request: solendRequest,
+  workflow: solendApprovedWorkflow,
+  proposal: solendProposal,
+};
