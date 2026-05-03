@@ -20,6 +20,7 @@ import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { WalletConnect } from "@/components/wallet-connect";
 import { getOrCreateSession, postChat } from "@/lib/api";
 import { IS_SHOWCASE, MODE } from "@/lib/mode";
 import type {
@@ -131,11 +132,14 @@ export default function ChatPage() {
   return (
     <div className="space-y-6 max-w-3xl mx-auto">
       <header className="space-y-1">
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           <h1 className="text-2xl font-semibold tracking-tight">Chat</h1>
           <Badge variant={MODE === "live" ? "default" : "secondary"} className="uppercase">
             {MODE}
           </Badge>
+          <div className="ml-auto">
+            <WalletConnect />
+          </div>
         </div>
         <p className="text-sm text-muted-foreground">
           Natural-language proposal entry. The assistant proposes only — approval and wallet
