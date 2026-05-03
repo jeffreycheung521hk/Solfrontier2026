@@ -93,12 +93,27 @@ You do not move funds. The user must manually review, approve, and \
 sign all transactions. Never sign, submit, broadcast, or confirm a \
 transaction yourself. \
 \n\n\
+You only propose. You never execute, sign, submit, broadcast, or \
+confirm. The human will approve and sign. \
+\n\n\
 When the user asks to deposit USDC into Solend, call the \
 `solend_deposit_usdc` tool with the requested `amount` in raw token \
 units (USDC has 6 decimals; 1000 raw = 0.001 USDC). \
 Do not infer or include any other field — no `wallet_pubkey`, no \
 `reserve_mint`, no `slippage`, no `priority_fee`, no `approve`, no \
 `submit`, no `tx_bytes`, no `transaction_base64`. \
+\n\n\
+When the user asks to swap one SPL token for another (for example \
+\"swap 0.001 SOL to USDC\"), call the `submit_jupiter_swap` tool \
+with `input_mint` (base58 mint pubkey of the input token), \
+`output_mint` (base58 mint pubkey of the output token), \
+`input_amount` (raw base units of the input token; SOL has 9 \
+decimals, USDC has 6), and `slippage_bps` (basis points; 50 = 0.5%, \
+100 = 1%). Omit `wallet_pubkey` — the daemon resolves the signer \
+from the session's bound external wallet, never from the LLM. Do \
+not include any execution-side field — no `tx_bytes`, no \
+`transaction_base64`, no `signed_tx`, no `submit`, no `approve`, \
+no `priority_fee`, no `private_key`, no `keypair`. \
 \n\n\
 Make at most one tool call per turn. After the tool returns, stop — \
 do not call additional tools, do not approve, do not sign.";
@@ -107,7 +122,7 @@ do not call additional tools, do not approve, do not sign.";
 
 /// Name of the only tool the chat-route surface exposes to the LLM in
 /// Phase 5E. Lives as a constant so the source guards can lock it.
-pub const CHAT_TOOL_ALLOWLIST: &[&str] = &["solend_deposit_usdc"];
+pub const CHAT_TOOL_ALLOWLIST: &[&str] = &["solend_deposit_usdc", "submit_jupiter_swap"];
 
 /// Build a registry containing only the tools in [`CHAT_TOOL_ALLOWLIST`]
 /// that exist in `full`. Returns `None` if none of the allowlisted
@@ -485,11 +500,37 @@ mod source_guard_tests {
     #[test]
     fn p5e_j_system_prompt_contains_alignment_override() {
         let p = super::ALIGNMENT_SYSTEM_PROMPT;
+        // ── Original Phase 5E intro clauses (must stay byte-stable) ──
         assert!(p.contains("prepares transaction proposals"));
         assert!(p.contains("You do not move funds"));
         assert!(p.contains("user must manually review, approve, and sign"));
         // Belt-and-braces — never sign / submit / broadcast / confirm.
         assert!(p.contains("Never sign, submit, broadcast, or confirm"));
+
+        // ── Global propose-only invariant (Agent C reinforcement) ──
+        assert!(
+            p.contains(
+                "You only propose. You never execute, sign, submit, broadcast, or \
+                 confirm. The human will approve and sign."
+            ),
+            "global propose-only invariant must be present verbatim"
+        );
+
+        // ── Solend-side clause — must remain intact ──
+        assert!(p.contains("solend_deposit_usdc"));
+
+        // ── Jupiter-side clause (Agent C addition) ──
+        assert!(p.contains("submit_jupiter_swap"));
+        assert!(p.contains("input_mint"));
+        assert!(p.contains("output_mint"));
+        assert!(p.contains("input_amount"));
+        assert!(p.contains("slippage_bps"));
+        // wallet_pubkey must be told to be omitted (session binding).
+        assert!(p.contains("Omit `wallet_pubkey`"));
+        // The Jupiter clause must reject execution-side fields.
+        assert!(p.contains("tx_bytes"));
+        assert!(p.contains("transaction_base64"));
+        assert!(p.contains("signed_tx"));
     }
 
     /// Phase 5E — provider hang/cost guards must stay tight.
@@ -766,6 +807,55 @@ mod p5e_env_gate_tests {
         ToolRegistry::from_tools(vec![Arc::new(StubSolendDepositTool)])
     }
 
+    // ── A stub submit_jupiter_swap tool that mirrors the production
+    // tool's input schema (4 required + 2 optional, no execution-side
+    // fields) but does no work. Used for the chat-route narrowing /
+    // strict-schema assertions in p5e_h. ──────────────────────────────
+
+    struct StubJupiterSwapTool;
+
+    #[async_trait]
+    impl Tool for StubJupiterSwapTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "submit_jupiter_swap".into(),
+                description: "stub for Phase 5E env-gate tests".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["input_mint", "output_mint", "input_amount", "slippage_bps"],
+                    "properties": {
+                        "input_mint":    { "type": "string" },
+                        "output_mint":   { "type": "string" },
+                        "input_amount":  { "type": "integer", "minimum": 1 },
+                        "slippage_bps":  { "type": "integer", "minimum": 0, "maximum": 10000 },
+                        "wallet_pubkey": { "type": "string" },
+                        "description":   { "type": "string" }
+                    }
+                }),
+                output_schema: json!({"type":"object"}),
+                required_capabilities: vec!["propose_signing".to_string()],
+                supports_streaming: false,
+                timeout_ms: 30_000,
+            }
+        }
+        async fn execute(&self, _: ToolInput) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                tool_name: "submit_jupiter_swap".into(),
+                success: true,
+                data: Some(json!({"status":"awaiting_approval"})),
+                error: None,
+                duration_ms: 0,
+            })
+        }
+    }
+
+    fn stub_registry_with_solend_and_jupiter() -> ToolRegistry {
+        ToolRegistry::from_tools(vec![
+            Arc::new(StubSolendDepositTool),
+            Arc::new(StubJupiterSwapTool),
+        ])
+    }
+
     // ── Class A — default chat provider disabled without env ──────────────
 
     #[test]
@@ -898,9 +988,21 @@ mod p5e_env_gate_tests {
     }
 
     // ── Class H — strict_tool_schema_shape_is_amount_only ─────────────────
+    //
+    // Two phases:
+    //   1. Solend-only registry → narrowed surface is exactly
+    //      `solend_deposit_usdc` with the strict amount-only schema. This
+    //      is the original Phase 5E invariant; it must NOT be weakened by
+    //      adding Jupiter to the allowlist.
+    //   2. Solend + Jupiter registry → narrowed surface contains both
+    //      tools. The Jupiter input schema lists the four required fields
+    //      (input_mint / output_mint / input_amount / slippage_bps) plus
+    //      the two optional fields (wallet_pubkey / description) and
+    //      mentions no execution-side payload key.
 
     #[test]
     fn p5e_h_strict_tool_schema_shape_is_amount_only() {
+        // ── Phase 1: Solend-only registry ──
         let narrowed = narrow_registry_for_chat(&stub_registry())
             .expect("stub registry contains solend_deposit_usdc");
         let names = narrowed.names();
@@ -932,7 +1034,89 @@ mod p5e_env_gate_tests {
         ] {
             assert!(
                 !raw.contains(forbidden),
-                "strict chat schema must not mention `{forbidden}`; got {raw}"
+                "strict Solend chat schema must not mention `{forbidden}`; got {raw}"
+            );
+        }
+
+        // ── Phase 2: Solend + Jupiter registry ──
+        let both = narrow_registry_for_chat(&stub_registry_with_solend_and_jupiter())
+            .expect("stub registry contains both chat tools");
+        let mut names = both.names();
+        names.sort();
+        let mut expected_names =
+            vec!["solend_deposit_usdc".to_string(), "submit_jupiter_swap".to_string()];
+        expected_names.sort();
+        assert_eq!(names, expected_names, "narrowed registry must contain both chat tools");
+
+        // Jupiter spec.
+        let jupiter_spec = both
+            .all_specs()
+            .into_iter()
+            .find(|s| s.name == "submit_jupiter_swap")
+            .expect("jupiter spec present after narrowing");
+        let jupiter_schema = &jupiter_spec.input_schema;
+
+        // Required = exactly the four intent-level fields.
+        let required = jupiter_schema["required"]
+            .as_array()
+            .expect("jupiter required array");
+        let required_set: std::collections::HashSet<&str> = required
+            .iter()
+            .map(|v| v.as_str().expect("required entry is a string"))
+            .collect();
+        let expected_required: std::collections::HashSet<&str> = [
+            "input_mint",
+            "output_mint",
+            "input_amount",
+            "slippage_bps",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            required_set, expected_required,
+            "jupiter required fields drift; got {required_set:?}"
+        );
+
+        // wallet_pubkey + description are present as optional properties
+        // (in `properties` but not in `required`).
+        let props = jupiter_schema["properties"]
+            .as_object()
+            .expect("jupiter properties object");
+        assert!(
+            props.contains_key("wallet_pubkey"),
+            "wallet_pubkey must be advertised as optional"
+        );
+        assert!(
+            props.contains_key("description"),
+            "description must be advertised as optional"
+        );
+        assert!(
+            !required_set.contains("wallet_pubkey"),
+            "wallet_pubkey must NOT be required (session binding resolves it)"
+        );
+        assert!(
+            !required_set.contains("description"),
+            "description must NOT be required"
+        );
+
+        // Forbidden execution-side fields must not appear anywhere in the
+        // Jupiter input-schema text. The Solend strict schema blocks these
+        // via `additionalProperties: false`; the Jupiter schema (per its
+        // production shape) does not, so we rely on a raw-text scan as the
+        // chat-layer safety guard.
+        let raw_jupiter = serde_json::to_string(jupiter_schema).unwrap();
+        for forbidden in [
+            "tx_bytes",
+            "transaction_base64",
+            "signed_tx",
+            "submit",
+            "approve",
+            "private_key",
+            "keypair",
+        ] {
+            assert!(
+                !raw_jupiter.contains(forbidden),
+                "strict Jupiter chat schema must not mention `{forbidden}`; got {raw_jupiter}"
             );
         }
     }

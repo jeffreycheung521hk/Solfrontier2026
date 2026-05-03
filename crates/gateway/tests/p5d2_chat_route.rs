@@ -211,6 +211,91 @@ impl Tool for FakeTool {
     }
 }
 
+// ── Real-name stubs for the chat allowlist ────────────────────────────────
+//
+// The classes below (R/S/T/U) exercise the chat-route dispatch path with
+// the *actual* tool names the chat allowlist exposes (`solend_deposit_usdc`,
+// `submit_jupiter_swap`). Using real names — rather than the generic
+// `fake_propose` — lets class T prove that the multi-tool rejection is
+// driven purely by the one-tool-per-turn policy: both calls are valid
+// allowlisted names, and the whole turn is still rejected.
+//
+// These stubs do no work and have no provider dependency; they simply
+// emit a deterministic `awaiting_approval` output so the route can map
+// it into a `tool_dispatched` wire response.
+
+struct SolendDepositStub;
+
+#[async_trait]
+impl Tool for SolendDepositStub {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "solend_deposit_usdc".into(),
+            description: "test-only Solend deposit stub".into(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["amount"],
+                "properties": {
+                    "amount": { "type": "integer", "minimum": 1 }
+                }
+            }),
+            output_schema: json!({"type": "object"}),
+            required_capabilities: vec!["propose_signing".to_string()],
+            supports_streaming: false,
+            timeout_ms: 5_000,
+        }
+    }
+
+    async fn execute(&self, _: ToolInput) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            tool_name: "solend_deposit_usdc".into(),
+            success: true,
+            data: Some(json!({"status": "awaiting_approval"})),
+            error: None,
+            duration_ms: 0,
+        })
+    }
+}
+
+struct JupiterSwapStub;
+
+#[async_trait]
+impl Tool for JupiterSwapStub {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "submit_jupiter_swap".into(),
+            description: "test-only Jupiter swap stub".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["input_mint", "output_mint", "input_amount", "slippage_bps"],
+                "properties": {
+                    "input_mint":    { "type": "string" },
+                    "output_mint":   { "type": "string" },
+                    "input_amount":  { "type": "integer", "minimum": 1 },
+                    "slippage_bps":  { "type": "integer", "minimum": 0, "maximum": 10000 },
+                    "wallet_pubkey": { "type": "string" },
+                    "description":   { "type": "string" }
+                }
+            }),
+            output_schema: json!({"type": "object"}),
+            required_capabilities: vec!["propose_signing".to_string()],
+            supports_streaming: false,
+            timeout_ms: 30_000,
+        }
+    }
+
+    async fn execute(&self, _: ToolInput) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            tool_name: "submit_jupiter_swap".into(),
+            success: true,
+            data: Some(json!({"status": "awaiting_approval"})),
+            error: None,
+            duration_ms: 0,
+        })
+    }
+}
+
 // ── Test harness ───────────────────────────────────────────────────────────
 
 struct Ctx {
@@ -231,7 +316,25 @@ fn registry_with_fake_tool() -> ToolRegistry {
     ToolRegistry::from_tools(vec![Arc::new(FakeTool)])
 }
 
+/// Registry that exposes BOTH chat-allowlisted tool names with their
+/// real names. Used by the Jupiter / multi-tool / unknown-tool tests
+/// (classes R / S / T / U) to verify the dispatch / rejection paths
+/// hold for the real allowlist surface.
+fn registry_with_solend_and_jupiter_stubs() -> ToolRegistry {
+    ToolRegistry::from_tools(vec![
+        Arc::new(SolendDepositStub),
+        Arc::new(JupiterSwapStub),
+    ])
+}
+
 async fn build_ctx(scripted: Option<Arc<ScriptedLlmProvider>>) -> Ctx {
+    build_ctx_with_registry(scripted, registry_with_fake_tool()).await
+}
+
+async fn build_ctx_with_registry(
+    scripted: Option<Arc<ScriptedLlmProvider>>,
+    registry: ToolRegistry,
+) -> Ctx {
     let sid = SessionId::from(Uuid::new_v4());
     let (tx, _) = broadcast::channel::<GatewayEvent>(4);
 
@@ -239,7 +342,7 @@ async fn build_ctx(scripted: Option<Arc<ScriptedLlmProvider>>) -> Ctx {
         let llm: LlmClientRef = p;
         GatewayChatHandler::new(
             llm,
-            registry_with_fake_tool(),
+            registry,
             SYS_PROMPT.to_string(),
             caps_for_chat(),
         )
@@ -536,4 +639,130 @@ async fn class_q_missing_bearer_returns_401() {
         .unwrap();
     let resp = ctx.router.clone().oneshot(unauth).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─── Agent C additions — Jupiter swap on the chat route ───────────────────
+//
+// Class R / S / T / U exercise the chat-route dispatch path with the real
+// allowlisted tool names (`solend_deposit_usdc` and `submit_jupiter_swap`).
+// They run against an in-memory registry built via
+// `registry_with_solend_and_jupiter_stubs()` and use `ScriptedLlmProvider`,
+// so no provider API call, no live network, no signing/submit code path is
+// exercised.
+
+// Class R — Jupiter swap dispatched (non-pending) → 200
+#[tokio::test]
+async fn class_r_jupiter_swap_dispatched_returns_200_with_output() {
+    let prov = scripted_tool_call(
+        "submit_jupiter_swap",
+        json!({
+            "input_mint":   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "output_mint":  "So11111111111111111111111111111111111111112",
+            "input_amount": 1_000_000,
+            "slippage_bps": 50,
+        }),
+    );
+    let ctx = build_ctx_with_registry(
+        Some(prov.clone()),
+        registry_with_solend_and_jupiter_stubs(),
+    )
+    .await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message": "swap 1 USDC to SOL"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "tool_dispatched");
+    assert_eq!(body["tool_name"], "submit_jupiter_swap");
+    assert_eq!(body["output"]["data"]["status"], "awaiting_approval");
+}
+
+// Class S — malformed Jupiter args → 200 with malformed variant
+//
+// Provider returns a non-object input for `submit_jupiter_swap` (a JSON
+// array). The chat handler must fail closed with the malformed-arguments
+// variant — same path Class E exercises for `fake_propose`.
+#[tokio::test]
+async fn class_s_malformed_jupiter_args_returns_200_with_malformed() {
+    let prov = scripted_tool_call(
+        "submit_jupiter_swap",
+        json!(["not", "an", "object"]),
+    );
+    let ctx = build_ctx_with_registry(
+        Some(prov.clone()),
+        registry_with_solend_and_jupiter_stubs(),
+    )
+    .await;
+    let req = authed_post(chat_uri(&ctx.sid), json!({"message":"x"}).to_string());
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "malformed_tool_arguments");
+    assert_eq!(body["tool_name"], "submit_jupiter_swap");
+}
+
+// Class T — multi-tool with both real allowlisted names rejected whole-turn
+//
+// This is the load-bearing one: even if the LLM emits two perfectly
+// valid allowlisted tool calls (Solend deposit + Jupiter swap) in a
+// single turn, the ConversationHandler MUST reject the entire turn
+// because of the one-tool-per-turn invariant — not because either tool
+// is unknown.
+#[tokio::test]
+async fn class_t_solend_plus_jupiter_multi_tool_rejected_whole_turn() {
+    let prov = Arc::new(ScriptedLlmProvider::tool_calls(vec![
+        LlmToolCall {
+            id: "a".into(),
+            tool_name: "solend_deposit_usdc".into(),
+            input: json!({"amount": 1000}),
+        },
+        LlmToolCall {
+            id: "b".into(),
+            tool_name: "submit_jupiter_swap".into(),
+            input: json!({
+                "input_mint":   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "output_mint":  "So11111111111111111111111111111111111111112",
+                "input_amount": 1_000_000,
+                "slippage_bps": 50,
+            }),
+        },
+    ]));
+    let ctx = build_ctx_with_registry(
+        Some(prov.clone()),
+        registry_with_solend_and_jupiter_stubs(),
+    )
+    .await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message":"deposit and swap in one turn"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "multiple_tool_calls_rejected");
+    assert_eq!(body["count"], 2);
+}
+
+// Class U — unknown / forbidden tool still denied with Jupiter registered
+//
+// Adding `submit_jupiter_swap` to the chat allowlist must not widen the
+// surface to other tools. A scripted call to a name that is not in the
+// allowlist (`send_raw_transaction`) must still resolve to the
+// unknown-or-denied variant, even when the registry has both real
+// chat tools registered.
+#[tokio::test]
+async fn class_u_unknown_tool_still_denied_with_jupiter_registered() {
+    let prov = scripted_tool_call("send_raw_transaction", json!({"tx": "00"}));
+    let ctx = build_ctx_with_registry(
+        Some(prov.clone()),
+        registry_with_solend_and_jupiter_stubs(),
+    )
+    .await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message":"submit raw"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "unknown_or_denied_tool");
+    assert_eq!(body["tool_name"], "send_raw_transaction");
 }
