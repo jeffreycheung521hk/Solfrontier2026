@@ -767,3 +767,294 @@ async fn class_u_unknown_tool_still_denied_with_jupiter_registered() {
     assert_eq!(body["status"], "unknown_or_denied_tool");
     assert_eq!(body["tool_name"], "send_raw_transaction");
 }
+
+// ─── Phase 6C additions — read-only chat tools ────────────────────────────
+//
+// Class V/W/X/Y/Z/AA exercise the chat-route dispatch path with the two
+// new read-only tools (`get_wallet_balances` and `get_jupiter_quote`).
+// They use ScriptedLlmProvider so no live provider call, no RPC, no
+// Jupiter API contact. The stubs below mirror the production tool names
+// so the multi-tool rejection (class Z) provably triggers on the
+// batching policy alone, not on a name-unknown path.
+
+struct BalancesStub;
+
+#[async_trait]
+impl Tool for BalancesStub {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "get_wallet_balances".into(),
+            description: "test-only Phase 6C balances stub".into(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": [],
+                "properties": {}
+            }),
+            output_schema: json!({"type": "object"}),
+            required_capabilities: vec![],
+            supports_streaming: false,
+            timeout_ms: 8_000,
+        }
+    }
+
+    async fn execute(&self, _: ToolInput) -> Result<ToolOutput, ToolError> {
+        // Simulate a wallet with 0.05 USDC and 0.1 SOL — chosen so the
+        // insufficient-balance demo (class AA) is unambiguous when the
+        // user requests "deposit 0.1 USDC".
+        Ok(ToolOutput {
+            tool_name: "get_wallet_balances".into(),
+            success: true,
+            data: Some(json!({
+                "status": "ok",
+                "wallet_pubkey": "3xTfBYx7Y7iC5HgKXTpe9eKJD1FH3v4qDcSFv6oxrt7P",
+                "sol_lamports": 100_000_000,
+                "sol_ui": "0.100000000",
+                "usdc_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "usdc_ata": "BalancesStubATA1111111111111111111111111111",
+                "usdc_raw": 50_000,
+                "usdc_ui": "0.050000",
+            })),
+            error: None,
+            duration_ms: 0,
+        })
+    }
+}
+
+struct QuoteStub;
+
+#[async_trait]
+impl Tool for QuoteStub {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "get_jupiter_quote".into(),
+            description: "test-only Phase 6C Jupiter quote stub".into(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["input_mint", "output_mint", "input_amount", "slippage_bps"],
+                "properties": {
+                    "input_mint":   { "type": "string" },
+                    "output_mint":  { "type": "string" },
+                    "input_amount": { "type": "integer", "minimum": 1 },
+                    "slippage_bps": { "type": "integer", "minimum": 0, "maximum": 100 }
+                }
+            }),
+            output_schema: json!({"type": "object"}),
+            required_capabilities: vec![],
+            supports_streaming: false,
+            timeout_ms: 8_000,
+        }
+    }
+
+    async fn execute(&self, input: ToolInput) -> Result<ToolOutput, ToolError> {
+        let slippage_bps = input.parameters["slippage_bps"].as_u64().unwrap_or(0);
+        if slippage_bps > 100 {
+            return Ok(ToolOutput {
+                tool_name: "get_jupiter_quote".into(),
+                success: false,
+                data: Some(json!({
+                    "status": "policy_blocked",
+                    "policy_rule_name": "slippage-exceeds-quote-cap",
+                    "slippage_bps": slippage_bps,
+                })),
+                error: Some(format!("slippage_bps {slippage_bps} exceeds 100")),
+                duration_ms: 0,
+            });
+        }
+        Ok(ToolOutput {
+            tool_name: "get_jupiter_quote".into(),
+            success: true,
+            data: Some(json!({
+                "status": "ok",
+                "input_mint": input.parameters["input_mint"],
+                "output_mint": input.parameters["output_mint"],
+                "input_amount": input.parameters["input_amount"],
+                "out_amount": 150_000,
+                "other_amount_threshold": 148_500,
+                "price_impact_pct": "0.0123",
+                "route_summary": ["Orca"],
+                "slippage_bps": slippage_bps,
+            })),
+            error: None,
+            duration_ms: 0,
+        })
+    }
+}
+
+fn registry_with_all_chat_tools() -> ToolRegistry {
+    ToolRegistry::from_tools(vec![
+        Arc::new(SolendDepositStub),
+        Arc::new(JupiterSwapStub),
+        Arc::new(BalancesStub),
+        Arc::new(QuoteStub),
+    ])
+}
+
+// Class V — get_wallet_balances dispatched → 200 with balance JSON
+#[tokio::test]
+async fn class_v_balance_query_dispatched_returns_200_with_output() {
+    let prov = scripted_tool_call("get_wallet_balances", json!({}));
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message":"What are my balances?"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "tool_dispatched");
+    assert_eq!(body["tool_name"], "get_wallet_balances");
+    assert_eq!(body["output"]["data"]["status"], "ok");
+    assert_eq!(body["output"]["data"]["usdc_raw"], 50_000);
+    assert_eq!(body["output"]["data"]["usdc_ui"], "0.050000");
+    assert_eq!(body["output"]["data"]["sol_lamports"], 100_000_000);
+}
+
+// Class W — get_jupiter_quote dispatched → 200 with quote JSON
+#[tokio::test]
+async fn class_w_quote_query_dispatched_returns_200_with_output() {
+    let prov = scripted_tool_call(
+        "get_jupiter_quote",
+        json!({
+            "input_mint":   "So11111111111111111111111111111111111111112",
+            "output_mint":  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "input_amount": 1_000_000,
+            "slippage_bps": 100,
+        }),
+    );
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message":"How much USDC for 0.001 SOL?"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "tool_dispatched");
+    assert_eq!(body["tool_name"], "get_jupiter_quote");
+    assert_eq!(body["output"]["data"]["status"], "ok");
+    assert_eq!(body["output"]["data"]["out_amount"], 150_000);
+    assert!(body["output"]["data"]["route_summary"].is_array());
+}
+
+// Class X — quote with slippage > 100 → 200 dispatched with policy_blocked
+//
+// The tool intentionally keeps this on the dispatched path (Ok ToolOutput
+// with success=false) so the LLM/UI can render structured rejection info
+// instead of a generic ToolError variant.
+#[tokio::test]
+async fn class_x_quote_over_slippage_returns_policy_blocked() {
+    let prov = scripted_tool_call(
+        "get_jupiter_quote",
+        json!({
+            "input_mint":   "So11111111111111111111111111111111111111112",
+            "output_mint":  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "input_amount": 1_000_000,
+            "slippage_bps": 200,
+        }),
+    );
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message":"Quote 0.001 SOL with 2% slippage"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "tool_dispatched");
+    assert_eq!(body["tool_name"], "get_jupiter_quote");
+    assert_eq!(body["output"]["data"]["status"], "policy_blocked");
+    assert_eq!(
+        body["output"]["data"]["policy_rule_name"],
+        "slippage-exceeds-quote-cap"
+    );
+}
+
+// Class Y — conditional prompt scripted to call get_wallet_balances FIRST
+//
+// When the LLM is given a conditional message ("deposit X if balance is
+// above Y"), the alignment prompt instructs it to call the read-only
+// tool first and stop the turn. We assert the wire shape: the chat
+// route returns the balance dispatch — NOT a deposit proposal.
+#[tokio::test]
+async fn class_y_conditional_prompt_routes_to_balance_check_first() {
+    let prov = scripted_tool_call("get_wallet_balances", json!({}));
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message":"Deposit 0.001 USDC into Solend if my USDC balance is above 0.3."})
+            .to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "tool_dispatched");
+    assert_eq!(body["tool_name"], "get_wallet_balances");
+    // The deposit tool MUST NOT have been invoked in this turn.
+    assert_ne!(body["tool_name"], "solend_deposit_usdc");
+}
+
+// Class Z — read-only + write tool batched in one turn → whole-turn rejected
+//
+// Even when the LLM emits a perfectly valid balance check AND a valid
+// solend_deposit_usdc call in the same turn, the ConversationHandler
+// MUST reject the entire turn for one-tool-per-turn — exactly as it
+// rejected the Solend + Jupiter batch in class T.
+#[tokio::test]
+async fn class_z_balance_plus_deposit_multi_tool_rejected_whole_turn() {
+    let prov = Arc::new(ScriptedLlmProvider::tool_calls(vec![
+        LlmToolCall {
+            id: "a".into(),
+            tool_name: "get_wallet_balances".into(),
+            input: json!({}),
+        },
+        LlmToolCall {
+            id: "b".into(),
+            tool_name: "solend_deposit_usdc".into(),
+            input: json!({"amount": 1000}),
+        },
+    ]));
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message":"Check balance and deposit"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "multiple_tool_calls_rejected");
+    assert_eq!(body["count"], 2);
+}
+
+// Class AA — insufficient-balance demo: LLM declines with text only
+//
+// Demo flow: user asks "deposit 0.1 USDC if I have it". On a follow-up
+// turn (or in a single-turn fast path) where the LLM has already seen
+// the balance and concluded it is insufficient, the alignment prompt
+// instructs it to respond with plain text and NOT call any transaction
+// tool. This test scripts that exact path: the provider returns an
+// assistant_text response naming the observed balance and declining.
+// The chat route surfaces this as ChatResponse::AssistantText (200).
+#[tokio::test]
+async fn class_aa_insufficient_balance_returns_assistant_text_no_proposal() {
+    let prov = scripted_assistant(
+        "Your USDC balance is 0.050000 (50000 raw), which is insufficient \
+         for the requested 0.1 USDC deposit. I will not create a proposal.",
+    );
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message":"Deposit 0.1 USDC into Solend if I have it."}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "assistant_text");
+    let text = body["assistant_text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("insufficient") || text.contains("Insufficient"),
+        "expected insufficient-balance phrasing; got {text}"
+    );
+    assert!(
+        text.contains("not create") || text.contains("will not"),
+        "expected explicit no-proposal phrasing; got {text}"
+    );
+    // Wire-shape: no tool_dispatched fields on this 200 path.
+    assert!(body["tool_name"].is_null());
+    assert!(body["output"].is_null());
+}
