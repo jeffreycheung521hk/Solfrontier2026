@@ -833,6 +833,7 @@ async fn a1_execute_daemon_path_reaches_mainnet_confirmed() {
         events: EventSubscriberRef::new(Arc::new(BusEvents(tx))),
         wallet_signatures: WalletSignatureHandlerRef::new(completion_handler),
         solend_signatures: None,
+        solend_jit_prepare: None,
         wallet_challenges: WalletChallengeHandlerRef::new(challenge_handler),
         auth_token: AuthToken::new(AUTH_TOKEN),
         operator_registry: OperatorRegistry::new(),

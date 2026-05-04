@@ -356,6 +356,7 @@ async fn build_ctx_with_registry(
         events:            EventSubscriberRef::new(Arc::new(StubEvents(tx))),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(StubWalletSig)),
         solend_signatures: None,
+        solend_jit_prepare: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubChallenge)),
         auth_token:        AuthToken::new(TOKEN),
         operator_registry: OperatorRegistry::new(),

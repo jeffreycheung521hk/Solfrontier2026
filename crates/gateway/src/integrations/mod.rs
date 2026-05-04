@@ -11,6 +11,7 @@ pub mod jupiter_production;
 pub mod jupiter_tx;
 pub mod solend;
 pub mod solend_confirmation;
+pub mod solend_jit_ready;
 pub mod solend_lifecycle;
 pub mod solend_park;
 pub mod solend_preflight;

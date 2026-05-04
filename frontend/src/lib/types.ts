@@ -416,6 +416,13 @@ export type SolendSubmitResult =
 export type SigningHandoffState =
   | { kind: "idle" }
   | { kind: "polling"; attempts: number }
+  /// Phase 6B Window 3: POST /sessions/:s/approvals/:a/solend-signing/prepare
+  /// is in flight. Entered on the user's Sign-with-Phantom click.
+  | { kind: "preparing" }
+  /// Phase 6B Window 3: prepare returned a typed failure variant
+  /// other than Ready. The UI shows a retryable error so the operator
+  /// can click Sign again (or fix wallet binding) without re-approval.
+  | { kind: "prepare_failed"; reason: string }
   | {
       kind: "ready";
       unsigned_tx_b64: string;
@@ -444,3 +451,30 @@ export type SigningHandoffState =
       tx_signature: string;
     }
   | { kind: "error"; error: string };
+
+// ── Phase 6B Window 3 — JIT-prepare wire shape ──────────────────────────────
+//
+// Wire shape of the `POST /sessions/:s/approvals/:a/solend-signing/prepare`
+// response. Tagged union by `status`; HTTP status mapping:
+//   200  → "ready"
+//   404  → "not_found" | "jit_ready_missing"
+//   422  → "not_approved" | "wallet_mismatch"
+//   502  → "handoff_create_failed"
+// 400 / 503 / network errors are surfaced through the api.ts envelope as
+// `{ kind: "error", httpStatus, error }` rather than as a status variant.
+export type SolendJitPrepareResult =
+  | {
+      status: "ready";
+      approval_request_id: Uuid;
+      signing_request_id: Uuid;
+      session_id: SessionId;
+      wallet: string;
+      last_valid_block_height: number;
+      verified_slot: number;
+      expires_at_unix_ms: number;
+    }
+  | { status: "not_approved"; state: string }
+  | { status: "jit_ready_missing" }
+  | { status: "wallet_mismatch"; expected: string; bound: string | null }
+  | { status: "handoff_create_failed"; error_type: string; message: string }
+  | { status: "not_found" };
