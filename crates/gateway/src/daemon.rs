@@ -516,6 +516,40 @@ impl GatewayDaemon {
             solend_audit_sink.clone(),
             config.policy.approval_lease_seconds,
         );
+
+        // ── 10d. Phase 6C-B — read-only copilot tools ────────────────────────
+        //
+        // `get_wallet_balances` and `get_jupiter_quote` are wired into the
+        // production registry so the chat handler can dispatch them at run
+        // time. Both are pure reads:
+        //
+        //   - get_wallet_balances has no inputs and uses the existing RPC
+        //     pool + the same `external_wallet` session-binding lookup as
+        //     `submit_jupiter_swap`.
+        //   - get_jupiter_quote uses its own `HttpJupiterClient` so the
+        //     read-only quote tool is available even when
+        //     `[jupiter] enabled = false` (quote is safe; only the swap
+        //     execution is gated).
+        //
+        // Capability footprint: both tools advertise
+        // `required_capabilities: vec![]`. No approval, no signing, no
+        // broadcast path is added by this wiring.
+        let registry = crate::runtime::copilot_tools_wiring::wire_get_wallet_balances_tool(
+            registry,
+            rpc_client.clone(),
+            external_wallet.clone(),
+        );
+        let registry = {
+            use crate::integrations::jupiter::{HttpJupiterClient, JupiterClient};
+            let quote_client: Arc<dyn JupiterClient> = Arc::new(
+                HttpJupiterClient::with_base_url(config.jupiter.base_url.clone()),
+            );
+            crate::runtime::copilot_tools_wiring::wire_get_jupiter_quote_tool(
+                registry,
+                quote_client,
+            )
+        };
+        info!("get_wallet_balances + get_jupiter_quote read-only chat tools active");
         // Phase 4C-6: Solend submit HTTP handler. Bridges the API trait
         // to the 4C-5 submit pipeline + 4C-6 lifecycle cache. No new
         // background task, no new blockhash/signer path — the handler
