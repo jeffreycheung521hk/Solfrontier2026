@@ -476,12 +476,19 @@ impl GatewayDaemon {
         // integration-specific glue must NOT bloat `daemon.rs`. This
         // daemon site stays a one-line call so the next integration's
         // wiring lands in its own sibling module rather than here.
-        // Phase 4C-4 signing handoff: the new SolendSigningStore lives
-        // for the daemon lifetime (same as SolendParkStore). The
-        // BlockhashManager is reused from §3 above — no new background
-        // task, no new route.
+        // Phase 4C-4 signing handoff: the SolendSigningStore lives for
+        // the daemon lifetime (same as SolendParkStore). It is no
+        // longer populated by the resume task (Phase 6B); the prepare
+        // HTTP route added in Window 2 will populate it on demand.
         let pending_solend_signing =
             crate::integrations::solend_signing::SolendSigningStore::new();
+        // Phase 6B JIT-ready store. The resume task parks a JIT-ready
+        // entry here keyed by approval_request_id when preflight
+        // passes, instead of creating a signing handoff at approval
+        // time. Carries plan + preflight only — no transaction bytes,
+        // no blockhash, no signature.
+        let pending_solend_jit_ready =
+            crate::integrations::solend_jit_ready::SolendJitReadyStore::new();
         // Phase 4C-6 submission-outcome cache. Shares the approval
         // lease TTL so a submit attempt that arrives just past the
         // signing window still sees the terminal state for one lease
@@ -505,8 +512,7 @@ impl GatewayDaemon {
             external_wallet.clone(),
             approval_store.clone(),
             pending_solend_park.clone(),
-            pending_solend_signing.clone(),
-            blockhash_mgr.clone(),
+            pending_solend_jit_ready.clone(),
             solend_audit_sink.clone(),
             config.policy.approval_lease_seconds,
         );

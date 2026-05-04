@@ -42,7 +42,6 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use claw_solana_core::blockhash::BlockhashManager;
 use claw_solana_core::rpc::RpcPool;
 use claw_tool_system::registry::ToolRegistry;
 
@@ -51,12 +50,10 @@ use crate::external_wallet::ExternalWalletStore;
 use crate::integrations::solend::{
     ClawRpcPoolAccountFetcher, SolendSnapshotAssembler,
 };
-use crate::integrations::solend_park::{SolendParkStore, SolendSigningDeps};
+use crate::integrations::solend_jit_ready::{SolendJitReadyDeps, SolendJitReadyStore};
+use crate::integrations::solend_park::SolendParkStore;
 use crate::integrations::solend_preflight::{
     ClawRpcPoolPreflightRpc, SolendPreflightSimulator,
-};
-use crate::integrations::solend_signing::{
-    ClawBlockhashProvider, RecentBlockhashProvider, SolendSigningStore,
 };
 use crate::integrations::solend_submit::SolendAuditSink;
 use crate::lending::{
@@ -162,8 +159,7 @@ pub fn wire_solend_deposit_tool(
     external_wallet: ExternalWalletStore,
     approval_store: ApprovalStore,
     pending_solend_park: SolendParkStore,
-    signing_store: SolendSigningStore,
-    blockhash_manager: Arc<BlockhashManager>,
+    jit_ready_store: SolendJitReadyStore,
     audit_sink: Arc<dyn SolendAuditSink>,
     approval_lease_seconds: u64,
 ) -> ToolRegistry {
@@ -203,26 +199,23 @@ pub fn wire_solend_deposit_tool(
         ),
     );
 
-    // ── Phase 4C-4 signing handoff deps ─────────────────────────────────────
+    // ── Phase 6B JIT-ready deps ─────────────────────────────────────────────
     //
-    // `SolendSigningStore` holds the obligation Keypair + partially-signed
-    // tx bytes for the signing window only (TTL-enforced). The blockhash
-    // provider wraps the daemon's `BlockhashManager` so the signing
-    // handoff uses a real cached recent blockhash — NOT
-    // `replace_recent_blockhash`, which is preflight-only.
-    let blockhash_provider: Arc<dyn RecentBlockhashProvider> =
-        Arc::new(ClawBlockhashProvider::new(blockhash_manager));
-
-    // Phase 4C-5 W3 remediation: audit sink is shared between handoff
-    // events (4C-4) and submit events (4C-5) so every Solend signing /
-    // submit lifecycle step is append-only recorded. Production passes
-    // `Arc<AuditRepositorySink>` wrapping the shared `AuditRepository`;
-    // tests pass `Arc<NullSolendAuditSink>` or a recording mock.
-    let signing_deps = SolendSigningDeps {
-        store: signing_store,
-        blockhash_provider,
+    // The resume task no longer constructs a signing-handoff artifact
+    // at approval time. Instead it parks a JIT-ready entry in the
+    // `SolendJitReadyStore` (keyed by approval_request_id) carrying the
+    // pure plan + preflight outcome. The prepare HTTP route (added in
+    // Window 2) drives the handoff-creation step on demand with a
+    // fresh blockhash when the user clicks Sign with Phantom — so the
+    // blockhash budget starts at the click, not at approval time.
+    //
+    // The audit sink is shared between this resume-time JIT-ready
+    // event and submit events so every Solend lifecycle step is
+    // append-only recorded.
+    let jit_ready_deps = SolendJitReadyDeps {
+        store: jit_ready_store,
         audit: audit_sink,
-        signing_lease_seconds: approval_lease_seconds,
+        jit_ready_lease_seconds: approval_lease_seconds,
     };
 
     // ── Compose + register the tool ─────────────────────────────────────────
@@ -237,10 +230,10 @@ pub fn wire_solend_deposit_tool(
             approval_lease_seconds,
         )
         .with_preflight_simulator(preflight_simulator)
-        .with_signing_deps(signing_deps),
+        .with_jit_ready_deps(jit_ready_deps),
     );
 
-    info!("solend_deposit_usdc tool active (propose + policy + park + preflight + signing handoff)");
+    info!("solend_deposit_usdc tool active (propose + policy + park + preflight + jit_ready persist; signing handoff deferred to prepare route)");
     registry.with_tool(solend_deposit_tool)
 }
 
@@ -281,8 +274,7 @@ mod tests {
             external_wallet,
             approval_store,
             park,
-            SolendSigningStore::new(),
-            Arc::new(BlockhashManager::new(rpc_pool)),
+            SolendJitReadyStore::new(),
             Arc::new(crate::integrations::solend_submit::NullSolendAuditSink),
             120,
         );
@@ -302,8 +294,7 @@ mod tests {
             ExternalWalletStore::new(),
             ApprovalStore::new(),
             SolendParkStore::new(),
-            SolendSigningStore::new(),
-            Arc::new(BlockhashManager::new(stub_rpc_pool())),
+            SolendJitReadyStore::new(),
             Arc::new(crate::integrations::solend_submit::NullSolendAuditSink),
             120,
         );
@@ -358,8 +349,7 @@ mod tests {
             ExternalWalletStore::new(),
             ApprovalStore::new(),
             SolendParkStore::new(),
-            SolendSigningStore::new(),
-            Arc::new(BlockhashManager::new(stub_rpc_pool())),
+            SolendJitReadyStore::new(),
             Arc::new(crate::integrations::solend_submit::NullSolendAuditSink),
             120,
         );
