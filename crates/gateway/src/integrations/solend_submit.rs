@@ -120,6 +120,13 @@ pub const AUDIT_EVENT_HANDOFF_FAILED: &str = "solend_signing_handoff_failed";
 /// just-in-time signing-handoff creation. No transaction, no
 /// blockhash, no signature has been produced when this fires.
 pub const AUDIT_EVENT_JIT_READY_PERSISTED: &str = "solend_jit_ready_persisted";
+/// Phase 6B Window 2: emitted by the prepare HTTP route when a
+/// caller's request is rejected by validation BEFORE any signing-
+/// handoff construction is attempted (unknown approval, not approved,
+/// missing JIT-ready entry, expired entry, wallet mismatch, cross-
+/// session probe). Distinct from `solend_signing_handoff_failed`,
+/// which fires only when the handoff-creation step itself errors.
+pub const AUDIT_EVENT_JIT_PREPARE_REJECTED: &str = "solend_jit_prepare_rejected";
 pub const AUDIT_EVENT_SIGNED_TX_RECEIVED: &str = "solend_signed_tx_received";
 pub const AUDIT_EVENT_SIGNED_TX_VERIFIED: &str = "solend_signed_tx_verified";
 pub const AUDIT_EVENT_SIGNED_TX_REJECTED: &str = "solend_signed_tx_rejected";

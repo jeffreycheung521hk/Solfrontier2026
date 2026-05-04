@@ -279,6 +279,7 @@ fn setup() -> TestHarness {
         events: EventSubscriberRef::new(Arc::new(StubEventSubscriber)),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(handler)),
         solend_signatures: None,
+        solend_jit_prepare: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(StubWalletChallengeHandler)),
         auth_token: AuthToken::new(token.clone()),
         metrics: Arc::new(claw_observability::metrics::MetricsRegistry::new()),

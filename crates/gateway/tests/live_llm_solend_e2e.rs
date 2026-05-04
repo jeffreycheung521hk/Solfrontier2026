@@ -750,14 +750,18 @@ async fn run_live_llm_solend_e2e() {
     let audit_sink: Arc<dyn claw_gateway::integrations::solend_submit::SolendAuditSink> =
         Arc::new(NullSolendAuditSink);
 
+    // Phase 6B: wiring takes jit_ready_store instead of
+    // signing_store + blockhash_manager. The signing_store is still
+    // wired into the existing GET/POST signature handlers below.
+    let jit_ready_store =
+        claw_gateway::integrations::solend_jit_ready::SolendJitReadyStore::new();
     let registry = wire_solend_deposit_tool(
         ToolRegistry::new(),
         rpc_pool.clone(),
         external_wallet.clone(),
         approval_store.clone(),
         solend_park.clone(),
-        signing_store.clone(),
-        blockhash_mgr.clone(),
+        jit_ready_store.clone(),
         audit_sink.clone(),
         600,
     );

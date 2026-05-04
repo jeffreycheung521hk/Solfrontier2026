@@ -849,6 +849,40 @@ impl GatewayDaemon {
                 }
             };
 
+        // Phase 6B Window 2 — JIT prepare handler. Bridges the API
+        // trait (`SolendJitPrepareHandler`) to the gateway-internal
+        // dependencies (approval store, external wallet, jit-ready
+        // store, signing store, blockhash provider, audit sink).
+        // Holds clones of the daemon-lifetime stores; the route
+        // dispatches into this handler on every prepare HTTP request.
+        let solend_jit_prepare_ref: Option<
+            claw_api::state::SolendJitPrepareHandlerRef,
+        > = {
+            let blockhash_provider: std::sync::Arc<
+                dyn crate::integrations::solend_signing::RecentBlockhashProvider,
+            > = std::sync::Arc::new(
+                crate::integrations::solend_signing::ClawBlockhashProvider::new(
+                    blockhash_mgr.clone(),
+                ),
+            );
+            let external_wallet_ref: std::sync::Arc<
+                dyn crate::tools::jupiter_swap::SessionBoundWallet,
+            > = std::sync::Arc::new(external_wallet.clone());
+            let prepare_handler =
+                crate::runtime::solend_jit_prepare_wiring::GatewaySolendJitPrepareHandler::new(
+                    approval_store.clone(),
+                    external_wallet_ref,
+                    pending_solend_jit_ready.clone(),
+                    pending_solend_signing.clone(),
+                    blockhash_provider,
+                    solend_audit_sink.clone(),
+                    config.policy.approval_lease_seconds,
+                );
+            Some(claw_api::state::SolendJitPrepareHandlerRef::new(
+                std::sync::Arc::new(prepare_handler),
+            ))
+        };
+
         let app_state = AppState {
             session_mgr:       session_ref,
             message_handler:   message_handler_ref,
@@ -856,6 +890,7 @@ impl GatewayDaemon {
             events:            event_subscriber_ref,
             wallet_signatures: wallet_sig_handler_ref,
             solend_signatures: solend_sig_handler_ref,
+            solend_jit_prepare: solend_jit_prepare_ref,
             wallet_challenges: wallet_challenge_handler_ref,
             auth_token:        AuthToken::new(api_token),
             operator_registry: operator_registry.clone(),
