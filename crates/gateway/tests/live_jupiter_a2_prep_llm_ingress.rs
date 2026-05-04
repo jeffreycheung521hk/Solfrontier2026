@@ -541,6 +541,7 @@ async fn a2_prep_http_messages_ingress_drives_jupiter_tool_to_park() {
         events: EventSubscriberRef::new(Arc::new(BusEvents(tx))),
         wallet_signatures: WalletSignatureHandlerRef::new(Arc::new(NoopSig)),
         solend_signatures: None,
+        solend_jit_prepare: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(RealChallengeHandler {
             service: challenge_service,
             store: external_store.clone(),

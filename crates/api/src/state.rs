@@ -809,6 +809,102 @@ impl SolendSignatureHandlerRef {
     }
 }
 
+// ── Phase 6B Window 2 — JIT signing-handoff prepare ─────────────────────────
+//
+// The prepare route turns an `Approved + JIT-ready` Solend deposit
+// into a fresh signing handoff. It is the new Sign-click backend
+// seam: the frontend calls it from the user's "Sign with Phantom"
+// click handler, the daemon fetches a fresh blockhash + assembles +
+// partial-signs the obligation slot, and returns a `signing_request_id`
+// that the existing GET / POST `/sessions/:id/solend-signatures/:id`
+// pair then consumes.
+//
+// This boundary is the structural fix for the live-mainnet timing race
+// observed twice on 2026-05-04 where the blockhash expired between
+// approval-time tx assembly and the user reading + clicking Approve in
+// Phantom. By deferring assembly to Sign-click time, the blockhash
+// budget starts at the click instead of at approval time.
+
+/// Wire-shape for the Solend JIT prepare endpoint response.
+///
+/// Tagged-union: `{"status": "ready", ...}` on success, `{"status":
+/// "<failure_variant>", ...}` on every typed failure. Cross-session
+/// probes always collapse to `not_found` so an attacker cannot
+/// distinguish "this id doesn't exist" from "you don't own it".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SolendJitPrepareResult {
+    /// Fresh signing handoff created. The frontend now uses
+    /// `signing_request_id` with the existing GET retrieve / POST
+    /// submit endpoints to drive Phantom + finalize.
+    Ready {
+        approval_request_id: uuid::Uuid,
+        signing_request_id: uuid::Uuid,
+        session_id: SessionId,
+        wallet: String,
+        last_valid_block_height: u64,
+        verified_slot: u64,
+        expires_at_unix_ms: i64,
+    },
+    /// The approval workflow exists and belongs to this session, but
+    /// is not in `Approved` state (still pending, rejected, or
+    /// lease-expired). `state` mirrors `ApprovalWorkflowState`.
+    NotApproved { state: String },
+    /// No JIT-ready entry exists for this approval_request_id. Either
+    /// the resume task never persisted one (preflight didn't pass) or
+    /// the entry's TTL elapsed AND the lazy sweep has already removed
+    /// it. Distinct from `JitReadyExpired` only by timing of access.
+    JitReadyMissing,
+    /// The currently-bound session wallet differs from the wallet that
+    /// was bound when the resume task captured the JIT-ready entry.
+    /// The frontend must rebind the original wallet (or the operator
+    /// must re-propose) before the handoff can be created — using the
+    /// new wallet would break message-hash + obligation-signature
+    /// invariants downstream.
+    WalletMismatch {
+        expected: String,
+        bound: Option<String>,
+    },
+    /// `create_signing_handoff` returned a typed error. Mirrors the
+    /// `SigningHandoffError` variants without leaking raw Debug of
+    /// private-key-adjacent types.
+    HandoffCreateFailed { error_type: String, message: String },
+    /// Indistinguishable variant for: approval workflow not found OR
+    /// workflow's session_id does not match the path session. Cross-
+    /// session probes cannot distinguish these.
+    NotFound,
+}
+
+/// Backend seam for the prepare route. Concrete implementation lives
+/// in `claw-gateway` (`runtime::solend_jit_prepare_wiring`); the route
+/// handler calls through this trait so `claw-api` stays gateway-
+/// agnostic.
+pub trait SolendJitPrepareHandler: Send + Sync + 'static {
+    fn prepare(
+        &self,
+        session_id: &SessionId,
+        approval_request_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = SolendJitPrepareResult> + Send + '_>>;
+}
+
+/// Cloneable reference to a `SolendJitPrepareHandler`.
+#[derive(Clone)]
+pub struct SolendJitPrepareHandlerRef(pub Arc<dyn SolendJitPrepareHandler>);
+
+impl SolendJitPrepareHandlerRef {
+    pub fn new(inner: Arc<dyn SolendJitPrepareHandler>) -> Self {
+        Self(inner)
+    }
+
+    pub async fn prepare(
+        &self,
+        session_id: &SessionId,
+        approval_request_id: uuid::Uuid,
+    ) -> SolendJitPrepareResult {
+        self.0.prepare(session_id, approval_request_id).await
+    }
+}
+
 // ── Phase 5D.2 — User-facing chat route ─────────────────────────────────────
 //
 // The chat route invokes a strict one-turn conversational handler. The HTTP
@@ -927,6 +1023,11 @@ pub struct AppState {
     /// Solend-specific signing retrieval + submit handler. `None` when
     /// Solend integration isn't wired (e.g., minimal test harnesses).
     pub solend_signatures:   Option<SolendSignatureHandlerRef>,
+    /// Phase 6B Window 2: backend seam for the JIT-prepare route that
+    /// turns an `Approved + JIT-ready` Solend deposit into a fresh
+    /// signing handoff at user-click time. `None` when Solend
+    /// integration isn't wired.
+    pub solend_jit_prepare:  Option<SolendJitPrepareHandlerRef>,
     /// Wallet ownership challenge-response.
     pub wallet_challenges:   WalletChallengeHandlerRef,
     /// Bearer token for API authentication (legacy single-token mode).

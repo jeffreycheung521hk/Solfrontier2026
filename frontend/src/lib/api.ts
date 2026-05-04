@@ -5,6 +5,8 @@ import { IS_SHOWCASE, GATEWAY_URL, GATEWAY_TOKEN } from "@/lib/mode";
 import type {
   ApprovalRequest,
   ApprovalWorkflow,
+  ApproveRequest,
+  ApproveResponse,
   AuditRow,
   ChatRequest,
   ChatResponse,
@@ -14,7 +16,11 @@ import type {
   OpenSessionResponse,
   PolicyRule,
   SessionId,
+  SolendJitPrepareResult,
+  SolendRetrievalResult,
+  SolendSubmitResult,
   TransactionProposal,
+  Uuid,
   WalletSummary,
 } from "@/lib/types";
 import {
@@ -22,6 +28,7 @@ import {
   pendingView,
   policyRules,
   auditRows,
+  solendApprovedView,
   wallets,
   workflowPending,
   workflowStageTwo,
@@ -114,10 +121,16 @@ export async function fetchApproval(
   requestId: string,
 ): Promise<{ request: ApprovalRequest; workflow: ApprovalWorkflow; proposal: TransactionProposal | null }> {
   if (IS_SHOWCASE) {
+    // /approval/[id] is now the SigningFlow stage. Showcase narrates the
+    // Phase 5G mainnet proof: 0.001 USDC Solend deposit, treasury-approved,
+    // ready for the user to sign + submit. The four-state policy-chain demo
+    // (50k USDC transfer, risk → treasury → CFO) lives on the same page's
+    // "Demo flow" tab via the workflowPending/StageTwo/Approved/Expired
+    // snapshots, so both narratives coexist without contradicting each other.
     return {
-      request: pendingView.request,
-      workflow: pendingView.workflow,
-      proposal: pendingView.proposal,
+      request: solendApprovedView.request,
+      workflow: solendApprovedView.workflow,
+      proposal: solendApprovedView.proposal,
     };
   }
   const item = await live<{ request: ApprovalRequest; workflow: ApprovalWorkflow }>(
@@ -310,4 +323,350 @@ function showcaseChatReply(message: string): ChatRouteResult {
         "Ask me to deposit USDC into Solend to see the LLM tool-call shape.",
     },
   };
+}
+
+// ── Wallet bind challenge-response (Phase 6 Day 3) ──────────────────────────
+//
+// Two-step proof-of-ownership flow that binds the user's Phantom wallet
+// to the daemon session. Without this binding, the Solend tool's session
+// resolver (`SessionBoundWallet::session_wallet_pubkey`) returns None
+// and chat → tool dispatch fails before producing `awaiting_approval`.
+//
+// 1. POST /sessions/:id/wallet-bind-challenge { pubkey }
+//    → { challenge_id, message, expires_at }
+// 2. Phantom signs the canonical message via signMessage().
+// 3. POST /sessions/:id/wallet-bind-confirm { challenge_id, pubkey, signature_b64 }
+//    → { session_id, pubkey, bound: true, verified: true }
+//
+// Daemon enforces: 5-minute TTL, single-use, session+pubkey match,
+// ed25519 signature verification, atomic mark-used. See
+// `crates/gateway/src/wallet_challenge.rs` for the full security model.
+//
+// SECURITY NOTE: never wire this UI to /sessions/:id/bind-wallet — that
+// route accepts a pubkey claim with no proof of ownership. The
+// challenge-response pair above is the only product-UI path.
+
+export interface WalletBindChallenge {
+  challenge_id: string;
+  message: string;
+  expires_at: number;
+}
+
+export interface WalletBindConfirm {
+  session_id: string;
+  pubkey: string;
+  bound: boolean;
+  verified: boolean;
+}
+
+export async function createWalletBindChallenge(
+  sessionId: SessionId,
+  pubkey: string,
+): Promise<WalletBindChallenge> {
+  if (IS_SHOWCASE) {
+    throw new Error("wallet binding is not used in showcase mode");
+  }
+  return live<WalletBindChallenge>(
+    `/sessions/${sessionId}/wallet-bind-challenge`,
+    {
+      method: "POST",
+      body: JSON.stringify({ pubkey }),
+    },
+  );
+}
+
+export async function confirmWalletBindChallenge(
+  sessionId: SessionId,
+  challengeId: string,
+  pubkey: string,
+  signatureB64: string,
+): Promise<WalletBindConfirm> {
+  if (IS_SHOWCASE) {
+    throw new Error("wallet binding is not used in showcase mode");
+  }
+  return live<WalletBindConfirm>(
+    `/sessions/${sessionId}/wallet-bind-confirm`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        challenge_id: challengeId,
+        pubkey,
+        signature_b64: signatureB64,
+      }),
+    },
+  );
+}
+
+// ── Approval decide + Solend signature flow (Phase 6 Day 2) ─────────────────
+//
+// `decideApproval`     POST /sessions/:id/approve
+// `getSolendSignature` GET  /sessions/:id/solend-signatures/:request_id
+// `submitSolendSig...` POST /sessions/:id/solend-signatures/:request_id
+//
+// All three return a typed result envelope (HTTP-status-aware on the
+// retrieval / submit pair) — domain failures (404 / 410 / 422 / 502) are
+// branches in the result, not exceptions. Network and parse errors still
+// bubble up as thrown errors.
+//
+// Showcase fixtures: `decideApproval` always returns an "approved"
+// outcome; the signature retrieval / submit fixtures live in the hook
+// (see `use-signing-handoff.ts`) so the polling state machine has a
+// single place to drive the simulated lifecycle. This file just exposes
+// the wire-shape-correct functions.
+
+/// Showcase fixture id for the parked Solend signing handoff. The
+/// `useSigningHandoff` hook recognises this id and runs a simulated
+/// lifecycle (no daemon, no Phantom popup). Live mode never sees this
+/// id — it's a sentinel for the fixture path only.
+export const SHOWCASE_SIGNING_REQUEST_ID: Uuid =
+  "fffffff0-0000-0000-0000-000000000000";
+
+/// HTTP-aware result envelope for `getSolendSignature`. The HTTP
+/// status comes back through `httpStatus` so the hook can branch
+/// without re-deriving from body shape (the body is the typed enum
+/// for 200 / 410 / 422 / 502; an `{ error }` shape for 400 / 404 /
+/// 503 misconfiguration paths).
+export type SolendRetrievalEnvelope =
+  | { kind: "ok"; response: SolendRetrievalResult }
+  | { kind: "error"; httpStatus: number; error: string };
+
+export async function getSolendSignature(
+  sessionId: SessionId,
+  signingRequestId: Uuid,
+): Promise<SolendRetrievalEnvelope> {
+  if (IS_SHOWCASE) {
+    // Showcase: hook owns simulation; return a synthetic Found shape
+    // so the hook's terminal logic can map it. Hook's auto-fixture
+    // path will normally bypass this and drive its own simulation.
+    return {
+      kind: "ok",
+      response: {
+        status: "found",
+        signing_request_id: signingRequestId,
+        intent_id: "00000000-0000-0000-0000-000000000000",
+        session_wallet: "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+        unsigned_tx_b64: "AQAAAAAA",
+        obligation_signer_backend_partial: true,
+        last_valid_block_height: 393666166,
+        expires_at_unix_ms: Date.now() + 60_000,
+        verified_slot: 415_571_900,
+        simulation_slot: 415_571_900,
+        units_consumed: 22_000,
+      },
+    };
+  }
+
+  const headers: Record<string, string> = {};
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+  const res = await fetch(
+    `${GATEWAY_URL}/sessions/${sessionId}/solend-signatures/${signingRequestId}`,
+    { method: "GET", headers, cache: "no-store" },
+  );
+
+  // Successful body shapes (200 / 410 / 422 / 502 all carry the typed enum).
+  // 400 / 404 (session-not-active) / 503 carry `{ error }`.
+  if (res.status === 200 || res.status === 410 || res.status === 422 || res.status === 502) {
+    const body = (await res.json()) as SolendRetrievalResult;
+    return { kind: "ok", response: body };
+  }
+  if (res.status === 404) {
+    // Could be either "session not found" ({ error }) OR the typed
+    // `{ status: "not_found" }` body. Try parsing as JSON either way.
+    const body = (await res.json().catch(() => ({}))) as
+      | SolendRetrievalResult
+      | { error?: string };
+    if ("status" in body && body.status === "not_found") {
+      return { kind: "ok", response: body };
+    }
+    const errMsg = (body as { error?: string }).error ?? "session not found";
+    return { kind: "error", httpStatus: 404, error: errMsg };
+  }
+
+  let errorText = "";
+  try {
+    const body = (await res.json()) as { error?: string };
+    errorText = body.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+  return { kind: "error", httpStatus: res.status, error: errorText };
+}
+
+export type SolendSubmitEnvelope =
+  | { kind: "ok"; response: SolendSubmitResult }
+  | { kind: "error"; httpStatus: number; error: string };
+
+export async function submitSolendSignature(
+  sessionId: SessionId,
+  signingRequestId: Uuid,
+  signedTxB64: string,
+): Promise<SolendSubmitEnvelope> {
+  if (IS_SHOWCASE) {
+    // Live mode handles real submit; showcase path is driven by the
+    // hook's simulation. If we get here in showcase, return a synthetic
+    // accepted shape using the Phase 5G real on-chain hash so the UI
+    // shows a working Solscan link end-to-end.
+    return {
+      kind: "ok",
+      response: {
+        status: "submitted",
+        signing_request_id: signingRequestId,
+        intent_id: "00000000-0000-0000-0000-000000000000",
+        session_wallet: "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+        tx_signature:
+          "4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
+        verified_slot: 415_571_900,
+        last_valid_block_height: 393666166,
+      },
+    };
+  }
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+  const res = await fetch(
+    `${GATEWAY_URL}/sessions/${sessionId}/solend-signatures/${signingRequestId}`,
+    {
+      method: "POST",
+      headers,
+      cache: "no-store",
+      body: JSON.stringify({ signed_tx_b64: signedTxB64 }),
+    },
+  );
+
+  // 200 (Recovered), 202 (Submitted), 410 (Expired), 422 (Rejected),
+  // 502 (BroadcastFailed) — all carry the typed `SolendSubmitResult`.
+  if ([200, 202, 410, 422, 502].includes(res.status)) {
+    const body = (await res.json()) as SolendSubmitResult;
+    return { kind: "ok", response: body };
+  }
+  if (res.status === 404) {
+    const body = (await res.json().catch(() => ({}))) as
+      | SolendSubmitResult
+      | { error?: string };
+    if ("status" in body && body.status === "not_found") {
+      return { kind: "ok", response: body };
+    }
+    const errMsg = (body as { error?: string }).error ?? "session not found";
+    return { kind: "error", httpStatus: 404, error: errMsg };
+  }
+
+  let errorText = "";
+  try {
+    const body = (await res.json()) as { error?: string };
+    errorText = body.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+  return { kind: "error", httpStatus: res.status, error: errorText };
+}
+
+// ── Phase 6B Window 3 — JIT signing-handoff prepare ─────────────────────────
+//
+// `POST /sessions/:s/approvals/:a/solend-signing/prepare` is the new
+// Sign-click backend seam: the frontend calls it from the user's
+// "Sign with Phantom" click handler, and the daemon constructs a
+// fresh signing handoff with a fresh blockhash. The returned
+// `signing_request_id` is then immediately used with the existing
+// GET retrieve / POST submit endpoints.
+//
+// Showcase mode short-circuits to a synthetic Ready response that
+// echoes `SHOWCASE_SIGNING_REQUEST_ID`, so the existing showcase
+// `useSigningHandoff` hook continues to play out its timer-driven
+// lifecycle without any daemon traffic.
+
+export type SolendJitPrepareEnvelope =
+  | { kind: "ok"; response: SolendJitPrepareResult }
+  | { kind: "error"; httpStatus: number; error: string };
+
+export async function prepareSolendSigning(
+  sessionId: SessionId,
+  approvalRequestId: Uuid,
+): Promise<SolendJitPrepareEnvelope> {
+  if (IS_SHOWCASE) {
+    // Showcase: synthesize a Ready response. The hook's showcase
+    // simulation drives the rest of the lifecycle from timers; no
+    // network call is made.
+    return {
+      kind: "ok",
+      response: {
+        status: "ready",
+        approval_request_id: approvalRequestId,
+        signing_request_id: SHOWCASE_SIGNING_REQUEST_ID,
+        session_id: sessionId,
+        wallet: "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+        last_valid_block_height: 393_666_166,
+        verified_slot: 415_571_900,
+        expires_at_unix_ms: Date.now() + 60_000,
+      },
+    };
+  }
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+
+  const res = await fetch(
+    `${GATEWAY_URL}/sessions/${sessionId}/approvals/${approvalRequestId}/solend-signing/prepare`,
+    { method: "POST", headers, cache: "no-store" },
+  );
+
+  // 200 = Ready; 404 = NotFound | JitReadyMissing;
+  // 422 = NotApproved | WalletMismatch; 502 = HandoffCreateFailed.
+  // All of these carry the typed `SolendJitPrepareResult` body.
+  if ([200, 404, 422, 502].includes(res.status)) {
+    const body = (await res.json()) as SolendJitPrepareResult;
+    return { kind: "ok", response: body };
+  }
+
+  // 400 (malformed ids) and 503 (handler not wired) carry `{ error }`.
+  let errorText = "";
+  try {
+    const body = (await res.json()) as { error?: string };
+    errorText = body.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+  return { kind: "error", httpStatus: res.status, error: errorText };
+}
+
+/// Decide an approval. Backend route: `POST /sessions/:id/approve`.
+/// Backend uses `approved: boolean` (not a `decision` string).
+export async function decideApproval(
+  sessionId: SessionId,
+  approvalRequestId: Uuid,
+  approved: boolean,
+  note?: string,
+): Promise<{ ok: boolean; httpStatus: number; outcome?: string; error?: string }> {
+  if (IS_SHOWCASE) {
+    return {
+      ok: true,
+      httpStatus: 200,
+      outcome: approved ? "approved" : "rejected",
+    };
+  }
+
+  const body: ApproveRequest = {
+    request_id: approvalRequestId,
+    approved,
+    note: note ?? null,
+  };
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+  const res = await fetch(`${GATEWAY_URL}/sessions/${sessionId}/approve`, {
+    method: "POST",
+    headers,
+    cache: "no-store",
+    body: JSON.stringify(body),
+  });
+  if (res.status === 200 || res.status === 202) {
+    const data = (await res.json()) as ApproveResponse;
+    return { ok: true, httpStatus: res.status, outcome: data.outcome };
+  }
+  let errorText = "";
+  try {
+    const data = (await res.json()) as { error?: string };
+    errorText = data.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+  return { ok: false, httpStatus: res.status, error: errorText };
 }

@@ -306,15 +306,17 @@ impl Default for SolendParkStore {
 use tracing::{info, warn};
 
 use crate::integrations::solend::SolendAssemblyError;
+use crate::integrations::solend_jit_ready::{
+    SolendJitReady, SolendJitReadyDeps, SolendJitReadyStore,
+};
 use crate::integrations::solend_preflight::{
     preflight_solend_deposit_plan, SolendPreflightOutcome, SolendPreflightSimulator,
 };
 use crate::integrations::solend_signing::{
-    create_signing_handoff, RecentBlockhashProvider, SigningHandoffError,
-    SolendSigningStore,
+    RecentBlockhashProvider, SolendSigningStore,
 };
 use crate::integrations::solend_submit::{
-    SolendAuditSink, AUDIT_EVENT_HANDOFF_FAILED,
+    SolendAuditSink, AUDIT_EVENT_JIT_READY_PERSISTED,
 };
 use crate::integrations::solend_tx_plan::{
     assemble_solend_deposit_tx_plan, SolendDepositTxPlan, SolendTxPlanError,
@@ -414,16 +416,12 @@ pub enum SolendResumeOutcome {
         plan: SolendDepositTxPlan,
         preflight: SolendPreflightOutcome,
     },
-    /// Phase 4C-4 happy path: preflight Passed AND a signing handoff
-    /// has been created — a pending signing artifact is parked in the
-    /// Solend signing store and the user's external wallet can now
-    /// co-sign. The `signing_request_id` correlates the backend parked
-    /// artifact with the frontend-visible pending signature request.
-    ///
-    /// This variant does NOT imply any broadcast or submission. The
-    /// user has NOT signed yet; the backend has merely created the
-    /// artifact. 4C-5 will wire the send path after the user's signed
-    /// bytes arrive.
+    /// Phase 4C-4 (deprecated by 6B): preflight Passed AND a signing
+    /// handoff was created at approval time. Retained as a defined
+    /// variant only because some older Solend tests still construct it
+    /// indirectly via deprecated paths. PRODUCTION NEVER PRODUCES THIS
+    /// VARIANT in Phase 6B+ — handoff creation is deferred to the
+    /// just-in-time prepare route exercised at Sign-with-Phantom click.
     RecheckPassedSigningRequested {
         verified_slot: u64,
         signing_request_id: uuid::Uuid,
@@ -432,14 +430,28 @@ pub enum SolendResumeOutcome {
         last_valid_block_height: u64,
         obligation_signer_backend_partial: bool,
     },
-    /// Phase 4C-4: preflight Passed but signer handoff creation
-    /// failed (blockhash RPC failure, plan inconsistency, serialization
-    /// error, partial-sign failure). Terminal and fail-closed — no
-    /// broadcast, no retry.
+    /// Phase 4C-4 (deprecated by 6B): preflight Passed but signer
+    /// handoff creation failed at approval time. Retained for back-
+    /// compatibility; PRODUCTION NEVER PRODUCES THIS VARIANT in
+    /// Phase 6B+ since no handoff is created on the resume path.
     SignerHandoffFailed {
         verified_slot: u64,
         error_type: String,
         message: String,
+    },
+    /// Phase 6B happy path: re-check passed, plan assembled, structural
+    /// preflight Passed, AND the JIT-ready entry is parked in the
+    /// `SolendJitReadyStore` keyed by `approval_request_id`. NO
+    /// transaction has been built, NO blockhash has been fetched, NO
+    /// signature exists. The frontend's Sign-with-Phantom click will
+    /// trigger the prepare route which calls `create_signing_handoff`
+    /// on demand with a fresh blockhash. `expires_at_unix_ms` mirrors
+    /// the JIT-ready entry's TTL (matches `approval_lease_seconds`).
+    RecheckPassedJitReady {
+        verified_slot: u64,
+        simulation_slot: Option<u64>,
+        units_consumed: Option<u64>,
+        expires_at_unix_ms: i64,
     },
     /// Phase 4C-2: re-check passed but the plan-assembly layer rejected
     /// the fresh snapshot inputs (e.g. zero amount, mismatched reserve
@@ -474,15 +486,15 @@ pub enum SolendResumeOutcome {
 /// The task MUST NOT build instructions, fetch blockhash, simulate,
 /// sign, or broadcast. Its only RPC is the read-only
 /// [`SolendDepositSnapshotAssembler::assemble_for_deposit`] call.
-/// Optional Phase 4C-4 signing handoff dependencies. Bundled into one
-/// struct so the resume-task signature stays manageable and existing
-/// tests that don't exercise signing can pass `None` in a single slot.
-///
-/// When present, the resume task creates a signing handoff on the
-/// preflight-Passed happy path and returns
-/// [`SolendResumeOutcome::RecheckPassedSigningRequested`] or
-/// [`SolendResumeOutcome::SignerHandoffFailed`]. When absent, the 4C-3
-/// `RecheckPassedPreflighted` outcome is produced instead.
+/// **Phase 4C-4 (deprecated by 6B): the resume task no longer creates
+/// a signing handoff at approval time.** This struct is retained as a
+/// public type because the new prepare HTTP route (added in Phase 6B
+/// Window 2) consumes the same field shape — a Solend signing store, a
+/// blockhash provider, a shared audit sink, and a signing lease — when
+/// it calls `create_signing_handoff` just-in-time on the user's
+/// Sign-with-Phantom click. Production resume tasks use
+/// [`SolendJitReadyDeps`] instead; this type is no longer constructed
+/// from the resume path.
 #[derive(Clone)]
 pub struct SolendSigningDeps {
     pub store: SolendSigningStore,
@@ -501,7 +513,7 @@ pub async fn run_solend_resume_task(
     assembler: Arc<dyn SolendDepositSnapshotAssembler>,
     rule_config: LendingRuleConfig,
     preflight_simulator: Option<Arc<dyn SolendPreflightSimulator>>,
-    signing_deps: Option<SolendSigningDeps>,
+    jit_ready_deps: Option<SolendJitReadyDeps>,
     decision_rx: oneshot::Receiver<ApprovalWorkflowState>,
 ) -> SolendResumeOutcome {
     // ── 1. Await the approval decision ──────────────────────────────────
@@ -670,83 +682,79 @@ pub async fn run_solend_resume_task(
                                 "solend_resume: structural preflight complete (no broadcast)"
                             );
 
-                            // Phase 4C-4: if signing deps are wired AND
-                            // preflight Passed, create a signing handoff.
-                            // Any non-Passed preflight (Failed /
-                            // ConfigError / TooLargeNeedsChunking) stops
-                            // here — no signing handoff is attempted.
-                            match (&preflight, signing_deps) {
-                                (SolendPreflightOutcome::Passed { .. }, Some(deps)) => {
-                                    match create_signing_handoff(
-                                        &plan,
-                                        &preflight,
-                                        &deps.store,
-                                        deps.blockhash_provider.as_ref(),
-                                        deps.audit.as_ref(),
-                                        deps.signing_lease_seconds,
-                                    )
-                                    .await
-                                    {
-                                        Ok(summary) => {
-                                            info!(
-                                                request_id = %request_id,
-                                                intent_id = %parked.intent_id,
-                                                signing_request_id = %summary.signing_request_id,
-                                                verified_slot = verified_slot,
-                                                obligation_partial = summary.obligation_signer_backend_partial,
-                                                "solend_resume: signing handoff created (no broadcast)"
-                                            );
-                                            SolendResumeOutcome::RecheckPassedSigningRequested {
-                                                verified_slot,
-                                                signing_request_id: summary.signing_request_id,
-                                                simulation_slot: summary.simulation_slot,
-                                                units_consumed: summary.units_consumed,
-                                                last_valid_block_height: summary.last_valid_block_height,
-                                                obligation_signer_backend_partial:
-                                                    summary.obligation_signer_backend_partial,
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let label = signing_handoff_error_label(&e);
-                                            let msg = format!("{e}");
-                                            warn!(
-                                                request_id = %request_id,
-                                                intent_id = %parked.intent_id,
-                                                verified_slot = verified_slot,
-                                                error_type = %label,
-                                                error = %msg,
-                                                "solend_resume: signer handoff failed"
-                                            );
-                                            // W3 remediation: append-only
-                                            // audit event for failed handoff.
-                                            deps.audit
-                                                .append_solend_event(
-                                                    AUDIT_EVENT_HANDOFF_FAILED,
-                                                    request_id.to_string(),
-                                                    Some(parked.session_id.to_string()),
-                                                    claw_state_store::audit::AuditSeverity::Warning,
-                                                    serde_json::json!({
-                                                        "request_id":    request_id,
-                                                        "intent_id":     parked.intent_id,
-                                                        "session_wallet": parked.session_wallet.to_string(),
-                                                        "verified_slot": verified_slot,
-                                                        "error_type":    label,
-                                                        "message":       msg,
-                                                    }),
-                                                )
-                                                .await;
-                                            SolendResumeOutcome::SignerHandoffFailed {
-                                                verified_slot,
-                                                error_type: label.to_string(),
-                                                message: msg,
-                                            }
-                                        }
+                            // Phase 6B: if jit_ready deps are wired AND
+                            // preflight Passed, persist a JIT-ready
+                            // entry in the SolendJitReadyStore keyed
+                            // by approval_request_id. NO transaction is
+                            // built, NO blockhash is fetched, NO
+                            // signature is created — that work is
+                            // deferred to the prepare HTTP route which
+                            // runs `create_signing_handoff` on demand
+                            // when the user clicks Sign with Phantom.
+                            //
+                            // This is the structural fix for the live-
+                            // mainnet timing race observed twice on
+                            // 2026-05-04: the manual paste / poll /
+                            // sign loop consistently exceeds Solana's
+                            // ~150-block validity window, so the
+                            // blockhash must be fetched as close to the
+                            // Phantom popup as possible.
+                            match (&preflight, jit_ready_deps) {
+                                (SolendPreflightOutcome::Passed { simulation_slot, units_consumed, .. }, Some(deps)) => {
+                                    let now = chrono::Utc::now();
+                                    let expires_at = now
+                                        + chrono::Duration::seconds(
+                                            deps.jit_ready_lease_seconds as i64,
+                                        );
+                                    let expires_at_unix_ms = expires_at.timestamp_millis();
+                                    let entry = SolendJitReady {
+                                        intent_id: parked.intent_id,
+                                        session_id: parked.session_id.clone(),
+                                        session_wallet: parked.session_wallet,
+                                        plan: plan.clone(),
+                                        preflight: preflight.clone(),
+                                        verified_slot,
+                                        created_at: now,
+                                        expires_at,
+                                    };
+                                    deps.store.put(request_id, entry);
+                                    info!(
+                                        request_id = %request_id,
+                                        intent_id = %parked.intent_id,
+                                        verified_slot = verified_slot,
+                                        expires_at_unix_ms = expires_at_unix_ms,
+                                        "solend_resume: JIT-ready persisted \
+                                         (no handoff, no blockhash, no signature)"
+                                    );
+                                    deps.audit
+                                        .append_solend_event(
+                                            AUDIT_EVENT_JIT_READY_PERSISTED,
+                                            request_id.to_string(),
+                                            Some(parked.session_id.to_string()),
+                                            claw_state_store::audit::AuditSeverity::Info,
+                                            serde_json::json!({
+                                                "request_id":    request_id,
+                                                "intent_id":     parked.intent_id,
+                                                "session_wallet": parked.session_wallet.to_string(),
+                                                "verified_slot": verified_slot,
+                                                "simulation_slot": simulation_slot,
+                                                "units_consumed": units_consumed,
+                                                "expires_at_unix_ms": expires_at_unix_ms,
+                                            }),
+                                        )
+                                        .await;
+                                    SolendResumeOutcome::RecheckPassedJitReady {
+                                        verified_slot,
+                                        simulation_slot: *simulation_slot,
+                                        units_consumed: *units_consumed,
+                                        expires_at_unix_ms,
                                     }
                                 }
-                                // No signing deps wired, or preflight was
+                                // No jit_ready deps wired, or preflight was
                                 // not Passed — fall back to the 4C-3
-                                // outcome so existing tests still produce
-                                // the right variant.
+                                // outcome so existing tests that bypass
+                                // jit_ready persistence still produce the
+                                // right variant.
                                 (_, _) => SolendResumeOutcome::RecheckPassedPreflighted {
                                     verified_slot,
                                     plan,
@@ -810,18 +818,10 @@ fn preflight_outcome_label(outcome: &SolendPreflightOutcome) -> &'static str {
     }
 }
 
-/// Stable label for a [`SigningHandoffError`] (Phase 4C-4). Used in the
-/// `SignerHandoffFailed` outcome's `error_type` field. Never leaks raw
-/// Rust Debug of private-key-adjacent types.
-fn signing_handoff_error_label(e: &SigningHandoffError) -> &'static str {
-    match e {
-        SigningHandoffError::MissingTransientObligation => "MissingTransientObligation",
-        SigningHandoffError::UnexpectedTransientObligation => "UnexpectedTransientObligation",
-        SigningHandoffError::BlockhashFetchFailed(_) => "BlockhashFetchFailed",
-        SigningHandoffError::SerializationFailed(_) => "SerializationFailed",
-        SigningHandoffError::PartialSignFailed(_) => "PartialSignFailed",
-    }
-}
+// `signing_handoff_error_label` removed in Phase 6B: the resume task no
+// longer calls `create_signing_handoff`, so the helper has no remaining
+// callers. The mapping is moved into the prepare HTTP route in Window 2
+// where it is needed.
 
 /// Stable variant name for a [`SolendAssemblyError`]. Used in
 /// [`SolendResumeOutcome::ReassembleFailed`] so audit logs and tests can
@@ -2255,6 +2255,146 @@ mod tests {
             // Failed preflight still cleans up the park store — no further
             // execution path is possible in this slice.
             assert!(!store.contains(&request_id));
+        }
+
+        // ── Phase 6B · JIT-ready persistence on Approve ─────────────────────
+        //
+        // These tests cover the new resume-task happy path: when
+        // `Some(jit_ready_deps)` is wired AND preflight Passed, the
+        // resume task persists a JIT-ready entry in the
+        // `SolendJitReadyStore` keyed by `approval_request_id` and
+        // returns `RecheckPassedJitReady`. CRUCIALLY, NO signing
+        // handoff is created — the `SolendSigningStore` remains empty
+        // until the prepare HTTP route (Window 2) calls
+        // `create_signing_handoff` on demand.
+        //
+        // This is the structural fix for the live-mainnet timing race
+        // observed twice on 2026-05-04 where blockhash expired between
+        // approval-time tx assembly and the user clicking Approve in
+        // the Phantom popup.
+
+        use crate::integrations::solend_jit_ready::{
+            SolendJitReadyDeps, SolendJitReadyStore,
+        };
+        use crate::integrations::solend_signing::SolendSigningStore;
+        use crate::integrations::solend_submit::NullSolendAuditSink;
+
+        #[tokio::test]
+        async fn resume_task_persists_jit_ready_when_deps_wired_and_preflight_passed() {
+            let wallet = Pubkey::new_unique();
+            let park_store = SolendParkStore::new();
+            let request_id = Uuid::new_v4();
+            let rx = park_store.park(
+                request_id,
+                parked_intent_for(wallet, Utc::now() + Duration::seconds(60), 1_000),
+            );
+            let assembler = Arc::new(ResumeMockAssembler::with_responses(vec![Ok(
+                assembled_snapshot_passing(wallet, 1_000),
+            )]));
+            let sim: Arc<dyn SolendPreflightSimulator> = StubSim::passing();
+
+            // Phase 6B: jit-ready store + null audit sink. The signing
+            // store is constructed but should remain empty after the
+            // resume task runs — proves no handoff was created.
+            let jit_ready_store = SolendJitReadyStore::new();
+            let signing_store = SolendSigningStore::new();
+            let jit_ready_deps = SolendJitReadyDeps {
+                store: jit_ready_store.clone(),
+                audit: Arc::new(NullSolendAuditSink),
+                jit_ready_lease_seconds: 120,
+            };
+
+            assert!(park_store.signal(request_id, ApprovalWorkflowState::Approved));
+            let outcome = run_solend_resume_task(
+                request_id,
+                park_store.clone(),
+                assembler,
+                permissive_v1_config(),
+                Some(sim),
+                Some(jit_ready_deps),
+                rx,
+            )
+            .await;
+
+            // Outcome variant: new JIT-ready terminal.
+            match outcome {
+                SolendResumeOutcome::RecheckPassedJitReady {
+                    verified_slot: _,
+                    simulation_slot,
+                    units_consumed,
+                    expires_at_unix_ms,
+                } => {
+                    assert_eq!(simulation_slot, Some(777_777));
+                    assert_eq!(units_consumed, Some(4242));
+                    // Expiry must be in the future (lease=120s).
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    assert!(expires_at_unix_ms > now_ms);
+                }
+                other => panic!("expected RecheckPassedJitReady, got {other:?}"),
+            }
+
+            // The JIT-ready store now contains an entry keyed by the
+            // approval request id.
+            let entry = jit_ready_store
+                .get(request_id)
+                .expect("jit-ready entry persisted under approval request id");
+            assert_eq!(entry.session_wallet, wallet);
+
+            // CRITICAL: the signing store must be empty. No handoff
+            // was created, no obligation Keypair generated, no
+            // blockhash fetched. The whole point of Phase 6B.
+            assert!(
+                signing_store.summary(request_id).is_none(),
+                "Phase 6B contract: approval must not create a signing handoff",
+            );
+
+            // Park store cleanup is unchanged.
+            assert!(!park_store.contains(&request_id));
+        }
+
+        #[tokio::test]
+        async fn resume_task_skips_jit_ready_persist_when_preflight_failed() {
+            let wallet = Pubkey::new_unique();
+            let park_store = SolendParkStore::new();
+            let request_id = Uuid::new_v4();
+            let rx = park_store.park(
+                request_id,
+                parked_intent_for(wallet, Utc::now() + Duration::seconds(60), 1_000),
+            );
+            let assembler = Arc::new(ResumeMockAssembler::with_responses(vec![Ok(
+                assembled_snapshot_passing(wallet, 1_000),
+            )]));
+            let sim: Arc<dyn SolendPreflightSimulator> = StubSim::failing_custom_14();
+
+            let jit_ready_store = SolendJitReadyStore::new();
+            let jit_ready_deps = SolendJitReadyDeps {
+                store: jit_ready_store.clone(),
+                audit: Arc::new(NullSolendAuditSink),
+                jit_ready_lease_seconds: 120,
+            };
+
+            assert!(park_store.signal(request_id, ApprovalWorkflowState::Approved));
+            let outcome = run_solend_resume_task(
+                request_id,
+                park_store.clone(),
+                assembler,
+                permissive_v1_config(),
+                Some(sim),
+                Some(jit_ready_deps),
+                rx,
+            )
+            .await;
+
+            // Failed preflight short-circuits to Preflighted (with
+            // Failed inside) — JIT-ready arm is gated on Passed.
+            match outcome {
+                SolendResumeOutcome::RecheckPassedPreflighted { .. } => {}
+                other => panic!("expected RecheckPassedPreflighted (Failed inside), got {other:?}"),
+            }
+            assert!(
+                jit_ready_store.is_empty(),
+                "JIT-ready arm must NOT persist when preflight is non-Passed",
+            );
         }
     }
 }

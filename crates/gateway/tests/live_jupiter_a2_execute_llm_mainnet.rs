@@ -730,6 +730,7 @@ async fn a2_execute_llm_mainnet_full_daemon_path() {
         events: EventSubscriberRef::new(Arc::new(BusEvents(tx))),
         wallet_signatures: WalletSignatureHandlerRef::new(completion_handler),
         solend_signatures: None,
+        solend_jit_prepare: None,
         wallet_challenges: WalletChallengeHandlerRef::new(Arc::new(RealChallengeHandler {
             service: challenge_service.clone(),
             store: external_store.clone(),

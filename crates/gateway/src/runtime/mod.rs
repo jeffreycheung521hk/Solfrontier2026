@@ -20,5 +20,6 @@
 //! call line in `daemon.rs`. Do NOT inline the block into `daemon.rs`.
 
 pub mod chat_wiring;
+pub mod solend_jit_prepare_wiring;
 pub mod solend_submit_wiring;
 pub mod solend_wiring;

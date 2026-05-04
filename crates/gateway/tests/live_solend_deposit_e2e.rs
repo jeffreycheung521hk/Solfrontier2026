@@ -620,14 +620,19 @@ async fn live_solend_deposit_e2e() {
         Arc::new(NullSolendAuditSink);
 
     // Build tool registry with the production Solend wiring helper.
+    // Phase 6B: wiring no longer takes signing_store + blockhash_manager
+    // (those moved to the JIT prepare endpoint); it takes a JIT-ready
+    // store instead. The signing_store is still used downstream by the
+    // prepare endpoint and the existing GET/POST signature handlers.
+    let jit_ready_store =
+        claw_gateway::integrations::solend_jit_ready::SolendJitReadyStore::new();
     let registry = wire_solend_deposit_tool(
         ToolRegistry::new(),
         rpc_pool.clone(),
         external_wallet.clone(),
         approval_store.clone(),
         solend_park.clone(),
-        signing_store.clone(),
-        blockhash_mgr.clone(),
+        jit_ready_store.clone(),
         audit_sink.clone(),
         600,
     );

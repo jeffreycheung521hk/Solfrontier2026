@@ -7,6 +7,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatRelative, shortPubkey } from "@/lib/format";
 import { LeaseCountdown } from "@/components/lease-countdown";
+import { SigningFlow } from "@/components/signing-flow";
 import type { ApprovalStage, ApprovalWorkflow, StageDecision } from "@/lib/types";
 
 export default async function ApprovalChainPage({
@@ -40,8 +41,14 @@ export default async function ApprovalChainPage({
           <TabsTrigger value="flow">Demo flow (showcase)</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="live" className="pt-4">
+        <TabsContent value="live" className="pt-4 space-y-6">
           <ChainVisualization workflow={workflow} />
+          <Separator />
+          <SigningFlow
+            approvalRequestId={request.id}
+            sessionId={request.session_id}
+            workflowState={workflow.state}
+          />
         </TabsContent>
 
         <TabsContent value="flow" className="pt-4 space-y-6">
