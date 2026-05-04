@@ -145,8 +145,18 @@ impl Tool for GetJupiterQuoteTool {
 
     async fn execute(&self, input: ToolInput) -> Result<ToolOutput, ToolError> {
         // ── Input validation ────────────────────────────────────────────────
-        let input_mint = require_string(&input, "input_mint")?;
-        let output_mint = require_string(&input, "output_mint")?;
+        //
+        // Phase 6C-C — symbol normalisation. Live smoke showed the LLM
+        // sometimes passes the human-readable symbol (`"SOL"`, `"USDC"`,
+        // sometimes lower-cased or padded) instead of the base58 mint
+        // pubkey. We normalise BEFORE the allowlist check so a request
+        // like `{ input_mint: "SOL", output_mint: "USDC", ... }` flows
+        // through cleanly and the on-wire `SwapQuoteRequest` carries the
+        // canonical mint pubkeys Jupiter expects. Unknown symbols pass
+        // through unchanged and fall through to the existing
+        // `is_allowed_mint` gate (returning `policy_blocked`).
+        let input_mint = normalize_mint(&require_string(&input, "input_mint")?);
+        let output_mint = normalize_mint(&require_string(&input, "output_mint")?);
         let input_amount = input.parameters["input_amount"]
             .as_u64()
             .ok_or_else(|| ToolError::InvalidInput {
@@ -259,6 +269,25 @@ impl Tool for GetJupiterQuoteTool {
 
 fn is_allowed_mint(mint: &str) -> bool {
     mint == SOL_MINT_BS58 || mint == USDC_MINT_BS58
+}
+
+/// Phase 6C-C — accept either the canonical base58 mint pubkey OR a
+/// human-readable symbol (case-insensitive, whitespace-trimmed) for the
+/// SOL ↔ USDC pair this slice supports. Unknown values pass through
+/// unchanged so the existing `is_allowed_mint` gate produces a clean
+/// `policy_blocked` outcome with the original input visible in the
+/// reason text.
+///
+/// Symbols handled (case-insensitive, after `.trim()`):
+///   - `"SOL"`, `"WSOL"` → wrapped-SOL canonical mint
+///   - `"USDC"`          → USDC mainnet canonical mint
+fn normalize_mint(input: &str) -> String {
+    let trimmed = input.trim();
+    match trimmed.to_ascii_uppercase().as_str() {
+        "SOL" | "WSOL" => SOL_MINT_BS58.to_string(),
+        "USDC" => USDC_MINT_BS58.to_string(),
+        _ => trimmed.to_string(),
+    }
 }
 
 fn require_string(input: &ToolInput, key: &str) -> Result<String, ToolError> {
@@ -560,5 +589,166 @@ mod tests {
                 "get_jupiter_quote schema must not mention `{forbidden}`; got {raw}"
             );
         }
+    }
+
+    // ── Phase 6C-C — symbol normalisation regression ──────────────────────
+
+    /// `JupiterQuoteSource` stub that captures the request that reached
+    /// the Jupiter side, so the assertions below can prove the canonical
+    /// mints actually flowed through the request shape (not just the
+    /// output JSON).
+    struct CapturingStub {
+        captured: std::sync::Mutex<Option<SwapQuoteRequest>>,
+    }
+
+    impl CapturingStub {
+        fn new() -> Self {
+            Self {
+                captured: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl JupiterQuoteSource for CapturingStub {
+        async fn fetch_quote(
+            &self,
+            request: &SwapQuoteRequest,
+        ) -> Result<SwapQuoteResponse, JupiterError> {
+            *self.captured.lock().unwrap() = Some(SwapQuoteRequest {
+                input_mint: request.input_mint.clone(),
+                output_mint: request.output_mint.clone(),
+                amount: request.amount,
+                slippage_bps: request.slippage_bps,
+                swap_mode: request.swap_mode,
+                only_direct_routes: request.only_direct_routes,
+                max_accounts: request.max_accounts,
+            });
+            Ok(SwapQuoteResponse {
+                input_mint: request.input_mint.clone(),
+                in_amount: request.amount.to_string(),
+                output_mint: request.output_mint.clone(),
+                out_amount: "150000".to_string(),
+                other_amount_threshold: "148500".to_string(),
+                swap_mode: SwapMode::ExactIn,
+                slippage_bps: request.slippage_bps.unwrap_or(0),
+                price_impact_pct: Some("0.0".to_string()),
+                route_plan: vec![],
+                context_slot: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn p6c_c_symbol_sol_normalises_to_canonical_mint() {
+        let stub = Arc::new(CapturingStub::new());
+        let tool = GetJupiterQuoteTool::new(stub.clone());
+        let out = tool
+            .execute(input_for("SOL", "USDC", 1_000_000, 100))
+            .await
+            .unwrap();
+        assert!(out.success, "SOL/USDC symbols must succeed: {:?}", out);
+        let data = out.data.unwrap();
+        assert_eq!(data["status"], "ok");
+        // Output echoes the canonical mints, never the symbols.
+        assert_eq!(data["input_mint"], SOL_MINT_BS58);
+        assert_eq!(data["output_mint"], USDC_MINT_BS58);
+        // The Jupiter request itself carries the canonical mints.
+        let captured = stub.captured.lock().unwrap().clone().expect("captured");
+        assert_eq!(captured.input_mint, SOL_MINT_BS58);
+        assert_eq!(captured.output_mint, USDC_MINT_BS58);
+    }
+
+    #[tokio::test]
+    async fn p6c_c_symbol_lowercase_and_whitespace_normalises() {
+        let stub = Arc::new(CapturingStub::new());
+        let tool = GetJupiterQuoteTool::new(stub.clone());
+        let out = tool
+            .execute(input_for(" sol ", "  usdc", 1_000_000, 50))
+            .await
+            .unwrap();
+        assert!(out.success);
+        let data = out.data.unwrap();
+        assert_eq!(data["input_mint"], SOL_MINT_BS58);
+        assert_eq!(data["output_mint"], USDC_MINT_BS58);
+    }
+
+    #[tokio::test]
+    async fn p6c_c_wsol_alias_normalises_to_sol_mint() {
+        let stub = Arc::new(CapturingStub::new());
+        let tool = GetJupiterQuoteTool::new(stub);
+        let out = tool
+            .execute(input_for("WSOL", "USDC", 1_000_000, 50))
+            .await
+            .unwrap();
+        let data = out.data.unwrap();
+        assert_eq!(data["input_mint"], SOL_MINT_BS58);
+    }
+
+    #[tokio::test]
+    async fn p6c_c_canonical_pubkeys_still_accepted() {
+        let stub = Arc::new(CapturingStub::new());
+        let tool = GetJupiterQuoteTool::new(stub);
+        // Mix: symbol on one side, canonical pubkey on the other.
+        let out = tool
+            .execute(input_for("SOL", USDC_MINT_BS58, 1_000_000, 50))
+            .await
+            .unwrap();
+        assert!(out.success);
+        let data = out.data.unwrap();
+        assert_eq!(data["input_mint"], SOL_MINT_BS58);
+        assert_eq!(data["output_mint"], USDC_MINT_BS58);
+    }
+
+    #[tokio::test]
+    async fn p6c_c_unknown_symbol_returns_policy_blocked() {
+        let stub = Arc::new(CapturingStub::new());
+        let tool = GetJupiterQuoteTool::new(stub);
+        let out = tool
+            .execute(input_for("BONK", "USDC", 1_000, 50))
+            .await
+            .unwrap();
+        assert!(!out.success);
+        let data = out.data.unwrap();
+        assert_eq!(data["status"], "policy_blocked");
+        assert_eq!(data["policy_rule_name"], "input-mint-not-allowed");
+        assert!(
+            data["error"].as_str().unwrap().contains("BONK"),
+            "rule reason should echo the offending input"
+        );
+    }
+
+    #[tokio::test]
+    async fn p6c_c_slippage_above_cap_still_policy_blocked_after_normalisation() {
+        // Confirms Fix 2 did not relax the slippage cap.
+        let stub = Arc::new(CapturingStub::new());
+        let tool = GetJupiterQuoteTool::new(stub);
+        let out = tool
+            .execute(input_for("SOL", "USDC", 1_000_000, 200))
+            .await
+            .unwrap();
+        let data = out.data.unwrap();
+        assert_eq!(data["status"], "policy_blocked");
+        assert_eq!(data["policy_rule_name"], "slippage-exceeds-quote-cap");
+        assert_eq!(data["slippage_bps"], 200);
+    }
+
+    #[test]
+    fn p6c_c_normalize_mint_unit_table() {
+        // Pure unit table — no async, no stubs.
+        assert_eq!(normalize_mint("SOL"), SOL_MINT_BS58);
+        assert_eq!(normalize_mint("sol"), SOL_MINT_BS58);
+        assert_eq!(normalize_mint(" SOL "), SOL_MINT_BS58);
+        assert_eq!(normalize_mint("WSOL"), SOL_MINT_BS58);
+        assert_eq!(normalize_mint("wsol"), SOL_MINT_BS58);
+        assert_eq!(normalize_mint("USDC"), USDC_MINT_BS58);
+        assert_eq!(normalize_mint("usdc"), USDC_MINT_BS58);
+        // Pass-through for canonical pubkey.
+        assert_eq!(normalize_mint(USDC_MINT_BS58), USDC_MINT_BS58);
+        assert_eq!(normalize_mint(SOL_MINT_BS58), SOL_MINT_BS58);
+        // Pass-through for unknown — the allowlist gate handles rejection.
+        assert_eq!(normalize_mint("BONK"), "BONK");
+        // Whitespace trimmed even on pass-through.
+        assert_eq!(normalize_mint("  BONK  "), "BONK");
     }
 }

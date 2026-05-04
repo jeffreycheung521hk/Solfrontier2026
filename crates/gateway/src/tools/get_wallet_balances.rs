@@ -48,8 +48,20 @@ use crate::tools::jupiter_swap::SessionBoundWallet;
 pub const USDC_MINT_BS58: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 /// Classic SPL Token program id.
 pub const SPL_TOKEN_PROGRAM_BS58: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-/// Associated Token Account program id.
-pub const ATA_PROGRAM_BS58: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bC8";
+//
+// Phase 6C-C — the previous build of this module hard-coded an ATA
+// program id constant `"ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bC8"`
+// (last six chars `LJe1bC8`) which is NOT the SPL Associated Token
+// Account program. The canonical ATA program id ends in `LJA8knL`.
+// Calling `find_program_address([owner, token_program, mint], <wrong>)`
+// produced an unrelated PDA, so RPC correctly returned AccountNotFound
+// and the tool reported `usdc_raw=0`.
+//
+// The canonical helper `crate::integrations::solend::derive_associated_token_address`
+// delegates to `spl_associated_token_account::get_associated_token_address_with_program_id`
+// (already a dependency; live-mainnet-validated by the Solend pipeline).
+// We re-use that helper here so this module never re-derives the ATA
+// program id itself.
 
 /// Minimal token-account snapshot — only the fields the LLM and UI need.
 #[derive(Debug, Clone)]
@@ -159,17 +171,16 @@ impl GetWalletBalancesTool {
     }
 }
 
-/// Inline ATA derivation (avoids reaching into the Solend integration
-/// for what is a generic SPL primitive).
+/// Derive the wallet's USDC ATA via the canonical SPL helper.
+///
+/// Delegates to `crate::integrations::solend::derive_associated_token_address`
+/// which itself wraps `spl_associated_token_account::get_associated_token_address_with_program_id`.
+/// This avoids re-implementing — and miscopying — the ATA program id.
 fn derive_usdc_ata(owner: &Pubkey) -> Pubkey {
     let mint = Pubkey::from_str(USDC_MINT_BS58).expect("USDC mint constant is valid base58");
-    let token_program =
-        Pubkey::from_str(SPL_TOKEN_PROGRAM_BS58).expect("SPL Token program constant is valid base58");
-    let ata_program =
-        Pubkey::from_str(ATA_PROGRAM_BS58).expect("ATA program constant is valid base58");
-    let seeds = &[owner.as_ref(), token_program.as_ref(), mint.as_ref()];
-    let (ata, _bump) = Pubkey::find_program_address(seeds, &ata_program);
-    ata
+    let token_program = Pubkey::from_str(SPL_TOKEN_PROGRAM_BS58)
+        .expect("SPL Token program constant is valid base58");
+    crate::integrations::solend::derive_associated_token_address(owner, &mint, &token_program)
 }
 
 fn lamports_to_ui(lamports: u64) -> String {
@@ -493,5 +504,59 @@ mod tests {
                 "get_wallet_balances schema must not mention `{forbidden}`; got {raw}"
             );
         }
+    }
+
+    // ── Phase 6C-C — known-vector regression for the canonical ATA fix ─────
+
+    /// Known-vector ATA derivation: this catches the Phase 6C bug where
+    /// the wrong ATA program id was hard-coded. The on-chain wallet
+    /// `C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW` holds USDC at the
+    /// associated token account `4bDArC4UVoBjecHUZaCKqhuhTYPoiKS4qpQQpxuvm1qn`
+    /// (verified via mainnet RPC during live smoke). Any future regression
+    /// in `derive_usdc_ata` will fail this assertion deterministically,
+    /// without contacting the network.
+    #[test]
+    fn p6c_c_known_vector_usdc_ata_derivation() {
+        const OWNER_BS58: &str = "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW";
+        const EXPECTED_USDC_ATA: &str = "4bDArC4UVoBjecHUZaCKqhuhTYPoiKS4qpQQpxuvm1qn";
+        let owner = Pubkey::from_str(OWNER_BS58).expect("owner is valid base58");
+        let derived = derive_usdc_ata(&owner);
+        assert_eq!(
+            derived.to_string(),
+            EXPECTED_USDC_ATA,
+            "USDC ATA derivation must match the canonical SPL helper"
+        );
+    }
+
+    /// Phase 6C-C smoke-driven fixture: bound wallet C4QQ + StubReader
+    /// returning the on-chain USDC balance (397_264 raw = 0.397264 USDC)
+    /// must surface in the tool output WITH the correct ATA pubkey.
+    /// Locks both the ATA derivation fix and the raw -> UI formatting.
+    #[tokio::test]
+    async fn p6c_c_known_balance_round_trip_for_c4qq_wallet() {
+        const OWNER_BS58: &str = "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW";
+        const EXPECTED_USDC_ATA: &str = "4bDArC4UVoBjecHUZaCKqhuhTYPoiKS4qpQQpxuvm1qn";
+        const KNOWN_USDC_RAW: u64 = 397_264;
+        let tool = GetWalletBalancesTool::new(
+            Arc::new(StubWallet {
+                pubkey: Some(OWNER_BS58.to_string()),
+            }),
+            Arc::new(StubReader::ok(
+                500_000_000,
+                Some(TokenAccountSnapshot {
+                    mint: USDC_MINT_BS58.to_string(),
+                    owner: OWNER_BS58.to_string(),
+                    raw_amount: KNOWN_USDC_RAW,
+                }),
+            )),
+        );
+        let out = tool.execute(input()).await.unwrap();
+        assert!(out.success);
+        let data = out.data.unwrap();
+        assert_eq!(data["status"], "ok");
+        assert_eq!(data["wallet_pubkey"], OWNER_BS58);
+        assert_eq!(data["usdc_ata"], EXPECTED_USDC_ATA);
+        assert_eq!(data["usdc_raw"], KNOWN_USDC_RAW);
+        assert_eq!(data["usdc_ui"], "0.397264");
     }
 }

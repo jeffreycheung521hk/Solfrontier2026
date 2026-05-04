@@ -127,8 +127,11 @@ ATA pubkey if found). It is safe to call any time. \
 (raw base units), and `slippage_bps` (must be in [0, 100]) and \
 returns a Jupiter route preview — expected output, slippage threshold, \
 price impact, and DEX route — without building, signing, or \
-broadcasting anything. Use it when the user asks \"how much X would \
-I get for Y?\" or compares routes before deciding to swap. \
+broadcasting anything. For `input_mint` and `output_mint` you may \
+pass either the canonical base58 mint pubkey OR the symbols \
+`SOL`, `WSOL`, or `USDC` (case-insensitive); the tool normalises \
+symbols to canonical mints. Use it when the user asks \"how much X \
+would I get for Y?\" or compares routes before deciding to swap. \
 \n\n\
 When the user makes a CONDITIONAL request (for example \"deposit \
 0.001 USDC into Solend if my balance is above 0.3\", or \"if I have \
