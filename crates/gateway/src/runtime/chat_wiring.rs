@@ -115,6 +115,35 @@ not include any execution-side field — no `tx_bytes`, no \
 `transaction_base64`, no `signed_tx`, no `submit`, no `approve`, \
 no `priority_fee`, no `private_key`, no `keypair`. \
 \n\n\
+You also have two READ-ONLY tools that DO NOT propose, sign, or move \
+funds. Use them to inform reasoning before deciding whether to \
+propose. \
+\n\n\
+`get_wallet_balances` takes no inputs and returns SOL + USDC balances \
+for the session-bound wallet (raw + UI-decimal forms, plus the USDC \
+ATA pubkey if found). It is safe to call any time. \
+\n\n\
+`get_jupiter_quote` takes `input_mint`, `output_mint`, `input_amount` \
+(raw base units), and `slippage_bps` (must be in [0, 100]) and \
+returns a Jupiter route preview — expected output, slippage threshold, \
+price impact, and DEX route — without building, signing, or \
+broadcasting anything. Use it when the user asks \"how much X would \
+I get for Y?\" or compares routes before deciding to swap. \
+\n\n\
+When the user makes a CONDITIONAL request (for example \"deposit \
+0.001 USDC into Solend if my balance is above 0.3\", or \"if I have \
+enough SOL, swap 0.001 SOL to USDC\"), call the appropriate \
+read-only tool FIRST and stop the turn. The system returns the \
+result to the user; the user (or a follow-up turn) then decides. \
+Do NOT batch a read-only tool with `solend_deposit_usdc` or \
+`submit_jupiter_swap` in the same turn — that violates the \
+one-tool-per-turn rule and the entire turn is rejected. \
+\n\n\
+If a read-only tool reveals that the wallet's balance is INSUFFICIENT \
+for the user's requested action, do NOT call a transaction tool. \
+Respond with plain text instead, explaining the balance you observed \
+and that you are not creating a proposal. Fail closed. \
+\n\n\
 Make at most one tool call per turn. After the tool returns, stop — \
 do not call additional tools, do not approve, do not sign.";
 
@@ -122,7 +151,12 @@ do not call additional tools, do not approve, do not sign.";
 
 /// Name of the only tool the chat-route surface exposes to the LLM in
 /// Phase 5E. Lives as a constant so the source guards can lock it.
-pub const CHAT_TOOL_ALLOWLIST: &[&str] = &["solend_deposit_usdc", "submit_jupiter_swap"];
+pub const CHAT_TOOL_ALLOWLIST: &[&str] = &[
+    "solend_deposit_usdc",
+    "submit_jupiter_swap",
+    "get_wallet_balances",
+    "get_jupiter_quote",
+];
 
 /// Build a registry containing only the tools in [`CHAT_TOOL_ALLOWLIST`]
 /// that exist in `full`. Returns `None` if none of the allowlisted
@@ -531,6 +565,38 @@ mod source_guard_tests {
         assert!(p.contains("tx_bytes"));
         assert!(p.contains("transaction_base64"));
         assert!(p.contains("signed_tx"));
+
+        // ── Phase 6C: read-only tools + conditional + insufficient-balance ──
+        assert!(p.contains("get_wallet_balances"));
+        assert!(p.contains("get_jupiter_quote"));
+        assert!(
+            p.contains("READ-ONLY"),
+            "prompt must mark the read-only tools explicitly"
+        );
+        // Conditional pattern guidance.
+        assert!(
+            p.contains("CONDITIONAL"),
+            "prompt must call out the conditional pattern"
+        );
+        assert!(
+            p.contains("call the appropriate \nread-only tool FIRST")
+                || p.contains("call the appropriate read-only tool FIRST"),
+            "prompt must instruct read-first for conditional requests"
+        );
+        // Insufficient-balance / fail-closed guidance.
+        assert!(
+            p.contains("INSUFFICIENT"),
+            "prompt must call out the insufficient-balance branch"
+        );
+        assert!(
+            p.contains("Fail closed"),
+            "prompt must use the fail-closed phrasing for insufficient-balance"
+        );
+        // Multi-tool batching is rejected.
+        assert!(
+            p.contains("one-tool-per-turn"),
+            "prompt must reference the one-tool-per-turn rule by name"
+        );
     }
 
     /// Phase 5E — provider hang/cost guards must stay tight.
@@ -856,6 +922,84 @@ mod p5e_env_gate_tests {
         ])
     }
 
+    // ── Phase 6C — read-only tool stubs (mirror production schemas) ────────
+
+    struct StubGetWalletBalancesTool;
+
+    #[async_trait]
+    impl Tool for StubGetWalletBalancesTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "get_wallet_balances".into(),
+                description: "stub for Phase 6C narrowing tests".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [],
+                    "properties": {}
+                }),
+                output_schema: json!({"type":"object"}),
+                required_capabilities: vec![],
+                supports_streaming: false,
+                timeout_ms: 8_000,
+            }
+        }
+        async fn execute(&self, _: ToolInput) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                tool_name: "get_wallet_balances".into(),
+                success: true,
+                data: Some(json!({"status":"ok"})),
+                error: None,
+                duration_ms: 0,
+            })
+        }
+    }
+
+    struct StubGetJupiterQuoteTool;
+
+    #[async_trait]
+    impl Tool for StubGetJupiterQuoteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "get_jupiter_quote".into(),
+                description: "stub for Phase 6C narrowing tests".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["input_mint", "output_mint", "input_amount", "slippage_bps"],
+                    "properties": {
+                        "input_mint":   { "type": "string" },
+                        "output_mint":  { "type": "string" },
+                        "input_amount": { "type": "integer", "minimum": 1 },
+                        "slippage_bps": { "type": "integer", "minimum": 0, "maximum": 100 }
+                    }
+                }),
+                output_schema: json!({"type":"object"}),
+                required_capabilities: vec![],
+                supports_streaming: false,
+                timeout_ms: 8_000,
+            }
+        }
+        async fn execute(&self, _: ToolInput) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                tool_name: "get_jupiter_quote".into(),
+                success: true,
+                data: Some(json!({"status":"ok"})),
+                error: None,
+                duration_ms: 0,
+            })
+        }
+    }
+
+    fn stub_registry_with_all_chat_tools() -> ToolRegistry {
+        ToolRegistry::from_tools(vec![
+            Arc::new(StubSolendDepositTool),
+            Arc::new(StubJupiterSwapTool),
+            Arc::new(StubGetWalletBalancesTool),
+            Arc::new(StubGetJupiterQuoteTool),
+        ])
+    }
+
     // ── Class A — default chat provider disabled without env ──────────────
 
     #[test]
@@ -971,8 +1115,14 @@ mod p5e_env_gate_tests {
             ALIGNMENT_SYSTEM_PROMPT.to_string(),
             chat_capabilities(),
         );
+        // Use a unique marker as the user message so the role-separation
+        // substring check below cannot collide with any prompt example
+        // text (the alignment prompt now contains illustrative phrases
+        // such as "deposit 0.001 USDC into Solend if my balance is above
+        // 0.3" which would have falsely failed an earlier substring guard).
+        const MARKER: &str = "Phase5G-roleSep-UserMessage-Marker-42";
         let outcome = handler
-            .handle_chat(&SessionId::from(Uuid::new_v4()), "deposit 0.001 USDC".into())
+            .handle_chat(&SessionId::from(Uuid::new_v4()), MARKER.into())
             .await;
         assert!(matches!(outcome, ChatRouteOutcome::Ok(ChatResponse::ToolDispatched { .. })));
         assert_eq!(
@@ -984,7 +1134,10 @@ mod p5e_env_gate_tests {
         // never the user text.
         let nth = scripted.nth_call(0).expect("recorded call");
         assert_eq!(nth.system, ALIGNMENT_SYSTEM_PROMPT);
-        assert!(!nth.system.contains("deposit 0.001 USDC"));
+        assert!(
+            !nth.system.contains(MARKER),
+            "user message must not bleed into the system prompt"
+        );
     }
 
     // ── Class H — strict_tool_schema_shape_is_amount_only ─────────────────
@@ -1117,6 +1270,99 @@ mod p5e_env_gate_tests {
             assert!(
                 !raw_jupiter.contains(forbidden),
                 "strict Jupiter chat schema must not mention `{forbidden}`; got {raw_jupiter}"
+            );
+        }
+
+        // ── Phase 3: read-only tools (Phase 6C) — schemas in narrowed registry ──
+        let all = narrow_registry_for_chat(&stub_registry_with_all_chat_tools())
+            .expect("stub registry contains all chat tools");
+        let mut all_names = all.names();
+        all_names.sort();
+        let mut expected_all = vec![
+            "solend_deposit_usdc".to_string(),
+            "submit_jupiter_swap".to_string(),
+            "get_wallet_balances".to_string(),
+            "get_jupiter_quote".to_string(),
+        ];
+        expected_all.sort();
+        assert_eq!(
+            all_names, expected_all,
+            "narrowed registry must contain every chat-allowlisted tool when present"
+        );
+
+        // get_wallet_balances — no inputs, no required fields.
+        let bal_spec = all
+            .all_specs()
+            .into_iter()
+            .find(|s| s.name == "get_wallet_balances")
+            .expect("get_wallet_balances spec");
+        let bal_schema = &bal_spec.input_schema;
+        assert_eq!(bal_schema["additionalProperties"], json!(false));
+        assert!(bal_schema["required"].as_array().unwrap().is_empty());
+        assert!(bal_schema["properties"].as_object().unwrap().is_empty());
+        assert!(
+            bal_spec.required_capabilities.is_empty(),
+            "read-only tool must require no capabilities"
+        );
+        let raw_bal = serde_json::to_string(bal_schema).unwrap();
+        for forbidden in [
+            "tx_bytes",
+            "transaction_base64",
+            "signed_tx",
+            "private_key",
+            "keypair",
+            "submit",
+            "approve",
+        ] {
+            assert!(
+                !raw_bal.contains(forbidden),
+                "get_wallet_balances schema must not mention `{forbidden}`; got {raw_bal}"
+            );
+        }
+
+        // get_jupiter_quote — exactly the four documented required fields,
+        // additionalProperties false, slippage_bps capped at 100.
+        let quote_spec = all
+            .all_specs()
+            .into_iter()
+            .find(|s| s.name == "get_jupiter_quote")
+            .expect("get_jupiter_quote spec");
+        let quote_schema = &quote_spec.input_schema;
+        assert_eq!(quote_schema["additionalProperties"], json!(false));
+        let q_required: std::collections::HashSet<&str> = quote_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let q_expected: std::collections::HashSet<&str> =
+            ["input_mint", "output_mint", "input_amount", "slippage_bps"]
+                .into_iter()
+                .collect();
+        assert_eq!(q_required, q_expected);
+        assert_eq!(
+            quote_schema["properties"]["slippage_bps"]["maximum"],
+            json!(100),
+            "Phase 6C cap: slippage_bps must be schema-bounded at 100 bps"
+        );
+        assert!(
+            quote_spec.required_capabilities.is_empty(),
+            "read-only tool must require no capabilities"
+        );
+        let raw_q = serde_json::to_string(quote_schema).unwrap();
+        for forbidden in [
+            "tx_bytes",
+            "transaction_base64",
+            "signed_tx",
+            "private_key",
+            "keypair",
+            "submit",
+            "approve",
+            "wallet_pubkey",
+        ] {
+            assert!(
+                !raw_q.contains(forbidden),
+                "get_jupiter_quote schema must not mention `{forbidden}`; got {raw_q}"
             );
         }
     }
