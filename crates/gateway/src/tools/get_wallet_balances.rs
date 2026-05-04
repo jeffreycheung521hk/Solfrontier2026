@@ -36,7 +36,10 @@ use async_trait::async_trait;
 use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
 
+use claw_solana_core::errors::SolanaError;
+use claw_solana_core::rpc::ClawRpcClient;
 use claw_tool_system::{errors::ToolError, tool::Tool};
+use claw_types::solana::CommitmentLevel;
 use claw_types::tool::{ToolInput, ToolOutput, ToolSpec};
 
 use crate::tools::jupiter_swap::SessionBoundWallet;
@@ -68,6 +71,73 @@ pub trait WalletBalanceReader: Send + Sync {
         &self,
         ata: &str,
     ) -> Result<Option<TokenAccountSnapshot>, String>;
+}
+
+/// Production [`WalletBalanceReader`] backed by [`ClawRpcClient`].
+///
+/// The daemon owns a single `ClawRpcClient` (cheap to clone — internally
+/// shares the connection pool); we wrap a clone here so the read-only
+/// tool inherits the same RPC pool, retry, and tracing posture as every
+/// other read in the gateway.
+pub struct RpcWalletBalanceReader {
+    rpc: ClawRpcClient,
+}
+
+impl RpcWalletBalanceReader {
+    pub fn new(rpc: ClawRpcClient) -> Self {
+        Self { rpc }
+    }
+}
+
+#[async_trait]
+impl WalletBalanceReader for RpcWalletBalanceReader {
+    async fn get_sol_lamports(&self, pubkey: &str) -> Result<u64, String> {
+        self.rpc
+            .get_balance(pubkey, Some(CommitmentLevel::Confirmed))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn get_token_account(
+        &self,
+        ata: &str,
+    ) -> Result<Option<TokenAccountSnapshot>, String> {
+        let acct = match self
+            .rpc
+            .get_account(ata, Some(CommitmentLevel::Confirmed))
+            .await
+        {
+            Ok(a) => a,
+            // Treat "ATA does not exist on chain" as a structured `None`
+            // rather than an error — the tool contract differentiates
+            // "no ATA yet" (usdc_raw=0) from "RPC failed".
+            Err(SolanaError::AccountNotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        // Classic SPL Token account layout: 165 bytes.
+        //   [0..32]  mint
+        //   [32..64] owner
+        //   [64..72] amount (u64 little-endian)
+        if acct.data.len() < 72 {
+            return Err(format!(
+                "token account data too short: {} bytes (need >= 72)",
+                acct.data.len()
+            ));
+        }
+        let mint_bytes: [u8; 32] = acct.data[0..32]
+            .try_into()
+            .map_err(|e| format!("mint slice: {e}"))?;
+        let owner_bytes: [u8; 32] = acct.data[32..64]
+            .try_into()
+            .map_err(|e| format!("owner slice: {e}"))?;
+        let mut amount_le: [u8; 8] = [0u8; 8];
+        amount_le.copy_from_slice(&acct.data[64..72]);
+        Ok(Some(TokenAccountSnapshot {
+            mint: Pubkey::new_from_array(mint_bytes).to_string(),
+            owner: Pubkey::new_from_array(owner_bytes).to_string(),
+            raw_amount: u64::from_le_bytes(amount_le),
+        }))
+    }
 }
 
 /// Read-only wallet-balances tool. Wired into the chat allowlist as
