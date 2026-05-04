@@ -738,7 +738,12 @@ pub async fn submit_signed_solend_transaction(
                         "protocol":                "Solend",
                         "action":                  "Deposit",
                         "asset":                   "USDC",
-                        "amount_raw":              parked.action.amount().raw(),
+                        // Deposit's `amount_raw()` is in underlying USDC
+                        // base units. The submit pipeline currently only
+                        // consumes deposit-flow `ParkedSolendSigning`
+                        // artifacts, so `parked.action` is always Deposit
+                        // here in Phase 5H-B.
+                        "amount_raw":              parked.action.amount_raw(),
                         "verified_slot":           parked.verified_slot,
                         "simulation_slot":         parked.simulation_slot,
                         "last_valid_block_height": parked.last_valid_block_height,
@@ -811,7 +816,9 @@ fn handoff_safe_payload(
         "protocol":                "Solend",
         "action":                  "Deposit",
         "asset":                   "USDC",
-        "amount_raw":              parked.action.amount().raw(),
+        // Deposit's `amount_raw()` is in underlying USDC base units
+        // (Phase 5H-B: this code path is deposit-flow only).
+        "amount_raw":              parked.action.amount_raw(),
         "verified_slot":           parked.verified_slot,
         "simulation_slot":         parked.simulation_slot,
         "last_valid_block_height": parked.last_valid_block_height,
@@ -848,7 +855,9 @@ async fn audit_rejected(
         payload["protocol"] = json!("Solend");
         payload["action"] = json!("Deposit");
         payload["asset"] = json!("USDC");
-        payload["amount_raw"] = json!(p.action.amount().raw());
+        // Deposit's `amount_raw()` is in underlying USDC base units
+        // (Phase 5H-B: this audit-payload helper is deposit-flow only).
+        payload["amount_raw"] = json!(p.action.amount_raw());
         payload["verified_slot"] = json!(p.verified_slot);
         payload["last_valid_block_height"] = json!(p.last_valid_block_height);
     }

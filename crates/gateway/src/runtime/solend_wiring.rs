@@ -130,6 +130,13 @@ pub fn solend_usdc_lending_rule_config() -> LendingRuleConfig {
                 usdc_mint,
                 UnderlyingAmount::new(MAX_STRUCTURAL_AMOUNT_RAW),
             )],
+            // Phase 5H — Withdraw cap list. Empty here because the
+            // `solend_deposit_usdc` tool only constructs Deposit
+            // actions; an evaluator invocation against this config
+            // with a Withdraw action would HardBlock on
+            // `NoCapConfigured`. The future withdraw tool will own its
+            // own wire helper that populates this list.
+            per_mint_collateral_caps: vec![],
         },
     }
 }

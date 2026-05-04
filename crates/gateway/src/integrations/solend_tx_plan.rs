@@ -239,6 +239,18 @@ pub fn assemble_solend_deposit_tx_plan(
         ProposedAction::Repay { .. } => {
             return Err(SolendTxPlanError::UnsupportedActionKind);
         }
+        // Phase 5H — Withdraw is a protocol-level action variant but the
+        // deposit tx-plan assembler only knows how to compose deposit
+        // ixs. Return the existing typed unsupported-action error so the
+        // resume task surfaces this as `RecheckPassedPlanAssemblyFailed`
+        // rather than a panic. The withdraw flow has its own (un-wired,
+        // future) plan assembler — see Phase 5H roadmap. Note: this arm
+        // is unreachable in production today because no code path
+        // constructs `ProposedAction::Withdraw` (the future withdraw
+        // tool that would do so is not wired in 5H-B).
+        ProposedAction::Withdraw { .. } => {
+            return Err(SolendTxPlanError::UnsupportedActionKind);
+        }
     };
     if action_protocol != ProtocolTag::Solend {
         return Err(SolendTxPlanError::UnsupportedProtocol {

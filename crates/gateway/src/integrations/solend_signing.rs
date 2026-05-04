@@ -692,7 +692,13 @@ pub async fn create_signing_handoff(
                 "protocol":                         "Solend",
                 "action":                           "Deposit",
                 "asset":                            "USDC",
-                "amount_raw":                       plan.action.amount().raw(),
+                // Deposit's `amount_raw()` is in underlying USDC base
+                // units (the `Deposit` variant carries `UnderlyingAmount`).
+                // Phase 5H's `Withdraw` variant carries
+                // `CollateralTokenAmount`; this code path remains
+                // Deposit-only because the deposit signing flow only
+                // produces `SolendDepositTxPlan` artifacts.
+                "amount_raw":                       plan.action.amount_raw(),
                 "verified_slot":                    plan.verified_slot,
                 "simulation_slot":                  summary.simulation_slot,
                 "last_valid_block_height":          summary.last_valid_block_height,

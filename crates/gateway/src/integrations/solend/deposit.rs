@@ -508,6 +508,7 @@ mod tests {
             },
             max_action_input_amount: MaxActionInputAmountConfig {
                 per_mint_caps: vec![(mint, UnderlyingAmount::new(1_000_000))],
+                per_mint_collateral_caps: vec![],
             },
         };
         let action = ProposedAction::Deposit {

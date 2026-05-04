@@ -17,3 +17,17 @@ pub mod solend_preflight;
 pub mod solend_signing;
 pub mod solend_submit;
 pub mod solend_tx_plan;
+
+// Phase 5H-C — un-wired Solend WITHDRAW transaction PLAN assembler.
+//
+// `solend_withdraw_tx_plan` is intentionally NOT `pub mod`. It is
+// declared only under `#[cfg(test)]` so its deterministic tests run
+// under `cargo test -p claw-gateway --lib solend`. Production builds
+// exclude this file entirely; no symbol from it is reachable from any
+// tool, runtime, park, signing, submit, or chat code path.
+//
+// Mirrors the test-only-module posture introduced in Phase 5H-A for
+// `integrations/solend/withdraw.rs`. Phase 5H-D will flip both gates
+// together when the `solend_withdraw_usdc` tool is wired.
+#[cfg(test)]
+mod solend_withdraw_tx_plan;

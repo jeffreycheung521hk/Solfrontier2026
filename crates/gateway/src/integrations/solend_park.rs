@@ -915,6 +915,12 @@ fn rule_detail_label(detail: &RuleRejectionDetail) -> &'static str {
         RuleRejectionDetail::MintNotAllowed => "MintNotAllowed",
         RuleRejectionDetail::ReserveNotInSnapshot => "ReserveNotInSnapshot",
         RuleRejectionDetail::RepayWithoutDebt => "RepayWithoutDebt",
+        // Phase 5H — Withdraw cross-reference details. Unreachable
+        // from the deposit-resume code path (the deposit tool only
+        // constructs `ProposedAction::Deposit`), but the formatter
+        // must remain exhaustive over `RuleRejectionDetail`.
+        RuleRejectionDetail::WithdrawWithoutDeposit => "WithdrawWithoutDeposit",
+        RuleRejectionDetail::WithdrawWithDebt => "WithdrawWithDebt",
         RuleRejectionDetail::NoCapConfigured => "NoCapConfigured",
         RuleRejectionDetail::AmountOverCap => "AmountOverCap",
     }
@@ -1407,6 +1413,9 @@ mod tests {
             },
             max_action_input_amount: MaxActionInputAmountConfig {
                 per_mint_caps: vec![(usdc_mint(), UnderlyingAmount::new(10_000))],
+                // Phase 5H — deposit-park tests don't construct Withdraw
+                // actions; collateral cap list stays empty.
+                per_mint_collateral_caps: vec![],
             },
         }
     }
