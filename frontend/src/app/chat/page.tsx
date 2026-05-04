@@ -12,7 +12,7 @@
 // yet have polished UX. Phantom signing and live balance display are
 // Day 2+.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -21,14 +21,32 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { WalletConnect } from "@/components/wallet-connect";
-import { getOrCreateSession, postChat } from "@/lib/api";
+import {
+  confirmWalletBindChallenge,
+  createWalletBindChallenge,
+  getOrCreateSession,
+  postChat,
+} from "@/lib/api";
 import { IS_SHOWCASE, MODE } from "@/lib/mode";
+import { signMessage } from "@/lib/phantom";
 import type {
   ChatMessage,
   ChatResponse,
   ChatRouteResult,
   SessionId,
 } from "@/lib/types";
+
+// Live-mode wallet bind state. The Phantom popup for signMessage is
+// triggered ONLY inside `handleBindWallet` (a click handler), never from
+// an effect — Phantom rejects popups that aren't rooted in a user
+// gesture, and we want to uphold INV-1 even for the binding step.
+type BindState =
+  | { kind: "idle" }
+  | { kind: "challenge_fetching" }
+  | { kind: "awaiting_signature"; message: string }
+  | { kind: "confirming" }
+  | { kind: "bound"; pubkey: string }
+  | { kind: "error"; reason: string };
 
 // Backend caps the request body at 4096 bytes; the harness caps the
 // message string at 4000 chars after trim. Mirror the char cap here so
@@ -46,6 +64,12 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+
+  // Live-mode wallet binding: tracked here (not in <WalletConnect>) so
+  // the Send button can gate on it and the bind state is reset by
+  // disconnect / accountChanged events surfaced by <WalletConnect>.
+  const [walletPubkey, setWalletPubkey] = useState<string | null>(null);
+  const [bind, setBind] = useState<BindState>({ kind: "idle" });
 
   const listEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -73,9 +97,60 @@ export default function ChatPage() {
     listEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
 
+  // If the connected wallet changes (or disconnects), invalidate any
+  // existing bind. Daemon would also reject a stale binding because the
+  // session+pubkey check on /wallet-bind-confirm is exact-match.
+  useEffect(() => {
+    setBind((prev) => {
+      if (prev.kind === "bound" && prev.pubkey !== walletPubkey) {
+        return { kind: "idle" };
+      }
+      return prev;
+    });
+  }, [walletPubkey]);
+
+  const handleBindWallet = useCallback(async () => {
+    if (IS_SHOWCASE) return;
+    if (!sessionId || !walletPubkey) return;
+    setBind({ kind: "challenge_fetching" });
+    try {
+      const challenge = await createWalletBindChallenge(sessionId, walletPubkey);
+      setBind({ kind: "awaiting_signature", message: challenge.message });
+      const { signatureB64 } = await signMessage(challenge.message);
+      setBind({ kind: "confirming" });
+      const result = await confirmWalletBindChallenge(
+        sessionId,
+        challenge.challenge_id,
+        walletPubkey,
+        signatureB64,
+      );
+      if (result.bound && result.verified) {
+        setBind({ kind: "bound", pubkey: walletPubkey });
+      } else {
+        setBind({
+          kind: "error",
+          reason: "daemon returned bound=false or verified=false",
+        });
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : "binding failed";
+      setBind({ kind: "error", reason });
+    }
+  }, [sessionId, walletPubkey]);
+
   const trimmed = input.trim();
+  // In live mode, sending is gated on a verified wallet bind. Solend
+  // tool dispatch will fail without it (SessionBoundWallet has no
+  // pubkey for this session), so blocking up-front is more honest than
+  // letting the chat error out at tool-resolve time.
+  const liveBindBlocked =
+    !IS_SHOWCASE && (walletPubkey === null || bind.kind !== "bound");
   const canSend =
-    !!sessionId && !sending && trimmed.length > 0 && trimmed.length <= MAX_MESSAGE_CHARS;
+    !!sessionId &&
+    !sending &&
+    trimmed.length > 0 &&
+    trimmed.length <= MAX_MESSAGE_CHARS &&
+    !liveBindBlocked;
 
   async function send() {
     if (!canSend || !sessionId) return;
@@ -138,7 +213,7 @@ export default function ChatPage() {
             {MODE}
           </Badge>
           <div className="ml-auto">
-            <WalletConnect />
+            <WalletConnect onChange={setWalletPubkey} />
           </div>
         </div>
         <p className="text-sm text-muted-foreground">
@@ -148,6 +223,15 @@ export default function ChatPage() {
       </header>
 
       <SessionStatus sessionId={sessionId} sessionError={sessionError} />
+
+      {!IS_SHOWCASE && (
+        <WalletBindStatus
+          sessionId={sessionId}
+          walletPubkey={walletPubkey}
+          bind={bind}
+          onBindClick={handleBindWallet}
+        />
+      )}
 
       <Card>
         <CardHeader>
@@ -181,11 +265,15 @@ export default function ChatPage() {
           rows={3}
           maxLength={MAX_MESSAGE_CHARS}
           placeholder={
-            sessionId
-              ? "Type a request — e.g. 'Deposit 0.001 USDC into Solend'"
-              : "Opening session…"
+            !sessionId
+              ? "Opening session…"
+              : liveBindBlocked
+                ? walletPubkey === null
+                  ? "Connect Phantom and bind your wallet first"
+                  : "Bind your wallet to the session before sending"
+                : "Type a request — e.g. 'Deposit 0.001 USDC into Solend'"
           }
-          disabled={!sessionId}
+          disabled={!sessionId || liveBindBlocked}
           className="w-full rounded-md border bg-background px-3 py-2 text-sm font-sans
                      focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-60"
         />
@@ -203,6 +291,140 @@ export default function ChatPage() {
 }
 
 // ── Sub-components ──────────────────────────────────────────────────────────
+
+function WalletBindStatus({
+  sessionId,
+  walletPubkey,
+  bind,
+  onBindClick,
+}: {
+  sessionId: SessionId | null;
+  walletPubkey: string | null;
+  bind: BindState;
+  onBindClick: () => void;
+}) {
+  // Bound (and matches the currently-connected wallet): minimal green confirmation.
+  if (bind.kind === "bound" && bind.pubkey === walletPubkey) {
+    return (
+      <div
+        className="rounded-md border bg-card px-3 py-2 text-xs flex items-center gap-2"
+        data-testid="wallet-bind-bound"
+      >
+        <span className="inline-block h-2 w-2 rounded-full bg-green-600" />
+        <span className="text-foreground">Wallet bound to session</span>
+        <span className="text-muted-foreground font-mono">
+          ({walletPubkey?.slice(0, 4)}…{walletPubkey?.slice(-4)})
+        </span>
+      </div>
+    );
+  }
+
+  // No wallet yet: muted nudge.
+  if (walletPubkey === null) {
+    return (
+      <Alert className="border-amber-500/40">
+        <AlertTitle>Connect Phantom to bind your wallet</AlertTitle>
+        <AlertDescription>
+          Live mode requires the wallet to prove ownership of the session before any
+          Solend tool can resolve a signer. Connect Phantom in the header to begin.
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  // Wallet connected but not yet bound: explicit user action required.
+  if (bind.kind === "idle") {
+    return (
+      <Alert className="border-amber-500/40">
+        <AlertTitle>Wallet not bound to session</AlertTitle>
+        <AlertDescription className="space-y-2">
+          <span className="block">
+            Phantom is connected but the daemon hasn&apos;t verified ownership for this
+            session. Click below to request a challenge — you&apos;ll be asked to sign
+            a short message in Phantom (no transaction).
+          </span>
+          <Button
+            size="sm"
+            onClick={onBindClick}
+            disabled={!sessionId}
+            data-testid="wallet-bind-start"
+          >
+            Bind wallet to session
+          </Button>
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  if (bind.kind === "challenge_fetching") {
+    return (
+      <Alert>
+        <AlertTitle>Requesting challenge…</AlertTitle>
+        <AlertDescription>
+          Asking the daemon for a one-time message to sign.
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  if (bind.kind === "awaiting_signature") {
+    return (
+      <Alert>
+        <AlertTitle>Approve the message in Phantom</AlertTitle>
+        <AlertDescription className="space-y-2">
+          <span className="block">
+            Phantom should be prompting you to sign a short ownership-proof message.
+            No transaction is being signed — this is text only.
+          </span>
+          <details className="text-xs text-muted-foreground">
+            <summary className="cursor-pointer hover:text-foreground">
+              show challenge text
+            </summary>
+            <pre className="mt-2 overflow-x-auto rounded bg-muted px-3 py-2 text-[11px] leading-snug whitespace-pre-wrap">
+              {bind.message}
+            </pre>
+          </details>
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  if (bind.kind === "confirming") {
+    return (
+      <Alert>
+        <AlertTitle>Verifying signature…</AlertTitle>
+        <AlertDescription>
+          Sending the signed challenge back to the daemon for verification.
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  if (bind.kind === "error") {
+    return (
+      <Alert variant="destructive" data-testid="wallet-bind-error">
+        <AlertTitle>Wallet bind failed</AlertTitle>
+        <AlertDescription className="space-y-2">
+          <span className="block break-all">{bind.reason}</span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onBindClick}
+            disabled={!sessionId || !walletPubkey}
+          >
+            Retry bind
+          </Button>
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  // bind.kind === "bound" but bind.pubkey doesn't match walletPubkey —
+  // transient state between an `accountChanged` from <WalletConnect>
+  // and the page-level effect that resets bind to idle. Render nothing
+  // for that single tick instead of a confusing stale-bound chip.
+  return null;
+}
 
 function SessionStatus({
   sessionId,

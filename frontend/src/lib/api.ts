@@ -324,6 +324,78 @@ function showcaseChatReply(message: string): ChatRouteResult {
   };
 }
 
+// ── Wallet bind challenge-response (Phase 6 Day 3) ──────────────────────────
+//
+// Two-step proof-of-ownership flow that binds the user's Phantom wallet
+// to the daemon session. Without this binding, the Solend tool's session
+// resolver (`SessionBoundWallet::session_wallet_pubkey`) returns None
+// and chat → tool dispatch fails before producing `awaiting_approval`.
+//
+// 1. POST /sessions/:id/wallet-bind-challenge { pubkey }
+//    → { challenge_id, message, expires_at }
+// 2. Phantom signs the canonical message via signMessage().
+// 3. POST /sessions/:id/wallet-bind-confirm { challenge_id, pubkey, signature_b64 }
+//    → { session_id, pubkey, bound: true, verified: true }
+//
+// Daemon enforces: 5-minute TTL, single-use, session+pubkey match,
+// ed25519 signature verification, atomic mark-used. See
+// `crates/gateway/src/wallet_challenge.rs` for the full security model.
+//
+// SECURITY NOTE: never wire this UI to /sessions/:id/bind-wallet — that
+// route accepts a pubkey claim with no proof of ownership. The
+// challenge-response pair above is the only product-UI path.
+
+export interface WalletBindChallenge {
+  challenge_id: string;
+  message: string;
+  expires_at: number;
+}
+
+export interface WalletBindConfirm {
+  session_id: string;
+  pubkey: string;
+  bound: boolean;
+  verified: boolean;
+}
+
+export async function createWalletBindChallenge(
+  sessionId: SessionId,
+  pubkey: string,
+): Promise<WalletBindChallenge> {
+  if (IS_SHOWCASE) {
+    throw new Error("wallet binding is not used in showcase mode");
+  }
+  return live<WalletBindChallenge>(
+    `/sessions/${sessionId}/wallet-bind-challenge`,
+    {
+      method: "POST",
+      body: JSON.stringify({ pubkey }),
+    },
+  );
+}
+
+export async function confirmWalletBindChallenge(
+  sessionId: SessionId,
+  challengeId: string,
+  pubkey: string,
+  signatureB64: string,
+): Promise<WalletBindConfirm> {
+  if (IS_SHOWCASE) {
+    throw new Error("wallet binding is not used in showcase mode");
+  }
+  return live<WalletBindConfirm>(
+    `/sessions/${sessionId}/wallet-bind-confirm`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        challenge_id: challengeId,
+        pubkey,
+        signature_b64: signatureB64,
+      }),
+    },
+  );
+}
+
 // ── Approval decide + Solend signature flow (Phase 6 Day 2) ─────────────────
 //
 // `decideApproval`     POST /sessions/:id/approve
