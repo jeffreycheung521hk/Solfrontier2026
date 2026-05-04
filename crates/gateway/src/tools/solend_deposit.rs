@@ -251,15 +251,21 @@ pub struct SubmitSolendDepositTool {
     /// **read-only RPC simulation only** — it does NOT carry signer,
     /// broadcast, orchestrator, or external-wallet capability.
     preflight_simulator: Option<Arc<dyn crate::integrations::solend_preflight::SolendPreflightSimulator>>,
-    /// Phase 4C-4 signing-handoff dependencies. `None` preserves the
-    /// pre-4C-4 behaviour (resume task returns `RecheckPassedPreflighted`
+    /// Phase 6B JIT-ready dependencies. `None` preserves the
+    /// pre-handoff behaviour (resume task returns `RecheckPassedPreflighted`
     /// after preflight). When wired, a preflight-Passed outcome is
-    /// upgraded to `RecheckPassedSigningRequested`.
+    /// upgraded to `RecheckPassedJitReady` and a JIT-ready entry is
+    /// parked in the `SolendJitReadyStore` for the prepare HTTP route
+    /// (Window 2) to consume on the user's Sign-with-Phantom click.
     ///
-    /// The signing store holds the obligation Keypair and the
-    /// partially-signed transaction bytes — NO broadcast, NO signer
-    /// dispatch, NO orchestrator. Phase 4C-5 adds the send path.
-    signing_deps: Option<crate::integrations::solend_park::SolendSigningDeps>,
+    /// CRUCIALLY: NO transaction is built, NO blockhash is fetched, NO
+    /// signature is created at this point. Compare to the previous
+    /// `signing_deps` field, which created a fully-signed obligation
+    /// transaction at approval time and locked the blockhash there —
+    /// that approach exceeded Solana's ~150-block validity window
+    /// during manual paste/poll/sign latency.
+    jit_ready_deps:
+        Option<crate::integrations::solend_jit_ready::SolendJitReadyDeps>,
 }
 
 impl SubmitSolendDepositTool {
@@ -279,7 +285,7 @@ impl SubmitSolendDepositTool {
             park_store,
             approval_lease_seconds,
             preflight_simulator: None,
-            signing_deps: None,
+            jit_ready_deps: None,
         }
     }
 
@@ -295,13 +301,16 @@ impl SubmitSolendDepositTool {
         self
     }
 
-    /// Opt-in: attach Phase 4C-4 signing-handoff dependencies. Absent
-    /// this call, the resume task stops at the 4C-3 preflight outcome.
-    pub fn with_signing_deps(
+    /// Opt-in: attach Phase 6B JIT-ready dependencies. Absent this call,
+    /// the resume task stops at the preflight outcome and no JIT-ready
+    /// entry is parked. Production wiring always provides this. The
+    /// signing handoff itself is created later by the prepare HTTP
+    /// route (Window 2) — not here.
+    pub fn with_jit_ready_deps(
         mut self,
-        signing_deps: crate::integrations::solend_park::SolendSigningDeps,
+        jit_ready_deps: crate::integrations::solend_jit_ready::SolendJitReadyDeps,
     ) -> Self {
-        self.signing_deps = Some(signing_deps);
+        self.jit_ready_deps = Some(jit_ready_deps);
         self
     }
 }
@@ -615,7 +624,7 @@ impl Tool for SubmitSolendDepositTool {
                 let resume_assembler = self.assembler.clone();
                 let resume_rule_config = self.rule_config.clone();
                 let resume_preflight = self.preflight_simulator.clone();
-                let resume_signing_deps = self.signing_deps.clone();
+                let resume_jit_ready_deps = self.jit_ready_deps.clone();
                 tokio::spawn(async move {
                     let _outcome = run_solend_resume_task(
                         request_id,
@@ -623,7 +632,7 @@ impl Tool for SubmitSolendDepositTool {
                         resume_assembler,
                         resume_rule_config,
                         resume_preflight,
-                        resume_signing_deps,
+                        resume_jit_ready_deps,
                         decision_rx,
                     )
                     .await;

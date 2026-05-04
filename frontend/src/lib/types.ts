@@ -290,3 +290,191 @@ export type ChatMessage =
   | { id: string; kind: "user"; text: string; sentAt: IsoDate }
   | { id: string; kind: "assistant"; result: ChatRouteResult; receivedAt: IsoDate }
   | { id: string; kind: "system"; text: string; at: IsoDate };
+
+// ── Approval decide route (Phase 6 Day 2) ────────────────────────────────────
+
+/// Wire body for `POST /sessions/:id/approve` (mirrors
+/// `claw-api::routes::approve::ApproveRequest`). Note the
+/// `approved: boolean` shape — not a "decision" string discriminator.
+export interface ApproveRequest {
+  request_id: Uuid;
+  approved: boolean;
+  note?: string | null;
+  approver_role?: string | null;
+}
+
+/// Wire body for the success branch (200 / 202).
+export interface ApproveResponse {
+  request_id: Uuid;
+  outcome: string;
+  transaction_id: Uuid;
+  note: string | null;
+}
+
+// ── Solend signature retrieval / submit wire shapes ──────────────────────────
+//
+// Mirror `claw-api::state::{SolendRetrievalResult, SolendSubmitResult}` —
+// both are `#[serde(tag = "status", rename_all = "snake_case")]`.
+
+export type SolendRetrievalResult =
+  | {
+      status: "found";
+      signing_request_id: Uuid;
+      intent_id: Uuid;
+      session_wallet: string;
+      unsigned_tx_b64: string;
+      obligation_signer_backend_partial: boolean;
+      last_valid_block_height: number;
+      expires_at_unix_ms: number;
+      verified_slot: number;
+      simulation_slot: number | null;
+      units_consumed: number | null;
+    }
+  | {
+      status: "submitted";
+      signing_request_id: Uuid;
+      intent_id: Uuid;
+      tx_signature: string;
+      last_valid_block_height: number;
+    }
+  | {
+      status: "confirming";
+      signing_request_id: Uuid;
+      intent_id: Uuid;
+      tx_signature: string;
+      slot: number;
+      last_valid_block_height: number;
+    }
+  | {
+      status: "finalized";
+      signing_request_id: Uuid;
+      intent_id: Uuid;
+      tx_signature: string;
+      slot: number;
+    }
+  | {
+      status: "failed";
+      signing_request_id: Uuid;
+      intent_id: Uuid;
+      tx_signature: string;
+      err: string;
+    }
+  | {
+      status: "confirmation_timeout";
+      signing_request_id: Uuid;
+      tx_signature: string;
+      last_valid_block_height: number;
+      current_block_height: number;
+      requires_reproposal: boolean;
+      reason: string;
+    }
+  | {
+      status: "rejected";
+      signing_request_id: Uuid;
+      error_type: string;
+      message: string;
+    }
+  | {
+      status: "broadcast_failed";
+      signing_request_id: Uuid;
+      error_type: string;
+      message: string;
+    }
+  | { status: "pre_submit_expired"; reason: string }
+  | { status: "not_found" }
+  | { status: "expired" };
+
+export type SolendSubmitResult =
+  | {
+      status: "submitted";
+      signing_request_id: Uuid;
+      intent_id: Uuid;
+      session_wallet: string;
+      tx_signature: string;
+      verified_slot: number;
+      last_valid_block_height: number;
+    }
+  | {
+      status: "recovered";
+      signing_request_id: Uuid;
+      tx_signature: string;
+      recorded_at_unix_ms: number;
+    }
+  | { status: "not_found" }
+  | { status: "expired"; reason: string }
+  | { status: "rejected"; error_type: string; message: string }
+  | {
+      status: "broadcast_failed";
+      signing_request_id: Uuid;
+      error_type: string;
+      message: string;
+    };
+
+/// Local UI state for the `useSigningHandoff` hook. Collapses the
+/// retrieval + submit DTOs into a single state machine the
+/// `<SigningFlow>` component renders one branch at a time.
+export type SigningHandoffState =
+  | { kind: "idle" }
+  | { kind: "polling"; attempts: number }
+  /// Phase 6B Window 3: POST /sessions/:s/approvals/:a/solend-signing/prepare
+  /// is in flight. Entered on the user's Sign-with-Phantom click.
+  | { kind: "preparing" }
+  /// Phase 6B Window 3: prepare returned a typed failure variant
+  /// other than Ready. The UI shows a retryable error so the operator
+  /// can click Sign again (or fix wallet binding) without re-approval.
+  | { kind: "prepare_failed"; reason: string }
+  | {
+      kind: "ready";
+      unsigned_tx_b64: string;
+      session_wallet: string;
+      verified_slot: number;
+      last_valid_block_height: number;
+    }
+  | { kind: "signing" }
+  | { kind: "submitting" }
+  | {
+      kind: "submitted";
+      tx_signature: string;
+      last_valid_block_height: number;
+    }
+  | { kind: "confirming"; tx_signature: string; slot: number }
+  | { kind: "finalized"; tx_signature: string; slot: number }
+  | { kind: "rejected"; error: string }
+  | { kind: "broadcast_failed"; error: string; tx_signature?: string }
+  | { kind: "expired"; reason: string }
+  | { kind: "not_found" }
+  | { kind: "execution_failed"; err: string; tx_signature: string }
+  | {
+      kind: "confirmation_timeout";
+      reason: string;
+      requires_reproposal: boolean;
+      tx_signature: string;
+    }
+  | { kind: "error"; error: string };
+
+// ── Phase 6B Window 3 — JIT-prepare wire shape ──────────────────────────────
+//
+// Wire shape of the `POST /sessions/:s/approvals/:a/solend-signing/prepare`
+// response. Tagged union by `status`; HTTP status mapping:
+//   200  → "ready"
+//   404  → "not_found" | "jit_ready_missing"
+//   422  → "not_approved" | "wallet_mismatch"
+//   502  → "handoff_create_failed"
+// 400 / 503 / network errors are surfaced through the api.ts envelope as
+// `{ kind: "error", httpStatus, error }` rather than as a status variant.
+export type SolendJitPrepareResult =
+  | {
+      status: "ready";
+      approval_request_id: Uuid;
+      signing_request_id: Uuid;
+      session_id: SessionId;
+      wallet: string;
+      last_valid_block_height: number;
+      verified_slot: number;
+      expires_at_unix_ms: number;
+    }
+  | { status: "not_approved"; state: string }
+  | { status: "jit_ready_missing" }
+  | { status: "wallet_mismatch"; expected: string; bound: string | null }
+  | { status: "handoff_create_failed"; error_type: string; message: string }
+  | { status: "not_found" };

@@ -13,6 +13,7 @@ pub mod pending_approvals;
 pub mod policy_rules;
 pub mod propose;
 pub mod sessions;
+pub mod solend_jit_signing;
 pub mod solend_signatures;
 pub mod wallets;
 pub mod wallet_challenges;
