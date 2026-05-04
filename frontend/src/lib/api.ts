@@ -16,6 +16,7 @@ import type {
   OpenSessionResponse,
   PolicyRule,
   SessionId,
+  SolendJitPrepareResult,
   SolendRetrievalResult,
   SolendSubmitResult,
   TransactionProposal,
@@ -549,6 +550,74 @@ export async function submitSolendSignature(
     return { kind: "error", httpStatus: 404, error: errMsg };
   }
 
+  let errorText = "";
+  try {
+    const body = (await res.json()) as { error?: string };
+    errorText = body.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+  return { kind: "error", httpStatus: res.status, error: errorText };
+}
+
+// ── Phase 6B Window 3 — JIT signing-handoff prepare ─────────────────────────
+//
+// `POST /sessions/:s/approvals/:a/solend-signing/prepare` is the new
+// Sign-click backend seam: the frontend calls it from the user's
+// "Sign with Phantom" click handler, and the daemon constructs a
+// fresh signing handoff with a fresh blockhash. The returned
+// `signing_request_id` is then immediately used with the existing
+// GET retrieve / POST submit endpoints.
+//
+// Showcase mode short-circuits to a synthetic Ready response that
+// echoes `SHOWCASE_SIGNING_REQUEST_ID`, so the existing showcase
+// `useSigningHandoff` hook continues to play out its timer-driven
+// lifecycle without any daemon traffic.
+
+export type SolendJitPrepareEnvelope =
+  | { kind: "ok"; response: SolendJitPrepareResult }
+  | { kind: "error"; httpStatus: number; error: string };
+
+export async function prepareSolendSigning(
+  sessionId: SessionId,
+  approvalRequestId: Uuid,
+): Promise<SolendJitPrepareEnvelope> {
+  if (IS_SHOWCASE) {
+    // Showcase: synthesize a Ready response. The hook's showcase
+    // simulation drives the rest of the lifecycle from timers; no
+    // network call is made.
+    return {
+      kind: "ok",
+      response: {
+        status: "ready",
+        approval_request_id: approvalRequestId,
+        signing_request_id: SHOWCASE_SIGNING_REQUEST_ID,
+        session_id: sessionId,
+        wallet: "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+        last_valid_block_height: 393_666_166,
+        verified_slot: 415_571_900,
+        expires_at_unix_ms: Date.now() + 60_000,
+      },
+    };
+  }
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+
+  const res = await fetch(
+    `${GATEWAY_URL}/sessions/${sessionId}/approvals/${approvalRequestId}/solend-signing/prepare`,
+    { method: "POST", headers, cache: "no-store" },
+  );
+
+  // 200 = Ready; 404 = NotFound | JitReadyMissing;
+  // 422 = NotApproved | WalletMismatch; 502 = HandoffCreateFailed.
+  // All of these carry the typed `SolendJitPrepareResult` body.
+  if ([200, 404, 422, 502].includes(res.status)) {
+    const body = (await res.json()) as SolendJitPrepareResult;
+    return { kind: "ok", response: body };
+  }
+
+  // 400 (malformed ids) and 503 (handler not wired) carry `{ error }`.
   let errorText = "";
   try {
     const body = (await res.json()) as { error?: string };

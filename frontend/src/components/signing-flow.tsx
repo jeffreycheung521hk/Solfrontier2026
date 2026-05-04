@@ -1,23 +1,24 @@
 "use client";
 
-// Phase 6 Day 2 — `<SigningFlow>` panel for `/approval/[id]`.
+// Phase 6B Window 3 — `<SigningFlow>` panel for `/approval/[id]`.
 //
-// Renders three sequential phases on top of an existing approval
-// request:
+// Now drives the JIT-prepare flow: when the operator clicks Sign with
+// Phantom, the frontend POSTs the new prepare endpoint to mint a fresh
+// signing_request_id with a fresh blockhash, then immediately runs the
+// existing retrieve → Phantom-sign → submit chain. No manual UUID
+// paste is required on the happy path.
 //
-//  1. Approve (visible while `workflow.state === "pending"`):
-//       Approve / Reject buttons → POST /sessions/:id/approve.
+// Flow:
 //
-//  2. Awaiting handoff (visible after approve, before the daemon
-//     parks a signing request):
-//       In showcase mode the fixture id auto-fills; in live mode the
-//       operator pastes the `signing_request_id` (printed by the
-//       daemon's audit log / surfaced via the SSE event stream in a
-//       later phase).
+//   1. Approve (visible while workflow is `pending`):
+//        Approve / Reject buttons → POST /sessions/:id/approve.
 //
-//  3. Sign + submit + confirm (driven by `useSigningHandoff`):
-//       "Sign with Phantom" button → Phantom popup → submit to
-//       daemon → polling lifecycle → Finalized + Solscan link.
+//   2. Sign + submit + confirm (visible once approved):
+//        "Sign with Phantom" button (idle state) → preparing →
+//        signing → submitting → submitted → confirming → finalized.
+//        On `expired` (pre_submit_expired from submit), a "Sign again"
+//        button re-runs the chain with a fresh blockhash via prepare,
+//        without needing re-approval.
 
 import { useCallback, useState } from "react";
 
@@ -26,7 +27,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
-import { decideApproval, SHOWCASE_SIGNING_REQUEST_ID } from "@/lib/api";
+import { decideApproval } from "@/lib/api";
 import { IS_SHOWCASE } from "@/lib/mode";
 import { useSigningHandoff } from "@/lib/use-signing-handoff";
 import type {
@@ -69,18 +70,12 @@ export function SigningFlow({
           : { kind: "error", error: `workflow is ${workflowState}` },
   );
 
-  // In showcase mode the fixture id is known statically, so we can
-  // seed it on first render instead of via an effect (avoids a
-  // cascading render that ESLint flags). In live mode the operator
-  // pastes the id and we set it imperatively below.
-  const [signingRequestId, setSigningRequestId] = useState<Uuid | null>(() =>
-    IS_SHOWCASE && workflowState === "approved" ? SHOWCASE_SIGNING_REQUEST_ID : null,
-  );
-  const [pasteValue, setPasteValue] = useState<string>("");
-
+  // Phase 6B Window 3: hook now takes approvalRequestId. The
+  // signing_request_id is minted JIT inside signWithPhantom() on each
+  // user click — no manual paste, no upfront polling.
   const { state: handoffState, signWithPhantom, reset } = useSigningHandoff(
     approval.kind === "approved" ? sessionId : null,
-    signingRequestId,
+    approval.kind === "approved" ? approvalRequestId : null,
   );
 
   const handleApprove = useCallback(
@@ -97,9 +92,6 @@ export function SigningFlow({
         }
         if (approved) {
           setApproval({ kind: "approved" });
-          if (IS_SHOWCASE) {
-            setSigningRequestId(SHOWCASE_SIGNING_REQUEST_ID);
-          }
         } else {
           setApproval({ kind: "rejected", reason: "operator chose reject" });
         }
@@ -111,11 +103,14 @@ export function SigningFlow({
     [sessionId, approvalRequestId],
   );
 
-  const handlePasteConfirm = useCallback(() => {
-    const trimmed = pasteValue.trim();
-    if (!isUuid(trimmed)) return;
-    setSigningRequestId(trimmed);
-  }, [pasteValue]);
+  const handleSignAgain = useCallback(() => {
+    reset();
+    // Restart the chain on the next event loop tick so the reset's
+    // state housekeeping flushes before the new gesture call.
+    queueMicrotask(() => {
+      void signWithPhantom();
+    });
+  }, [reset, signWithPhantom]);
 
   return (
     <div className="space-y-4" data-testid="signing-flow">
@@ -124,18 +119,11 @@ export function SigningFlow({
         onDecide={handleApprove}
       />
 
-      {approval.kind === "approved" && signingRequestId === null && !IS_SHOWCASE && (
-        <ManualHandoffIdPanel
-          pasteValue={pasteValue}
-          onPaste={setPasteValue}
-          onConfirm={handlePasteConfirm}
-        />
-      )}
-
-      {signingRequestId !== null && (
+      {approval.kind === "approved" && (
         <HandoffPanel
           state={handoffState}
           onSign={signWithPhantom}
+          onSignAgain={handleSignAgain}
           onReset={reset}
         />
       )}
@@ -162,9 +150,9 @@ function ApprovePanel({
           </CardTitle>
         </CardHeader>
         <CardContent className="text-xs text-muted-foreground">
-          The operator has approved this request. The daemon resume task is
-          parking a partially-signed transaction; once it surfaces the
-          handoff, you can sign with Phantom.
+          The operator has approved this request. Click Sign with Phantom
+          below — the daemon will assemble a fresh transaction with a
+          fresh blockhash on demand and hand it to your wallet.
         </CardContent>
       </Card>
     );
@@ -227,85 +215,48 @@ function ApprovePanel({
   );
 }
 
-// ── Manual handoff-id panel (live mode only) ───────────────────────────────
-
-function ManualHandoffIdPanel({
-  pasteValue,
-  onPaste,
-  onConfirm,
-}: {
-  pasteValue: string;
-  onPaste: (v: string) => void;
-  onConfirm: () => void;
-}) {
-  const isValid = isUuid(pasteValue.trim());
-  return (
-    <Card data-testid="handoff-id-panel">
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm">2. Awaiting daemon handoff</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <p className="text-xs text-muted-foreground">
-          The daemon parks the partially-signed transaction with a
-          fresh <code>signing_request_id</code>. SSE wiring to surface this
-          automatically lands in a later phase. For now, paste the id from
-          the daemon&apos;s audit log (event{" "}
-          <code>solend_signing_handoff_created</code>):
-        </p>
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={pasteValue}
-            onChange={(e) => onPaste(e.target.value)}
-            placeholder="00000000-0000-0000-0000-000000000000"
-            className="flex-1 rounded-md border bg-background px-3 py-1.5 text-sm font-mono
-                       focus:outline-none focus:ring-2 focus:ring-ring"
-            data-testid="handoff-id-input"
-          />
-          <Button
-            size="sm"
-            onClick={onConfirm}
-            disabled={!isValid}
-            data-testid="handoff-id-confirm"
-          >
-            Begin polling
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 // ── Handoff lifecycle panel ────────────────────────────────────────────────
 
 function HandoffPanel({
   state,
   onSign,
+  onSignAgain,
   onReset,
 }: {
   state: SigningHandoffState;
   onSign: () => void | Promise<void>;
+  onSignAgain: () => void;
   onReset: () => void;
 }) {
   return (
     <Card data-testid="handoff-panel">
       <CardHeader className="pb-3">
         <CardTitle className="text-sm flex items-center gap-2">
-          <span>{IS_SHOWCASE ? "2." : "3."} Sign &amp; submit</span>
+          <span>2. Sign &amp; submit</span>
           <HandoffStateBadge state={state} />
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
-        <HandoffStateBody state={state} onSign={onSign} onReset={onReset} />
+        <HandoffStateBody
+          state={state}
+          onSign={onSign}
+          onSignAgain={onSignAgain}
+          onReset={onReset}
+        />
       </CardContent>
     </Card>
   );
 }
 
 function HandoffStateBadge({ state }: { state: SigningHandoffState }) {
-  const variantMap: Record<SigningHandoffState["kind"], "default" | "secondary" | "destructive" | "outline"> = {
-    idle: "outline",
+  const variantMap: Record<
+    SigningHandoffState["kind"],
+    "default" | "secondary" | "destructive" | "outline"
+  > = {
+    idle: "default",
     polling: "secondary",
+    preparing: "secondary",
+    prepare_failed: "destructive",
     ready: "default",
     signing: "secondary",
     submitting: "secondary",
@@ -327,34 +278,31 @@ function HandoffStateBadge({ state }: { state: SigningHandoffState }) {
 function HandoffStateBody({
   state,
   onSign,
+  onSignAgain,
   onReset,
 }: {
   state: SigningHandoffState;
   onSign: () => void | Promise<void>;
+  onSignAgain: () => void;
   onReset: () => void;
 }) {
   switch (state.kind) {
     case "idle":
-      return <p className="text-xs text-muted-foreground">Waiting to begin.</p>;
-    case "polling":
       return (
-        <p className="text-xs text-muted-foreground" data-testid="handoff-polling">
-          Polling for parked signing handoff… (attempt {state.attempts})
-        </p>
-      );
-    case "ready":
-      return (
-        <div className="space-y-3" data-testid="handoff-ready">
-          <div className="text-xs text-muted-foreground space-y-1">
-            <div>
-              session wallet:{" "}
-              <code className="text-foreground">{state.session_wallet.slice(0, 8)}…{state.session_wallet.slice(-4)}</code>
-            </div>
-            <div>verified slot: <code className="text-foreground">{state.verified_slot}</code></div>
-          </div>
+        <div className="space-y-3" data-testid="handoff-idle">
+          <p className="text-xs text-muted-foreground">
+            Approval recorded. Clicking Sign with Phantom triggers the
+            daemon to assemble a fresh transaction with a fresh
+            blockhash, then immediately hands it to your wallet for
+            signing. No transaction is built or signed in advance.
+          </p>
           <Separator />
           <div className="flex items-center gap-2">
-            <Button size="sm" onClick={() => void onSign()} data-testid="sign-with-phantom">
+            <Button
+              size="sm"
+              onClick={() => void onSign()}
+              data-testid="sign-with-phantom"
+            >
               Sign with Phantom
             </Button>
             <span className="text-xs text-muted-foreground">
@@ -362,6 +310,44 @@ function HandoffStateBody({
             </span>
           </div>
         </div>
+      );
+    case "polling":
+      return (
+        <p className="text-xs text-muted-foreground" data-testid="handoff-polling">
+          Awaiting confirmation… (attempt {state.attempts})
+        </p>
+      );
+    case "preparing":
+      return (
+        <p className="text-xs text-muted-foreground" data-testid="handoff-preparing">
+          Asking daemon to assemble a fresh signing handoff…
+        </p>
+      );
+    case "prepare_failed":
+      return (
+        <FailureBody
+          title="Could not prepare signing handoff"
+          detail={state.reason}
+          onReset={onReset}
+          extra={
+            <Button
+              size="sm"
+              onClick={() => void onSign()}
+              data-testid="prepare-retry"
+            >
+              Retry
+            </Button>
+          }
+        />
+      );
+    case "ready":
+      // Transient state if the daemon's retrieve returned `found`
+      // but the hook is still in flight. Render a calm wait — the
+      // chain should advance to `signing` within a few ms.
+      return (
+        <p className="text-xs text-muted-foreground">
+          Handoff fetched — opening Phantom…
+        </p>
       );
     case "signing":
       return (
@@ -417,7 +403,25 @@ function HandoffStateBody({
         />
       );
     case "expired":
-      return <FailureBody title="Signing TTL elapsed" detail={state.reason} onReset={onReset} />;
+      // Phase 6B Window 3: blockhash expired between sign and submit.
+      // The fix is to click Sign again so prepare mints a fresh
+      // signing handoff. No re-approval needed.
+      return (
+        <FailureBody
+          title="Blockhash expired before broadcast"
+          detail={`${state.reason}. Click Sign again to prepare a fresh transaction — no re-approval needed.`}
+          onReset={onReset}
+          extra={
+            <Button
+              size="sm"
+              onClick={onSignAgain}
+              data-testid="sign-again"
+            >
+              Sign again
+            </Button>
+          }
+        />
+      );
     case "not_found":
       return (
         <FailureBody
@@ -491,8 +495,11 @@ function SolscanRow({ signature }: { signature: string }) {
   );
 }
 
-// ── Util ────────────────────────────────────────────────────────────────────
+// Note: the manual signing_request_id paste UI from prior phases is
+// intentionally removed in Window 3. The prepare endpoint mints the
+// id JIT on every Sign click; pasting an external id would bypass
+// the freshness guarantee and is no longer offered as a UI affordance.
 
-function isUuid(s: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
-}
+// Suppress unused-import warning when IS_SHOWCASE is referenced only
+// indirectly through the hook's branching (see use-signing-handoff.ts).
+void IS_SHOWCASE;
