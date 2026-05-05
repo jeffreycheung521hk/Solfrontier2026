@@ -638,13 +638,18 @@ async fn live_solend_deposit_e2e() {
     );
 
     // Submit handler with confirmation tracker attached.
+    let solend_sender = Arc::new(ClawRpcSolendSender::new(rpc_client.clone()));
     let sender: Arc<dyn claw_gateway::integrations::solend_submit::SolendTransactionSender> =
-        Arc::new(ClawRpcSolendSender::new(rpc_client.clone()));
+        solend_sender.clone();
+    let rebroadcast_sender:
+        Arc<dyn claw_gateway::integrations::solend_submit::SolendRebroadcastSender> =
+        solend_sender.clone();
     let height: Arc<dyn claw_gateway::integrations::solend_submit::SolendBlockHeightProvider> =
         Arc::new(ClawRpcBlockHeightProvider::new(rpc_client.clone()));
     let confirmation_tracker = wire_solend_confirmation_tracker(
         lifecycle_store.clone(),
         rpc_pool_arc.clone(),
+        rebroadcast_sender,
         audit_sink.clone(),
         Duration::from_secs(2),
     );

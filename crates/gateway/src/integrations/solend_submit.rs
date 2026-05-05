@@ -215,6 +215,23 @@ pub trait SolendAuditSink: Send + Sync {
     );
 }
 
+/// Phase 6E — confirmation-side rebroadcast seam. Production wraps the
+/// same `ClawRpcClient::send_raw_transaction` path as the submit-time
+/// sender. Defined as a separate trait (and named `rebroadcast` rather
+/// than `send_raw_transaction`) so the confirmation tracker source is
+/// structurally clean of any direct `.send_raw_transaction(` reference
+/// — the structural-scan property test in `solend_confirmation.rs`
+/// continues to forbid that substring there.
+#[async_trait]
+pub trait SolendRebroadcastSender: Send + Sync {
+    /// Re-broadcast bincode-serialized legacy `Transaction` bytes that
+    /// have ALREADY been signed and verified at submit time. Returns
+    /// the base58 signature string. Implementations MUST NOT re-sign,
+    /// rebuild, or refresh the blockhash — the input bytes are the
+    /// only artifact permitted on the wire.
+    async fn rebroadcast(&self, signed_bytes: &[u8]) -> Result<String, SolendSubmitError>;
+}
+
 // ── Outcome ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +243,11 @@ pub enum SolendSubmitOutcome {
         session_wallet: Pubkey,
         verified_slot: u64,
         last_valid_block_height: u64,
+        /// Phase 6E — byte-identical signed transaction, passed to the
+        /// confirmation tracker on enqueue so confirmation-side
+        /// rebroadcasts use exactly these bytes (never re-signed,
+        /// rebuilt, or re-blockhashed).
+        signed_bytes: Arc<Vec<u8>>,
     },
     /// Parked entry not present at consume time (never existed, already
     /// consumed, or expired-and-swept).
@@ -277,6 +299,20 @@ impl SolendTransactionSender for ClawRpcSolendSender {
             .map_err(|e| SolendSubmitError::RpcFailure {
                 reason: format!("send_raw_transaction (legacy, skip_preflight=true): {e}"),
             })
+    }
+}
+
+/// Phase 6E — same ClawRpcClient adapter, exposed via the rebroadcast
+/// trait so the confirmation tracker can ask for a same-bytes resend
+/// without holding a `SolendTransactionSender` reference.
+#[async_trait]
+impl SolendRebroadcastSender for ClawRpcSolendSender {
+    async fn rebroadcast(&self, signed_bytes: &[u8]) -> Result<String, SolendSubmitError> {
+        // Identical RPC path as submit-time send: skip_preflight=true,
+        // legacy Transaction bytes. The trait wrapper exists so call
+        // sites (the confirmation tracker) reference `.rebroadcast(`
+        // and not `.send_raw_transaction(`.
+        <Self as SolendTransactionSender>::send_raw_transaction(self, signed_bytes).await
     }
 }
 
@@ -900,6 +936,9 @@ pub async fn submit_signed_solend_transaction(
                     session_wallet: parked.session_wallet,
                     verified_slot: parked.verified_slot,
                     last_valid_block_height: parked.last_valid_block_height,
+                    // Phase 6E: hand byte-identical signed payload to the
+                    // confirmation tracker for same-bytes rebroadcast.
+                    signed_bytes: Arc::new(signed_bytes),
                 };
             }
             Err(e) => {
