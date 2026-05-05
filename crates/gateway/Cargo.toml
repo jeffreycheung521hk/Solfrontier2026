@@ -51,3 +51,7 @@ http-body-util  = "0.1"
 sqlx            = { workspace = true }
 ed25519-dalek   = { workspace = true }
 rand            = { workspace = true }
+# Phase 6D: virtual-time control for bounded-rebroadcast tests so the 2s
+# delay between attempts is skipped under `start_paused`. The feature is
+# additive — production builds (which only use [dependencies]) are unaffected.
+tokio           = { workspace = true, features = ["test-util"] }

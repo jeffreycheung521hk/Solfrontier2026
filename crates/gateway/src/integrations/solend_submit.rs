@@ -84,13 +84,25 @@
 //! - Does NOT mutate `tx.signatures` or any part of the signed
 //!   transaction after deserialization. The signed tx is read-only
 //!   between deserialize and `send_raw_transaction`.
-//! - Does NOT retry broadcast. A single broadcast attempt with
-//!   `max_retries = 0` is the existing `ClawRpcClient::send_raw_transaction`
-//!   convention (also used by Jupiter's post-approval send path).
 //! - Does NOT touch lending policy, Solend pure builders, approval
 //!   store, approval routing, preflight module, or tx-plan module.
+//!
+//! # Phase 6D — bounded rebroadcast (post-verification only)
+//!
+//! After A–G pass, the same signed-tx bytes are rebroadcast up to
+//! [`MAX_BROADCAST_ATTEMPTS`] times with [`REBROADCAST_DELAY`] between
+//! attempts, while the parked `last_valid_block_height` is still ahead of
+//! the chain. Re-signing, rebuilding, blockhash refresh, and new
+//! signing_request_id allocation are explicitly forbidden — the
+//! transaction message hash, the user's signature, and the backend's
+//! optional partial signature are bit-stable across every attempt.
+//! Confirmation polling is unchanged: the first signature observed by
+//! `getSignatureStatuses` after any successful broadcast is the same one
+//! the confirmation tracker would have seen with the old single-shot
+//! sender, so confirmation_timeout classification continues to apply.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -99,6 +111,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::Transaction;
 use thiserror::Error;
+use tokio::time::sleep;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -132,6 +145,27 @@ pub const AUDIT_EVENT_SIGNED_TX_VERIFIED: &str = "solend_signed_tx_verified";
 pub const AUDIT_EVENT_SIGNED_TX_REJECTED: &str = "solend_signed_tx_rejected";
 pub const AUDIT_EVENT_TRANSACTION_SUBMITTED: &str = "solend_transaction_submitted";
 pub const AUDIT_EVENT_TRANSACTION_SUBMIT_FAILED: &str = "solend_transaction_submit_failed";
+/// Phase 6D: per-broadcast-attempt audit row. One row per attempt
+/// (attempt 1 = initial send; attempts 2..N = rebroadcasts of identical
+/// bytes). Distinct from `solend_transaction_submitted` (which still
+/// fires once on the first successful ack) and from
+/// `solend_transaction_submit_failed` (which fires once after every
+/// attempt has failed).
+pub const AUDIT_EVENT_TRANSACTION_BROADCAST_ATTEMPT: &str = "solend_transaction_broadcast_attempt";
+
+// ── Phase 6D rebroadcast parameters ─────────────────────────────────────────
+//
+// `MAX_BROADCAST_ATTEMPTS = 4` and `REBROADCAST_DELAY = 2s` per Phase 6D
+// spec. Tuning is deliberately by-constant for now; an env-driven knob
+// can be added later if production telemetry justifies it.
+
+/// Total broadcast attempts (attempt 1 = initial send; attempts 2..N =
+/// rebroadcasts of the same signed bytes).
+pub const MAX_BROADCAST_ATTEMPTS: u32 = 4;
+
+/// Delay between attempts. Applied before attempts 2..N (no delay before
+/// attempt 1). Tests may use `tokio::time::pause` to advance virtual time.
+pub const REBROADCAST_DELAY: Duration = Duration::from_secs(2);
 
 // ── Error surfaces ──────────────────────────────────────────────────────────
 
@@ -726,81 +760,205 @@ pub async fn submit_signed_solend_transaction(
         "solend submit: verification passed — broadcasting"
     );
 
-    // ── Broadcast ───────────────────────────────────────────────────────────
+    // ── Phase 6D bounded rebroadcast loop ───────────────────────────────────
     //
-    // The sender uses skip_preflight=true (via ClawRpcClient's existing
+    // Sender uses skip_preflight=true (via ClawRpcClient's existing
     // config). Preflight already happened in 4C-3 under sig_verify=false
     // + replace_recent_blockhash=true. At this point we have a real
     // signed tx with a real blockhash — asking the RPC node to
     // preflight again would waste a round trip and widen the window
     // for blockhash expiry during queueing.
-    match tx_sender.send_raw_transaction(&signed_bytes).await {
-        Ok(signature) => {
-            audit
-                .append_solend_event(
-                    AUDIT_EVENT_TRANSACTION_SUBMITTED,
-                    signing_request_id.to_string(),
-                    Some(parked.session_id.to_string()),
-                    AuditSeverity::Info,
-                    json!({
-                        "signing_request_id":      signing_request_id,
-                        "intent_id":               parked.intent_id,
-                        "session_id":              parked.session_id.to_string(),
-                        "session_wallet":          parked.session_wallet.to_string(),
-                        "protocol":                "Solend",
-                        "action":                  "Deposit",
-                        "asset":                   "USDC",
-                        "amount_raw":              parked.action.amount().raw(),
-                        "verified_slot":           parked.verified_slot,
-                        "simulation_slot":         parked.simulation_slot,
-                        "last_valid_block_height": parked.last_valid_block_height,
-                        "tx_signature":            signature,
-                    }),
+    //
+    // Up to MAX_BROADCAST_ATTEMPTS attempts of the SAME signed_bytes
+    // are made, with REBROADCAST_DELAY between attempts. The
+    // tx_signature (= base58 of session-wallet's signature, which is
+    // the canonical Solana tx ID) is identical across attempts because
+    // we never re-sign; we capture it once before the loop so the
+    // per-attempt audit row has a stable identifier.
+    let tx_signature_str = signed_tx.signatures[session_idx].to_string();
+    let mut last_send_err: Option<String> = None;
+
+    for attempt_n in 1..=MAX_BROADCAST_ATTEMPTS {
+        // Per-attempt blockhash freshness gate. Attempt 1 reuses the
+        // height already fetched in step (G). Attempts 2..N sleep
+        // first, then refetch.
+        let attempt_height: u64 = if attempt_n == 1 {
+            current_height
+        } else {
+            sleep(REBROADCAST_DELAY).await;
+            match block_height_provider.current_block_height().await {
+                Ok(h) => h,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    emit_broadcast_attempt_audit(
+                        audit,
+                        signing_request_id,
+                        &parked,
+                        &tx_signature_str,
+                        attempt_n,
+                        MAX_BROADCAST_ATTEMPTS,
+                        None,
+                        parked.last_valid_block_height,
+                        None,
+                        BroadcastAttemptOutcome::HeightFetchError(&msg),
+                    )
+                    .await;
+                    // Cannot prove freshness — abort retries (do not
+                    // continue blindly sending).
+                    if last_send_err.is_none() {
+                        last_send_err = Some(format!("block height fetch: {msg}"));
+                    }
+                    break;
+                }
+            }
+        };
+
+        if attempt_height > parked.last_valid_block_height {
+            // Blockhash dropped during the retry window — stop. The
+            // existing pre-G gate handles the case where blockhash is
+            // already dead at submit time and returns Expired; here we
+            // are mid-retry so the appropriate terminal is
+            // BroadcastFailed (we did try at least once with a fresh
+            // gate).
+            let msg = format!(
+                "blockhash expired before attempt {attempt_n} of {}: current={}, last_valid={}",
+                MAX_BROADCAST_ATTEMPTS, attempt_height, parked.last_valid_block_height
+            );
+            emit_broadcast_attempt_audit(
+                audit,
+                signing_request_id,
+                &parked,
+                &tx_signature_str,
+                attempt_n,
+                MAX_BROADCAST_ATTEMPTS,
+                Some(attempt_height),
+                parked.last_valid_block_height,
+                Some(0),
+                BroadcastAttemptOutcome::BlockhashExpired(&msg),
+            )
+            .await;
+            if last_send_err.is_none() {
+                last_send_err = Some(msg);
+            }
+            break;
+        }
+
+        let remaining_block_budget = parked
+            .last_valid_block_height
+            .saturating_sub(attempt_height);
+
+        match tx_sender.send_raw_transaction(&signed_bytes).await {
+            Ok(signature) => {
+                emit_broadcast_attempt_audit(
+                    audit,
+                    signing_request_id,
+                    &parked,
+                    &signature,
+                    attempt_n,
+                    MAX_BROADCAST_ATTEMPTS,
+                    Some(attempt_height),
+                    parked.last_valid_block_height,
+                    Some(remaining_block_budget),
+                    BroadcastAttemptOutcome::Ok,
                 )
                 .await;
-            info!(
-                signing_request_id = %signing_request_id,
-                intent_id = %parked.intent_id,
-                tx_signature = %signature,
-                "solend submit: transaction broadcast (skip_preflight=true, max_retries=0)"
-            );
-            SolendSubmitOutcome::Submitted {
-                tx_signature: signature,
-                signing_request_id,
-                intent_id: parked.intent_id,
-                session_wallet: parked.session_wallet,
-                verified_slot: parked.verified_slot,
-                last_valid_block_height: parked.last_valid_block_height,
+                audit
+                    .append_solend_event(
+                        AUDIT_EVENT_TRANSACTION_SUBMITTED,
+                        signing_request_id.to_string(),
+                        Some(parked.session_id.to_string()),
+                        AuditSeverity::Info,
+                        json!({
+                            "signing_request_id":      signing_request_id,
+                            "intent_id":               parked.intent_id,
+                            "session_id":              parked.session_id.to_string(),
+                            "session_wallet":          parked.session_wallet.to_string(),
+                            "protocol":                "Solend",
+                            "action":                  "Deposit",
+                            "asset":                   "USDC",
+                            "amount_raw":              parked.action.amount().raw(),
+                            "verified_slot":           parked.verified_slot,
+                            "simulation_slot":         parked.simulation_slot,
+                            "last_valid_block_height": parked.last_valid_block_height,
+                            "tx_signature":            signature,
+                            "broadcast_attempts_used": attempt_n,
+                            "max_broadcast_attempts":  MAX_BROADCAST_ATTEMPTS,
+                        }),
+                    )
+                    .await;
+                info!(
+                    signing_request_id = %signing_request_id,
+                    intent_id = %parked.intent_id,
+                    tx_signature = %signature,
+                    attempt_n = attempt_n,
+                    "solend submit: transaction broadcast (skip_preflight=true)"
+                );
+                return SolendSubmitOutcome::Submitted {
+                    tx_signature: signature,
+                    signing_request_id,
+                    intent_id: parked.intent_id,
+                    session_wallet: parked.session_wallet,
+                    verified_slot: parked.verified_slot,
+                    last_valid_block_height: parked.last_valid_block_height,
+                };
             }
-        }
-        Err(e) => {
-            let msg = format!("{e}");
-            audit
-                .append_solend_event(
-                    AUDIT_EVENT_TRANSACTION_SUBMIT_FAILED,
-                    signing_request_id.to_string(),
-                    Some(parked.session_id.to_string()),
-                    AuditSeverity::Error,
-                    json!({
-                        "signing_request_id": signing_request_id,
-                        "intent_id":          parked.intent_id,
-                        "session_wallet":     parked.session_wallet.to_string(),
-                        "error_type":         "RpcBroadcastError",
-                        "message":            msg,
-                    }),
+            Err(e) => {
+                let msg = format!("{e}");
+                emit_broadcast_attempt_audit(
+                    audit,
+                    signing_request_id,
+                    &parked,
+                    &tx_signature_str,
+                    attempt_n,
+                    MAX_BROADCAST_ATTEMPTS,
+                    Some(attempt_height),
+                    parked.last_valid_block_height,
+                    Some(remaining_block_budget),
+                    BroadcastAttemptOutcome::SendError(&msg),
                 )
                 .await;
-            warn!(
-                signing_request_id = %signing_request_id,
-                error = %msg,
-                "solend submit: broadcast failed after successful verification"
-            );
-            SolendSubmitOutcome::BroadcastFailed {
-                error_type: "RpcBroadcastError".to_string(),
-                message: msg,
-                signing_request_id,
+                last_send_err = Some(msg);
+                // Continue to the next attempt; loop guard enforces
+                // MAX_BROADCAST_ATTEMPTS.
             }
         }
+    }
+
+    // ── Loop exhausted without an Ok ────────────────────────────────────────
+    //
+    // last_send_err is always populated here (attempt 1 always tries
+    // to send because its height comes from step G). Emit the existing
+    // submit-failed event and return BroadcastFailed.
+    let final_msg = last_send_err.unwrap_or_else(|| {
+        // Defensive: should not happen because attempt 1 always sends.
+        "solend rebroadcast loop ended without attempting".to_string()
+    });
+    audit
+        .append_solend_event(
+            AUDIT_EVENT_TRANSACTION_SUBMIT_FAILED,
+            signing_request_id.to_string(),
+            Some(parked.session_id.to_string()),
+            AuditSeverity::Error,
+            json!({
+                "signing_request_id":     signing_request_id,
+                "intent_id":              parked.intent_id,
+                "session_wallet":         parked.session_wallet.to_string(),
+                "error_type":             "RpcBroadcastError",
+                "message":                final_msg,
+                "max_broadcast_attempts": MAX_BROADCAST_ATTEMPTS,
+            }),
+        )
+        .await;
+    warn!(
+        signing_request_id = %signing_request_id,
+        error = %final_msg,
+        max_attempts = MAX_BROADCAST_ATTEMPTS,
+        "solend submit: all broadcast attempts failed after successful verification"
+    );
+    SolendSubmitOutcome::BroadcastFailed {
+        error_type: "RpcBroadcastError".to_string(),
+        message: final_msg,
+        signing_request_id,
     }
 }
 
@@ -836,6 +994,92 @@ fn handoff_safe_payload(
         payload["tx_signature"] = json!(sig);
     }
     payload
+}
+
+/// Phase 6D — outcome label for one rebroadcast attempt.
+enum BroadcastAttemptOutcome<'a> {
+    /// `send_raw_transaction` returned `Ok(signature)`.
+    Ok,
+    /// `send_raw_transaction` returned `Err`.
+    SendError(&'a str),
+    /// Pre-attempt blockhash gate showed `current > last_valid`.
+    BlockhashExpired(&'a str),
+    /// Pre-attempt block-height fetch itself failed (RPC error).
+    HeightFetchError(&'a str),
+}
+
+/// Phase 6D — emit `solend_transaction_broadcast_attempt`. Field set is
+/// the spec-mandated row: signing_request_id, intent_id, wallet,
+/// tx_signature, attempt_n, max_attempts, current_block_height,
+/// last_valid_block_height, remaining_block_budget, plus rpc outcome
+/// (`ok` / `error`) and an `error_kind` label that distinguishes
+/// SendError, BlockhashExpired, and HeightFetchError.
+async fn emit_broadcast_attempt_audit(
+    audit: &dyn SolendAuditSink,
+    signing_request_id: Uuid,
+    parked: &ParkedSolendSigning,
+    tx_signature: &str,
+    attempt_n: u32,
+    max_attempts: u32,
+    current_block_height: Option<u64>,
+    last_valid_block_height: u64,
+    remaining_block_budget: Option<u64>,
+    outcome: BroadcastAttemptOutcome<'_>,
+) {
+    let mut payload = json!({
+        "signing_request_id":      signing_request_id,
+        "intent_id":               parked.intent_id,
+        "session_id":              parked.session_id.to_string(),
+        "wallet":                  parked.session_wallet.to_string(),
+        "tx_signature":            tx_signature,
+        "attempt_n":               attempt_n,
+        "max_attempts":            max_attempts,
+        "current_block_height":    current_block_height,
+        "last_valid_block_height": last_valid_block_height,
+        "remaining_block_budget":  remaining_block_budget,
+    });
+    let (severity, rpc_outcome, error_kind, error_message): (
+        AuditSeverity,
+        &'static str,
+        Option<&'static str>,
+        Option<String>,
+    ) = match outcome {
+        BroadcastAttemptOutcome::Ok => (AuditSeverity::Info, "ok", None, None),
+        BroadcastAttemptOutcome::SendError(m) => (
+            AuditSeverity::Warning,
+            "error",
+            Some("SendError"),
+            Some(m.to_string()),
+        ),
+        BroadcastAttemptOutcome::BlockhashExpired(m) => (
+            AuditSeverity::Warning,
+            "error",
+            Some("BlockhashExpired"),
+            Some(m.to_string()),
+        ),
+        BroadcastAttemptOutcome::HeightFetchError(m) => (
+            AuditSeverity::Warning,
+            "error",
+            Some("HeightFetchError"),
+            Some(m.to_string()),
+        ),
+    };
+    payload["rpc_outcome"] = json!(rpc_outcome);
+    if let Some(k) = error_kind {
+        payload["error_kind"] = json!(k);
+    }
+    if let Some(m) = error_message {
+        payload["error_message"] = json!(m);
+    }
+    audit
+        .append_solend_event(
+            AUDIT_EVENT_TRANSACTION_BROADCAST_ATTEMPT,
+            signing_request_id.to_string(),
+            Some(parked.session_id.to_string()),
+            severity,
+            payload,
+        )
+        .await;
 }
 
 /// Emit a rejected-audit event. Centralizes the payload shape so
@@ -1564,8 +1808,12 @@ mod tests {
     }
 
     // ── (U) Broadcast failure surfaces cleanly ────────────────────────────
+    //
+    // Phase 6D: a persistently-erroring sender now exhausts
+    // MAX_BROADCAST_ATTEMPTS attempts, not just one, and emits one
+    // per-attempt audit row plus a final submit-failed event.
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn broadcast_failure_returns_broadcast_failed_and_audits() {
         let session_kp = Keypair::new();
         let (store, request_id, _, signed_bytes) = park_and_co_sign(&session_kp, false).await;
@@ -1581,10 +1829,386 @@ mod tests {
             }
             other => panic!("expected BroadcastFailed, got {other:?}"),
         }
-        assert_eq!(sender.call_count(), 1, "attempted once");
-        assert!(audit
-            .event_names()
-            .contains(&AUDIT_EVENT_TRANSACTION_SUBMIT_FAILED.to_string()));
+        assert_eq!(
+            sender.call_count(),
+            MAX_BROADCAST_ATTEMPTS as usize,
+            "attempted MAX_BROADCAST_ATTEMPTS times"
+        );
+        // One submit_failed event total (not per-attempt).
+        let names = audit.event_names();
+        assert!(names.contains(&AUDIT_EVENT_TRANSACTION_SUBMIT_FAILED.to_string()));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| *n == AUDIT_EVENT_TRANSACTION_SUBMIT_FAILED)
+                .count(),
+            1,
+            "exactly one submit_failed event"
+        );
+        // One broadcast_attempt event per attempt.
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| *n == AUDIT_EVENT_TRANSACTION_BROADCAST_ATTEMPT)
+                .count(),
+            MAX_BROADCAST_ATTEMPTS as usize,
+            "one broadcast_attempt audit per attempt"
+        );
+    }
+
+    // ── Phase 6D — bounded rebroadcast tests ──────────────────────────────
+
+    /// Sender that returns an injectable sequence of results; each call
+    /// records the sent bytes so tests can assert byte-stability across
+    /// rebroadcasts. Falls back to the last response if the queue runs
+    /// out (so a single Ok/Err can be stretched across the whole loop).
+    struct SequencedSender {
+        responses: Mutex<Vec<Result<String, SolendSubmitError>>>,
+        calls: Mutex<Vec<Vec<u8>>>,
+    }
+    impl SequencedSender {
+        fn new(seq: Vec<Result<String, SolendSubmitError>>) -> Self {
+            Self {
+                responses: Mutex::new(seq),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+        fn calls_snapshot(&self) -> Vec<Vec<u8>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl SolendTransactionSender for SequencedSender {
+        async fn send_raw_transaction(
+            &self,
+            tx_bytes: &[u8],
+        ) -> Result<String, SolendSubmitError> {
+            self.calls.lock().unwrap().push(tx_bytes.to_vec());
+            let mut resps = self.responses.lock().unwrap();
+            if resps.is_empty() {
+                Err(SolendSubmitError::RpcFailure {
+                    reason: "sequenced sender exhausted".into(),
+                })
+            } else {
+                resps.remove(0)
+            }
+        }
+    }
+
+    /// Block-height provider whose response sequence advances across
+    /// calls. Falls back to the last value once the queue is empty.
+    struct SequencedHeight {
+        heights: Mutex<Vec<u64>>,
+        last: Mutex<u64>,
+        calls: Mutex<u32>,
+    }
+    impl SequencedHeight {
+        fn new(seq: Vec<u64>) -> Self {
+            let last = *seq.last().unwrap_or(&0);
+            Self {
+                heights: Mutex::new(seq),
+                last: Mutex::new(last),
+                calls: Mutex::new(0),
+            }
+        }
+        fn call_count(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+    #[async_trait]
+    impl SolendBlockHeightProvider for SequencedHeight {
+        async fn current_block_height(&self) -> Result<u64, SolendSubmitError> {
+            *self.calls.lock().unwrap() += 1;
+            let mut heights = self.heights.lock().unwrap();
+            if heights.is_empty() {
+                Ok(*self.last.lock().unwrap())
+            } else {
+                let v = heights.remove(0);
+                *self.last.lock().unwrap() = v;
+                Ok(v)
+            }
+        }
+    }
+
+    fn err(reason: &str) -> Result<String, SolendSubmitError> {
+        Err(SolendSubmitError::RpcFailure {
+            reason: reason.into(),
+        })
+    }
+
+    fn ok_sig(s: &str) -> Result<String, SolendSubmitError> {
+        Ok(s.to_string())
+    }
+
+    /// Test-1: attempt 1 returns Ok → no retry, no extra sleeps, exactly
+    /// one sender call, exactly one broadcast_attempt audit row.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_one_success_does_not_retry() {
+        let session_kp = Keypair::new();
+        let (store, request_id, _, signed_bytes) = park_and_co_sign(&session_kp, false).await;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
+        let sender = SequencedSender::new(vec![ok_sig("sigOne")]);
+        let audit = RecordingAudit::default();
+        let height = StubHeight { h: 100 };
+        let outcome =
+            submit_signed_solend_transaction(request_id, &b64, &store, &sender, &audit, &height).await;
+        assert!(matches!(outcome, SolendSubmitOutcome::Submitted { .. }));
+        assert_eq!(sender.call_count(), 1, "exactly one sender call");
+        let names = audit.event_names();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| *n == AUDIT_EVENT_TRANSACTION_BROADCAST_ATTEMPT)
+                .count(),
+            1,
+            "one broadcast_attempt audit (attempt 1 only)"
+        );
+        assert!(names.contains(&AUDIT_EVENT_TRANSACTION_SUBMITTED.to_string()));
+        assert!(!names.contains(&AUDIT_EVENT_TRANSACTION_SUBMIT_FAILED.to_string()));
+    }
+
+    /// Test-2: transient send errors trigger rebroadcasts of the same
+    /// signed bytes, recovering on a later attempt.
+    #[tokio::test(start_paused = true)]
+    async fn transient_send_error_retries_same_bytes_up_to_max() {
+        let session_kp = Keypair::new();
+        let (store, request_id, _, signed_bytes) = park_and_co_sign(&session_kp, false).await;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
+        // Three errors then success on attempt 4 (= MAX_BROADCAST_ATTEMPTS).
+        let sender = SequencedSender::new(vec![
+            err("transient 1"),
+            err("transient 2"),
+            err("transient 3"),
+            ok_sig("sigFinal"),
+        ]);
+        let audit = RecordingAudit::default();
+        let height = StubHeight { h: 100 };
+        let outcome =
+            submit_signed_solend_transaction(request_id, &b64, &store, &sender, &audit, &height).await;
+        match outcome {
+            SolendSubmitOutcome::Submitted { tx_signature, .. } => {
+                assert_eq!(tx_signature, "sigFinal");
+            }
+            other => panic!("expected Submitted, got {other:?}"),
+        }
+        assert_eq!(
+            sender.call_count(),
+            MAX_BROADCAST_ATTEMPTS as usize,
+            "all attempts used"
+        );
+        // All calls share identical bytes.
+        let calls = sender.calls_snapshot();
+        for (i, c) in calls.iter().enumerate() {
+            assert_eq!(
+                c, &signed_bytes,
+                "attempt {} sent different bytes",
+                i + 1
+            );
+        }
+        // Per-attempt audit count = MAX, plus exactly one submitted event.
+        let names = audit.event_names();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| *n == AUDIT_EVENT_TRANSACTION_BROADCAST_ATTEMPT)
+                .count(),
+            MAX_BROADCAST_ATTEMPTS as usize,
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| *n == AUDIT_EVENT_TRANSACTION_SUBMITTED)
+                .count(),
+            1,
+        );
+    }
+
+    /// Test-3: blockhash expires between attempts → loop stops, no further
+    /// sender calls, no Submitted, BroadcastFailed returned.
+    #[tokio::test(start_paused = true)]
+    async fn mid_loop_blockhash_expiry_stops_retries() {
+        let session_kp = Keypair::new();
+        let (store, request_id, _, signed_bytes) = park_and_co_sign(&session_kp, false).await;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
+        // Attempt 1: send errors. Attempt 2: blockhash now expired.
+        let sender = SequencedSender::new(vec![err("first send error")]);
+        let audit = RecordingAudit::default();
+        // Step G fetches first → returns 100 (well below LVBH).
+        // Attempt-2 retry-gate fetch returns a height > LVBH (10_000_000)
+        // so the loop must stop before issuing a 2nd send.
+        let height = SequencedHeight::new(vec![100, 99_999_999_999]);
+        let outcome =
+            submit_signed_solend_transaction(request_id, &b64, &store, &sender, &audit, &height).await;
+        match outcome {
+            SolendSubmitOutcome::BroadcastFailed { .. } => {}
+            other => panic!("expected BroadcastFailed, got {other:?}"),
+        }
+        assert_eq!(sender.call_count(), 1, "no second send");
+        // One broadcast_attempt for the SendError + one for the
+        // BlockhashExpired stop.
+        let names = audit.event_names();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| *n == AUDIT_EVENT_TRANSACTION_BROADCAST_ATTEMPT)
+                .count(),
+            2,
+            "two attempt audits: one error, one blockhash-expired stop"
+        );
+        // Confirm the second audit row's error_kind label is BlockhashExpired.
+        let attempt_events: Vec<_> = audit
+            .events()
+            .into_iter()
+            .filter(|e| e.0 == AUDIT_EVENT_TRANSACTION_BROADCAST_ATTEMPT)
+            .collect();
+        let second = &attempt_events[1].4;
+        assert_eq!(second["error_kind"], json!("BlockhashExpired"));
+        assert_eq!(second["attempt_n"], json!(2));
+    }
+
+    /// Test-4: per-attempt audit row contains every required field.
+    #[tokio::test(start_paused = true)]
+    async fn per_attempt_audit_contains_required_fields() {
+        let session_kp = Keypair::new();
+        let (store, request_id, signed_tx, signed_bytes) = park_and_co_sign(&session_kp, false).await;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
+        let sender = SequencedSender::new(vec![ok_sig("sigABC")]);
+        let audit = RecordingAudit::default();
+        let height = StubHeight { h: 100 };
+        let _ = submit_signed_solend_transaction(request_id, &b64, &store, &sender, &audit, &height)
+            .await;
+        let attempt = audit
+            .events()
+            .into_iter()
+            .find(|e| e.0 == AUDIT_EVENT_TRANSACTION_BROADCAST_ATTEMPT)
+            .expect("at least one attempt event");
+        let p = &attempt.4;
+        for field in [
+            "signing_request_id",
+            "intent_id",
+            "session_id",
+            "wallet",
+            "tx_signature",
+            "attempt_n",
+            "max_attempts",
+            "current_block_height",
+            "last_valid_block_height",
+            "remaining_block_budget",
+            "rpc_outcome",
+        ] {
+            assert!(
+                p.get(field).is_some(),
+                "broadcast_attempt audit missing field `{field}`"
+            );
+        }
+        assert_eq!(p["attempt_n"], json!(1));
+        assert_eq!(p["max_attempts"], json!(MAX_BROADCAST_ATTEMPTS));
+        assert_eq!(p["rpc_outcome"], json!("ok"));
+        // tx_signature on a successful attempt is the signature returned
+        // by the sender; on failed attempts it is the canonical first-
+        // signature of the parked tx (verified bit-stable below).
+        assert_eq!(p["tx_signature"], json!("sigABC"));
+        // Sanity: the canonical pre-loop tx_signature equals the
+        // Display of signatures[0] (tested separately in
+        // tx_signature_id_stable_across_attempts).
+        let _ = signed_tx;
+    }
+
+    /// Test-5: signed bytes (and therefore message hash + signature) are
+    /// bit-stable across every rebroadcast, and the signing_request_id
+    /// is identical in every audit row.
+    #[tokio::test(start_paused = true)]
+    async fn tx_bytes_and_signing_request_id_stable_across_attempts() {
+        let session_kp = Keypair::new();
+        let (store, request_id, signed_tx, signed_bytes) = park_and_co_sign(&session_kp, false).await;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
+        // Force all attempts to fail so we exercise the full loop.
+        let sender = SequencedSender::new(vec![
+            err("e1"),
+            err("e2"),
+            err("e3"),
+            err("e4"),
+        ]);
+        let audit = RecordingAudit::default();
+        let height = StubHeight { h: 100 };
+        let _ = submit_signed_solend_transaction(request_id, &b64, &store, &sender, &audit, &height)
+            .await;
+        let calls = sender.calls_snapshot();
+        assert_eq!(calls.len(), MAX_BROADCAST_ATTEMPTS as usize);
+        let first_hash = signed_tx.message.hash();
+        for (i, bytes) in calls.iter().enumerate() {
+            assert_eq!(bytes, &signed_bytes, "attempt {} bytes mutated", i + 1);
+            // Verify message hash matches (defense in depth — same
+            // bytes ⇒ same hash, but cheap to assert).
+            let parsed: Transaction = bincode::deserialize(bytes).unwrap();
+            assert_eq!(parsed.message.hash(), first_hash);
+        }
+        // Every audit row carries the SAME signing_request_id.
+        let srid_str = request_id.to_string();
+        for (name, corr, _sid, _sev, payload) in audit.events() {
+            assert_eq!(corr, srid_str, "event {name} has wrong correlation_id");
+            if let Some(v) = payload.get("signing_request_id") {
+                assert_eq!(v.as_str().unwrap_or_default(), srid_str);
+            }
+        }
+    }
+
+    /// Test-6: pre-submit blockhash expiry (step G) still returns
+    /// Expired and never enters the rebroadcast loop. Existing
+    /// `expired_blockhash_returns_expired_no_send` covers this; this
+    /// test additionally asserts that no broadcast_attempt audit was
+    /// emitted (the loop never started).
+    #[tokio::test]
+    async fn pre_submit_expired_emits_no_broadcast_attempt_rows() {
+        let session_kp = Keypair::new();
+        let (store, request_id, _, signed_bytes) = park_and_co_sign(&session_kp, false).await;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
+        let sender = StubSender::ok();
+        let audit = RecordingAudit::default();
+        let height = StubHeight { h: 99_999_999_999 };
+        let outcome =
+            submit_signed_solend_transaction(request_id, &b64, &store, &sender, &audit, &height).await;
+        assert!(matches!(outcome, SolendSubmitOutcome::Expired { .. }));
+        assert_eq!(sender.call_count(), 0);
+        let names = audit.event_names();
+        assert!(
+            !names.contains(&AUDIT_EVENT_TRANSACTION_BROADCAST_ATTEMPT.to_string()),
+            "no broadcast_attempt rows when step G blocks pre-loop"
+        );
+        assert!(!names.contains(&AUDIT_EVENT_TRANSACTION_SUBMITTED.to_string()));
+    }
+
+    /// Test-7: the canonical tx_signature emitted on FAILED attempts
+    /// equals base58(signed_tx.signatures[0]) — i.e., the first-signature
+    /// = Solana tx ID convention is preserved and stable. This is what
+    /// the confirmation tracker would observe via getSignatureStatuses
+    /// and is the basis for confirmation_timeout classification still
+    /// working when at least one send eventually accepted.
+    #[tokio::test(start_paused = true)]
+    async fn tx_signature_id_stable_across_attempts() {
+        let session_kp = Keypair::new();
+        let (store, request_id, signed_tx, signed_bytes) = park_and_co_sign(&session_kp, false).await;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
+        let canonical_sig = signed_tx.signatures[0].to_string();
+        // All attempts fail so we see only the canonical-derived sig.
+        let sender =
+            SequencedSender::new(vec![err("a1"), err("a2"), err("a3"), err("a4")]);
+        let audit = RecordingAudit::default();
+        let height = StubHeight { h: 100 };
+        let _ = submit_signed_solend_transaction(request_id, &b64, &store, &sender, &audit, &height)
+            .await;
+        for (name, _corr, _sid, _sev, payload) in audit.events() {
+            if name == AUDIT_EVENT_TRANSACTION_BROADCAST_ATTEMPT {
+                assert_eq!(
+                    payload["tx_signature"].as_str().unwrap_or_default(),
+                    canonical_sig,
+                    "every attempt's tx_signature equals first-signature canonical id"
+                );
+            }
+        }
     }
 
     // ── (V/W) Forbidden-term structural scan ───────────────────────────────
