@@ -59,11 +59,11 @@ use crate::integrations::solend_submit::SolendAuditSink;
 use crate::lending::{
     AllowedLendingProtocolsConfig, AllowedMintsConfig, DurationMs, LendingRuleConfig,
     MaxActionInputAmountConfig, MaxOracleStalenessConfig, ProtocolTag,
-    RequireFreshStateConfig, UnderlyingAmount,
+    RequireFreshStateConfig, SolendDepositRiskBudgetConfig, UnderlyingAmount,
 };
 use crate::tools::solend_deposit::{
     ProductionSolendDepositSnapshotAssembler, SolendDepositSnapshotAssembler,
-    SubmitSolendDepositTool, MAX_STRUCTURAL_AMOUNT_RAW, USDC_MINT_BASE58,
+    SubmitSolendDepositTool, USDC_MINT_BASE58,
 };
 
 /// Phase 4C-8G-Staleness-Calibration — Solend USDC oracle publish-age
@@ -98,11 +98,24 @@ pub const SOLEND_USDC_MAX_ORACLE_PUBLISH_AGE_MS: u64 = 120_000;
 /// the full runtime wiring (RPC pool, blockhash manager, audit sink,
 /// signing store, …).
 ///
+/// **Phase 6G:** the per-mint cap is no longer a hardcoded structural
+/// constant — it comes from the operator-supplied
+/// [`SolendDepositRiskBudgetConfig`]. The demo profile sets it to 5
+/// USDC; future profiles raise it without touching wiring code. The
+/// cap is enforced by the policy evaluator's `MaxActionInputAmount`
+/// rule, NOT by LLM behavior or by the tool's structural overflow
+/// guard.
+///
 /// **Pure:** no RPC, no clock, no I/O. Returns a fresh
 /// `LendingRuleConfig` every call. Cheap to recompute.
-pub fn solend_usdc_lending_rule_config() -> LendingRuleConfig {
+pub fn solend_usdc_lending_rule_config(
+    risk_budget: &SolendDepositRiskBudgetConfig,
+) -> LendingRuleConfig {
     let usdc_mint = solana_sdk::pubkey::Pubkey::try_from(USDC_MINT_BASE58)
         .expect("USDC_MINT_BASE58 parses");
+    let max_raw = risk_budget
+        .max_deposit_amount_raw()
+        .expect("risk-budget profile is malformed; daemon startup should have caught this");
     LendingRuleConfig {
         require_fresh_state: RequireFreshStateConfig {
             // Snapshot fetch age — kept at 30 s. Distinct from oracle
@@ -123,10 +136,7 @@ pub fn solend_usdc_lending_rule_config() -> LendingRuleConfig {
             allowlist: vec![usdc_mint],
         },
         max_action_input_amount: MaxActionInputAmountConfig {
-            per_mint_caps: vec![(
-                usdc_mint,
-                UnderlyingAmount::new(MAX_STRUCTURAL_AMOUNT_RAW),
-            )],
+            per_mint_caps: vec![(usdc_mint, UnderlyingAmount::new(max_raw))],
             // Phase 5H — Withdraw cap list. Empty here because the
             // `solend_deposit_usdc` tool only constructs Deposit
             // actions; an evaluator invocation against this config
@@ -160,6 +170,7 @@ pub fn solend_usdc_lending_rule_config() -> LendingRuleConfig {
 ///
 /// The returned `ToolRegistry` is the caller's input with the Solend
 /// tool registered.
+#[allow(clippy::too_many_arguments)]
 pub fn wire_solend_deposit_tool(
     registry: ToolRegistry,
     rpc_pool: RpcPool,
@@ -169,6 +180,7 @@ pub fn wire_solend_deposit_tool(
     jit_ready_store: SolendJitReadyStore,
     audit_sink: Arc<dyn SolendAuditSink>,
     approval_lease_seconds: u64,
+    risk_budget: SolendDepositRiskBudgetConfig,
 ) -> ToolRegistry {
     // ── Read-only RPC adapter: get_slot / get_account / get_multiple_accounts ─
     //
@@ -186,12 +198,11 @@ pub fn wire_solend_deposit_tool(
 
     // ── V1 default policy config (Solend+USDC only) ─────────────────────────
     //
-    // Conservative defaults; cap pinned to the tool's structural max so
-    // the evaluator's cap rule aligns with the tool-surface guard.
-    // Future slices may promote this to a TOML-driven config. Extracted
-    // into a pure helper [`solend_usdc_lending_rule_config`] so unit
-    // tests can assert calibration without standing up the full wiring.
-    let rule_config = solend_usdc_lending_rule_config();
+    // Phase 6G: cap is driven by the operator-supplied `risk_budget`
+    // profile (e.g. demo = 5 USDC). Extracted into a pure helper
+    // [`solend_usdc_lending_rule_config`] so unit tests can assert
+    // calibration without standing up the full wiring.
+    let rule_config = solend_usdc_lending_rule_config(&risk_budget);
 
     // ── Structural preflight simulator (Phase 4C-3) ─────────────────────────
     //
@@ -235,6 +246,7 @@ pub fn wire_solend_deposit_tool(
             approval_store,
             pending_solend_park,
             approval_lease_seconds,
+            risk_budget,
         )
         .with_preflight_simulator(preflight_simulator)
         .with_jit_ready_deps(jit_ready_deps),
@@ -284,6 +296,7 @@ mod tests {
             SolendJitReadyStore::new(),
             Arc::new(crate::integrations::solend_submit::NullSolendAuditSink),
             120,
+            SolendDepositRiskBudgetConfig::demo(),
         );
 
         assert!(
@@ -304,6 +317,7 @@ mod tests {
             SolendJitReadyStore::new(),
             Arc::new(crate::integrations::solend_submit::NullSolendAuditSink),
             120,
+            SolendDepositRiskBudgetConfig::demo(),
         );
         let tool = registry
             .get("solend_deposit_usdc")
@@ -359,6 +373,7 @@ mod tests {
             SolendJitReadyStore::new(),
             Arc::new(crate::integrations::solend_submit::NullSolendAuditSink),
             120,
+            SolendDepositRiskBudgetConfig::demo(),
         );
         let names = registry.names();
         assert!(names.iter().any(|n| n == "noop_for_wiring_test"));
@@ -468,7 +483,7 @@ mod tests {
 
     #[test]
     fn helper_config_uses_calibrated_publish_age_and_keeps_other_fields() {
-        let cfg = solend_usdc_lending_rule_config();
+        let cfg = solend_usdc_lending_rule_config(&SolendDepositRiskBudgetConfig::demo());
         assert_eq!(
             cfg.max_oracle_staleness.max_publish_age.raw(),
             SOLEND_USDC_MAX_ORACLE_PUBLISH_AGE_MS,
@@ -482,7 +497,25 @@ mod tests {
         assert_eq!(cfg.max_action_input_amount.per_mint_caps.len(), 1);
         let (capped_mint, cap) = &cfg.max_action_input_amount.per_mint_caps[0];
         assert_eq!(*capped_mint, usdc_mint_pk());
-        assert_eq!(cap.raw(), MAX_STRUCTURAL_AMOUNT_RAW);
+        // Phase 6G — cap is now driven by the demo risk budget (5 USDC),
+        // not by the structural max constant.
+        assert_eq!(cap.raw(), 5_000_000);
+    }
+
+    /// Phase 6G — a non-demo profile (e.g. rehearsal at 100 USDC)
+    /// produces a higher cap purely via config; no Rust touch in the
+    /// tool / wiring / chat allowlist required to enable it.
+    #[test]
+    fn rehearsal_profile_cap_is_one_hundred_usdc() {
+        let rehearsal = SolendDepositRiskBudgetConfig {
+            profile_name: "rehearsal".to_string(),
+            max_deposit_amount_ui: "100".to_string(),
+            asset: "USDC".to_string(),
+            decimals: 6,
+        };
+        let cfg = solend_usdc_lending_rule_config(&rehearsal);
+        let (_mint, cap) = &cfg.max_action_input_amount.per_mint_caps[0];
+        assert_eq!(cap.raw(), 100_000_000);
     }
 
     #[test]
@@ -491,7 +524,7 @@ mod tests {
         // have BLOCKED this; post-calibration (120 s) must PASS the
         // oracle-staleness rule.
         let snap = snapshot_with_pyth_age_slots(200);
-        let cfg = solend_usdc_lending_rule_config();
+        let cfg = solend_usdc_lending_rule_config(&SolendDepositRiskBudgetConfig::demo());
         let action = deposit_action_usdc(1_000);
         let ctx = EvaluationContext {
             session_wallet: snap.session_wallet,
@@ -508,7 +541,7 @@ mod tests {
         // 300 slots × 400 ms = 120 000 ms; equal to the budget. The
         // rule uses `age > max_slots` (strict), so the boundary passes.
         let snap = snapshot_with_pyth_age_slots(300);
-        let cfg = solend_usdc_lending_rule_config();
+        let cfg = solend_usdc_lending_rule_config(&SolendDepositRiskBudgetConfig::demo());
         let action = deposit_action_usdc(1_000);
         let ctx = EvaluationContext {
             session_wallet: snap.session_wallet,
@@ -525,7 +558,7 @@ mod tests {
         // 350 slots × 400 ms = 140 000 ms — beyond the calibrated 120 s.
         // Calibration is NOT a bypass: the rule still fires.
         let snap = snapshot_with_pyth_age_slots(350);
-        let cfg = solend_usdc_lending_rule_config();
+        let cfg = solend_usdc_lending_rule_config(&SolendDepositRiskBudgetConfig::demo());
         let action = deposit_action_usdc(1_000);
         let ctx = EvaluationContext {
             session_wallet: snap.session_wallet,
@@ -555,7 +588,7 @@ mod tests {
         // pins the allowlist value rather than constructing a foreign
         // protocol action — which would require widening the action
         // type. We assert the allowlist is exactly `[Solend]`.
-        let cfg = solend_usdc_lending_rule_config();
+        let cfg = solend_usdc_lending_rule_config(&SolendDepositRiskBudgetConfig::demo());
         assert_eq!(
             cfg.allowed_lending_protocols.allowlist.len(),
             1,
@@ -573,7 +606,7 @@ mod tests {
         // is fresh USDC; the action's reserve_mint != USDC. The
         // evaluator must reject before any oracle check.
         let snap = snapshot_with_pyth_age_slots(50); // healthy oracle
-        let cfg = solend_usdc_lending_rule_config();
+        let cfg = solend_usdc_lending_rule_config(&SolendDepositRiskBudgetConfig::demo());
         let bogus_mint = Pubkey::new_unique();
         let action = ProposedAction::Deposit {
             protocol: ProtocolTag::Solend,
@@ -592,12 +625,13 @@ mod tests {
 
     #[test]
     fn calibration_still_blocks_amount_above_cap() {
-        // Cap is `MAX_STRUCTURAL_AMOUNT_RAW = 10_000`. An action above
-        // the cap must hard-block on the AmountOverCap rule, not on
-        // anything oracle-related.
+        // Phase 6G: cap = demo profile = 5 USDC = 5_000_000 raw.
+        // 5_000_001 raw is one base unit above the cap and must
+        // hard-block on the AmountOverCap rule, not on anything
+        // oracle-related.
         let snap = snapshot_with_pyth_age_slots(50); // healthy oracle
-        let cfg = solend_usdc_lending_rule_config();
-        let action = deposit_action_usdc(MAX_STRUCTURAL_AMOUNT_RAW + 1);
+        let cfg = solend_usdc_lending_rule_config(&SolendDepositRiskBudgetConfig::demo());
+        let action = deposit_action_usdc(5_000_001);
         let ctx = EvaluationContext {
             session_wallet: snap.session_wallet,
         };

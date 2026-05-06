@@ -515,6 +515,12 @@ impl GatewayDaemon {
             pending_solend_jit_ready.clone(),
             solend_audit_sink.clone(),
             config.policy.approval_lease_seconds,
+            // Phase 6G — Solend deposit risk-budget profile. Defaults to
+            // the demo profile (5 USDC max). Future profiles
+            // ("rehearsal", "private_beta", …) will read this from
+            // TOML; for now the daemon hardcodes the demo to make the
+            // intent explicit at the integration call site.
+            crate::lending::SolendDepositRiskBudgetConfig::demo(),
         );
 
         // ── 10d. Phase 6C-B — read-only copilot tools ────────────────────────

@@ -635,6 +635,7 @@ async fn live_solend_deposit_e2e() {
         jit_ready_store.clone(),
         audit_sink.clone(),
         600,
+        claw_gateway::lending::SolendDepositRiskBudgetConfig::demo(),
     );
 
     // Submit handler with confirmation tracker attached.

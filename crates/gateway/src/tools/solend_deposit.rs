@@ -95,9 +95,10 @@ use crate::integrations::solend_park::{
     run_solend_resume_task, ParkedSolendDepositIntent, SolendParkStore,
 };
 use crate::lending::{
-    evaluate_lending_policy, EvaluationContext, HardBlockReason, LendingPolicyVerdict,
-    LendingRuleConfig, ProposedAction, ProtocolTag, RuleKind, RuleRejectionDetail,
-    SystemInvariantSubreason, UnderlyingAmount,
+    evaluate_lending_policy, raw_to_ui_decimal, EvaluationContext, HardBlockReason,
+    LendingPolicyVerdict, LendingRuleConfig, ProposedAction, ProtocolTag, RuleKind,
+    RuleRejectionDetail, SolendDepositRiskBudgetConfig, SystemInvariantSubreason,
+    UnderlyingAmount,
 };
 use crate::tools::jupiter_swap::SessionBoundWallet;
 
@@ -118,15 +119,19 @@ const SOLEND_PROGRAM_ID_BASE58: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMC
 /// later uses a real obligation keypair where required.
 const PROPOSE_STAGE_OBLIGATION_SEED: &[u8] = b"claw_v1_solend_obligation";
 
-/// Conservative structural upper bound on deposit amount for this slice,
-/// in USDC base units (6 decimals). 10_000 raw = 0.01 USDC.
+/// Tool-surface structural upper bound on deposit amount, in USDC base
+/// units (6 decimals). Phase 6G: raised from the previous 10_000
+/// (= 0.01 USDC) to 1×10^15 (= 10^9 USDC = 1 billion USDC) so the
+/// constant unambiguously NO LONGER doubles as a risk cap.
 ///
-/// Intentionally local and small. This is a tool-surface sanity check to
-/// keep the productization slice boring, NOT a policy cap. Real caps
-/// belong in [`crate::lending::MaxActionInputAmountConfig`] and are
-/// enforced by the evaluator. Do NOT repurpose this constant as a risk
-/// limit.
-pub const MAX_STRUCTURAL_AMOUNT_RAW: u64 = 10_000;
+/// **This is NOT a risk limit.** The risk limit is owned by the
+/// operator-supplied [`SolendDepositRiskBudgetConfig`][crate::lending::SolendDepositRiskBudgetConfig]
+/// and enforced by the policy evaluator's `MaxActionInputAmount` rule
+/// (typed `RuleRejectionDetail::AmountOverCap`). The structural bound
+/// here is a defensive guard against absurd `u64` inputs that would
+/// otherwise feed into account-fetch / preflight RPC paths; it sits
+/// well above any expected production profile.
+pub const MAX_STRUCTURAL_AMOUNT_RAW: u64 = 1_000_000_000_000_000;
 
 // ── Input schema ────────────────────────────────────────────────────────────
 
@@ -245,6 +250,13 @@ pub struct SubmitSolendDepositTool {
     approval_store: ApprovalStore,
     park_store: SolendParkStore,
     approval_lease_seconds: u64,
+    /// Phase 6G — operator-facing risk-budget profile. The cap inside
+    /// `rule_config.max_action_input_amount.per_mint_caps` is derived
+    /// from this; the tool's outputs include `profile_name`,
+    /// `max_allowed_amount_*`, and `requested_amount_*` so callers
+    /// (UI, audit) can render a clear "blocked / passed" row without
+    /// re-deriving the cap.
+    risk_budget: SolendDepositRiskBudgetConfig,
     /// Phase 4C-3 structural preflight simulator. `None` preserves the
     /// pre-4C-3 behaviour (no simulation after plan assembly). Production
     /// daemon wires a `ClawRpcPoolPreflightRpc`. This dependency is
@@ -269,6 +281,7 @@ pub struct SubmitSolendDepositTool {
 }
 
 impl SubmitSolendDepositTool {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_wallet_lookup: Arc<dyn SessionBoundWallet>,
         assembler: Arc<dyn SolendDepositSnapshotAssembler>,
@@ -276,6 +289,7 @@ impl SubmitSolendDepositTool {
         approval_store: ApprovalStore,
         park_store: SolendParkStore,
         approval_lease_seconds: u64,
+        risk_budget: SolendDepositRiskBudgetConfig,
     ) -> Self {
         Self {
             session_wallet_lookup,
@@ -284,6 +298,7 @@ impl SubmitSolendDepositTool {
             approval_store,
             park_store,
             approval_lease_seconds,
+            risk_budget,
             preflight_simulator: None,
             jit_ready_deps: None,
         }
@@ -652,6 +667,7 @@ impl Tool for SubmitSolendDepositTool {
                     parsed.amount,
                     &session_wallet_pk,
                     &reserve_mint,
+                    &self.risk_budget,
                 ))
             }
             LendingPolicyVerdict::HardBlock(reason) => Ok(policy_blocked_output(
@@ -660,6 +676,7 @@ impl Tool for SubmitSolendDepositTool {
                 &session_wallet_pk,
                 &reserve_mint,
                 &reason,
+                &self.risk_budget,
             )),
         }
     }
@@ -783,23 +800,57 @@ fn policy_blocked_output(
     session_wallet: &Pubkey,
     reserve_mint: &Pubkey,
     reason: &HardBlockReason,
+    risk_budget: &SolendDepositRiskBudgetConfig,
 ) -> ToolOutput {
     let reason_str = hard_block_reason_summary(reason);
+    let max_raw = risk_budget.max_deposit_amount_raw().unwrap_or(0);
+    let max_ui = risk_budget.max_deposit_amount_ui_padded();
+    let requested_ui = raw_to_ui_decimal(amount, risk_budget.decimals);
+    let policy_rule_name = match reason {
+        HardBlockReason::RuleRejected(_, RuleRejectionDetail::AmountOverCap) => {
+            // Phase 6G — risk-budget cap is the rule that fired. Use
+            // the stable label so audit / UI can correlate.
+            SolendDepositRiskBudgetConfig::POLICY_RULE_NAME.to_string()
+        }
+        HardBlockReason::RuleRejected(rule, _) => format!("{rule:?}"),
+        HardBlockReason::SystemInvariantFailed(_) => "system-invariant".to_string(),
+        HardBlockReason::ScopeBoundary(_) => "scope-boundary".to_string(),
+    };
+    let human_readable_reason = match reason {
+        HardBlockReason::RuleRejected(_, RuleRejectionDetail::AmountOverCap) => format!(
+            "Blocked by policy: current `{}` profile allows at most {} {} per Solend deposit. Requested {} {}.",
+            risk_budget.profile_name,
+            max_ui,
+            risk_budget.asset,
+            requested_ui,
+            risk_budget.asset,
+        ),
+        _ => format!("Blocked by policy: {reason_str}"),
+    };
     ToolOutput {
         tool_name: TOOL_NAME.to_string(),
         success: false,
         data: Some(json!({
-            "status":              "policy_blocked",
-            "intent_id":           intent_id.to_string(),
-            "protocol":            "Solend",
-            "asset":               "USDC",
-            "amount_raw":          amount,
-            "reserve_mint":        reserve_mint.to_string(),
-            "session_wallet":      session_wallet.to_string(),
-            "policy_verdict":      "HardBlock",
-            "hard_block_reason":   reason_str,
-            "approval_required":   false,
-            "approval_request_id": Value::Null,
+            "status":                 "policy_blocked",
+            "intent_id":              intent_id.to_string(),
+            "protocol":               "Solend",
+            "asset":                  risk_budget.asset,
+            "amount_raw":             amount,
+            "amount_ui":              requested_ui,
+            "reserve_mint":           reserve_mint.to_string(),
+            "session_wallet":         session_wallet.to_string(),
+            "policy_verdict":         "HardBlock",
+            "hard_block_reason":      reason_str,
+            "approval_required":      false,
+            "approval_request_id":    Value::Null,
+            // Phase 6G — risk-budget context.
+            "profile_name":           risk_budget.profile_name,
+            "policy_rule_name":       policy_rule_name,
+            "requested_amount_raw":   amount,
+            "requested_amount_ui":    requested_ui,
+            "max_allowed_amount_raw": max_raw,
+            "max_allowed_amount_ui":  max_ui,
+            "human_readable_reason":  human_readable_reason,
             // Phase 5A — single safe summary string for the LLM context.
             "human_readable_next_step": "Request blocked by policy.",
         })),
@@ -812,28 +863,46 @@ fn policy_blocked_output(
 /// created a real `ApprovalRequest`, and the parked intent is awaiting an
 /// operator decision. `approval_request_id` is always present here;
 /// `approval_required` is always `true`.
+///
+/// Phase 6G — risk-budget context (`profile_name`, requested/max raw +
+/// UI) is embedded so callers can render "this proposal is within the
+/// active risk budget" without re-deriving the cap.
 fn awaiting_approval_output(
     intent_id: Uuid,
     approval_request_id: Uuid,
     amount: u64,
     session_wallet: &Pubkey,
     reserve_mint: &Pubkey,
+    risk_budget: &SolendDepositRiskBudgetConfig,
 ) -> ToolOutput {
+    let max_raw = risk_budget.max_deposit_amount_raw().unwrap_or(0);
+    let max_ui = risk_budget.max_deposit_amount_ui_padded();
+    let requested_ui = raw_to_ui_decimal(amount, risk_budget.decimals);
     ToolOutput {
         tool_name: TOOL_NAME.to_string(),
         success: true,
         data: Some(json!({
-            "status":              "awaiting_approval",
-            "intent_id":           intent_id.to_string(),
-            "approval_request_id": approval_request_id.to_string(),
-            "protocol":            "Solend",
-            "asset":               "USDC",
-            "amount_raw":          amount,
-            "amount_ui":           format_usdc_ui(amount),
-            "reserve_mint":        reserve_mint.to_string(),
-            "session_wallet":      session_wallet.to_string(),
-            "policy_verdict":      "Pass",
-            "approval_required":   true,
+            "status":                 "awaiting_approval",
+            "intent_id":              intent_id.to_string(),
+            "approval_request_id":    approval_request_id.to_string(),
+            "protocol":               "Solend",
+            "asset":                  risk_budget.asset,
+            "amount_raw":             amount,
+            "amount_ui":              format_usdc_ui(amount),
+            "reserve_mint":           reserve_mint.to_string(),
+            "session_wallet":         session_wallet.to_string(),
+            "policy_verdict":         "Pass",
+            "approval_required":      true,
+            // Phase 6G — risk-budget context. `risk_budget_note` is
+            // intentionally a literal "this is a daemon-enforced cap,
+            // not an AI permission" reminder for downstream display.
+            "profile_name":           risk_budget.profile_name,
+            "policy_rule_name":       SolendDepositRiskBudgetConfig::POLICY_RULE_NAME,
+            "requested_amount_raw":   amount,
+            "requested_amount_ui":    requested_ui,
+            "max_allowed_amount_raw": max_raw,
+            "max_allowed_amount_ui":  max_ui,
+            "risk_budget_note":       "Daemon-enforced risk budget — not an LLM permission. Operator changes profile.",
             // Phase 5A — single safe summary string for the LLM context.
             "human_readable_next_step": "Waiting for user approval.",
         })),
@@ -1424,6 +1493,18 @@ mod tests {
         assembler: Arc<dyn SolendDepositSnapshotAssembler>,
         config: LendingRuleConfig,
     ) -> (SubmitSolendDepositTool, ApprovalStore, SolendParkStore) {
+        tool_with_stores_and_budget(pubkey, assembler, config, demo_risk_budget())
+    }
+
+    /// Phase 6G — version of `tool_with_stores` that lets a test inject a
+    /// specific risk-budget profile. The default helper above pins the
+    /// demo profile (5 USDC); profile-sensitive tests use this variant.
+    fn tool_with_stores_and_budget(
+        pubkey: Option<&str>,
+        assembler: Arc<dyn SolendDepositSnapshotAssembler>,
+        config: LendingRuleConfig,
+        risk_budget: SolendDepositRiskBudgetConfig,
+    ) -> (SubmitSolendDepositTool, ApprovalStore, SolendParkStore) {
         let approval_store = ApprovalStore::new();
         let park_store = SolendParkStore::new();
         let tool = SubmitSolendDepositTool::new(
@@ -1435,8 +1516,17 @@ mod tests {
             approval_store.clone(),
             park_store.clone(),
             TEST_LEASE_SECONDS,
+            risk_budget,
         );
         (tool, approval_store, park_store)
+    }
+
+    /// Phase 6G — the demo risk-budget profile (5 USDC). Most test
+    /// fixtures use this; the wiring layer's `permissive_v1_config()`
+    /// runs the policy with a higher cap, so existing tests asserting
+    /// "amount within policy cap" still pass.
+    fn demo_risk_budget() -> SolendDepositRiskBudgetConfig {
+        SolendDepositRiskBudgetConfig::demo()
     }
 
     fn input_with_params(params: Value) -> ToolInput {
@@ -1844,6 +1934,7 @@ mod tests {
             ApprovalStore::new(),
             SolendParkStore::new(),
             TEST_LEASE_SECONDS,
+            demo_risk_budget(),
         );
     }
 
@@ -2408,6 +2499,162 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────────
 
     use claw_types::approval::ApprovalWorkflowState;
+
+    // ── Phase 6G — risk-budget profile boundary tests ─────────────────────
+    //
+    // The demo profile caps deposits at 5 USDC (5_000_000 raw). These
+    // tests pin the boundary on every side (smoke amounts pass; exact
+    // 5 USDC passes; 5_000_001 raw blocks; 20 USDC blocks) and verify
+    // the new structured output fields (`profile_name`,
+    // `policy_rule_name`, `requested_amount_*`, `max_allowed_amount_*`,
+    // `human_readable_reason`).
+    //
+    // The rule_config used here is `permissive_v1_config()` overridden
+    // with the demo cap so the only failing rule is `AmountOverCap`.
+    fn demo_profile_v1_config() -> LendingRuleConfig {
+        let mut cfg = permissive_v1_config();
+        cfg.max_action_input_amount.per_mint_caps =
+            vec![(usdc_mint(), UnderlyingAmount::new(5_000_000))];
+        cfg
+    }
+
+    async fn run_demo_profile_amount(
+        amount_raw: u64,
+    ) -> serde_json::Value {
+        let wallet_bs58 = valid_wallet_bs58();
+        let wallet_pk = Pubkey::try_from(wallet_bs58.as_str()).unwrap();
+        let assembler = Arc::new(MockAssembler::with_ok(fresh_first_deposit_snapshot(
+            wallet_pk,
+        )));
+        let (tool, _approval_store, _park_store) = tool_with_stores_and_budget(
+            Some(&wallet_bs58),
+            assembler,
+            demo_profile_v1_config(),
+            SolendDepositRiskBudgetConfig::demo(),
+        );
+        let out = tool
+            .execute(input_with_params(json!({ "amount": amount_raw })))
+            .await
+            .expect("execute returns Ok");
+        out.data.expect("data present")
+    }
+
+    #[tokio::test]
+    async fn p6g_demo_profile_passes_one_milli_usdc() {
+        // 0.001 USDC = 1_000 raw — under the demo cap.
+        let data = run_demo_profile_amount(1_000).await;
+        assert_eq!(data["status"], "awaiting_approval");
+        assert_eq!(data["profile_name"], "demo");
+        assert_eq!(data["requested_amount_raw"], 1_000);
+        assert_eq!(data["requested_amount_ui"], "0.001000");
+        assert_eq!(data["max_allowed_amount_raw"], 5_000_000);
+        assert_eq!(data["max_allowed_amount_ui"], "5.000000");
+        assert_eq!(
+            data["policy_rule_name"],
+            SolendDepositRiskBudgetConfig::POLICY_RULE_NAME
+        );
+    }
+
+    #[tokio::test]
+    async fn p6g_demo_profile_passes_one_centi_usdc() {
+        // 0.01 USDC = 10_000 raw.
+        let data = run_demo_profile_amount(10_000).await;
+        assert_eq!(data["status"], "awaiting_approval");
+        assert_eq!(data["requested_amount_raw"], 10_000);
+        assert_eq!(data["requested_amount_ui"], "0.010000");
+    }
+
+    #[tokio::test]
+    async fn p6g_demo_profile_passes_exactly_5_usdc() {
+        // 5 USDC = 5_000_000 raw — at the cap (≤ rule).
+        let data = run_demo_profile_amount(5_000_000).await;
+        assert_eq!(data["status"], "awaiting_approval");
+        assert_eq!(data["requested_amount_raw"], 5_000_000);
+        assert_eq!(data["requested_amount_ui"], "5.000000");
+        assert_eq!(data["max_allowed_amount_raw"], 5_000_000);
+    }
+
+    #[tokio::test]
+    async fn p6g_demo_profile_blocks_one_micro_usdc_above_cap() {
+        // 5.000001 USDC = 5_000_001 raw — exactly one base unit above
+        // the cap. No float drift because the parser uses pure
+        // integer arithmetic.
+        let data = run_demo_profile_amount(5_000_001).await;
+        assert_eq!(data["status"], "policy_blocked");
+        assert_eq!(data["profile_name"], "demo");
+        assert_eq!(data["requested_amount_raw"], 5_000_001);
+        assert_eq!(data["requested_amount_ui"], "5.000001");
+        assert_eq!(data["max_allowed_amount_raw"], 5_000_000);
+        assert_eq!(data["max_allowed_amount_ui"], "5.000000");
+        assert_eq!(
+            data["policy_rule_name"],
+            SolendDepositRiskBudgetConfig::POLICY_RULE_NAME
+        );
+        assert!(data["approval_request_id"].is_null());
+        let reason = data["human_readable_reason"]
+            .as_str()
+            .expect("human_readable_reason is a string");
+        assert!(reason.contains("demo"), "human_readable_reason: {reason}");
+        assert!(reason.contains("5.000000"), "human_readable_reason: {reason}");
+        assert!(reason.contains("5.000001"), "human_readable_reason: {reason}");
+    }
+
+    #[tokio::test]
+    async fn p6g_demo_profile_blocks_twenty_usdc() {
+        // 20 USDC = 20_000_000 raw — well above the demo cap.
+        let data = run_demo_profile_amount(20_000_000).await;
+        assert_eq!(data["status"], "policy_blocked");
+        assert_eq!(data["profile_name"], "demo");
+        assert_eq!(data["requested_amount_raw"], 20_000_000);
+        assert_eq!(data["requested_amount_ui"], "20.000000");
+        assert_eq!(data["max_allowed_amount_raw"], 5_000_000);
+        assert_eq!(data["max_allowed_amount_ui"], "5.000000");
+        assert!(data["approval_request_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn p6g_demo_profile_block_creates_no_approval_no_park() {
+        // Spec demo prompt: "Deposit 20 USDC into Solend." → no
+        // approval_request_id, no parked intent, no signing handoff.
+        let wallet_bs58 = valid_wallet_bs58();
+        let wallet_pk = Pubkey::try_from(wallet_bs58.as_str()).unwrap();
+        let assembler = Arc::new(MockAssembler::with_ok(fresh_first_deposit_snapshot(
+            wallet_pk,
+        )));
+        let (tool, approval_store, park_store) = tool_with_stores_and_budget(
+            Some(&wallet_bs58),
+            assembler,
+            demo_profile_v1_config(),
+            SolendDepositRiskBudgetConfig::demo(),
+        );
+        let out = tool
+            .execute(input_with_params(json!({ "amount": 20_000_000 })))
+            .await
+            .unwrap();
+        let data = out.data.unwrap();
+        assert_eq!(data["status"], "policy_blocked");
+        assert!(data["approval_request_id"].is_null());
+        assert_eq!(approval_store.pending_count(), 0);
+        assert_eq!(park_store.parked_count(), 0);
+    }
+
+    /// Sanity: even if the LLM emitted `5.000001` worth of raw units,
+    /// no float intermediate produced a passing 5.0000009999… value.
+    /// The parser is integer-only; this is a regression guard.
+    #[test]
+    fn p6g_no_float_drift_at_cap_boundary() {
+        let raw_at_cap =
+            crate::lending::parse_ui_decimal_to_raw("5.000000", 6).unwrap();
+        let raw_one_above =
+            crate::lending::parse_ui_decimal_to_raw("5.000001", 6).unwrap();
+        assert_eq!(raw_at_cap, 5_000_000);
+        assert_eq!(raw_one_above, 5_000_001);
+        assert!(raw_one_above > raw_at_cap);
+        // raw_to_ui round-trip: pad 5_000_000 to "5.000000" not
+        // "4.999999..." (the kind of bug a float pipeline could
+        // introduce).
+        assert_eq!(crate::lending::raw_to_ui_decimal(5_000_000, 6), "5.000000");
+    }
 
     // ── (B') policy_blocked creates NO approval + parks NO intent ────────
 

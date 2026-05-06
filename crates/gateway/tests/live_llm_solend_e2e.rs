@@ -764,6 +764,7 @@ async fn run_live_llm_solend_e2e() {
         jit_ready_store.clone(),
         audit_sink.clone(),
         600,
+        claw_gateway::lending::SolendDepositRiskBudgetConfig::demo(),
     );
 
     // ── Build the chat handler over the same registry ─────────────────────

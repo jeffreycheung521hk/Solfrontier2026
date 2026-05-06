@@ -26,6 +26,7 @@
 
 pub mod gate;
 pub mod policy;
+pub mod risk_budget;
 pub mod snapshot;
 pub mod types;
 
@@ -36,6 +37,10 @@ pub use policy::{
     LendingRuleConfig, MaxActionInputAmountConfig, MaxOracleStalenessConfig,
     ProposedAction, RequireFreshStateConfig, RuleKind, RuleRejectionDetail,
     ScopeBoundarySubreason, SystemInvariantSubreason,
+};
+pub use risk_budget::{
+    parse_ui_decimal_to_raw, raw_to_ui_decimal, RiskBudgetParseError,
+    SolendDepositRiskBudgetConfig,
 };
 pub use snapshot::{
     ComponentFreshness, FeedPublishFreshness, LendingSnapshot, Obligation,
