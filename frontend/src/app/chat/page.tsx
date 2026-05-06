@@ -13,13 +13,12 @@
 // Day 2+.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import Link from "next/link";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
+import { ToolResultCard } from "@/components/tool-cards";
 import { WalletConnect } from "@/components/wallet-connect";
 import {
   confirmWalletBindChallenge,
@@ -560,7 +559,7 @@ function ChatResponseCard({ response }: { response: ChatResponse }) {
       );
 
     case "tool_dispatched":
-      return <ToolDispatchedCard toolName={response.tool_name} output={response.output} />;
+      return <ToolResultCard toolName={response.tool_name} output={response.output} />;
 
     case "multiple_tool_calls_rejected":
       return (
@@ -624,69 +623,6 @@ function ChatResponseCard({ response }: { response: ChatResponse }) {
       return exhaustive;
     }
   }
-}
-
-function ToolDispatchedCard({ toolName, output }: { toolName: string; output: unknown }) {
-  // Best-effort extraction of the inner status + approval id without
-  // assuming a tight schema. Day 2 will tighten this.
-  const data = (output as { data?: { status?: string; approval_request_id?: string; amount_raw?: number } })?.data;
-  const innerStatus = data?.status;
-  const approvalId = data?.approval_request_id;
-  const amount = data?.amount_raw;
-
-  const isAwaitingApproval = innerStatus === "awaiting_approval";
-
-  return (
-    <Card className="border-foreground/15">
-      <CardHeader className="pb-3">
-        <div className="flex items-center justify-between">
-          <CardTitle className="text-sm font-medium">
-            Tool call: <code>{toolName}</code>
-          </CardTitle>
-          {innerStatus && (
-            <Badge variant={isAwaitingApproval ? "default" : "secondary"} className="text-xs">
-              {innerStatus.replace(/_/g, " ")}
-            </Badge>
-          )}
-        </div>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {amount !== undefined && (
-          <div className="text-xs text-muted-foreground">
-            Amount: <span className="font-mono text-foreground">{amount}</span> raw units
-          </div>
-        )}
-        {isAwaitingApproval && approvalId && approvalId !== "00000000-0000-0000-0000-000000000000" && (
-          <>
-            <Separator />
-            <div className="flex items-center justify-between text-sm">
-              <div className="text-muted-foreground">
-                Approval request <code className="text-xs">{approvalId.slice(0, 8)}…</code>
-              </div>
-              <Link href={`/approval/${approvalId}`}>
-                <Button size="sm">Review &amp; Approve →</Button>
-              </Link>
-            </div>
-          </>
-        )}
-        {isAwaitingApproval && approvalId === "00000000-0000-0000-0000-000000000000" && (
-          <>
-            <Separator />
-            <div className="text-xs text-muted-foreground">
-              Showcase fixture — no real approval was created. In live mode this card links to
-              the operator approval page.
-            </div>
-          </>
-        )}
-        <details className="text-xs text-muted-foreground">
-          <summary className="cursor-pointer hover:text-foreground">raw output</summary>
-          <pre className="mt-2 overflow-x-auto rounded bg-muted px-3 py-2 text-[11px] leading-snug">
-            {JSON.stringify(output, null, 2)}
-          </pre>
-        </details>
-      </CardContent>
-    </Card>
-  );
 }
 
 function PendingActionCard({ reason }: { reason: string }) {

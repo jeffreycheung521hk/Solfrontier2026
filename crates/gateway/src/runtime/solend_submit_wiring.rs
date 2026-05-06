@@ -322,6 +322,7 @@ impl SolendSignatureHandler for GatewaySolendSignatureHandler {
                     session_wallet,
                     verified_slot,
                     last_valid_block_height,
+                    signed_bytes,
                 } => {
                     let _ = self.lifecycle_store.record(
                         signing_request_id,
@@ -361,7 +362,11 @@ impl SolendSignatureHandler for GatewaySolendSignatureHandler {
                             .unwrap_or(last_valid_block_height);
                         match tx_signature.parse::<solana_sdk::signature::Signature>() {
                             Ok(parsed_sig) => {
-                                let ctx = SolendTrackedContext::new_submitted(
+                                // Phase 6E: pass byte-identical signed
+                                // payload to the confirmation tracker so
+                                // it can rebroadcast same-bytes while
+                                // status remains null and blockhash valid.
+                                let ctx = SolendTrackedContext::new_submitted_with_bytes(
                                     signing_request_id,
                                     intent_id,
                                     session_id.clone(),
@@ -369,6 +374,7 @@ impl SolendSignatureHandler for GatewaySolendSignatureHandler {
                                     last_valid_block_height,
                                     submission_height,
                                     parsed_sig,
+                                    signed_bytes.clone(),
                                 );
                                 match tracker.enqueue(ctx) {
                                     TrackResult::Started => {
@@ -516,12 +522,18 @@ impl SolendSignatureHandler for GatewaySolendSignatureHandler {
 
 use crate::integrations::solend_confirmation::ClawRpcStatusProvider;
 use crate::integrations::solend_confirmation::SolendSignatureStatusProvider;
+use crate::integrations::solend_submit::SolendRebroadcastSender;
 
 /// Construct the Solend confirmation tracker, run boot-up recovery,
 /// and spawn the polling task. See module docs for design + D-2 scope.
+///
+/// Phase 6E: callers must pass a `rebroadcast_sender` (typically the
+/// same `ClawRpcSolendSender` used for submit-time send) so the tracker
+/// can rebroadcast same-bytes while polling.
 pub fn wire_solend_confirmation_tracker(
     lifecycle_store: SolendSubmissionLifecycleStore,
     rpc_pool: Arc<claw_solana_core::rpc::RpcPool>,
+    rebroadcast_sender: Arc<dyn SolendRebroadcastSender>,
     audit: Arc<dyn crate::integrations::solend_submit::SolendAuditSink>,
     poll_interval: std::time::Duration,
 ) -> Arc<SolendConfirmationTracker> {
@@ -530,6 +542,7 @@ pub fn wire_solend_confirmation_tracker(
     let tracker = Arc::new(SolendConfirmationTracker::new(
         lifecycle_store.clone(),
         status_provider,
+        rebroadcast_sender,
         audit,
         poll_interval,
     ));

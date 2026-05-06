@@ -31,11 +31,30 @@
 //!
 //! # What this module deliberately does NOT do
 //!
-//! - Does NOT broadcast. No `send_transaction`, no
-//!   `send_raw_transaction`.
 //! - Does NOT re-sign or re-handoff. On `ConfirmationTimeout` the
 //!   lifecycle records `RequiresReproposal` guidance for the UI; a new
 //!   signing handoff is the USER's next step, not this tracker's.
+//!
+//! # Phase 6E — confirmation-side bounded rebroadcast
+//!
+//! While `getSignatureStatuses` returns null for a tracked signature,
+//! the tracker periodically rebroadcasts the SAME signed bytes through
+//! a [`SolendRebroadcastSender`] seam — same bytes ⇒ same signature ⇒
+//! same on-chain identity, so confirmation polling continues to resolve
+//! against the same canonical tx ID. Bytes are passed in via
+//! [`SolendTrackedContext::signed_bytes`]; entries that have no bytes
+//! (e.g., bootstrap recovery from in-memory lifecycle store after a
+//! handler replacement) silently skip rebroadcast and fall back to
+//! polling-only behavior.
+//!
+//! Eligibility per tick: `signed_bytes.is_some()`, state non-terminal,
+//! status was null in this tick, attempts < `MAX_CONFIRMATION_REBROADCAST_ATTEMPTS`,
+//! `current_block_height + BLOCKHASH_GUARD_BUFFER_BLOCKS < last_valid_block_height`,
+//! and `now - max(enqueued_at, last_rebroadcast_at) >= CONFIRMATION_REBROADCAST_INTERVAL`.
+//!
+//! Rebroadcast errors (429, 503, network) are audited but do NOT abort
+//! the tracker — the next eligible tick simply retries until the
+//! attempt cap is reached or the blockhash guard trips.
 //! - Does NOT fabricate transaction bytes, pubkeys, or signatures.
 //! - Does NOT re-implement `calculate_next_state`. It calls the
 //!   shared function.
@@ -46,6 +65,7 @@
 //!   The two live side by side.
 //! - Does NOT mutate any parked signing artifact or approval record.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,6 +76,11 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use thiserror::Error;
 use tokio::sync::Notify;
+// tokio::time::Instant respects paused virtual time under
+// `#[tokio::test(start_paused = true)]`, unlike std::time::Instant
+// which always reads the real wall clock. The Phase 6E rebroadcast
+// interval gate relies on this for deterministic tests.
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -66,7 +91,7 @@ use claw_types::session::SessionId;
 use crate::integrations::solend_lifecycle::{
     RecordedSubmitOutcome, SolendSubmissionLifecycleStore,
 };
-use crate::integrations::solend_submit::SolendAuditSink;
+use crate::integrations::solend_submit::{SolendAuditSink, SolendRebroadcastSender};
 
 use claw_state_store::audit::AuditSeverity;
 
@@ -79,6 +104,41 @@ pub const AUDIT_EVENT_CONFIRMATION_FAILED: &str = "solend_transaction_failed";
 pub const AUDIT_EVENT_CONFIRMATION_TIMEOUT: &str = "solend_transaction_confirmation_timeout";
 pub const AUDIT_EVENT_CONFIRMATION_POLL_ERROR: &str =
     "solend_transaction_confirmation_poll_error";
+
+// ── Phase 6E confirmation-side rebroadcast ──────────────────────────────────
+
+/// Phase 6E: per-rebroadcast-attempt audit row, distinct from the
+/// submit-side `solend_transaction_broadcast_attempt`. One row fires
+/// per rebroadcast attempt regardless of outcome (Ok / SendError /
+/// HeightFetchError); Ok rebroadcasts also continue polling because
+/// the network may still drop the resent tx.
+pub const AUDIT_EVENT_TRANSACTION_REBROADCAST_ATTEMPT: &str =
+    "solend_transaction_rebroadcast_attempt";
+
+/// Phase 6E: emitted at most once per tracked entry when the
+/// confirmation-side blockhash guard trips while status is still null.
+/// The state machine will subsequently emit
+/// `solend_transaction_confirmation_timeout` once `current_block_height`
+/// exceeds `last_valid_block_height` — this earlier event records the
+/// exact tick at which we stopped rebroadcasting.
+pub const AUDIT_EVENT_BLOCKHASH_EXPIRED_DURING_CONFIRMATION: &str =
+    "solend_transaction_blockhash_expired_during_confirmation";
+
+/// Total rebroadcast attempts allowed per tracked tx (counts Ok and
+/// Err the same — every send call against the RPC counts).
+pub const MAX_CONFIRMATION_REBROADCAST_ATTEMPTS: u32 = 6;
+
+/// Minimum wall-clock time between rebroadcasts for the same tx.
+/// Independent of `poll_interval` (the cadence at which
+/// `getSignatureStatuses` is called); a fast poll cadence does NOT
+/// translate into faster rebroadcast spam.
+pub const CONFIRMATION_REBROADCAST_INTERVAL: Duration = Duration::from_secs(2);
+
+/// When the tracked entry's `last_valid_block_height` is within this
+/// many blocks of `current_block_height`, the tracker stops
+/// rebroadcasting (the resent tx would land too close to expiry to be
+/// useful).
+pub const BLOCKHASH_GUARD_BUFFER_BLOCKS: u64 = 5;
 
 // ── Errors + status shape ───────────────────────────────────────────────────
 
@@ -224,9 +284,32 @@ pub struct SolendTrackedContext {
     pub tx_signature: Signature,
     /// Current tracked state, reused from the shared state machine.
     pub state: TxState,
+    /// Phase 6E — bytes available for confirmation-side rebroadcast.
+    /// `None` when the context was constructed without bytes (e.g., the
+    /// boot-recovery path: in-memory lifecycle store does not persist
+    /// signed bytes across process restart). Tracker silently skips
+    /// rebroadcast for entries with `None`.
+    pub signed_bytes: Option<Arc<Vec<u8>>>,
+    /// Phase 6E — when this context was inserted into the tracker.
+    /// First-rebroadcast eligibility is `enqueued_at + INTERVAL`.
+    pub enqueued_at: Instant,
+    /// Phase 6E — number of rebroadcast attempts made (Ok or Err).
+    /// Capped at `MAX_CONFIRMATION_REBROADCAST_ATTEMPTS`.
+    pub rebroadcast_attempts: u32,
+    /// Phase 6E — wall-clock instant of the most recent rebroadcast
+    /// attempt; `None` until the first attempt fires.
+    pub last_rebroadcast_at: Option<Instant>,
+    /// Phase 6E — set once when the confirmation-side blockhash guard
+    /// trips, so the `…_blockhash_expired_during_confirmation` audit
+    /// event fires at most once per tracked entry.
+    pub blockhash_guard_audited: bool,
 }
 
 impl SolendTrackedContext {
+    /// Construct a fresh context that has NO signed bytes attached —
+    /// rebroadcast is silently disabled. Used by the boot-recovery
+    /// path (in-memory lifecycle store does not persist bytes across
+    /// process restart) and by tests that don't exercise rebroadcast.
     pub fn new_submitted(
         signing_request_id: Uuid,
         intent_id: Uuid,
@@ -245,6 +328,42 @@ impl SolendTrackedContext {
             submission_block_height,
             tx_signature,
             state: TxState::Submitted,
+            signed_bytes: None,
+            enqueued_at: Instant::now(),
+            rebroadcast_attempts: 0,
+            last_rebroadcast_at: None,
+            blockhash_guard_audited: false,
+        }
+    }
+
+    /// Phase 6E — fresh context WITH signed bytes attached. The wiring
+    /// layer uses this constructor so the tracker can perform same-bytes
+    /// rebroadcasts while polling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_submitted_with_bytes(
+        signing_request_id: Uuid,
+        intent_id: Uuid,
+        session_id: SessionId,
+        session_wallet: Pubkey,
+        last_valid_block_height: u64,
+        submission_block_height: u64,
+        tx_signature: Signature,
+        signed_bytes: Arc<Vec<u8>>,
+    ) -> Self {
+        Self {
+            signing_request_id,
+            intent_id,
+            session_id,
+            session_wallet,
+            last_valid_block_height,
+            submission_block_height,
+            tx_signature,
+            state: TxState::Submitted,
+            signed_bytes: Some(signed_bytes),
+            enqueued_at: Instant::now(),
+            rebroadcast_attempts: 0,
+            last_rebroadcast_at: None,
+            blockhash_guard_audited: false,
         }
     }
 }
@@ -270,6 +389,9 @@ pub struct SolendConfirmationTracker {
     tracked: Arc<DashMap<Signature, SolendTrackedContext>>,
     lifecycle: SolendSubmissionLifecycleStore,
     status_provider: Arc<dyn SolendSignatureStatusProvider>,
+    /// Phase 6E — confirmation-side rebroadcast seam. Production wraps
+    /// `ClawRpcSolendSender`; tests inject a stub that records calls.
+    rebroadcast_sender: Arc<dyn SolendRebroadcastSender>,
     audit: Arc<dyn SolendAuditSink>,
     poll_interval: Duration,
     shutdown: Arc<Notify>,
@@ -279,6 +401,7 @@ impl SolendConfirmationTracker {
     pub fn new(
         lifecycle: SolendSubmissionLifecycleStore,
         status_provider: Arc<dyn SolendSignatureStatusProvider>,
+        rebroadcast_sender: Arc<dyn SolendRebroadcastSender>,
         audit: Arc<dyn SolendAuditSink>,
         poll_interval: Duration,
     ) -> Self {
@@ -286,6 +409,7 @@ impl SolendConfirmationTracker {
             tracked: Arc::new(DashMap::new()),
             lifecycle,
             status_provider,
+            rebroadcast_sender,
             audit,
             poll_interval,
             shutdown: Arc::new(Notify::new()),
@@ -435,9 +559,16 @@ impl SolendConfirmationTracker {
             }
         };
 
+        // Phase 6E: track which sigs received non-null status this
+        // tick so the rebroadcast pass can skip them.
+        let mut observed_non_null: HashSet<Signature> = HashSet::new();
+
         // Zip defensively — provider contract says same length, but if
         // not we only iterate the minimum.
         for (sig, maybe_status) in sigs.iter().zip(statuses.iter()) {
+            if maybe_status.is_some() {
+                observed_non_null.insert(*sig);
+            }
             let observation = to_observation(maybe_status.as_ref());
 
             // Snapshot relevant context fields so we can drop the
@@ -495,6 +626,191 @@ impl SolendConfirmationTracker {
                 current_height,
             )
             .await;
+        }
+
+        // ── Phase 6E rebroadcast pass ──────────────────────────────
+        //
+        // For every still-tracked sig that:
+        //   - has signed_bytes attached (rebroadcast capability)
+        //   - did NOT receive a non-null status this tick
+        //   - has a non-terminal current state (post-status-update)
+        //   - has rebroadcast_attempts < MAX
+        //   - passes the blockhash guard
+        //   - is past its rebroadcast interval
+        // … fire one same-bytes rebroadcast and audit it. RPC errors
+        // are audited but do NOT abort the tracker — next eligible tick
+        // simply tries again until the cap or guard stops the loop.
+        for sig in &sigs {
+            if observed_non_null.contains(sig) {
+                continue;
+            }
+            // Snapshot fields before any await to avoid holding a
+            // DashMap guard across an await point.
+            let snapshot = self.tracked.get(sig).map(|e| {
+                (
+                    e.signing_request_id,
+                    e.intent_id,
+                    e.session_id.clone(),
+                    e.session_wallet,
+                    e.last_valid_block_height,
+                    e.signed_bytes.clone(),
+                    e.state.clone(),
+                    e.enqueued_at,
+                    e.rebroadcast_attempts,
+                    e.last_rebroadcast_at,
+                    e.blockhash_guard_audited,
+                )
+            });
+            let Some((
+                signing_request_id,
+                intent_id,
+                session_id,
+                session_wallet,
+                last_valid_block_height,
+                maybe_bytes,
+                state,
+                enqueued_at,
+                attempts,
+                last_rb_at,
+                guard_audited,
+            )) = snapshot
+            else {
+                continue;
+            };
+            if state.is_terminal() {
+                continue;
+            }
+            let Some(signed_bytes) = maybe_bytes else {
+                continue; // No bytes — skip rebroadcast for this entry.
+            };
+            if attempts >= MAX_CONFIRMATION_REBROADCAST_ATTEMPTS {
+                continue;
+            }
+
+            // Blockhash guard: stop rebroadcasting when current_height +
+            // GUARD_BUFFER >= last_valid_block_height. The state machine
+            // continues to drive the entry to ConfirmationTimeout once
+            // current_height passes last_valid_block_height; this audit
+            // event records the moment we STOP rebroadcasting.
+            let safe_height =
+                current_height.saturating_add(BLOCKHASH_GUARD_BUFFER_BLOCKS);
+            if safe_height >= last_valid_block_height {
+                if !guard_audited {
+                    self.audit
+                        .append_solend_event(
+                            AUDIT_EVENT_BLOCKHASH_EXPIRED_DURING_CONFIRMATION,
+                            signing_request_id.to_string(),
+                            Some(session_id.to_string()),
+                            AuditSeverity::Warning,
+                            json!({
+                                "signing_request_id":      signing_request_id,
+                                "intent_id":               intent_id,
+                                "session_id":              session_id.to_string(),
+                                "wallet":                  session_wallet.to_string(),
+                                "tx_signature":            sig.to_string(),
+                                "current_block_height":    current_height,
+                                "last_valid_block_height": last_valid_block_height,
+                                "guard_buffer_blocks":     BLOCKHASH_GUARD_BUFFER_BLOCKS,
+                                "rebroadcast_attempts":    attempts,
+                            }),
+                        )
+                        .await;
+                    if let Some(mut e) = self.tracked.get_mut(sig) {
+                        e.blockhash_guard_audited = true;
+                    }
+                }
+                continue;
+            }
+
+            // Interval gate: first rebroadcast fires no sooner than
+            // INTERVAL after enqueue; subsequent rebroadcasts fire no
+            // sooner than INTERVAL after the previous rebroadcast.
+            let now = Instant::now();
+            let interval_due = match last_rb_at {
+                Some(t) => now.saturating_duration_since(t)
+                    >= CONFIRMATION_REBROADCAST_INTERVAL,
+                None => now.saturating_duration_since(enqueued_at)
+                    >= CONFIRMATION_REBROADCAST_INTERVAL,
+            };
+            if !interval_due {
+                continue;
+            }
+
+            // Eligible. Perform the rebroadcast.
+            let attempt_n = attempts + 1;
+            let remaining_block_budget =
+                last_valid_block_height.saturating_sub(current_height);
+            let rebroadcast_result = self
+                .rebroadcast_sender
+                .rebroadcast(signed_bytes.as_ref())
+                .await;
+
+            // Update counters AFTER the await regardless of outcome —
+            // every send call counts toward the cap.
+            if let Some(mut e) = self.tracked.get_mut(sig) {
+                e.rebroadcast_attempts = attempt_n;
+                e.last_rebroadcast_at = Some(now);
+            }
+
+            // Audit row.
+            let (severity, rpc_outcome, error_kind, error_message): (
+                AuditSeverity,
+                &'static str,
+                Option<&'static str>,
+                Option<String>,
+            ) = match &rebroadcast_result {
+                Ok(_) => (AuditSeverity::Info, "ok", None, None),
+                Err(e) => (
+                    AuditSeverity::Warning,
+                    "error",
+                    Some("SendError"),
+                    Some(format!("{e}")),
+                ),
+            };
+            let mut payload = json!({
+                "signing_request_id":      signing_request_id,
+                "intent_id":               intent_id,
+                "session_id":              session_id.to_string(),
+                "wallet":                  session_wallet.to_string(),
+                "tx_signature":            sig.to_string(),
+                "attempt_n":               attempt_n,
+                "max_attempts":            MAX_CONFIRMATION_REBROADCAST_ATTEMPTS,
+                "current_block_height":    current_height,
+                "last_valid_block_height": last_valid_block_height,
+                "remaining_block_budget":  remaining_block_budget,
+                "rpc_outcome":             rpc_outcome,
+            });
+            if let Some(k) = error_kind {
+                payload["error_kind"] = json!(k);
+            }
+            if let Some(m) = error_message.as_ref() {
+                payload["error_message"] = json!(m);
+            }
+            self.audit
+                .append_solend_event(
+                    AUDIT_EVENT_TRANSACTION_REBROADCAST_ATTEMPT,
+                    signing_request_id.to_string(),
+                    Some(session_id.to_string()),
+                    severity,
+                    payload,
+                )
+                .await;
+            if let Err(e) = &rebroadcast_result {
+                debug!(
+                    signing_request_id = %signing_request_id,
+                    signature = %sig,
+                    attempt_n = attempt_n,
+                    error = %e,
+                    "solend confirmation rebroadcast failed; tracker continues"
+                );
+            } else {
+                debug!(
+                    signing_request_id = %signing_request_id,
+                    signature = %sig,
+                    attempt_n = attempt_n,
+                    "solend confirmation rebroadcast accepted by RPC"
+                );
+            }
         }
 
         // Prune terminal entries from the in-memory map — one terminal
@@ -651,7 +967,9 @@ fn to_observation(status: Option<&SolendSignatureStatus>) -> RpcObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::solend_submit::NullSolendAuditSink;
+    use crate::integrations::solend_submit::{NullSolendAuditSink, SolendSubmitError};
+    use claw_state_store::audit::AuditSeverity;
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     // ── Stub status provider ───────────────────────────────────────────────
@@ -739,6 +1057,117 @@ mod tests {
         )
     }
 
+    /// Stub rebroadcast sender that records calls and returns Ok by
+    /// default. Used by all existing tests (which don't exercise
+    /// rebroadcast because their contexts have no signed_bytes).
+    struct NoopRebroadcastSender {
+        calls: Mutex<Vec<Vec<u8>>>,
+    }
+    impl NoopRebroadcastSender {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl SolendRebroadcastSender for NoopRebroadcastSender {
+        async fn rebroadcast(&self, signed_bytes: &[u8]) -> Result<String, SolendSubmitError> {
+            self.calls.lock().unwrap().push(signed_bytes.to_vec());
+            Ok("noopRebroadcastSig".to_string())
+        }
+    }
+
+    /// Sequenced rebroadcast sender — for Phase 6E tests that exercise
+    /// retry behavior. Pops Result<String, SolendSubmitError> per call;
+    /// falls back to Err when the queue is empty.
+    struct SequencedRebroadcast {
+        responses: Mutex<VecDeque<Result<String, SolendSubmitError>>>,
+        calls: Mutex<Vec<Vec<u8>>>,
+    }
+    impl SequencedRebroadcast {
+        fn new(seq: Vec<Result<String, SolendSubmitError>>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(seq)),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+        fn calls_snapshot(&self) -> Vec<Vec<u8>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl SolendRebroadcastSender for SequencedRebroadcast {
+        async fn rebroadcast(&self, signed_bytes: &[u8]) -> Result<String, SolendSubmitError> {
+            self.calls.lock().unwrap().push(signed_bytes.to_vec());
+            let mut q = self.responses.lock().unwrap();
+            if q.is_empty() {
+                return Err(SolendSubmitError::RpcFailure {
+                    reason: "sequenced rebroadcast exhausted".into(),
+                });
+            }
+            q.pop_front().unwrap()
+        }
+    }
+
+    fn ok_sig(s: &str) -> Result<String, SolendSubmitError> {
+        Ok(s.to_string())
+    }
+
+    fn rb_err(reason: &str) -> Result<String, SolendSubmitError> {
+        Err(SolendSubmitError::RpcFailure {
+            reason: reason.into(),
+        })
+    }
+
+    /// Recording audit sink — captures every event so Phase 6E tests
+    /// can assert per-attempt audit row contents.
+    #[derive(Default)]
+    struct RecordingAudit {
+        events: Mutex<Vec<(String, String, Option<String>, AuditSeverity, serde_json::Value)>>,
+    }
+    impl RecordingAudit {
+        fn names(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.0.clone())
+                .collect()
+        }
+        fn rows_named(&self, name: &str) -> Vec<serde_json::Value> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.0 == name)
+                .map(|e| e.4.clone())
+                .collect()
+        }
+    }
+    #[async_trait]
+    impl SolendAuditSink for RecordingAudit {
+        async fn append_solend_event(
+            &self,
+            event_name: &'static str,
+            correlation_id: String,
+            session_id: Option<String>,
+            severity: AuditSeverity,
+            payload: serde_json::Value,
+        ) {
+            self.events.lock().unwrap().push((
+                event_name.to_string(),
+                correlation_id,
+                session_id,
+                severity,
+                payload,
+            ));
+        }
+    }
+
     fn tracker_with(
         status_provider: Arc<StubStatuses>,
         lifecycle: SolendSubmissionLifecycleStore,
@@ -746,9 +1175,45 @@ mod tests {
         Arc::new(SolendConfirmationTracker::new(
             lifecycle,
             status_provider,
+            Arc::new(NoopRebroadcastSender::new()),
             Arc::new(NullSolendAuditSink),
             Duration::from_millis(10),
         ))
+    }
+
+    /// Phase 6E tracker variant that lets tests inject a specific
+    /// rebroadcast sender + audit sink.
+    fn tracker_with_rebroadcast(
+        status_provider: Arc<StubStatuses>,
+        lifecycle: SolendSubmissionLifecycleStore,
+        rebroadcast: Arc<dyn SolendRebroadcastSender>,
+        audit: Arc<dyn SolendAuditSink>,
+    ) -> Arc<SolendConfirmationTracker> {
+        Arc::new(SolendConfirmationTracker::new(
+            lifecycle,
+            status_provider,
+            rebroadcast,
+            audit,
+            Duration::from_millis(10),
+        ))
+    }
+
+    fn ctx_with_bytes(
+        sig: Signature,
+        lvbh: u64,
+        sbh: u64,
+        signed_bytes: Vec<u8>,
+    ) -> SolendTrackedContext {
+        SolendTrackedContext::new_submitted_with_bytes(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            SessionId::new(),
+            Pubkey::new_unique(),
+            lvbh,
+            sbh,
+            sig,
+            Arc::new(signed_bytes),
+        )
     }
 
     fn seed_submitted(
@@ -1192,6 +1657,7 @@ mod tests {
         let tracker = Arc::new(SolendConfirmationTracker::new(
             lifecycle,
             status,
+            Arc::new(NoopRebroadcastSender::new()),
             Arc::new(NullSolendAuditSink),
             Duration::from_millis(50),
         ));
@@ -1203,6 +1669,453 @@ mod tests {
             .await
             .expect("run loop exits promptly after shutdown")
             .expect("no panic");
+    }
+
+    // ── Phase 6E — confirmation-side rebroadcast tests ─────────────────────
+    //
+    // All Phase 6E tests run under `start_paused = true` so the
+    // CONFIRMATION_REBROADCAST_INTERVAL (2s wall clock) collapses to
+    // virtual time. The tracker uses `Instant::now()`, which respects
+    // tokio's paused clock under the test runtime.
+
+    /// Test-1: status null + signed_bytes attached + interval elapsed
+    /// triggers a rebroadcast call against the same bytes.
+    #[tokio::test(start_paused = true)]
+    async fn null_status_triggers_rebroadcast_with_same_bytes() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        let status = Arc::new(StubStatuses::new(100));
+        let rebroadcast = Arc::new(SequencedRebroadcast::new(vec![ok_sig("rb1")]));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        let bytes = vec![0xAB, 0xCD, 0xEF, 0x01, 0x02];
+        let ctx = ctx_with_bytes(sig, 200, 100, bytes.clone());
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx);
+
+        // Advance virtual time past the rebroadcast interval.
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        // First tick — null status; rebroadcast eligible.
+        status.push(vec![None]);
+        tracker.tick_once().await;
+
+        assert_eq!(rebroadcast.call_count(), 1);
+        assert_eq!(rebroadcast.calls_snapshot()[0], bytes);
+        let names = audit.names();
+        assert!(names.contains(&AUDIT_EVENT_TRANSACTION_REBROADCAST_ATTEMPT.to_string()));
+    }
+
+    /// Test-2: a tick that fires immediately after enqueue (before the
+    /// interval elapses) MUST NOT trigger a rebroadcast.
+    #[tokio::test(start_paused = true)]
+    async fn first_rebroadcast_only_after_interval() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        let status = Arc::new(StubStatuses::new(100));
+        let rebroadcast = Arc::new(SequencedRebroadcast::new(vec![ok_sig("rb1")]));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        let bytes = vec![0x01, 0x02, 0x03];
+        let ctx = ctx_with_bytes(sig, 200, 100, bytes);
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx);
+
+        // Tick BEFORE interval: null status, but no rebroadcast yet.
+        status.push(vec![None]);
+        tracker.tick_once().await;
+        assert_eq!(rebroadcast.call_count(), 0, "no rebroadcast before interval");
+
+        // Advance past the interval and tick again — now a rebroadcast.
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![None]);
+        tracker.tick_once().await;
+        assert_eq!(rebroadcast.call_count(), 1);
+    }
+
+    /// Test-3: once status becomes non-null on a tick, no rebroadcast
+    /// fires for that entry on that tick OR subsequent ticks.
+    #[tokio::test(start_paused = true)]
+    async fn non_null_status_stops_rebroadcast() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        let status = Arc::new(StubStatuses::new(100));
+        let rebroadcast =
+            Arc::new(SequencedRebroadcast::new(vec![ok_sig("rb1"), ok_sig("rb2")]));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        let ctx = ctx_with_bytes(sig, 200, 100, vec![0xAA]);
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx);
+
+        // Past interval, but status is finalized this tick → no rebroadcast.
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![Some(SolendSignatureStatus {
+            confirmation_status: Some("finalized".into()),
+            err: None,
+            slot: Some(150),
+        })]);
+        tracker.tick_once().await;
+        assert_eq!(rebroadcast.call_count(), 0);
+
+        // Tracker pruned terminal — subsequent tick has nothing to retry.
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![None]);
+        tracker.tick_once().await;
+        assert_eq!(rebroadcast.call_count(), 0);
+    }
+
+    /// Test-4: blockhash guard trips → NO rebroadcast attempt fires
+    /// AND the new audit event is emitted exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn blockhash_guard_prevents_late_rebroadcast() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        // current_height = 198, last_valid = 200. With GUARD = 5,
+        // safe_height = 203 >= 200 → guard trips.
+        let status = Arc::new(StubStatuses::new(198));
+        let rebroadcast = Arc::new(SequencedRebroadcast::new(vec![ok_sig("rb1")]));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        let ctx = ctx_with_bytes(sig, 200, 100, vec![0x77]);
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx);
+
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![None]);
+        tracker.tick_once().await;
+        assert_eq!(
+            rebroadcast.call_count(),
+            0,
+            "guard must prevent rebroadcast"
+        );
+
+        // Audit event fired exactly once.
+        let guard_rows =
+            audit.rows_named(AUDIT_EVENT_BLOCKHASH_EXPIRED_DURING_CONFIRMATION);
+        assert_eq!(guard_rows.len(), 1);
+
+        // Subsequent tick → guard already audited; no second row.
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![None]);
+        tracker.tick_once().await;
+        let guard_rows_after =
+            audit.rows_named(AUDIT_EVENT_BLOCKHASH_EXPIRED_DURING_CONFIRMATION);
+        assert_eq!(guard_rows_after.len(), 1, "audit emitted at most once");
+        assert_eq!(rebroadcast.call_count(), 0);
+    }
+
+    /// Test-5: rebroadcasts cap at MAX_CONFIRMATION_REBROADCAST_ATTEMPTS.
+    #[tokio::test(start_paused = true)]
+    async fn max_rebroadcast_attempts_enforced() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        let status = Arc::new(StubStatuses::new(100));
+        // Provide enough Ok responses to cover the cap (loop will stop
+        // before the queue empties).
+        let mut seq = Vec::new();
+        for i in 0..(MAX_CONFIRMATION_REBROADCAST_ATTEMPTS + 2) {
+            seq.push(ok_sig(&format!("rb{i}")));
+        }
+        let rebroadcast = Arc::new(SequencedRebroadcast::new(seq));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        let ctx = ctx_with_bytes(sig, 200, 100, vec![0x55]);
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx);
+
+        // Run more ticks than the cap. Each tick: advance interval, push null.
+        for _ in 0..(MAX_CONFIRMATION_REBROADCAST_ATTEMPTS + 3) {
+            tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+            status.push(vec![None]);
+            tracker.tick_once().await;
+        }
+        assert_eq!(
+            rebroadcast.call_count(),
+            MAX_CONFIRMATION_REBROADCAST_ATTEMPTS as usize,
+            "cap enforced regardless of additional ticks"
+        );
+        let attempt_rows = audit.rows_named(AUDIT_EVENT_TRANSACTION_REBROADCAST_ATTEMPT);
+        assert_eq!(
+            attempt_rows.len(),
+            MAX_CONFIRMATION_REBROADCAST_ATTEMPTS as usize
+        );
+    }
+
+    /// Test-6: rebroadcast Err audited but tracker continues; next
+    /// eligible tick still rebroadcasts.
+    #[tokio::test(start_paused = true)]
+    async fn rebroadcast_err_does_not_abort_tracker() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        let status = Arc::new(StubStatuses::new(100));
+        let rebroadcast = Arc::new(SequencedRebroadcast::new(vec![
+            rb_err("503 unavailable"),
+            ok_sig("rb2"),
+        ]));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        let ctx = ctx_with_bytes(sig, 200, 100, vec![0xDE, 0xAD]);
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx);
+
+        // First tick (after interval): rebroadcast errors.
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![None]);
+        tracker.tick_once().await;
+        assert_eq!(rebroadcast.call_count(), 1);
+        let attempt_rows = audit.rows_named(AUDIT_EVENT_TRANSACTION_REBROADCAST_ATTEMPT);
+        assert_eq!(attempt_rows.len(), 1);
+        assert_eq!(attempt_rows[0]["rpc_outcome"], json!("error"));
+        assert_eq!(attempt_rows[0]["error_kind"], json!("SendError"));
+        assert!(attempt_rows[0]
+            .get("error_message")
+            .and_then(|m| m.as_str())
+            .map(|s| s.contains("503"))
+            .unwrap_or(false));
+
+        // Second tick (after another interval): rebroadcast succeeds.
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![None]);
+        tracker.tick_once().await;
+        assert_eq!(rebroadcast.call_count(), 2);
+        let attempt_rows = audit.rows_named(AUDIT_EVENT_TRANSACTION_REBROADCAST_ATTEMPT);
+        assert_eq!(attempt_rows.len(), 2);
+        assert_eq!(attempt_rows[1]["rpc_outcome"], json!("ok"));
+        // attempt_n grows monotonically across the two attempts.
+        assert_eq!(attempt_rows[0]["attempt_n"], json!(1));
+        assert_eq!(attempt_rows[1]["attempt_n"], json!(2));
+    }
+
+    /// Test-7: every rebroadcast call gets the SAME signed bytes —
+    /// verifies byte-stability across attempts.
+    #[tokio::test(start_paused = true)]
+    async fn rebroadcast_uses_byte_identical_payload_across_attempts() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        let status = Arc::new(StubStatuses::new(100));
+        let rebroadcast = Arc::new(SequencedRebroadcast::new(vec![
+            ok_sig("rb1"),
+            ok_sig("rb2"),
+            ok_sig("rb3"),
+        ]));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        let bytes = vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70];
+        let ctx = ctx_with_bytes(sig, 500, 100, bytes.clone());
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx);
+
+        // Trigger three rebroadcasts.
+        for _ in 0..3 {
+            tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+            status.push(vec![None]);
+            tracker.tick_once().await;
+        }
+        let snaps = rebroadcast.calls_snapshot();
+        assert_eq!(snaps.len(), 3);
+        for (i, b) in snaps.iter().enumerate() {
+            assert_eq!(b, &bytes, "rebroadcast {} payload differs", i + 1);
+        }
+        // Every audit row carries the SAME tx_signature.
+        let attempt_rows = audit.rows_named(AUDIT_EVENT_TRANSACTION_REBROADCAST_ATTEMPT);
+        let canonical = sig.to_string();
+        for r in &attempt_rows {
+            assert_eq!(r["tx_signature"].as_str().unwrap_or_default(), canonical);
+        }
+    }
+
+    /// Test-8: existing finalized / failed / confirmation_timeout
+    /// behavior is preserved — Phase 6E does not change the state
+    /// machine driven outcomes.
+    #[tokio::test(start_paused = true)]
+    async fn existing_finalized_path_unchanged_with_rebroadcast_capability() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        let status = Arc::new(StubStatuses::new(100));
+        let rebroadcast = Arc::new(SequencedRebroadcast::new(vec![ok_sig("rb1")]));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        let ctx = ctx_with_bytes(sig, 500, 100, vec![0x99]);
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx.clone());
+
+        // Status finalized — terminal; tracker prunes; no rebroadcast.
+        status.push(vec![Some(SolendSignatureStatus {
+            confirmation_status: Some("finalized".into()),
+            err: None,
+            slot: Some(150),
+        })]);
+        tracker.tick_once().await;
+
+        let rec = lifecycle
+            .lookup_for_session(&ctx.session_id, ctx.signing_request_id)
+            .unwrap();
+        assert!(matches!(rec.outcome, RecordedSubmitOutcome::Finalized { .. }));
+        assert!(!tracker.contains(&sig));
+        assert_eq!(rebroadcast.call_count(), 0);
+    }
+
+    /// Test-9: per-attempt audit row contains every required field.
+    #[tokio::test(start_paused = true)]
+    async fn rebroadcast_audit_row_has_required_fields() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        let status = Arc::new(StubStatuses::new(100));
+        let rebroadcast = Arc::new(SequencedRebroadcast::new(vec![ok_sig("rb1")]));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        let ctx = ctx_with_bytes(sig, 200, 100, vec![0x42]);
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx);
+
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![None]);
+        tracker.tick_once().await;
+
+        let rows = audit.rows_named(AUDIT_EVENT_TRANSACTION_REBROADCAST_ATTEMPT);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        for field in [
+            "signing_request_id",
+            "intent_id",
+            "session_id",
+            "wallet",
+            "tx_signature",
+            "attempt_n",
+            "max_attempts",
+            "current_block_height",
+            "last_valid_block_height",
+            "remaining_block_budget",
+            "rpc_outcome",
+        ] {
+            assert!(
+                r.get(field).is_some(),
+                "rebroadcast_attempt audit missing field `{field}`"
+            );
+        }
+        assert_eq!(r["attempt_n"], json!(1));
+        assert_eq!(r["max_attempts"], json!(MAX_CONFIRMATION_REBROADCAST_ATTEMPTS));
+        assert_eq!(r["rpc_outcome"], json!("ok"));
+        assert_eq!(r["current_block_height"], json!(100));
+        assert_eq!(r["last_valid_block_height"], json!(200));
+        assert_eq!(r["remaining_block_budget"], json!(100));
+    }
+
+    /// Test-10: tracker without bytes (e.g., bootstrap-recovery) does
+    /// NOT call the rebroadcast sender. Polling continues.
+    #[tokio::test(start_paused = true)]
+    async fn no_bytes_means_no_rebroadcast_attempts() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        let status = Arc::new(StubStatuses::new(100));
+        let rebroadcast = Arc::new(SequencedRebroadcast::new(vec![ok_sig("rb1")]));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        // No-bytes constructor — rebroadcast disabled for this entry.
+        let ctx = ctx_for(sig, 200, 100);
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx);
+
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![None]);
+        tracker.tick_once().await;
+
+        assert_eq!(rebroadcast.call_count(), 0);
+        let attempt_rows = audit.rows_named(AUDIT_EVENT_TRANSACTION_REBROADCAST_ATTEMPT);
+        assert_eq!(attempt_rows.len(), 0);
+    }
+
+    /// Test-11: after an entry transitions to a terminal state in a
+    /// later tick, NO rebroadcast attempts are emitted afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn no_rebroadcast_attempts_after_terminal_state() {
+        let lifecycle = SolendSubmissionLifecycleStore::new(120);
+        let status = Arc::new(StubStatuses::new(100));
+        let rebroadcast = Arc::new(SequencedRebroadcast::new(vec![ok_sig("rb1"), ok_sig("rb2")]));
+        let audit = Arc::new(RecordingAudit::default());
+        let tracker = tracker_with_rebroadcast(
+            status.clone(),
+            lifecycle.clone(),
+            rebroadcast.clone(),
+            audit.clone(),
+        );
+        let sig = random_sig();
+        let ctx = ctx_with_bytes(sig, 500, 100, vec![0x88]);
+        seed_submitted(&lifecycle, &ctx);
+        tracker.enqueue(ctx);
+
+        // Tick 1: null → rebroadcast.
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![None]);
+        tracker.tick_once().await;
+        assert_eq!(rebroadcast.call_count(), 1);
+
+        // Tick 2: status finalized → terminal; entry pruned.
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![Some(SolendSignatureStatus {
+            confirmation_status: Some("finalized".into()),
+            err: None,
+            slot: Some(150),
+        })]);
+        tracker.tick_once().await;
+        // No additional rebroadcast call (status was non-null, we skip).
+        assert_eq!(rebroadcast.call_count(), 1);
+
+        // Tick 3: entry already gone (pruned) — no further work.
+        tokio::time::advance(CONFIRMATION_REBROADCAST_INTERVAL).await;
+        status.push(vec![None]);
+        tracker.tick_once().await;
+        assert_eq!(rebroadcast.call_count(), 1, "no rebroadcast after terminal");
     }
 
     // ── Forbidden scan ─────────────────────────────────────────────────────

@@ -555,11 +555,20 @@ impl GatewayDaemon {
         // background task, no new blockhash/signer path — the handler
         // is called inline by the inbound HTTP request's tokio task.
         let solend_sig_handler_ref: Option<SolendSignatureHandlerRef> = {
-            let sender: std::sync::Arc<
-                dyn crate::integrations::solend_submit::SolendTransactionSender,
-            > = std::sync::Arc::new(
+            // Phase 6E: build one ClawRpcSolendSender and expose it
+            // through both trait references (submit-side
+            // SolendTransactionSender + confirmation-side
+            // SolendRebroadcastSender). Same RPC adapter, two seams —
+            // no extra connection or config drift.
+            let solend_sender = std::sync::Arc::new(
                 crate::integrations::solend_submit::ClawRpcSolendSender::new(rpc_client.clone()),
             );
+            let sender: std::sync::Arc<
+                dyn crate::integrations::solend_submit::SolendTransactionSender,
+            > = solend_sender.clone();
+            let rebroadcast_sender: std::sync::Arc<
+                dyn crate::integrations::solend_submit::SolendRebroadcastSender,
+            > = solend_sender.clone();
             let height: std::sync::Arc<
                 dyn crate::integrations::solend_submit::SolendBlockHeightProvider,
             > = std::sync::Arc::new(
@@ -575,6 +584,7 @@ impl GatewayDaemon {
                 crate::runtime::solend_submit_wiring::wire_solend_confirmation_tracker(
                     pending_solend_lifecycle.clone(),
                     std::sync::Arc::new(rpc_pool.clone()),
+                    rebroadcast_sender.clone(),
                     solend_audit_sink.clone(),
                     // Matches the shared TransactionTracker's 2-second
                     // base tick (claw_solana_core::tracker::BASE_TICK)
