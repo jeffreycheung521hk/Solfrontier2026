@@ -315,12 +315,23 @@ export function JupiterQuoteCard({ output }: { output: unknown }) {
 //                       | "awaiting_approval"
 //   intent_id, protocol, asset
 //   amount_raw            integer | null
+//   amount_ui             string  | null   (UI-formatted, e.g. "5.000000")
 //   reserve_mint, session_wallet
 //   policy_verdict, hard_block_reason
-//   assembly_error        object | null
 //   approval_required     boolean | null
 //   approval_request_id   string | null  (UUID, "00..00" sentinel in showcase)
 //   reason                string | null
+//
+// Phase 6G — risk-budget profile fields (present on both awaiting_approval
+// and policy_blocked outputs; absent on legacy outputs):
+//   profile_name             string | null   ("demo", "rehearsal", …)
+//   policy_rule_name         string | null   ("solend-deposit-risk-budget")
+//   requested_amount_raw     integer | null
+//   requested_amount_ui      string  | null
+//   max_allowed_amount_raw   integer | null
+//   max_allowed_amount_ui    string  | null
+//   risk_budget_note         string | null   (awaiting_approval only)
+//   human_readable_reason    string | null   (policy_blocked only)
 
 interface SolendDepositData {
   status?:
@@ -333,6 +344,7 @@ interface SolendDepositData {
   protocol?: string | null;
   asset?: string | null;
   amount_raw?: number | null;
+  amount_ui?: string | null;
   reserve_mint?: string | null;
   session_wallet?: string | null;
   policy_verdict?: string | null;
@@ -340,9 +352,35 @@ interface SolendDepositData {
   approval_required?: boolean | null;
   approval_request_id?: string | null;
   reason?: string | null;
+  // Phase 6G risk-budget fields. All optional so legacy outputs render
+  // cleanly without these — the UI falls back to amount_ui / amount_raw.
+  profile_name?: string | null;
+  policy_rule_name?: string | null;
+  requested_amount_raw?: number | null;
+  requested_amount_ui?: string | null;
+  max_allowed_amount_raw?: number | null;
+  max_allowed_amount_ui?: string | null;
+  risk_budget_note?: string | null;
+  human_readable_reason?: string | null;
 }
 
 const SHOWCASE_APPROVAL_SENTINEL = "00000000-0000-0000-0000-000000000000";
+
+/// Prefer the backend-provided UI string; fall back to raw / 1e6 for
+/// legacy outputs that didn't include `*_amount_ui` fields. Returns
+/// the raw display string only — caller appends "USDC" / etc.
+function formatUsdcUi(
+  uiField: string | null | undefined,
+  rawField: number | null | undefined,
+): string {
+  if (typeof uiField === "string" && uiField.length > 0) return uiField;
+  if (typeof rawField === "number") return (rawField / 1_000_000).toFixed(6);
+  return "—";
+}
+
+function formatRawCount(raw: number | null | undefined): string {
+  return typeof raw === "number" ? `${raw.toLocaleString()} raw` : "—";
+}
 
 export function SolendDepositCard({ output }: { output: unknown }) {
   const data = (output as { data?: SolendDepositData })?.data ?? {};
@@ -384,18 +422,18 @@ export function SolendDepositCard({ output }: { output: unknown }) {
                 v={<span className="font-mono text-foreground">{data.asset ?? "USDC"}</span>}
               />
               <KeyValueRow
-                k="amount"
+                k="requested"
                 v={
                   <span>
                     <span className="font-mono text-foreground">
-                      {typeof data.amount_raw === "number"
-                        ? (data.amount_raw / 1_000_000).toFixed(6)
-                        : "—"}
+                      {formatUsdcUi(
+                        data.requested_amount_ui ?? data.amount_ui,
+                        data.requested_amount_raw ?? data.amount_raw,
+                      )}{" "}
+                      {data.asset ?? "USDC"}
                     </span>
                     <span className="ml-2 text-muted-foreground">
-                      ({typeof data.amount_raw === "number"
-                        ? `${data.amount_raw.toLocaleString()} raw`
-                        : "—"})
+                      ({formatRawCount(data.requested_amount_raw ?? data.amount_raw)})
                     </span>
                   </span>
                 }
@@ -411,6 +449,52 @@ export function SolendDepositCard({ output }: { output: unknown }) {
                 />
               )}
             </div>
+
+            {/* Phase 6G — risk-budget context. Renders only when the
+                backend included risk-budget fields (i.e., post-6G
+                outputs). Legacy outputs without these fields skip this
+                block silently for backward compatibility. */}
+            {(data.profile_name || data.max_allowed_amount_raw != null) && (
+              <>
+                <Separator />
+                <div className="space-y-1">
+                  <div className="text-foreground/80 font-medium">Risk budget</div>
+                  {data.profile_name && (
+                    <KeyValueRow
+                      k="profile"
+                      v={<span className="font-mono text-foreground">{data.profile_name}</span>}
+                    />
+                  )}
+                  <KeyValueRow
+                    k="max allowed"
+                    v={
+                      <span>
+                        <span className="font-mono text-foreground">
+                          {formatUsdcUi(data.max_allowed_amount_ui, data.max_allowed_amount_raw)}{" "}
+                          {data.asset ?? "USDC"}
+                        </span>
+                        <span className="ml-2 text-muted-foreground">
+                          ({formatRawCount(data.max_allowed_amount_raw)})
+                        </span>
+                      </span>
+                    }
+                  />
+                  {data.policy_rule_name && (
+                    <KeyValueRow
+                      k="rule"
+                      v={
+                        <code className="text-foreground">{data.policy_rule_name}</code>
+                      }
+                    />
+                  )}
+                  <div className="text-[11px] text-muted-foreground italic pt-1">
+                    This profile&apos;s risk budget allows this proposal. Approval and
+                    Phantom signing are still required.
+                  </div>
+                </div>
+              </>
+            )}
+
             <Separator />
             {approvalId && !isShowcase && (
               <div className="flex items-center justify-between">
@@ -436,17 +520,86 @@ export function SolendDepositCard({ output }: { output: unknown }) {
           </div>
         )}
         {status === "policy_blocked" && (
-          <Alert>
-            <AlertTitle>Policy hard-blocked the proposal</AlertTitle>
-            <AlertDescription className="space-y-1 break-words">
-              <span className="block">{data.reason ?? data.hard_block_reason ?? "Blocked."}</span>
-              {data.policy_verdict && (
-                <span className="block text-xs text-muted-foreground">
-                  verdict: <code>{data.policy_verdict}</code>
-                </span>
+          <div className="space-y-3 text-xs">
+            <Alert variant="destructive">
+              <AlertTitle>Blocked by risk-budget policy</AlertTitle>
+              <AlertDescription className="break-words">
+                {data.human_readable_reason ??
+                  data.reason ??
+                  data.hard_block_reason ??
+                  "Request blocked by policy."}
+              </AlertDescription>
+            </Alert>
+            {/* Phase 6G — show the cap that fired. Renders only when
+                the backend included risk-budget fields; older outputs
+                (no profile_name) get the alert above and the verdict
+                line in the fallback block below. */}
+            {(data.profile_name ||
+              data.max_allowed_amount_raw != null ||
+              data.requested_amount_raw != null) && (
+              <div className="space-y-1">
+                {data.profile_name && (
+                  <KeyValueRow
+                    k="profile"
+                    v={<span className="font-mono text-foreground">{data.profile_name}</span>}
+                  />
+                )}
+                <KeyValueRow
+                  k="requested"
+                  v={
+                    <span>
+                      <span className="font-mono text-foreground">
+                        {formatUsdcUi(
+                          data.requested_amount_ui ?? data.amount_ui,
+                          data.requested_amount_raw ?? data.amount_raw,
+                        )}{" "}
+                        {data.asset ?? "USDC"}
+                      </span>
+                      <span className="ml-2 text-muted-foreground">
+                        ({formatRawCount(data.requested_amount_raw ?? data.amount_raw)})
+                      </span>
+                    </span>
+                  }
+                />
+                <KeyValueRow
+                  k="max allowed"
+                  v={
+                    <span>
+                      <span className="font-mono text-foreground">
+                        {formatUsdcUi(data.max_allowed_amount_ui, data.max_allowed_amount_raw)}{" "}
+                        {data.asset ?? "USDC"}
+                      </span>
+                      <span className="ml-2 text-muted-foreground">
+                        ({formatRawCount(data.max_allowed_amount_raw)})
+                      </span>
+                    </span>
+                  }
+                />
+                {data.policy_rule_name && (
+                  <KeyValueRow
+                    k="rule"
+                    v={<code className="text-foreground">{data.policy_rule_name}</code>}
+                  />
+                )}
+                {data.policy_verdict && (
+                  <KeyValueRow
+                    k="verdict"
+                    v={<code className="text-foreground">{data.policy_verdict}</code>}
+                  />
+                )}
+              </div>
+            )}
+            {/* Legacy fallback: pre-6G outputs only carry policy_verdict +
+                hard_block_reason. The alert above already shows the
+                reason; surface the verdict here so the card isn't bare. */}
+            {!data.profile_name &&
+              data.max_allowed_amount_raw == null &&
+              data.policy_verdict && (
+                <div className="text-muted-foreground">
+                  verdict: <code className="text-foreground">{data.policy_verdict}</code>
+                </div>
               )}
-            </AlertDescription>
-          </Alert>
+          </div>
         )}
         {status === "no_session_binding" && (
           <Alert>
