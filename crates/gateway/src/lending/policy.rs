@@ -12,8 +12,9 @@
 //! provider-specific oracle binary decoders (see §65).
 //!
 //! # Invariants
-//! - `ProposedAction` admits only `Deposit` and `Repay` at the type level.
-//!   `Withdraw` and `Borrow` are structurally unrepresentable (§49.2).
+//! - `ProposedAction` admits `Deposit`, `Repay`, and `Withdraw` (Phase 5H
+//!   scope unlock; see the variant doc for the narrowed risk-reducing
+//!   posture). `Borrow` remains structurally unrepresentable (§49.2).
 //! - `EvaluationContext` carries only a `session_wallet`. No RPC client,
 //!   clock, cache, DB, signer, approval_store, park_store, or daemon handle.
 //!   Adding a field is a spec change, not an implementation refinement
@@ -33,16 +34,32 @@ use solana_sdk::pubkey::Pubkey;
 
 use super::gate::{check_system_invariants, SystemInvariantError};
 use super::snapshot::{FeedPublishFreshness, LendingSnapshot, ProtocolTag, StaleMarker};
-use super::types::{DurationMs, UnderlyingAmount};
+use super::types::{CollateralTokenAmount, DurationMs, UnderlyingAmount};
 
 // ── ProposedAction ─────────────────────────────────────────────────────────
 
-/// V1 lending action. Only risk-reducing actions are representable: §3.1.
+/// V1 lending action.
 ///
-/// `Withdraw` and `Borrow` are intentionally absent. They are Part 1 §3.2
-/// scope-boundary blocks, enforced at the type level to prevent any V1
-/// code path from constructing them. Adding a variant here is a scope
-/// decision (Part 1), not an implementation change.
+/// `Borrow` is intentionally absent — that variant is Part 1 §3.2
+/// scope-boundary blocked and enforced at the type level.
+///
+/// `Withdraw` is REPRESENTABLE as of Phase 5H (a deliberate scope
+/// decision, not a schema correction). It exists as a protocol-level
+/// action so the daemon can model "withdraw collateral" internally for
+/// future tooling. It is a *risk-increasing* action in general; the
+/// V1 narrowed-scope unlock is enforced in policy:
+///
+/// - `Withdraw` HardBlocks if the obligation has any non-zero borrow
+///   (`RuleRejectionDetail::WithdrawWithDebt`).
+/// - `Withdraw` HardBlocks if the obligation has no deposit on the
+///   target reserve (`RuleRejectionDetail::WithdrawWithoutDeposit`).
+///
+/// Critically, the `Withdraw` variant carries `collateral_amount:
+/// CollateralTokenAmount` (cToken base units), NOT
+/// `UnderlyingAmount`. This unit choice matches the Solend
+/// `WithdrawObligationCollateralAndRedeemReserveCollateral`
+/// instruction's payload semantics and makes any
+/// underlying-vs-collateral confusion a compile-time error.
 ///
 /// The action does NOT carry a signer / wallet pubkey. Signer identity
 /// comes from the `SessionBoundWallet` seam via [`EvaluationContext`].
@@ -60,33 +77,82 @@ pub enum ProposedAction {
         reserve_mint: Pubkey,
         amount: UnderlyingAmount,
     },
+    /// Phase 5H — Solend USDC `withdraw_all` substrate.
+    ///
+    /// `collateral_amount` is in cToken base units (e.g. cUSDC for the
+    /// Solend USDC reserve). The future LLM-facing UX is `withdraw_all:
+    /// true`, which constructs this variant with
+    /// `CollateralTokenAmount::new(u64::MAX)`; Solend's program clamps
+    /// to the user's actual deposited collateral. The LLM never sees
+    /// or sets a numeric amount.
+    Withdraw {
+        protocol: ProtocolTag,
+        reserve_mint: Pubkey,
+        collateral_amount: CollateralTokenAmount,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     Deposit,
     Repay,
+    Withdraw,
 }
 
 impl ProposedAction {
     pub fn protocol(&self) -> ProtocolTag {
         match self {
             ProposedAction::Deposit { protocol, .. }
-            | ProposedAction::Repay { protocol, .. } => *protocol,
+            | ProposedAction::Repay { protocol, .. }
+            | ProposedAction::Withdraw { protocol, .. } => *protocol,
         }
     }
 
     pub fn reserve_mint(&self) -> Pubkey {
         match self {
             ProposedAction::Deposit { reserve_mint, .. }
-            | ProposedAction::Repay { reserve_mint, .. } => *reserve_mint,
+            | ProposedAction::Repay { reserve_mint, .. }
+            | ProposedAction::Withdraw { reserve_mint, .. } => *reserve_mint,
         }
     }
 
-    pub fn amount(&self) -> UnderlyingAmount {
+    /// Underlying-asset amount for actions whose unit is the underlying
+    /// (Deposit / Repay). Returns `None` for Withdraw, whose unit is
+    /// cToken collateral; use [`Self::collateral_amount`] for that case.
+    pub fn amount_underlying(&self) -> Option<UnderlyingAmount> {
         match self {
             ProposedAction::Deposit { amount, .. }
-            | ProposedAction::Repay { amount, .. } => *amount,
+            | ProposedAction::Repay { amount, .. } => Some(*amount),
+            ProposedAction::Withdraw { .. } => None,
+        }
+    }
+
+    /// cToken-collateral amount for Withdraw. Returns `None` for
+    /// Deposit / Repay, whose unit is the underlying asset; use
+    /// [`Self::amount_underlying`] for those cases.
+    pub fn collateral_amount(&self) -> Option<CollateralTokenAmount> {
+        match self {
+            ProposedAction::Withdraw {
+                collateral_amount, ..
+            } => Some(*collateral_amount),
+            ProposedAction::Deposit { .. } | ProposedAction::Repay { .. } => None,
+        }
+    }
+
+    /// Raw `u64` amount for audit / display payloads only. The unit
+    /// depends on the action variant — Deposit/Repay raw is in the
+    /// underlying base units; Withdraw raw is in cToken base units.
+    /// Callers that care about unit safety MUST use
+    /// [`Self::amount_underlying`] or [`Self::collateral_amount`]
+    /// instead. Audit JSON should annotate the unit alongside the raw
+    /// number.
+    pub fn amount_raw(&self) -> u64 {
+        match self {
+            ProposedAction::Deposit { amount, .. }
+            | ProposedAction::Repay { amount, .. } => amount.raw(),
+            ProposedAction::Withdraw {
+                collateral_amount, ..
+            } => collateral_amount.raw(),
         }
     }
 
@@ -94,6 +160,7 @@ impl ProposedAction {
         match self {
             ProposedAction::Deposit { .. } => ActionKind::Deposit,
             ProposedAction::Repay { .. } => ActionKind::Repay,
+            ProposedAction::Withdraw { .. } => ActionKind::Withdraw,
         }
     }
 }
@@ -161,10 +228,24 @@ pub struct AllowedMintsConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaxActionInputAmountConfig {
-    /// Per-mint caps. An action whose mint has no entry here is rejected
-    /// by [`RuleRejectionDetail::NoCapConfigured`] — the conservative
-    /// posture: a missing cap is not an implicit "no limit."
+    /// Per-mint caps for actions whose unit is the underlying asset
+    /// (Deposit / Repay). An action whose mint has no entry here is
+    /// rejected by [`RuleRejectionDetail::NoCapConfigured`] — the
+    /// conservative posture: a missing cap is not an implicit "no limit."
     pub per_mint_caps: Vec<(Pubkey, UnderlyingAmount)>,
+    /// Phase 5H — per-mint caps for actions whose unit is collateral
+    /// cTokens (Withdraw). Disjoint from `per_mint_caps`: callers MUST
+    /// explicitly populate this list for a Withdraw on a given mint to
+    /// pass [`max_action_input_amount`]. Empty list → every Withdraw is
+    /// rejected by `NoCapConfigured`. Sentinel passthrough
+    /// (`CollateralTokenAmount::new(u64::MAX)` for "withdraw all") is
+    /// expected and the policy cap MUST be set to `u64::MAX` for the
+    /// withdraw_all surface; otherwise a literal `u64::MAX` action will
+    /// HardBlock here. The position-size cap on Withdraw is a separate
+    /// concern enforced via the obligation's deposited amount during
+    /// the `allowed_mints` cross-reference (a future tightening can move
+    /// it here too).
+    pub per_mint_collateral_caps: Vec<(Pubkey, CollateralTokenAmount)>,
 }
 
 // ── Verdict / HardBlock reason taxonomy ───────────────────────────────────
@@ -248,6 +329,17 @@ pub enum RuleRejectionDetail {
     ReserveNotInSnapshot,
     /// Repay targets a mint the obligation holds no debt in.
     RepayWithoutDebt,
+    /// Phase 5H — Withdraw targets a reserve the obligation holds no
+    /// (non-zero) deposited collateral in. There is nothing to redeem.
+    /// Surfaced under `RuleKind::AllowedMints` cross-reference, parallel
+    /// to `RepayWithoutDebt`.
+    WithdrawWithoutDeposit,
+    /// Phase 5H — Withdraw is risk-increasing in general; V1's narrowed
+    /// scope unlock only allows `Withdraw` on obligations with zero
+    /// outstanding debt. If any non-zero borrow exists, the rule
+    /// HardBlocks. Surfaced under `RuleKind::AllowedMints`
+    /// cross-reference.
+    WithdrawWithDebt,
     /// No cap entry configured for the action's mint.
     NoCapConfigured,
     /// Action amount exceeds the configured per-mint cap.
@@ -448,23 +540,53 @@ fn allowed_mints(
         return Err(RuleRejectionDetail::MintNotAllowed);
     }
     // Cross-reference: the snapshot MUST contain a reserve for this mint —
-    // otherwise the deposit/repay has no target reserve to apply against.
+    // otherwise the action has no target reserve to apply against.
     let reserve = snapshot
         .reserves
         .iter()
         .find(|r| r.mint == mint)
         .ok_or(RuleRejectionDetail::ReserveNotInSnapshot)?;
-    // Repay-specific cross-reference: the obligation must carry a borrow
-    // on this reserve. Part 3A §18.4's "a Repay against a mint the
-    // obligation has no debt in is rejected by this rule's cross-reference."
-    if action.kind() == ActionKind::Repay {
-        let has_debt = snapshot
-            .obligation
-            .borrows
-            .iter()
-            .any(|b| b.reserve == reserve.identifier);
-        if !has_debt {
-            return Err(RuleRejectionDetail::RepayWithoutDebt);
+    match action.kind() {
+        ActionKind::Deposit => {}
+        // Repay-specific cross-reference: the obligation must carry a
+        // borrow on this reserve. Part 3A §18.4's "a Repay against a
+        // mint the obligation has no debt in is rejected by this rule's
+        // cross-reference."
+        ActionKind::Repay => {
+            let has_debt = snapshot
+                .obligation
+                .borrows
+                .iter()
+                .any(|b| b.reserve == reserve.identifier);
+            if !has_debt {
+                return Err(RuleRejectionDetail::RepayWithoutDebt);
+            }
+        }
+        // Phase 5H — Withdraw cross-references:
+        //   1. The obligation MUST hold a non-zero deposit on this
+        //      reserve (otherwise there is nothing to redeem).
+        //   2. The obligation MUST have ZERO outstanding debt across
+        //      ALL borrow positions. Withdraw is risk-increasing in the
+        //      general case; V1's narrowed scope unlock only permits it
+        //      against obligations with no debt at all, so this rule is
+        //      a hard precondition rather than a per-mint check.
+        ActionKind::Withdraw => {
+            let has_deposit = snapshot
+                .obligation
+                .deposits
+                .iter()
+                .any(|d| d.reserve == reserve.identifier && d.deposited.raw() > 0);
+            if !has_deposit {
+                return Err(RuleRejectionDetail::WithdrawWithoutDeposit);
+            }
+            let has_any_borrow = snapshot
+                .obligation
+                .borrows
+                .iter()
+                .any(|b| b.borrowed_wads.raw() > 0);
+            if has_any_borrow {
+                return Err(RuleRejectionDetail::WithdrawWithDebt);
+            }
         }
     }
     Ok(())
@@ -475,13 +597,42 @@ fn max_action_input_amount(
     config: &MaxActionInputAmountConfig,
 ) -> Result<(), RuleRejectionDetail> {
     let mint = action.reserve_mint();
-    match config.per_mint_caps.iter().find(|(m, _)| *m == mint) {
-        None => Err(RuleRejectionDetail::NoCapConfigured),
-        Some((_, cap)) => {
-            if action.amount() > *cap {
-                Err(RuleRejectionDetail::AmountOverCap)
-            } else {
-                Ok(())
+    // Dispatch on the action's amount-unit kind. Deposit / Repay carry
+    // an `UnderlyingAmount` and check against `per_mint_caps`. Withdraw
+    // carries a `CollateralTokenAmount` and checks against the disjoint
+    // `per_mint_collateral_caps` list. Cross-list lookups are
+    // structurally impossible — a missing cap in the appropriate list
+    // surfaces `NoCapConfigured`, never silently "no limit."
+    match action {
+        ProposedAction::Deposit { amount, .. }
+        | ProposedAction::Repay { amount, .. } => {
+            match config.per_mint_caps.iter().find(|(m, _)| *m == mint) {
+                None => Err(RuleRejectionDetail::NoCapConfigured),
+                Some((_, cap)) => {
+                    if *amount > *cap {
+                        Err(RuleRejectionDetail::AmountOverCap)
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        }
+        ProposedAction::Withdraw {
+            collateral_amount, ..
+        } => {
+            match config
+                .per_mint_collateral_caps
+                .iter()
+                .find(|(m, _)| *m == mint)
+            {
+                None => Err(RuleRejectionDetail::NoCapConfigured),
+                Some((_, cap)) => {
+                    if *collateral_amount > *cap {
+                        Err(RuleRejectionDetail::AmountOverCap)
+                    } else {
+                        Ok(())
+                    }
+                }
             }
         }
     }
@@ -575,6 +726,7 @@ mod tests {
             },
             max_action_input_amount: MaxActionInputAmountConfig {
                 per_mint_caps: vec![(allowed_mint, cap)],
+                per_mint_collateral_caps: vec![],
             },
         }
     }
@@ -582,13 +734,16 @@ mod tests {
     // ── API shape tests (lock the seam at compile + runtime) ──────────────
 
     /// Pattern-matching exhaustion: if a V1 variant is ever added (e.g.
-    /// `Withdraw` / `Borrow` sneaking back), this test fails to compile.
+    /// `Borrow` sneaking back), this test fails to compile. Phase 5H
+    /// added `Withdraw` as a deliberate scope unlock; that variant is
+    /// listed here.
     #[test]
-    fn proposed_action_is_deposit_or_repay_only() {
+    fn proposed_action_is_deposit_repay_or_withdraw_only() {
         fn _exhaustive(a: &ProposedAction) {
             match a {
                 ProposedAction::Deposit { .. } => {}
                 ProposedAction::Repay { .. } => {}
+                ProposedAction::Withdraw { .. } => {}
             }
         }
         let d = ProposedAction::Deposit {
@@ -601,8 +756,14 @@ mod tests {
             reserve_mint: Pubkey::new_unique(),
             amount: UnderlyingAmount::new(1),
         };
+        let w = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: Pubkey::new_unique(),
+            collateral_amount: CollateralTokenAmount::new(1),
+        };
         _exhaustive(&d);
         _exhaustive(&r);
+        _exhaustive(&w);
     }
 
     /// Destructuring without `..` — if a field is ever added to the action's
@@ -640,6 +801,67 @@ mod tests {
         else {
             panic!("expected Repay");
         };
+    }
+
+    /// Phase 5H — same lock for Withdraw. Signer/wallet must not appear.
+    /// If a future contributor adds an `owner: Pubkey` or
+    /// `wallet_pubkey: Pubkey` field to `ProposedAction::Withdraw`, this
+    /// test fails to compile because the destructure pattern lists every
+    /// expected field by name. The only valid fields are `protocol`,
+    /// `reserve_mint`, and `collateral_amount` (cToken units, NOT
+    /// underlying).
+    #[test]
+    fn withdraw_variant_has_no_signer_field() {
+        let action = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: Pubkey::new_unique(),
+            collateral_amount: CollateralTokenAmount::new(10),
+        };
+        let ProposedAction::Withdraw {
+            protocol: _,
+            reserve_mint: _,
+            collateral_amount: _,
+        } = action
+        else {
+            panic!("expected Withdraw");
+        };
+    }
+
+    /// Phase 5H — accessor unit-tagging contract. `amount_underlying()`
+    /// returns `Some` only for Deposit / Repay; `collateral_amount()`
+    /// returns `Some` only for Withdraw. The two are disjoint by
+    /// construction. `amount_raw()` returns the inner u64 for any
+    /// variant (unit-dependent — caller is responsible for labeling).
+    #[test]
+    fn action_amount_accessors_are_unit_disjoint() {
+        let mint = Pubkey::new_unique();
+        let d = ProposedAction::Deposit {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            amount: UnderlyingAmount::new(11),
+        };
+        let r = ProposedAction::Repay {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            amount: UnderlyingAmount::new(22),
+        };
+        let w = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            collateral_amount: CollateralTokenAmount::new(33),
+        };
+
+        assert_eq!(d.amount_underlying(), Some(UnderlyingAmount::new(11)));
+        assert_eq!(d.collateral_amount(), None);
+        assert_eq!(d.amount_raw(), 11);
+
+        assert_eq!(r.amount_underlying(), Some(UnderlyingAmount::new(22)));
+        assert_eq!(r.collateral_amount(), None);
+        assert_eq!(r.amount_raw(), 22);
+
+        assert_eq!(w.amount_underlying(), None);
+        assert_eq!(w.collateral_amount(), Some(CollateralTokenAmount::new(33)));
+        assert_eq!(w.amount_raw(), 33);
     }
 
     /// Lock EvaluationContext shape. Adding a field breaks compilation.
@@ -715,6 +937,7 @@ mod tests {
             },
             max_action_input_amount: MaxActionInputAmountConfig {
                 per_mint_caps: vec![],
+                per_mint_collateral_caps: vec![],
             },
         };
     }
@@ -738,11 +961,15 @@ mod tests {
             allowed_mints: AllowedMintsConfig { allowlist: vec![] },
             max_action_input_amount: MaxActionInputAmountConfig {
                 per_mint_caps: vec![(mint, UnderlyingAmount::new(42))],
+                per_mint_collateral_caps: vec![(mint, CollateralTokenAmount::new(7))],
             },
         };
         let cap: UnderlyingAmount = cfg.max_action_input_amount.per_mint_caps[0].1;
+        let coll_cap: CollateralTokenAmount =
+            cfg.max_action_input_amount.per_mint_collateral_caps[0].1;
         let age: DurationMs = cfg.require_fresh_state.max_fetch_age;
         assert_eq!(cap.raw(), 42);
+        assert_eq!(coll_cap.raw(), 7);
         assert_eq!(age.raw(), 1);
     }
 
@@ -855,6 +1082,305 @@ mod tests {
                 RuleKind::AllowedMints,
                 RuleRejectionDetail::RepayWithoutDebt,
             ))
+        );
+    }
+
+    // ── Phase 5H — Withdraw policy tests ───────────────────────────────
+
+    /// Build a fresh-state snapshot where the obligation has the given
+    /// deposit and borrow vectors against a single reserve. Mirrors the
+    /// `fresh_snapshot` helper but lets withdraw tests inject deposit /
+    /// borrow positions explicitly.
+    fn fresh_snapshot_with_positions(
+        owner: Pubkey,
+        reserve_mint: Pubkey,
+        deposits: &[u64],
+        borrows_wads: &[u128],
+    ) -> (LendingSnapshot, Pubkey, Pubkey) {
+        let mkt = Pubkey::new_unique();
+        let reserve_pk = Pubkey::new_unique();
+        let supply = Pubkey::new_unique();
+        let pyth = Pubkey::new_unique();
+        let pyth_owner: Pubkey = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ"
+            .parse()
+            .unwrap();
+        let sentinel: Pubkey = SOLEND_NULL_ORACLE_SENTINEL_BS58.parse().unwrap();
+
+        let synth_deposits: Vec<raw::SolendObligationCollateralRaw> = deposits
+            .iter()
+            .map(|amt| raw::SolendObligationCollateralRaw {
+                deposit_reserve: reserve_pk,
+                deposited_amount: *amt,
+            })
+            .collect();
+        let synth_borrows: Vec<raw::SolendObligationLiquidityRaw> = borrows_wads
+            .iter()
+            .map(|wads| raw::SolendObligationLiquidityRaw {
+                borrow_reserve: reserve_pk,
+                borrowed_amount_wads: *wads,
+            })
+            .collect();
+        let obl = synth_obligation(owner, mkt, 100, false, &synth_deposits, &synth_borrows);
+        let res = synth_reserve(
+            mkt,
+            reserve_mint,
+            6,
+            supply,
+            pyth,
+            sentinel,
+            9_999_999,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            100,
+            false,
+        );
+        let inputs = SolendAssemblyInputs {
+            session_wallet: owner,
+            obligation_pubkey: Pubkey::new_unique(),
+            obligation_raw: raw::decode_obligation(&obl).unwrap(),
+            obligation_fetched_at_slot: ChainSlot::new(1_000),
+            reserves: vec![ReserveInput {
+                pubkey: reserve_pk,
+                raw: raw::decode_reserve(&res).unwrap(),
+                fetched_at_slot: ChainSlot::new(1_000),
+            }],
+            oracles: vec![OracleAccountInfo {
+                pubkey: pyth,
+                owner_program: pyth_owner,
+                fetched_at_slot: ChainSlot::new(1_000),
+                publish: FeedPublishFreshness::KnownSlot(ChainSlot::new(1_000)),
+            }],
+            snapshot_observed_slot: ChainSlot::new(1_000),
+        };
+        let snap = map_snapshot(inputs).unwrap();
+        (snap, reserve_pk, reserve_mint)
+    }
+
+    /// Build a permissive Withdraw config: same as `permissive_config`
+    /// but populates `per_mint_collateral_caps` for the given mint.
+    fn withdraw_permissive_config(
+        allowed_mint: Pubkey,
+        collateral_cap: CollateralTokenAmount,
+    ) -> LendingRuleConfig {
+        LendingRuleConfig {
+            require_fresh_state: RequireFreshStateConfig {
+                max_fetch_age: DurationMs::new(60_000),
+            },
+            max_oracle_staleness: MaxOracleStalenessConfig {
+                max_publish_age: DurationMs::new(60_000),
+            },
+            allowed_lending_protocols: AllowedLendingProtocolsConfig {
+                allowlist: vec![ProtocolTag::Solend],
+            },
+            allowed_mints: AllowedMintsConfig {
+                allowlist: vec![allowed_mint],
+            },
+            max_action_input_amount: MaxActionInputAmountConfig {
+                per_mint_caps: vec![],
+                per_mint_collateral_caps: vec![(allowed_mint, collateral_cap)],
+            },
+        }
+    }
+
+    #[test]
+    fn withdraw_happy_path_passes_with_existing_deposit_and_no_debt() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let (snap, _reserve_pk, _) =
+            fresh_snapshot_with_positions(owner, mint, &[5_000], &[]);
+        let config = withdraw_permissive_config(mint, CollateralTokenAmount::new(u64::MAX));
+        let action = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            collateral_amount: CollateralTokenAmount::new(u64::MAX),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn withdraw_without_deposit_hardblocks_via_allowed_mints_cross_ref() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        // No deposit on the reserve → cross-ref must fire.
+        let (snap, _, _) = fresh_snapshot_with_positions(owner, mint, &[], &[]);
+        let config = withdraw_permissive_config(mint, CollateralTokenAmount::new(u64::MAX));
+        let action = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            collateral_amount: CollateralTokenAmount::new(u64::MAX),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::HardBlock(HardBlockReason::RuleRejected(
+                RuleKind::AllowedMints,
+                RuleRejectionDetail::WithdrawWithoutDeposit,
+            ))
+        );
+    }
+
+    /// A zero-amount deposit entry on the same reserve must also count
+    /// as "no deposit" — the cross-ref looks for non-zero collateral.
+    #[test]
+    fn withdraw_with_zero_amount_deposit_entry_still_hardblocks() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let (snap, _, _) = fresh_snapshot_with_positions(owner, mint, &[0], &[]);
+        let config = withdraw_permissive_config(mint, CollateralTokenAmount::new(u64::MAX));
+        let action = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            collateral_amount: CollateralTokenAmount::new(u64::MAX),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::HardBlock(HardBlockReason::RuleRejected(
+                RuleKind::AllowedMints,
+                RuleRejectionDetail::WithdrawWithoutDeposit,
+            ))
+        );
+    }
+
+    #[test]
+    fn withdraw_with_existing_debt_hardblocks_via_allowed_mints_cross_ref() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        // Has a deposit AND a non-zero borrow → V1 risk-reducing-only
+        // narrowed scope must HardBlock the withdraw.
+        let (snap, _, _) = fresh_snapshot_with_positions(
+            owner,
+            mint,
+            &[5_000],
+            &[1_000_000_000_000_000_000u128],
+        );
+        let config = withdraw_permissive_config(mint, CollateralTokenAmount::new(u64::MAX));
+        let action = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            collateral_amount: CollateralTokenAmount::new(u64::MAX),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::HardBlock(HardBlockReason::RuleRejected(
+                RuleKind::AllowedMints,
+                RuleRejectionDetail::WithdrawWithDebt,
+            ))
+        );
+    }
+
+    /// A zero-amount borrow entry on the obligation does NOT block
+    /// withdraw — the cross-ref looks for non-zero outstanding debt.
+    #[test]
+    fn withdraw_with_zero_amount_borrow_entry_still_passes() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let (snap, _, _) = fresh_snapshot_with_positions(owner, mint, &[5_000], &[0]);
+        let config = withdraw_permissive_config(mint, CollateralTokenAmount::new(u64::MAX));
+        let action = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            collateral_amount: CollateralTokenAmount::new(u64::MAX),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::Pass
+        );
+    }
+
+    /// The cap dispatch for Withdraw uses `per_mint_collateral_caps`,
+    /// not `per_mint_caps`. A config that only populates the underlying
+    /// list must HardBlock Withdraw with `NoCapConfigured`.
+    #[test]
+    fn withdraw_with_only_underlying_cap_configured_hardblocks_with_no_cap() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let (snap, _, _) = fresh_snapshot_with_positions(owner, mint, &[5_000], &[]);
+        // permissive_config populates per_mint_caps but NOT
+        // per_mint_collateral_caps.
+        let config = permissive_config(mint, UnderlyingAmount::new(1_000_000));
+        let action = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            collateral_amount: CollateralTokenAmount::new(1),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::HardBlock(HardBlockReason::RuleRejected(
+                RuleKind::MaxActionInputAmount,
+                RuleRejectionDetail::NoCapConfigured,
+            ))
+        );
+    }
+
+    /// A Withdraw whose `collateral_amount` exceeds the configured
+    /// `per_mint_collateral_caps` cap HardBlocks with `AmountOverCap`.
+    #[test]
+    fn withdraw_collateral_amount_over_cap_hardblocks() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let (snap, _, _) = fresh_snapshot_with_positions(owner, mint, &[5_000], &[]);
+        // Cap at 100 cTokens, action requests 1_000.
+        let config = withdraw_permissive_config(mint, CollateralTokenAmount::new(100));
+        let action = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            collateral_amount: CollateralTokenAmount::new(1_000),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::HardBlock(HardBlockReason::RuleRejected(
+                RuleKind::MaxActionInputAmount,
+                RuleRejectionDetail::AmountOverCap,
+            ))
+        );
+    }
+
+    /// Deposit / Repay must continue to use `per_mint_caps` — Phase 5H's
+    /// cap-dispatch refactor must NOT silently flip them to the new
+    /// collateral-cap list. This test exercises a Deposit whose
+    /// underlying-cap is populated and whose collateral-cap is empty;
+    /// it MUST pass (i.e. the dispatcher reads from `per_mint_caps`,
+    /// not `per_mint_collateral_caps`).
+    #[test]
+    fn deposit_cap_dispatch_unchanged_after_withdraw_addition() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let (snap, _) = fresh_snapshot(owner, mint);
+        let config = permissive_config(mint, UnderlyingAmount::new(1_000_000));
+        let action = ProposedAction::Deposit {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            amount: UnderlyingAmount::new(100),
+        };
+        let ctx = EvaluationContext {
+            session_wallet: owner,
+        };
+        assert_eq!(
+            evaluate_lending_policy(&snap, &action, &config, &ctx),
+            LendingPolicyVerdict::Pass
         );
     }
 
@@ -975,6 +1501,7 @@ mod tests {
             allowed_mints: AllowedMintsConfig { allowlist: vec![] },
             max_action_input_amount: MaxActionInputAmountConfig {
                 per_mint_caps: vec![],
+                per_mint_collateral_caps: vec![],
             },
         };
         let action = ProposedAction::Deposit {
@@ -1678,6 +2205,7 @@ mod tests {
             },
             max_action_input_amount: MaxActionInputAmountConfig {
                 per_mint_caps: vec![(mint, UnderlyingAmount::new(1_000_000))],
+                per_mint_collateral_caps: vec![],
             },
         }
     }

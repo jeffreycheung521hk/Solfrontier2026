@@ -1074,6 +1074,12 @@ fn rule_detail_label(detail: &RuleRejectionDetail) -> &'static str {
         RuleRejectionDetail::MintNotAllowed => "MintNotAllowed",
         RuleRejectionDetail::ReserveNotInSnapshot => "ReserveNotInSnapshot",
         RuleRejectionDetail::RepayWithoutDebt => "RepayWithoutDebt",
+        // Phase 5H — Withdraw cross-reference details. Unreachable on
+        // the deposit-tool surface (this tool only constructs
+        // `ProposedAction::Deposit`), but the formatter must remain
+        // exhaustive over `RuleRejectionDetail`.
+        RuleRejectionDetail::WithdrawWithoutDeposit => "WithdrawWithoutDeposit",
+        RuleRejectionDetail::WithdrawWithDebt => "WithdrawWithDebt",
         RuleRejectionDetail::NoCapConfigured => "NoCapConfigured",
         RuleRejectionDetail::AmountOverCap => "AmountOverCap",
     }
@@ -1262,6 +1268,9 @@ mod tests {
             },
             max_action_input_amount: MaxActionInputAmountConfig {
                 per_mint_caps: vec![(usdc_mint(), UnderlyingAmount::new(MAX_STRUCTURAL_AMOUNT_RAW))],
+                // Phase 5H — deposit-tool tests don't construct Withdraw
+                // actions; collateral cap list stays empty.
+                per_mint_collateral_caps: vec![],
             },
         }
     }
@@ -1504,7 +1513,12 @@ mod tests {
         assert!(matches!(parked.verdict_at_propose, LendingPolicyVerdict::Pass));
         // ProposedAction roundtrip
         assert_eq!(parked.action.kind(), crate::lending::ActionKind::Deposit);
-        assert_eq!(parked.action.amount().raw(), 1000);
+        assert_eq!(parked.action.amount_raw(), 1000);
+        assert_eq!(
+            parked.action.amount_underlying(),
+            Some(crate::lending::UnderlyingAmount::new(1000))
+        );
+        assert_eq!(parked.action.collateral_amount(), None);
         // TTL sanity: expires_at strictly after proposed_at.
         assert!(parked.expires_at > parked.proposed_at);
 

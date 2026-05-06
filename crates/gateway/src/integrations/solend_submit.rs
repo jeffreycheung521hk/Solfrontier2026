@@ -912,7 +912,14 @@ pub async fn submit_signed_solend_transaction(
                             "protocol":                "Solend",
                             "action":                  "Deposit",
                             "asset":                   "USDC",
-                            "amount_raw":              parked.action.amount().raw(),
+                            // Phase 5H-B accessor rename: `amount()` returns
+                            // `Option<UnderlyingAmount>` after the Withdraw
+                            // variant landed; `amount_raw()` returns the
+                            // unit-erased `u64` for audit payloads. Submit
+                            // pipeline only consumes deposit-flow parked
+                            // artifacts in Phase 6D/6E, so the unit here is
+                            // underlying USDC base units.
+                            "amount_raw":              parked.action.amount_raw(),
                             "verified_slot":           parked.verified_slot,
                             "simulation_slot":         parked.simulation_slot,
                             "last_valid_block_height": parked.last_valid_block_height,
@@ -1020,7 +1027,9 @@ fn handoff_safe_payload(
         "protocol":                "Solend",
         "action":                  "Deposit",
         "asset":                   "USDC",
-        "amount_raw":              parked.action.amount().raw(),
+        // Deposit's `amount_raw()` is in underlying USDC base units
+        // (Phase 5H-B: this code path is deposit-flow only).
+        "amount_raw":              parked.action.amount_raw(),
         "verified_slot":           parked.verified_slot,
         "simulation_slot":         parked.simulation_slot,
         "last_valid_block_height": parked.last_valid_block_height,
@@ -1143,7 +1152,9 @@ async fn audit_rejected(
         payload["protocol"] = json!("Solend");
         payload["action"] = json!("Deposit");
         payload["asset"] = json!("USDC");
-        payload["amount_raw"] = json!(p.action.amount().raw());
+        // Deposit's `amount_raw()` is in underlying USDC base units
+        // (Phase 5H-B: this audit-payload helper is deposit-flow only).
+        payload["amount_raw"] = json!(p.action.amount_raw());
         payload["verified_slot"] = json!(p.verified_slot);
         payload["last_valid_block_height"] = json!(p.last_valid_block_height);
     }

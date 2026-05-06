@@ -47,6 +47,25 @@ pub mod oracle_decoder;
 pub mod raw;
 pub mod refresh;
 
+// Phase 5H-A — un-wired Solend withdraw ix builder.
+//
+// `withdraw` is intentionally NOT `pub mod`. It is declared only
+// under `#[cfg(test)]` so its structural unit tests run under
+// `cargo test -p claw-gateway --lib solend`. Production builds
+// exclude this file entirely; no symbol from it is reachable from
+// any tool, runtime, park, signing, or submit code path.
+//
+// Phase 5H-C added a sibling `integrations/solend_withdraw_tx_plan.rs`
+// (also `#[cfg(test)]`) that depends on this builder. To let that
+// sibling import from here without exporting outside the crate, the
+// visibility is `pub(crate)` — still gated by `#[cfg(test)]`, so the
+// production binary remains byte-identical to the un-wired posture.
+//
+// Phase 5H-D will flip the `#[cfg(test)]` gates together when the
+// `solend_withdraw_usdc` tool is wired.
+#[cfg(test)]
+pub(crate) mod withdraw;
+
 pub use assembler::{
     AssembledSolendDepositSnapshot, AtaKind, ClawRpcPoolAccountFetcher, FetchError,
     SolanaAccountFetcher, SolendAssemblyError, SolendSnapshotAssembler,
