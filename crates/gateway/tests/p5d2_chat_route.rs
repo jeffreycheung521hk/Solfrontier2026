@@ -1007,6 +1007,78 @@ impl Tool for PreviewSolendWithdrawAllStub {
     }
 }
 
+/// Phase 6I-D — execution-proposal tool stub. Mirrors the production
+/// tool's awaiting_approval shape so the chat-route tests exercise
+/// dispatch + invariant assertions without standing up a real RPC
+/// reader / park store.
+struct SolendWithdrawAllUsdcStub;
+
+#[async_trait]
+impl Tool for SolendWithdrawAllUsdcStub {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "solend_withdraw_all_usdc".into(),
+            description: "test-only Phase 6I-D Solend withdraw-all execution stub".into(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["obligation_pubkey"],
+                "properties": {
+                    "obligation_pubkey": { "type": "string" }
+                }
+            }),
+            output_schema: json!({"type": "object"}),
+            required_capabilities: vec!["propose_signing".to_string()],
+            supports_streaming: false,
+            timeout_ms: 15_000,
+        }
+    }
+
+    async fn execute(&self, input: ToolInput) -> Result<ToolOutput, ToolError> {
+        let obligation_pubkey = input
+            .parameters
+            .get("obligation_pubkey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("HcKrv5Jo5f6qvzSGhJVYTNSqwKudRizn6fxbjPW7M8SV")
+            .to_string();
+        let approval_request_id = Uuid::new_v4();
+        let intent_id = Uuid::new_v4();
+        Ok(ToolOutput {
+            tool_name: "solend_withdraw_all_usdc".into(),
+            success: true,
+            data: Some(json!({
+                "status":                              "awaiting_approval",
+                "protocol":                            "Solend/Save",
+                "network":                             "mainnet",
+                "mode":                                "withdraw_all_collateral",
+                "asset":                               "USDC",
+                "wallet_pubkey":                       "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW",
+                "obligation_pubkey":                   obligation_pubkey,
+                "lending_market":                      "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
+                "reserve_pubkey":                      "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw",
+                "reserve_mint":                        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "collateral_amount_raw":               "3857506",
+                "underlying_usdc_estimate_raw":        null,
+                "estimate_unavailable_reason":         "stub",
+                "requires_user_signature":             true,
+                "required_signers":                    ["wallet"],
+                "requires_obligation_keypair":         false,
+                "intent_id":                           intent_id.to_string(),
+                "approval_request_id":                 approval_request_id.to_string(),
+                "approval_required":                   true,
+                "will_build_transaction_on_sign_click": true,
+                "will_sign":                           false,
+                "will_broadcast":                      false,
+                "policy_verdict":                      "Pass",
+                "policy_rule_name":                    "solend-withdraw-all-explicit-obligation",
+                "human_readable_reason":               "stub: awaiting_approval",
+            })),
+            error: None,
+            duration_ms: 0,
+        })
+    }
+}
+
 fn registry_with_all_chat_tools() -> ToolRegistry {
     ToolRegistry::from_tools(vec![
         Arc::new(SolendDepositStub),
@@ -1015,6 +1087,7 @@ fn registry_with_all_chat_tools() -> ToolRegistry {
         Arc::new(QuoteStub),
         Arc::new(SolendPositionStub),
         Arc::new(PreviewSolendWithdrawAllStub),
+        Arc::new(SolendWithdrawAllUsdcStub),
     ])
 }
 
@@ -1406,4 +1479,199 @@ async fn class_af_execute_withdraw_prompt_does_not_create_approval_or_sign() {
             "execute-style refusal must not contain `{forbidden}` anywhere in body"
         );
     }
+}
+
+// ─── Phase 6I-D additions — withdraw-all execution-proposal tool ─────────────
+//
+// Class AG / AH / AI / AJ / AK lock the chat-route invariants for
+// `solend_withdraw_all_usdc`: the explicit-obligation NL prompt
+// dispatches the tool and returns awaiting_approval; partial-amount
+// prompts do NOT reach the execution tool; preview+execute multi-tool
+// is rejected; the chat allowlist contains both preview and execution
+// while still excluding the legacy `solend_withdraw_usdc` execution
+// name; no body field surfaces tx_bytes / signing handoff at chat time.
+
+// Class AG — explicit-obligation withdraw-all NL prompt dispatches the
+// execution tool and returns awaiting_approval with the structured
+// proposal JSON. Asserts every invariant flag and the absence of any
+// signing / broadcast field.
+#[tokio::test]
+async fn class_ag_withdraw_all_explicit_obligation_dispatches_to_awaiting_approval() {
+    let prov = scripted_tool_call(
+        "solend_withdraw_all_usdc",
+        json!({ "obligation_pubkey": TARGET_OBLIGATION_BS58 }),
+    );
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({
+            "message": format!(
+                "Withdraw all USDC from Solend obligation {TARGET_OBLIGATION_BS58}. \
+                 Do not approve, sign, or broadcast."
+            )
+        })
+        .to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "tool_dispatched");
+    assert_eq!(body["tool_name"], "solend_withdraw_all_usdc");
+
+    let data = &body["output"]["data"];
+    assert_eq!(data["status"], "awaiting_approval");
+    assert_eq!(data["mode"], "withdraw_all_collateral");
+    assert_eq!(data["obligation_pubkey"], TARGET_OBLIGATION_BS58);
+    assert_eq!(
+        data["lending_market"],
+        "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY"
+    );
+    assert_eq!(data["reserve_pubkey"], "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw");
+    assert_eq!(data["reserve_mint"], "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+    assert_eq!(data["collateral_amount_raw"], "3857506");
+
+    // Brief-required invariant flags:
+    assert_eq!(data["requires_user_signature"], json!(true));
+    assert_eq!(data["required_signers"], json!(["wallet"]));
+    assert_eq!(data["requires_obligation_keypair"], json!(false));
+    assert_eq!(data["will_build_transaction_on_sign_click"], json!(true));
+    assert_eq!(data["will_sign"], json!(false));
+    assert_eq!(data["will_broadcast"], json!(false));
+
+    // approval_request_id is present and parses as a UUID.
+    let arid = data["approval_request_id"].as_str().expect("approval_request_id");
+    Uuid::parse_str(arid).expect("approval_request_id must parse as UUID");
+
+    // Body-wide forbidden-field scan: at chat-tool time, no signing
+    // handoff / tx-bytes / private-key surface should appear.
+    let body_s = serde_json::to_string(&body).unwrap();
+    for forbidden in &[
+        "signing_request_id",
+        "tx_signature",
+        "tx_bytes",
+        "signed_bytes",
+        "private_key",
+        "transaction_base64",
+    ] {
+        assert!(
+            !body_s.contains(forbidden),
+            "awaiting_approval response must not contain `{forbidden}` anywhere in body"
+        );
+    }
+}
+
+// Class AH — partial-amount prompt does NOT call the execution tool.
+// Scripted assistant text response models the alignment-prompt-driven
+// refuse-and-explain behavior. The wire shape is plain text — no
+// dispatched tool, no awaiting_approval payload.
+#[tokio::test]
+async fn class_ah_partial_amount_prompt_does_not_dispatch_execution_tool() {
+    let prov = scripted_assistant(
+        "Partial withdraws are not supported. Only withdraw-all by explicit obligation \
+         pubkey is available in this slice. If you'd like, give me the obligation \
+         pubkey and I'll run preview_solend_withdraw_all first.",
+    );
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message": "Withdraw 2 USDC from Solend"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert!(body["tool_name"].is_null(), "partial-amount prompt must not dispatch a tool");
+    assert!(body["output"].is_null(), "partial-amount prompt must not produce a tool output");
+    let body_s = serde_json::to_string(&body).unwrap();
+    for forbidden in &[
+        "awaiting_approval",
+        "approval_request_id",
+        "signing_request_id",
+        "tx_signature",
+        "tx_bytes",
+        "signed_bytes",
+    ] {
+        assert!(
+            !body_s.contains(forbidden),
+            "partial-amount refusal must not contain `{forbidden}`"
+        );
+    }
+}
+
+// Class AI — multi-tool rejection still triggers when the LLM tries
+// to batch the preview + execution in one turn.
+#[tokio::test]
+async fn class_ai_preview_plus_execute_multi_tool_rejected_whole_turn() {
+    let prov = Arc::new(ScriptedLlmProvider::tool_calls(vec![
+        LlmToolCall {
+            id: "a".into(),
+            tool_name: "preview_solend_withdraw_all".into(),
+            input: json!({ "obligation_pubkey": TARGET_OBLIGATION_BS58 }),
+        },
+        LlmToolCall {
+            id: "b".into(),
+            tool_name: "solend_withdraw_all_usdc".into(),
+            input: json!({ "obligation_pubkey": TARGET_OBLIGATION_BS58 }),
+        },
+    ]));
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message": "preview and then withdraw in one turn"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "multiple_tool_calls_rejected");
+    assert_eq!(body["count"], 2);
+}
+
+// Class AJ — chat allowlist contains both preview and execution; the
+// legacy / un-implemented `solend_withdraw_usdc` (without `_all`)
+// remains absent. Locks the Phase 6I-D chat surface.
+#[test]
+fn class_aj_chat_allowlist_includes_preview_and_execution() {
+    let allowlist = claw_gateway::runtime::chat_wiring::CHAT_TOOL_ALLOWLIST;
+    assert!(
+        allowlist.contains(&"preview_solend_withdraw_all"),
+        "preview tool must remain in allowlist"
+    );
+    assert!(
+        allowlist.contains(&"solend_withdraw_all_usdc"),
+        "Phase 6I-D: execution tool must be in allowlist"
+    );
+    assert!(
+        !allowlist.contains(&"solend_withdraw_usdc"),
+        "legacy / un-implemented `solend_withdraw_usdc` must remain absent"
+    );
+    assert!(
+        allowlist.contains(&"get_solend_position"),
+        "Phase 6H scanner must remain in allowlist"
+    );
+    // No borrow/repay tool added in this slice.
+    for forbidden in &["solend_borrow_usdc", "solend_repay_usdc"] {
+        assert!(
+            !allowlist.contains(forbidden),
+            "borrow/repay tool `{forbidden}` must not appear in allowlist"
+        );
+    }
+}
+
+// Class AK — malformed args (JSON array instead of object) targeting
+// the execution tool resolves to the malformed-arguments envelope —
+// same path Class E / S exercise for `fake_propose` / Jupiter swap.
+// The production tool also enforces `deny_unknown_fields` at its
+// `serde::Deserialize` boundary, exhaustively asserted by the unit
+// test `extra_fields_in_input_rejected_by_deny_unknown_fields`.
+#[tokio::test]
+async fn class_ak_execution_tool_malformed_args_rejected_as_malformed() {
+    let prov = scripted_tool_call(
+        "solend_withdraw_all_usdc",
+        json!(["not", "an", "object"]),
+    );
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message": "withdraw all from obligation"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "malformed_tool_arguments");
+    assert_eq!(body["tool_name"], "solend_withdraw_all_usdc");
 }

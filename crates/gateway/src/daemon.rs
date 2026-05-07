@@ -573,9 +573,24 @@ impl GatewayDaemon {
             std::sync::Arc::new(rpc_pool.clone()),
             external_wallet.clone(),
         );
+        // Phase 6I-D — withdraw-all execution PROPOSAL. Returns
+        // `awaiting_approval` with a parked intent (`approval_request_id`
+        // is the park-store key). NOT yet integrated with the daemon-wide
+        // ApprovalStore / approval-routing / JIT signing handoff —
+        // those are deferred to the follow-up slice. The withdraw-
+        // execution substrate (`solend::withdraw` +
+        // `solend_withdraw_tx_plan`) remains `#[cfg(test)]`-gated.
+        let solend_withdraw_all_park_store =
+            crate::integrations::solend_withdraw_park::SolendWithdrawAllParkStore::new();
+        let registry = crate::runtime::copilot_tools_wiring::wire_solend_withdraw_all_usdc_tool(
+            registry,
+            std::sync::Arc::new(rpc_pool.clone()),
+            external_wallet.clone(),
+            solend_withdraw_all_park_store,
+        );
         info!(
             "get_wallet_balances + get_jupiter_quote + get_solend_position + \
-             preview_solend_withdraw_all read-only chat tools active"
+             preview_solend_withdraw_all + solend_withdraw_all_usdc chat tools active"
         );
         // Phase 4C-6: Solend submit HTTP handler. Bridges the API trait
         // to the 4C-5 submit pipeline + 4C-6 lifecycle cache. No new

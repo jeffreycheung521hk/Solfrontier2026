@@ -186,6 +186,43 @@ preview if the user supplies an obligation pubkey. Do NOT batch \
 turn — the one-tool-per-turn rule applies; if the user wants both, \
 call the scanner first and stop. \
 \n\n\
+`solend_withdraw_all_usdc` takes a single required field \
+`obligation_pubkey` (base58 string — typically copied from a prior \
+`get_solend_position` or `preview_solend_withdraw_all` result) and \
+PROPOSES a Solend / Save withdraw-all transaction by parking an \
+awaiting-approval intent. It does NOT sign, does NOT broadcast, does \
+NOT build a final signed transaction at chat-tool time — the actual \
+withdraw transaction is assembled on the user's Sign-with-Phantom \
+click in a later step. The output's `status` is `awaiting_approval` \
+on success, or `policy_blocked` / `wallet_not_bound` / \
+`invalid_obligation_pubkey` / `obligation_not_found` / `decode_error` \
+/ `rpc_error` / `pending_action_exists` on the various refusal paths. \
+\n\n\
+Call `solend_withdraw_all_usdc` ONLY when the user explicitly asks to \
+withdraw ALL from a SPECIFIC Solend obligation pubkey — for example: \
+\"withdraw all USDC from Solend obligation HcKrv5Jo…\", \"withdraw \
+everything from this obligation: HcKrv5Jo…\". The user MUST provide \
+an explicit `obligation_pubkey`; do NOT infer one from prior \
+messages, do NOT silently pick from a prior `get_solend_position` \
+result, and do NOT auto-select the largest. \
+\n\n\
+Partial withdraws are NOT supported. If the user asks \"withdraw 5 \
+USDC\", \"withdraw some USDC\", \"take out half\", or anything that \
+implies a numeric amount, do NOT call `solend_withdraw_all_usdc`. \
+Respond with plain text explaining that only withdraw-all by \
+explicit obligation is available, and offer to run \
+`preview_solend_withdraw_all` first if the user provides an \
+obligation pubkey. Multi-obligation \"withdraw all positions\" is \
+also not supported — only one obligation per call. \
+\n\n\
+Never call `solend_withdraw_all_usdc` with a hallucinated `amount`, \
+`mode`, `wallet_pubkey`, `reserve_pubkey`, `slippage`, `approve`, \
+`tx_bytes`, or any other field — the tool's strict schema rejects \
+extra fields and the entire call fails. The session-bound wallet is \
+the only signer; do NOT include it in the input. The one-tool-per-turn \
+rule still applies — never batch the preview and execution in the \
+same turn. \
+\n\n\
 When the user makes a CONDITIONAL request (for example \"deposit \
 0.001 USDC into Solend if my balance is above 0.3\", or \"if I have \
 enough SOL, swap 0.001 SOL to USDC\"), call the appropriate \
@@ -221,10 +258,17 @@ pub const CHAT_TOOL_ALLOWLIST: &[&str] = &[
     // obligation pubkey. Validates owner / borrow-free / has-USDC-deposit
     // and returns a structured preview. Strictly preview-only:
     // `required_capabilities: vec![]`, no approval, no signing, no
-    // broadcast, no execution. The withdraw EXECUTION tool
-    // (`solend_withdraw_usdc`) remains absent from this list and from
-    // production builds — its substrate is `#[cfg(test)]` gated.
+    // broadcast, no execution.
     "preview_solend_withdraw_all",
+    // Phase 6I-D — Solend withdraw-all EXECUTION proposal. Returns
+    // `awaiting_approval` with a parked intent keyed by a real
+    // `approval_request_id`. The tool itself does NOT sign, broadcast,
+    // or build a transaction; the resume / JIT signing handoff /
+    // submit pipeline is deferred to the follow-up slice. Strictly
+    // bounded: one explicit obligation, withdraw-all only, USDC
+    // reserve only, Solend / Save Main Pool lending market only, no
+    // borrow tolerated, no partial amount field accepted.
+    "solend_withdraw_all_usdc",
 ];
 
 /// Build a registry containing only the tools in [`CHAT_TOOL_ALLOWLIST`]

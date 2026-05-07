@@ -32,3 +32,12 @@ pub mod solend_tx_plan;
 // together when the `solend_withdraw_usdc` tool is wired.
 #[cfg(test)]
 mod solend_withdraw_tx_plan;
+
+// Phase 6I-D — Solend withdraw-all park store. Holds parked intents
+// keyed by `approval_request_id` for the chat tool's awaiting_approval
+// path. Production-callable; carries no transaction bytes / blockhashes
+// / signer handles. The withdraw EXECUTION substrate
+// (`solend::withdraw` + `solend_withdraw_tx_plan`) remains
+// `#[cfg(test)]`-gated; the resume / JIT signing / submit pipeline is
+// deferred to a follow-up slice.
+pub mod solend_withdraw_park;

@@ -16,6 +16,14 @@ pub mod jupiter_swap;
 pub mod preview_solend_withdraw_all;
 pub mod signing;
 pub mod solend_deposit;
+// Phase 6I-D — first execution-side surface for Solend withdraw.
+// Strictly bounded to withdraw-all from one explicit Phase 6H-discovered
+// obligation. Returns `awaiting_approval` with a parked intent; does
+// NOT register with the daemon-wide ApprovalStore yet, does NOT spawn
+// a resume task, does NOT build / sign / broadcast a transaction. The
+// withdraw-execution substrate (`integrations::solend::withdraw` +
+// `integrations::solend_withdraw_tx_plan`) remains `#[cfg(test)]` gated.
+pub mod solend_withdraw_all_usdc;
 
 pub use get_jupiter_quote::{
     GetJupiterQuoteTool, JupiterClientQuoteSource, JupiterQuoteSource,
@@ -31,3 +39,4 @@ pub use preview_solend_withdraw_all::PreviewSolendWithdrawAllTool;
 pub use signing::SubmitForSigningTool;
 pub use signing::resume_after_approval;
 pub use solend_deposit::SubmitSolendDepositTool;
+pub use solend_withdraw_all_usdc::SubmitSolendWithdrawAllUsdcTool;
