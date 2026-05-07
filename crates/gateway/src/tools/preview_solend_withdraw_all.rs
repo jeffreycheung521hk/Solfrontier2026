@@ -891,31 +891,34 @@ mod tests {
 
     // ── Required test 10 — withdraw remains dead-source / unwired ───────
 
-    /// Phase 6I-A invariant: this preview tool is NOT the withdraw
-    /// execution tool. The execution tool's name (`solend_withdraw_usdc`)
-    /// is reserved for a future slice and remains absent from both
-    /// the chat allowlist AND any tool-registry constant in this
-    /// slice. The preview tool itself is also absent from the chat
-    /// allowlist in Phase 6I-A — wiring is deferred per the slice's
-    /// preferred path.
+    /// Phase 6I-B invariant: the preview tool is wired into the chat
+    /// allowlist, but the WITHDRAW EXECUTION tool
+    /// (`solend_withdraw_usdc`) remains unimplemented and absent from
+    /// the chat allowlist. This test locks the asymmetry so a future
+    /// slice cannot accidentally promote the execution tool.
+    ///
+    /// (Phase 6I-A had this test asserting the preview was NOT yet in
+    /// the allowlist; Phase 6I-B updated that clause when chat wiring
+    /// was added. The execution-tool guard remains identical.)
     #[test]
-    fn withdraw_remains_dead_source_with_preview_wiring_deferred() {
-        // 10a. This tool is the preview, not the execution.
+    fn execution_tool_remains_dead_source_with_preview_wired() {
+        // a. This tool is the preview, not the execution.
         assert_eq!(TOOL_NAME, "preview_solend_withdraw_all");
         assert_ne!(TOOL_NAME, "solend_withdraw_usdc");
 
-        // 10b. solend_withdraw_usdc is NOT in the chat allowlist.
+        // b. solend_withdraw_usdc is NOT in the chat allowlist.
         let allowlist = crate::runtime::chat_wiring::CHAT_TOOL_ALLOWLIST;
         assert!(
             !allowlist.contains(&"solend_withdraw_usdc"),
             "solend_withdraw_usdc must remain absent from CHAT_TOOL_ALLOWLIST"
         );
 
-        // 10c. preview_solend_withdraw_all is also NOT yet in the chat
-        //      allowlist (deferred to 6I-B per Phase 6I-A scope).
+        // c. preview_solend_withdraw_all IS now in the chat allowlist
+        //    (Phase 6I-B wiring). If a future slice removes it, this
+        //    test fails to flag the regression.
         assert!(
-            !allowlist.contains(&TOOL_NAME),
-            "preview tool wiring deferred — should not be in CHAT_TOOL_ALLOWLIST yet"
+            allowlist.contains(&TOOL_NAME),
+            "Phase 6I-B: preview tool must be in chat allowlist"
         );
     }
 
