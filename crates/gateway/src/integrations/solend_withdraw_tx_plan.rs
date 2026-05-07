@@ -917,6 +917,99 @@ mod tests {
         }
     }
 
+    // ── Phase 6I readiness: Phase 6H-supplied explicit obligation_pubkey ─
+
+    /// Phase 6I plan-only readiness rehearsal.
+    ///
+    /// Phase 6H's `get_solend_position` scanner reports an explicit
+    /// `obligation_pubkey` for each on-chain obligation owned by the
+    /// session wallet. Live mainnet wallet
+    /// `C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW` currently has
+    /// five obligations — the largest being
+    /// `HcKrv5Jo5f6qvzSGhJVYTNSqwKudRizn6fxbjPW7M8SV`
+    /// (`deposited_collateral_amount_raw = 3_857_506`).
+    ///
+    /// This test asserts the dead-source withdraw plan assembler
+    /// already accepts an arbitrary, externally-supplied obligation
+    /// pubkey (no derivation, no transient keypair) and threads it
+    /// verbatim into the plan and the withdraw ix at slot 3. It also
+    /// locks the user-wallet-only signer set: slots 9 + 10 both
+    /// equal the session wallet, no other slot is a signer.
+    ///
+    /// Plan-only: no signing, no approval, no broadcast, no daemon.
+    /// `solend_withdraw_usdc` remains absent from the chat allowlist
+    /// and from production builds (this module is `#[cfg(test)]`).
+    #[test]
+    fn phase6i_explicit_phase6h_obligation_pubkey_threads_through_plan_and_ix() {
+        let user_wallet =
+            Pubkey::from_str("C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW").unwrap();
+        let phase6h_obligation =
+            Pubkey::from_str("HcKrv5Jo5f6qvzSGhJVYTNSqwKudRizn6fxbjPW7M8SV").unwrap();
+
+        // Helper synthesises reserve / market / mint pubkeys; we only
+        // need the obligation pubkey to be the explicit Phase 6H one.
+        let mint = Pubkey::new_unique();
+        let mut fresh = fresh_withdraw_assembled(
+            user_wallet,
+            mint,
+            /*deposited_amount=*/ 3_857_506,
+            /*borrow_wads=*/ 0,
+            /*source_ata_exists=*/ true,
+            /*collateral_ata_exists=*/ true,
+            /*obligation_exists=*/ true,
+        );
+        fresh.obligation_pubkey = phase6h_obligation;
+
+        // Withdraw-all sentinel — does NOT require a reserve
+        // exchange-rate decode; Solend clamps to the user's deposited
+        // collateral on chain.
+        let action = ProposedAction::Withdraw {
+            protocol: ProtocolTag::Solend,
+            reserve_mint: mint,
+            collateral_amount: CollateralTokenAmount::new(u64::MAX),
+        };
+        let plan = assemble_solend_withdraw_tx_plan(
+            Uuid::new_v4(),
+            &action,
+            SessionId::new(),
+            user_wallet,
+            &fresh,
+            1,
+        )
+        .expect("Phase 6H explicit obligation_pubkey must thread through unchanged");
+
+        // 1. Plan echoes the explicit obligation pubkey verbatim.
+        assert_eq!(plan.accounts_summary.obligation_pubkey, phase6h_obligation);
+
+        // 2. No transient obligation keypair — no new account is
+        //    being created. Withdraw spends an existing obligation.
+        assert!(!plan.obligation_signer_required);
+        assert!(plan.transient_obligation_pubkey.is_none());
+
+        // 3. Withdraw ix slot 3 carries the explicit pubkey.
+        let ix = &plan.withdraw_instructions[0];
+        assert_eq!(ix.accounts[3].pubkey, phase6h_obligation);
+        assert!(ix.accounts[3].is_writable);
+        assert!(!ix.accounts[3].is_signer);
+
+        // 4. User-wallet-only signer set: slots 9 (obligation_owner)
+        //    + 10 (user_transfer_authority) both = session_wallet,
+        //    every other slot is non-signer.
+        assert_eq!(ix.accounts[9].pubkey, user_wallet);
+        assert!(ix.accounts[9].is_signer);
+        assert_eq!(ix.accounts[10].pubkey, user_wallet);
+        assert!(ix.accounts[10].is_signer);
+        let signer_count = ix.accounts.iter().filter(|a| a.is_signer).count();
+        assert_eq!(
+            signer_count, 2,
+            "withdraw ix must require exactly two signer slots — both = user wallet"
+        );
+
+        // 5. Slot 5 (lending-market authority PDA) is derived
+        //    internally and never a signer.
+        assert!(!ix.accounts[5].is_signer);
+    }
+
     // ── Anti-coupling guards ────────────────────────────────────────────
 
     /// The withdraw plan assembler MUST NOT depend on

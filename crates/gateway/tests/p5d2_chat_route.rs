@@ -939,6 +939,74 @@ impl Tool for SolendPositionStub {
     }
 }
 
+/// Phase 6I-B — preview tool stub. Returns a fully-populated OK preview
+/// JSON whose shape matches the production
+/// `PreviewSolendWithdrawAllTool::ok_preview_output`. The
+/// `obligation_pubkey` and `collateral_amount_raw` fields are echoed
+/// from the input so a single stub serves both the "happy path" and
+/// "echo-the-input" assertions.
+struct PreviewSolendWithdrawAllStub;
+
+#[async_trait]
+impl Tool for PreviewSolendWithdrawAllStub {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "preview_solend_withdraw_all".into(),
+            description: "test-only Phase 6I-B Solend withdraw-all preview stub".into(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["obligation_pubkey"],
+                "properties": {
+                    "obligation_pubkey": { "type": "string" }
+                }
+            }),
+            output_schema: json!({"type": "object"}),
+            required_capabilities: vec![],
+            supports_streaming: false,
+            timeout_ms: 8_000,
+        }
+    }
+
+    async fn execute(&self, input: ToolInput) -> Result<ToolOutput, ToolError> {
+        let obligation_pubkey = input
+            .parameters
+            .get("obligation_pubkey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("HcKrv5Jo5f6qvzSGhJVYTNSqwKudRizn6fxbjPW7M8SV")
+            .to_string();
+        Ok(ToolOutput {
+            tool_name: "preview_solend_withdraw_all".into(),
+            success: true,
+            data: Some(json!({
+                "status":                       "ok",
+                "mode":                         "withdraw_all_collateral",
+                "protocol":                     "Solend/Save",
+                "network":                      "mainnet",
+                "program_id":                   "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
+                "wallet_pubkey":                "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW",
+                "obligation_pubkey":            obligation_pubkey,
+                "lending_market":               "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
+                "reserve_pubkey":               "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw",
+                "reserve_mint":                 "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "collateral_amount_raw":        "3857506",
+                "underlying_usdc_estimate_raw": null,
+                "underlying_usdc_estimate_ui":  null,
+                "estimate_unavailable_reason":  "stub: exchange-rate decode deferred",
+                "requires_user_signature":      true,
+                "required_signers":             ["wallet"],
+                "requires_obligation_keypair":  false,
+                "will_create_approval":         false,
+                "will_sign":                    false,
+                "will_broadcast":               false,
+                "next_step":                    "stub: preview-only",
+            })),
+            error: None,
+            duration_ms: 0,
+        })
+    }
+}
+
 fn registry_with_all_chat_tools() -> ToolRegistry {
     ToolRegistry::from_tools(vec![
         Arc::new(SolendDepositStub),
@@ -946,6 +1014,7 @@ fn registry_with_all_chat_tools() -> ToolRegistry {
         Arc::new(BalancesStub),
         Arc::new(QuoteStub),
         Arc::new(SolendPositionStub),
+        Arc::new(PreviewSolendWithdrawAllStub),
     ])
 }
 
@@ -1162,6 +1231,179 @@ async fn class_ab_solend_position_query_dispatched_returns_200_with_output() {
         assert!(
             !body_s.contains(forbidden),
             "read-only response must not contain `{forbidden}` field"
+        );
+    }
+}
+
+// ─── Phase 6I-B additions — withdraw-all preview tool ────────────────────────
+//
+// Class AC / AD / AE / AF lock the chat-route invariants for the new
+// `preview_solend_withdraw_all` tool: NL dispatch reaches the preview;
+// the dispatched response carries the structured preview JSON; no
+// approval / signing / broadcast field is surfaced; the multi-tool
+// rejection still applies if the LLM tries to batch the scanner with
+// the preview in one turn; and the chat allowlist contains the preview
+// while still EXCLUDING the (un-implemented) `solend_withdraw_usdc`
+// execution tool.
+
+const TARGET_OBLIGATION_BS58: &str = "HcKrv5Jo5f6qvzSGhJVYTNSqwKudRizn6fxbjPW7M8SV";
+
+// Class AC — NL preview prompt routes to `preview_solend_withdraw_all`
+// and the chat handler returns 200 dispatched with the preview JSON.
+// Asserts every read-only invariant flag (`will_create_approval`,
+// `will_sign`, `will_broadcast`, `requires_obligation_keypair`) is
+// `false` and that no approval / signing / broadcast / private-key /
+// tx-bytes field appears anywhere in the response body.
+#[tokio::test]
+async fn class_ac_preview_withdraw_all_dispatched_returns_200_with_output() {
+    let prov = scripted_tool_call(
+        "preview_solend_withdraw_all",
+        json!({ "obligation_pubkey": TARGET_OBLIGATION_BS58 }),
+    );
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({
+            "message": format!(
+                "Preview withdraw-all for Solend obligation {TARGET_OBLIGATION_BS58}"
+            )
+        })
+        .to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "tool_dispatched");
+    assert_eq!(body["tool_name"], "preview_solend_withdraw_all");
+
+    let data = &body["output"]["data"];
+    assert_eq!(data["status"], "ok");
+    assert_eq!(data["mode"], "withdraw_all_collateral");
+    assert_eq!(data["obligation_pubkey"], TARGET_OBLIGATION_BS58);
+    assert_eq!(data["collateral_amount_raw"], "3857506");
+    assert_eq!(data["reserve_pubkey"], "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw");
+    assert_eq!(data["reserve_mint"], "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+
+    // Wire-shape invariant: no execution / approval bookkeeping is
+    // promoted to top-level chat fields. The dispatched envelope's
+    // `approval_request_id` / `signing_request_id` fields are absent
+    // (those would only appear for `awaiting_approval` flows).
+    assert!(body["approval_request_id"].is_null());
+    assert!(body["signing_request_id"].is_null());
+    assert!(body["tx_signature"].is_null());
+
+    // Output-shape invariant: every "future side effect" flag is false.
+    assert_eq!(data["will_create_approval"], json!(false));
+    assert_eq!(data["will_sign"], json!(false));
+    assert_eq!(data["will_broadcast"], json!(false));
+    assert_eq!(data["requires_obligation_keypair"], json!(false));
+    assert_eq!(data["requires_user_signature"], json!(true));
+    assert_eq!(data["required_signers"], json!(["wallet"]));
+
+    // Body-wide forbidden field scan. Any leak of execution / signing /
+    // private-key material would surface here regardless of nesting.
+    let body_s = serde_json::to_string(&body).unwrap();
+    for forbidden in &[
+        "approval_request_id",
+        "signing_request_id",
+        "tx_signature",
+        "tx_bytes",
+        "signed_bytes",
+        "private_key",
+    ] {
+        assert!(
+            !body_s.contains(forbidden),
+            "preview response must not contain `{forbidden}` anywhere in body"
+        );
+    }
+}
+
+// Class AD — multi-tool rejection still triggers if the LLM tries to
+// batch `get_solend_position` and `preview_solend_withdraw_all` in the
+// SAME turn. The one-tool-per-turn rule overrides any combination of
+// allowlisted read-only tools.
+#[tokio::test]
+async fn class_ad_position_plus_preview_multi_tool_rejected_whole_turn() {
+    let prov = Arc::new(ScriptedLlmProvider::tool_calls(vec![
+        LlmToolCall {
+            id: "a".into(),
+            tool_name: "get_solend_position".into(),
+            input: json!({}),
+        },
+        LlmToolCall {
+            id: "b".into(),
+            tool_name: "preview_solend_withdraw_all".into(),
+            input: json!({ "obligation_pubkey": TARGET_OBLIGATION_BS58 }),
+        },
+    ]));
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message": "find my Solend obligation and preview withdraw in one go"})
+            .to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "multiple_tool_calls_rejected");
+    assert_eq!(body["count"], 2);
+}
+
+// Class AE — chat allowlist contains the preview tool AND continues to
+// EXCLUDE the (still un-implemented) `solend_withdraw_usdc` execution
+// tool. Locks the Phase 6I-B chat surface.
+#[test]
+fn class_ae_chat_allowlist_includes_preview_excludes_execution() {
+    let allowlist = claw_gateway::runtime::chat_wiring::CHAT_TOOL_ALLOWLIST;
+    assert!(
+        allowlist.contains(&"preview_solend_withdraw_all"),
+        "Phase 6I-B: preview tool must be in chat allowlist"
+    );
+    assert!(
+        !allowlist.contains(&"solend_withdraw_usdc"),
+        "withdraw EXECUTION tool must remain absent from chat allowlist"
+    );
+    // Phase 6H scanner still in (no regression).
+    assert!(
+        allowlist.contains(&"get_solend_position"),
+        "Phase 6H scanner must remain in chat allowlist"
+    );
+}
+
+// Class AF — execute-style prompts that try to skip preview and go
+// straight to withdraw must NOT be answered with an `awaiting_approval`
+// dispatch. The script returns assistant text (the alignment prompt
+// directs the LLM to refuse-and-explain), and the chat envelope is the
+// plain text outcome — no dispatched tool, no approval id.
+#[tokio::test]
+async fn class_af_execute_withdraw_prompt_does_not_create_approval_or_sign() {
+    let prov = scripted_assistant(
+        "Withdraw EXECUTION is not enabled yet. I can only PREVIEW the \
+         withdraw — give me the obligation pubkey and I'll run \
+         preview_solend_withdraw_all.",
+    );
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message": "Withdraw it now and sign it"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    // No tool was dispatched on this turn — assistant text only.
+    assert!(body["tool_name"].is_null(), "execute-style prompt must not dispatch a tool");
+    assert!(body["output"].is_null(), "execute-style prompt must not produce a tool output");
+    // No approval / signing artifact anywhere in the body.
+    let body_s = serde_json::to_string(&body).unwrap();
+    for forbidden in &[
+        "approval_request_id",
+        "signing_request_id",
+        "tx_signature",
+        "tx_bytes",
+        "signed_bytes",
+        "private_key",
+        "awaiting_approval",
+    ] {
+        assert!(
+            !body_s.contains(forbidden),
+            "execute-style refusal must not contain `{forbidden}` anywhere in body"
         );
     }
 }

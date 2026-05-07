@@ -563,7 +563,20 @@ impl GatewayDaemon {
             std::sync::Arc::new(rpc_pool.clone()),
             external_wallet.clone(),
         );
-        info!("get_wallet_balances + get_jupiter_quote + get_solend_position read-only chat tools active");
+        // Phase 6I-B — read-only Solend withdraw-all PREVIEW. Reuses
+        // the same `Arc<RpcPool>` and `ExternalWalletStore` as the
+        // scanner. Single-account `getAccountInfo` against the
+        // caller-supplied `obligation_pubkey`. No approval, no
+        // signing, no broadcast — `required_capabilities: vec![]`.
+        let registry = crate::runtime::copilot_tools_wiring::wire_preview_solend_withdraw_all_tool(
+            registry,
+            std::sync::Arc::new(rpc_pool.clone()),
+            external_wallet.clone(),
+        );
+        info!(
+            "get_wallet_balances + get_jupiter_quote + get_solend_position + \
+             preview_solend_withdraw_all read-only chat tools active"
+        );
         // Phase 4C-6: Solend submit HTTP handler. Bridges the API trait
         // to the 4C-5 submit pipeline + 4C-6 lifecycle cache. No new
         // background task, no new blockhash/signer path — the handler

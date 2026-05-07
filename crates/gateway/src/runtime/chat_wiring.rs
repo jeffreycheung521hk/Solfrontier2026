@@ -153,6 +153,39 @@ say \"I found the on-chain obligation at X with N USDC-reserve \
 deposit entries\" when found, or \"I found no Solend obligation \
 owned by this wallet\" when the scan returns empty. \
 \n\n\
+`preview_solend_withdraw_all` takes a single required field \
+`obligation_pubkey` (base58 string — typically one of the \
+`obligation_pubkey` values returned by `get_solend_position`) and \
+returns a read-only PREVIEW of whether that obligation is safe for \
+withdraw-all. It never signs, never broadcasts, never creates an \
+approval, never builds a transaction the user could submit — it only \
+re-fetches that one obligation, decodes it, and reports preconditions. \
+The output's `mode` is always `withdraw_all_collateral`; \
+`requires_user_signature` is always `true`; \
+`requires_obligation_keypair`, `will_create_approval`, `will_sign`, and \
+`will_broadcast` are always `false`. The `collateral_amount_raw` is the \
+deposited cToken amount; `underlying_usdc_estimate_raw` is `null` (the \
+exchange-rate decode is a future slice). \
+\n\n\
+Call `preview_solend_withdraw_all` when the user asks to PREVIEW, \
+CHECK, VERIFY, or CONFIRM whether a specific Solend obligation can be \
+withdrawn — for example: \"preview withdraw-all for obligation \
+HcKrv5Jo...\", \"can I withdraw all from obligation HcKrv5Jo...?\", \
+\"check whether this Solend obligation is withdrawable: \
+HcKrv5Jo...\". The user MUST provide an explicit obligation pubkey; \
+do NOT invent one and do NOT silently pick from a prior \
+`get_solend_position` result. \
+\n\n\
+Do NOT call `preview_solend_withdraw_all` when the user asks to \
+EXECUTE a withdraw (\"withdraw it now\", \"take my 5 USDC out\", \
+\"sign and submit the withdrawal\"). Withdraw EXECUTION is not enabled \
+yet — for those requests respond with plain text explaining that you \
+can only PREVIEW the withdraw, not execute it, and offer to run the \
+preview if the user supplies an obligation pubkey. Do NOT batch \
+`get_solend_position` and `preview_solend_withdraw_all` in the same \
+turn — the one-tool-per-turn rule applies; if the user wants both, \
+call the scanner first and stop. \
+\n\n\
 When the user makes a CONDITIONAL request (for example \"deposit \
 0.001 USDC into Solend if my balance is above 0.3\", or \"if I have \
 enough SOL, swap 0.001 SOL to USDC\"), call the appropriate \
@@ -184,6 +217,14 @@ pub const CHAT_TOOL_ALLOWLIST: &[&str] = &[
     // no approval. Lets the assistant answer "where is my deposit?"
     // without exposing withdraw.
     "get_solend_position",
+    // Phase 6I-B — read-only Solend withdraw-all PREVIEW for a specific
+    // obligation pubkey. Validates owner / borrow-free / has-USDC-deposit
+    // and returns a structured preview. Strictly preview-only:
+    // `required_capabilities: vec![]`, no approval, no signing, no
+    // broadcast, no execution. The withdraw EXECUTION tool
+    // (`solend_withdraw_usdc`) remains absent from this list and from
+    // production builds — its substrate is `#[cfg(test)]` gated.
+    "preview_solend_withdraw_all",
 ];
 
 /// Build a registry containing only the tools in [`CHAT_TOOL_ALLOWLIST`]

@@ -34,6 +34,7 @@ use crate::tools::get_jupiter_quote::{GetJupiterQuoteTool, JupiterClientQuoteSou
 use crate::tools::get_solend_position::{GetSolendPositionTool, RpcSolendPositionReader, SolendPositionReader};
 use crate::tools::get_wallet_balances::{GetWalletBalancesTool, RpcWalletBalanceReader};
 use crate::tools::jupiter_swap::SessionBoundWallet;
+use crate::tools::preview_solend_withdraw_all::PreviewSolendWithdrawAllTool;
 
 /// Register the read-only `get_wallet_balances` tool in the registry.
 ///
@@ -83,6 +84,27 @@ pub fn wire_get_solend_position_tool(
     let reader: Arc<dyn SolendPositionReader> =
         Arc::new(RpcSolendPositionReader::new(rpc_pool));
     let tool = Arc::new(GetSolendPositionTool::new(session_wallet, reader));
+    registry.with_tool(tool)
+}
+
+/// Phase 6I-B — Register the read-only `preview_solend_withdraw_all` tool.
+///
+/// Composes against the same [`SolendPositionReader`] seam Phase 6H wires
+/// for `get_solend_position` (single-account `getAccountInfo` against the
+/// caller-supplied `obligation_pubkey`, plus `find_obligations_for_owner`
+/// for trait completeness — the preview tool only invokes
+/// `get_account_data`). Exposes `required_capabilities: vec![]`. Returns
+/// a structured preview only — no approval, no signing handoff, no
+/// broadcast call site is added by this wiring.
+pub fn wire_preview_solend_withdraw_all_tool(
+    registry: ToolRegistry,
+    rpc_pool: Arc<claw_solana_core::rpc::RpcPool>,
+    external_wallet: ExternalWalletStore,
+) -> ToolRegistry {
+    let session_wallet: Arc<dyn SessionBoundWallet> = Arc::new(external_wallet);
+    let reader: Arc<dyn SolendPositionReader> =
+        Arc::new(RpcSolendPositionReader::new(rpc_pool));
+    let tool = Arc::new(PreviewSolendWithdrawAllTool::new(session_wallet, reader));
     registry.with_tool(tool)
 }
 
@@ -177,6 +199,91 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "get_solend_position"),
             "registry must contain `get_solend_position` after wiring; got {names:?}"
+        );
+    }
+
+    /// Phase 6I-B wiring guard. Mirror of the Phase 6H test, asserting
+    /// that the preview helper inserts the tool under its canonical name.
+    #[test]
+    fn wire_preview_solend_withdraw_all_tool_registers_under_correct_name() {
+        let pool = Arc::new(RpcPool::new(RpcPoolConfig {
+            endpoints: vec![EndpointConfig {
+                url: "http://localhost:0".to_string(),
+                is_write_endpoint: false,
+                label: "phase6ib-test".to_string(),
+            }],
+            failure_threshold: 3,
+            recovery_interval: Duration::from_secs(30),
+            request_timeout: Duration::from_millis(100),
+        }));
+        let wallet = ExternalWalletStore::new();
+        let registry =
+            wire_preview_solend_withdraw_all_tool(ToolRegistry::new(), pool, wallet);
+        let names = registry.names();
+        assert!(
+            names.iter().any(|n| n == "preview_solend_withdraw_all"),
+            "registry must contain `preview_solend_withdraw_all` after wiring; got {names:?}"
+        );
+    }
+
+    /// Phase 6I-B compositional guard. After wiring all read-only chat
+    /// tools (Phase 6C balances + Phase 6C quote + Phase 6H scanner +
+    /// Phase 6I-B preview), every name appears once and only once and
+    /// the chat narrowing returns all four.
+    #[test]
+    fn all_read_only_chat_tools_compose_and_narrow_to_chat() {
+        let rpc = dummy_rpc_client();
+        let wallet = ExternalWalletStore::new();
+        let stub_client: Arc<dyn JupiterClient> = Arc::new(StubJupiterClient);
+        let pool = Arc::new(RpcPool::new(RpcPoolConfig {
+            endpoints: vec![EndpointConfig {
+                url: "http://localhost:0".to_string(),
+                is_write_endpoint: false,
+                label: "phase6ib-compose".to_string(),
+            }],
+            failure_threshold: 3,
+            recovery_interval: Duration::from_secs(30),
+            request_timeout: Duration::from_millis(100),
+        }));
+
+        let registry = ToolRegistry::new();
+        let registry = wire_get_wallet_balances_tool(registry, rpc, wallet.clone());
+        let registry = wire_get_jupiter_quote_tool(registry, stub_client);
+        let registry =
+            wire_get_solend_position_tool(registry, pool.clone(), wallet.clone());
+        let registry =
+            wire_preview_solend_withdraw_all_tool(registry, pool, wallet);
+
+        let mut names = registry.names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "get_jupiter_quote".to_string(),
+                "get_solend_position".to_string(),
+                "get_wallet_balances".to_string(),
+                "preview_solend_withdraw_all".to_string(),
+            ]
+        );
+
+        // Chat narrowing must surface all four read-only tools, and
+        // must NOT surface any execution tool name.
+        let narrowed = crate::runtime::chat_wiring::narrow_registry_for_chat(&registry)
+            .expect("narrow_registry_for_chat must return Some when read-only tools present");
+        let mut narrowed_names = narrowed.names();
+        narrowed_names.sort();
+        assert_eq!(
+            narrowed_names,
+            vec![
+                "get_jupiter_quote".to_string(),
+                "get_solend_position".to_string(),
+                "get_wallet_balances".to_string(),
+                "preview_solend_withdraw_all".to_string(),
+            ]
+        );
+        assert!(
+            !narrowed_names.contains(&"solend_withdraw_usdc".to_string()),
+            "execution tool `solend_withdraw_usdc` must NOT appear in narrowed chat registry"
         );
     }
 
