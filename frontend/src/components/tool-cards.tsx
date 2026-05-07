@@ -56,6 +56,8 @@ export function ToolResultCard({
       return <SolendDepositCard output={output} />;
     case "get_solend_position":
       return <SolendPositionCard output={output} />;
+    case "preview_solend_withdraw_all":
+      return <SolendWithdrawPreviewCard output={output} />;
     default:
       return <GenericToolCard toolName={toolName} output={output} />;
   }
@@ -1035,6 +1037,440 @@ function PositionRow({ position }: { position: SolendPositionEntry }) {
         />
       )}
     </div>
+  );
+}
+
+// ── preview_solend_withdraw_all ─────────────────────────────────────────────
+//
+// Phase 6I-C — read-only preview card for withdraw-all on the session
+// wallet's Solend / Save USDC obligation. PURELY informational.
+//
+// IMPORTANT (per Phase 6I-C prompt): this card MUST NOT
+//   - render an active withdraw button (no <Button> with onClick)
+//   - call any API (no fetch, no signTransaction, no signMessage,
+//     no submit, no broadcast)
+//   - link to /approval (no Review & Approve)
+//   - render a Review & Approve flow
+//
+// The single "Withdraw execution coming in Phase 6I-D" line is a
+// non-interactive plain <div>, not a Button — surfacing the roadmap
+// without implying an action available now.
+//
+// Backend statuses (`crates/gateway/src/tools/preview_solend_withdraw_all.rs`):
+//   - "ok"                          preview computed successfully
+//   - "wallet_not_bound"            no wallet bound to this session
+//   - "invalid_obligation_pubkey"   pubkey arg failed to parse
+//   - "obligation_not_found"        on-chain account doesn't exist
+//   - "owner_mismatch"              obligation belongs to a different wallet
+//   - "no_usdc_deposit"             obligation has no USDC main-pool deposit
+//   - "unsafe_to_withdraw_all"      obligation has borrows; withdraw-all blocked
+//   - "rpc_error"                   RPC call failed during scan
+//   - "decode_error"                obligation bytes failed to decode
+
+interface SolendWithdrawPreviewData {
+  status?:
+    | "ok"
+    | "wallet_not_bound"
+    | "invalid_obligation_pubkey"
+    | "obligation_not_found"
+    | "owner_mismatch"
+    | "no_usdc_deposit"
+    | "unsafe_to_withdraw_all"
+    | "rpc_error"
+    | "decode_error";
+  mode?: string | null;
+  protocol?: string | null;
+  network?: string | null;
+  program_id?: string | null;
+  wallet_pubkey?: string | null;
+  obligation_pubkey?: string | null;
+  lending_market?: string | null;
+  reserve_pubkey?: string | null;
+  reserve_mint?: string | null;
+  collateral_amount_raw?: string | number | null;
+  underlying_usdc_estimate_raw?: string | number | null;
+  underlying_usdc_estimate_ui?: string | null;
+  estimate_unavailable_reason?: string | null;
+  requires_user_signature?: boolean | null;
+  required_signers?: string[] | null;
+  requires_obligation_keypair?: boolean | null;
+  will_create_approval?: boolean | null;
+  will_sign?: boolean | null;
+  will_broadcast?: boolean | null;
+  next_step?: string | null;
+  reason?: string | null;
+  phase?: string | null;
+  decoded_owner?: string | null;
+  borrow_entry_count?: number | null;
+}
+
+export function SolendWithdrawPreviewCard({ output }: { output: unknown }) {
+  const data = (output as { data?: SolendWithdrawPreviewData })?.data ?? {};
+  const status = data.status;
+  const variant =
+    status === "ok"
+      ? "default"
+      : status === "wallet_not_bound" ||
+          status === "invalid_obligation_pubkey" ||
+          status === "obligation_not_found" ||
+          status === "no_usdc_deposit"
+        ? "outline"
+        : "destructive";
+
+  return (
+    <Card className="border-foreground/15" data-testid="card-solend-withdraw-preview">
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-sm font-medium">
+            Solend Withdraw Preview
+          </CardTitle>
+          {status && (
+            <Badge variant={variant} className="text-xs">
+              {status === "ok" ? "preview only" : status.replace(/_/g, " ")}
+            </Badge>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {status === "ok" && (
+          <div className="space-y-3 text-xs">
+            <div className="text-foreground/90">
+              This position can be previewed for withdraw-all. No approval, signing, or
+              broadcast has happened.
+            </div>
+
+            <div className="space-y-1">
+              <KeyValueRow
+                k="protocol"
+                v={
+                  <span className="font-mono text-foreground">
+                    {data.protocol ?? "Solend/Save"}
+                  </span>
+                }
+              />
+              <KeyValueRow
+                k="network"
+                v={
+                  <span className="font-mono text-foreground">
+                    {data.network ?? "mainnet"}
+                  </span>
+                }
+              />
+              <KeyValueRow
+                k="mode"
+                v={
+                  <span className="font-mono text-foreground">
+                    {data.mode ?? "withdraw_all_collateral"}
+                  </span>
+                }
+              />
+              {data.wallet_pubkey && (
+                <KeyValueRow
+                  k="wallet"
+                  v={
+                    <code className="text-foreground">
+                      {shortPubkey(data.wallet_pubkey, 6)}
+                    </code>
+                  }
+                />
+              )}
+              {data.obligation_pubkey && (
+                <KeyValueRow
+                  k="obligation"
+                  v={
+                    <code className="text-foreground">
+                      {shortPubkey(data.obligation_pubkey, 6)}
+                    </code>
+                  }
+                />
+              )}
+              {data.lending_market && (
+                <KeyValueRow
+                  k="lending market"
+                  v={
+                    <code className="text-muted-foreground">
+                      {shortPubkey(data.lending_market, 6)}
+                    </code>
+                  }
+                />
+              )}
+              {data.reserve_pubkey && (
+                <KeyValueRow
+                  k="reserve"
+                  v={
+                    <code className="text-muted-foreground">
+                      {shortPubkey(data.reserve_pubkey, 6)}
+                    </code>
+                  }
+                />
+              )}
+              {data.reserve_mint && (
+                <KeyValueRow
+                  k="reserve mint"
+                  v={
+                    <code className="text-muted-foreground">
+                      {shortPubkey(data.reserve_mint, 6)}
+                    </code>
+                  }
+                />
+              )}
+              {data.collateral_amount_raw != null && (
+                <KeyValueRow
+                  k="cToken raw"
+                  v={
+                    <span className="font-mono text-foreground break-all">
+                      {String(data.collateral_amount_raw)}
+                    </span>
+                  }
+                />
+              )}
+            </div>
+
+            <Separator />
+
+            <div className="space-y-1">
+              <div className="text-foreground/80 font-medium">Underlying USDC estimate</div>
+              {data.underlying_usdc_estimate_ui ? (
+                <div className="font-mono text-foreground">
+                  {data.underlying_usdc_estimate_ui} USDC
+                </div>
+              ) : (
+                <div
+                  className="text-muted-foreground italic"
+                  title={data.estimate_unavailable_reason ?? undefined}
+                >
+                  USDC estimate unavailable
+                  {data.estimate_unavailable_reason && (
+                    <span className="ml-1 text-[10px]">(hover for reason)</span>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <Separator />
+
+            <div className="space-y-1">
+              <div className="text-foreground/80 font-medium">Signing requirements</div>
+              <KeyValueRow
+                k="requires user signature"
+                v={
+                  <span className="font-mono text-foreground">
+                    {data.requires_user_signature === true ? "yes" : data.requires_user_signature === false ? "no" : "—"}
+                  </span>
+                }
+              />
+              <KeyValueRow
+                k="required signers"
+                v={
+                  <span className="font-mono text-foreground">
+                    {Array.isArray(data.required_signers) && data.required_signers.length > 0
+                      ? data.required_signers.join(", ")
+                      : "—"}
+                  </span>
+                }
+              />
+              <KeyValueRow
+                k="requires obligation keypair"
+                v={
+                  <span className="font-mono text-foreground">
+                    {data.requires_obligation_keypair === true ? "yes" : data.requires_obligation_keypair === false ? "no" : "—"}
+                  </span>
+                }
+              />
+            </div>
+
+            <Separator />
+
+            <div className="space-y-1">
+              <div className="text-foreground/80 font-medium">Safety checklist</div>
+              <SafetyFlagRow label="will create approval" value={data.will_create_approval} />
+              <SafetyFlagRow label="will sign" value={data.will_sign} />
+              <SafetyFlagRow label="will broadcast" value={data.will_broadcast} />
+            </div>
+
+            {data.next_step && (
+              <>
+                <Separator />
+                <p className="text-[11px] text-muted-foreground italic break-words">
+                  {data.next_step}
+                </p>
+              </>
+            )}
+
+            {/*
+              Phase 6I-C scope explicitly excludes withdraw execution.
+              This line is a non-interactive plain <div> — no <Button>,
+              no <Link>, no onClick, no fetch. Surfacing the roadmap
+              signal without implying any action available now.
+            */}
+            <div
+              className="text-[11px] text-muted-foreground italic"
+              data-testid="withdraw-execution-coming-soon"
+            >
+              Withdraw execution coming in Phase 6I-D.
+            </div>
+          </div>
+        )}
+
+        {status === "wallet_not_bound" && (
+          <Alert>
+            <AlertTitle>No wallet bound to this session</AlertTitle>
+            <AlertDescription>
+              {data.reason ??
+                "Bind a wallet via the wallet-bind challenge on /chat before previewing Solend withdraws."}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {status === "invalid_obligation_pubkey" && (
+          <Alert>
+            <AlertTitle>Invalid obligation pubkey</AlertTitle>
+            <AlertDescription className="break-words">
+              {data.reason ??
+                "The obligation pubkey supplied is not a valid base58 Solana address."}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {status === "obligation_not_found" && (
+          <Alert>
+            <AlertTitle>Obligation not found on chain</AlertTitle>
+            <AlertDescription className="space-y-1 break-words">
+              <div>{data.reason ?? "Obligation account does not exist on chain."}</div>
+              {data.obligation_pubkey && (
+                <div className="text-[11px] text-muted-foreground">
+                  pubkey:{" "}
+                  <code className="text-foreground">
+                    {shortPubkey(data.obligation_pubkey, 6)}
+                  </code>
+                </div>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {status === "owner_mismatch" && (
+          <Alert variant="destructive">
+            <AlertTitle>Obligation owner does not match this wallet</AlertTitle>
+            <AlertDescription className="space-y-1 break-words">
+              <div>
+                {data.reason ??
+                  "This obligation is not owned by the bound wallet. Preview blocked to prevent acting on someone else's position."}
+              </div>
+              {data.wallet_pubkey && (
+                <div className="text-[11px] text-muted-foreground">
+                  bound wallet:{" "}
+                  <code className="text-foreground">{shortPubkey(data.wallet_pubkey, 6)}</code>
+                </div>
+              )}
+              {data.decoded_owner && (
+                <div className="text-[11px] text-muted-foreground">
+                  obligation owner:{" "}
+                  <code className="text-foreground">{shortPubkey(data.decoded_owner, 6)}</code>
+                </div>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {status === "no_usdc_deposit" && (
+          <Alert>
+            <AlertTitle>No Solend Main Pool USDC deposit found</AlertTitle>
+            <AlertDescription className="space-y-1 break-words">
+              <div>
+                {data.reason ??
+                  "Obligation has no non-zero deposit entry for the Solend / Save Main Pool USDC reserve; nothing to withdraw via this preview."}
+              </div>
+              {data.obligation_pubkey && (
+                <div className="text-[11px] text-muted-foreground">
+                  obligation:{" "}
+                  <code className="text-foreground">
+                    {shortPubkey(data.obligation_pubkey, 6)}
+                  </code>
+                </div>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {status === "unsafe_to_withdraw_all" && (
+          <Alert variant="destructive">
+            <AlertTitle>Unsafe to withdraw all collateral</AlertTitle>
+            <AlertDescription className="space-y-1 break-words">
+              <div>
+                {data.reason ??
+                  "Withdraw-all preview blocked because this obligation has borrow entries. Withdrawing all collateral here would risk health-factor / liquidation."}
+              </div>
+              {typeof data.borrow_entry_count === "number" && (
+                <div className="text-[11px] text-muted-foreground">
+                  borrow entries:{" "}
+                  <span className="font-mono text-foreground">{data.borrow_entry_count}</span>
+                </div>
+              )}
+              {data.obligation_pubkey && (
+                <div className="text-[11px] text-muted-foreground">
+                  obligation:{" "}
+                  <code className="text-foreground">
+                    {shortPubkey(data.obligation_pubkey, 6)}
+                  </code>
+                </div>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {status === "rpc_error" && (
+          <Alert variant="destructive">
+            <AlertTitle>RPC error during withdraw preview</AlertTitle>
+            <AlertDescription className="space-y-1 break-words">
+              <div>{data.reason ?? "Upstream RPC call failed."}</div>
+              {data.phase && (
+                <div className="text-[11px] text-muted-foreground">
+                  phase: <code>{data.phase}</code>
+                </div>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {status === "decode_error" && (
+          <Alert variant="destructive">
+            <AlertTitle>Obligation decode failed</AlertTitle>
+            <AlertDescription className="break-words">
+              {data.reason ?? "Obligation account bytes failed to decode."}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        <RawOutputDetails output={output} />
+      </CardContent>
+    </Card>
+  );
+}
+
+function SafetyFlagRow({
+  label,
+  value,
+}: {
+  label: string;
+  value: boolean | null | undefined;
+}) {
+  // The preview tool always asserts these as `false`. We render any
+  // unexpected `true` (or missing) value distinctly so a future-proof
+  // operator catches a wire-shape change in the audit detail panel.
+  const display =
+    value === false ? "false" : value === true ? "true" : "—";
+  const tone =
+    value === false
+      ? "text-foreground"
+      : value === true
+        ? "text-destructive font-semibold"
+        : "text-muted-foreground";
+  return (
+    <KeyValueRow
+      k={label}
+      v={<span className={`font-mono ${tone}`}>{display}</span>}
+    />
   );
 }
 
