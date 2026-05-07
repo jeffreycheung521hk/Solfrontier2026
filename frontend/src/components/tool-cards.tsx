@@ -54,6 +54,8 @@ export function ToolResultCard({
       return <JupiterQuoteCard output={output} />;
     case "solend_deposit_usdc":
       return <SolendDepositCard output={output} />;
+    case "get_solend_position":
+      return <SolendPositionCard output={output} />;
     default:
       return <GenericToolCard toolName={toolName} output={output} />;
   }
@@ -629,6 +631,410 @@ export function SolendDepositCard({ output }: { output: unknown }) {
         <RawOutputDetails output={output} />
       </CardContent>
     </Card>
+  );
+}
+
+// ── get_solend_position ─────────────────────────────────────────────────────
+//
+// Phase 6H — read-only scanner for the session wallet's Solend / Save USDC
+// obligation(s). No signing, no withdraw, no approval; this card is purely
+// informational. See `crates/gateway/src/tools/get_solend_position.rs`.
+//
+// Statuses (from STATUS_* constants in the backend):
+//   - "ok"               position(s) found and decoded successfully
+//   - "no_position"      wallet bound, no obligations on chain
+//   - "wallet_not_bound" no wallet bound to this session
+//   - "rpc_error"        RPC failure during obligation scan
+//   - "decode_error"     obligation account bytes failed to decode
+//
+// Per-position shape (from `position_entry` / `borrow_entry`):
+//   - kind                              "deposit" | "borrow"
+//   - obligation_pubkey, owner_pubkey, lending_market, reserve_pubkey
+//   - is_usdc_main_pool_reserve         bool
+//   - deposited_collateral_amount_raw   string (u64) | null  (deposits)
+//   - supplied_usdc_estimate_raw        null  (cToken→USDC conversion deferred)
+//   - supplied_usdc_estimate_ui         null
+//   - estimate_unavailable_reason       string | null
+//   - borrowed_amount_raw               string (u128 wad-scaled) | null  (borrows)
+//   - borrowed_amount_ui                null
+//   - has_borrow                        bool
+//   - source                            "obligation_scan"
+//
+// IMPORTANT (per Phase 6H prompt): this card MUST NOT
+//   - link to /approval for any position row
+//   - call any withdraw API
+//   - render a clickable withdraw button (the muted "Withdraw preview
+//     coming in Phase 6I" line is intentionally a non-interactive note)
+
+interface SolendPositionEntry {
+  kind?: "deposit" | "borrow" | string;
+  obligation_pubkey?: string | null;
+  owner_pubkey?: string | null;
+  lending_market?: string | null;
+  reserve_pubkey?: string | null;
+  is_usdc_main_pool_reserve?: boolean | null;
+  deposited_collateral_amount_raw?: string | null;
+  supplied_usdc_estimate_raw?: string | number | null;
+  supplied_usdc_estimate_ui?: string | null;
+  estimate_unavailable_reason?: string | null;
+  borrowed_amount_raw?: string | null;
+  borrowed_amount_ui?: string | null;
+  has_borrow?: boolean | null;
+  source?: string | null;
+}
+
+interface SolendPositionData {
+  status?: "ok" | "no_position" | "wallet_not_bound" | "rpc_error" | "decode_error";
+  wallet_pubkey?: string | null;
+  network?: string | null;
+  protocol?: string | null;
+  program_id?: string | null;
+  lending_market?: string | null;
+  usdc_main_pool_reserve?: string | null;
+  usdc_main_pool_mint?: string | null;
+  obligation_count?: number | null;
+  usdc_deposit_position_count?: number | null;
+  positions?: SolendPositionEntry[] | null;
+  decode_warnings?: string[] | null;
+  dashboard_visibility_note?: string | null;
+  reason?: string | null;
+  phase?: string | null;
+}
+
+export function SolendPositionCard({ output }: { output: unknown }) {
+  const data = (output as { data?: SolendPositionData })?.data ?? {};
+  const status = data.status;
+  const variant =
+    status === "ok"
+      ? "default"
+      : status === "no_position" || status === "wallet_not_bound"
+        ? "outline"
+        : "destructive";
+
+  const positions = Array.isArray(data.positions) ? data.positions : [];
+
+  return (
+    <Card className="border-foreground/15" data-testid="card-solend-position">
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-sm font-medium">
+            Solend Position
+          </CardTitle>
+          {status && (
+            <Badge variant={variant} className="text-xs">
+              {status === "ok" ? "found" : status.replace(/_/g, " ")}
+            </Badge>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {status === "ok" && (
+          <div className="space-y-3 text-xs">
+            <div className="text-foreground/90">
+              Found{" "}
+              <span className="font-mono text-foreground">
+                {data.usdc_deposit_position_count ?? positions.filter((p) => p.kind === "deposit").length}
+              </span>{" "}
+              Solend / Save USDC position(s) owned by this wallet.
+            </div>
+
+            <div className="space-y-1">
+              {data.wallet_pubkey && (
+                <KeyValueRow
+                  k="wallet"
+                  v={
+                    <code className="text-foreground">{shortPubkey(data.wallet_pubkey, 6)}</code>
+                  }
+                />
+              )}
+              <KeyValueRow
+                k="protocol"
+                v={
+                  <span className="font-mono text-foreground">
+                    {data.protocol ?? "Solend/Save"}
+                  </span>
+                }
+              />
+              <KeyValueRow
+                k="network"
+                v={
+                  <span className="font-mono text-foreground">
+                    {data.network ?? "mainnet"}
+                  </span>
+                }
+              />
+              {data.lending_market && (
+                <KeyValueRow
+                  k="lending market"
+                  v={
+                    <code className="text-muted-foreground">
+                      {shortPubkey(data.lending_market, 6)}
+                    </code>
+                  }
+                />
+              )}
+              {data.usdc_main_pool_reserve && (
+                <KeyValueRow
+                  k="USDC reserve"
+                  v={
+                    <code className="text-muted-foreground">
+                      {shortPubkey(data.usdc_main_pool_reserve, 6)}
+                    </code>
+                  }
+                />
+              )}
+              {typeof data.obligation_count === "number" && (
+                <KeyValueRow
+                  k="obligations"
+                  v={
+                    <span className="font-mono text-foreground">
+                      {data.obligation_count}
+                    </span>
+                  }
+                />
+              )}
+              {typeof data.usdc_deposit_position_count === "number" && (
+                <KeyValueRow
+                  k="USDC deposits"
+                  v={
+                    <span className="font-mono text-foreground">
+                      {data.usdc_deposit_position_count}
+                    </span>
+                  }
+                />
+              )}
+            </div>
+
+            <Separator />
+
+            <div className="space-y-1">
+              <div className="text-foreground/80 font-medium">Custody</div>
+              <p className="text-[11px] text-muted-foreground">
+                Owner field matches your bound wallet. Withdraw will require your
+                Phantom signature.
+              </p>
+            </div>
+
+            {data.dashboard_visibility_note && (
+              <Alert className="border-amber-500/40">
+                <AlertTitle className="text-xs">Dashboard visibility note</AlertTitle>
+                <AlertDescription className="text-[11px] break-words">
+                  Solend dashboard may not show these positions because it may use
+                  different obligation discovery rules. (Discovery / indexing only — not
+                  a custody transfer.)
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {positions.length > 0 && (
+              <>
+                <Separator />
+                <div className="space-y-2">
+                  <div className="text-foreground/80 font-medium">Positions</div>
+                  <ul className="space-y-2">
+                    {positions.map((p, i) => (
+                      <li key={i}>
+                        <PositionRow position={p} />
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </>
+            )}
+
+            {Array.isArray(data.decode_warnings) && data.decode_warnings.length > 0 && (
+              <Alert className="border-amber-500/40">
+                <AlertTitle className="text-xs">Decode warnings</AlertTitle>
+                <AlertDescription className="text-[11px] space-y-1">
+                  {data.decode_warnings.map((w, i) => (
+                    <div key={i} className="break-words font-mono">{w}</div>
+                  ))}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            <Separator />
+            {/*
+              Phase 6H scope explicitly excludes withdraw execution. This
+              line is a non-interactive placeholder ONLY — no onClick, no
+              <Button>, no Link, no withdraw API call. Surfacing the
+              roadmap signal without implying any action available now.
+            */}
+            <div
+              className="text-[11px] text-muted-foreground italic"
+              data-testid="withdraw-coming-soon"
+            >
+              Withdraw preview coming in Phase 6I.
+            </div>
+          </div>
+        )}
+
+        {status === "no_position" && (
+          <div className="space-y-2 text-xs">
+            <Alert>
+              <AlertTitle>No Solend / Save USDC position found</AlertTitle>
+              <AlertDescription>
+                No obligations were discovered on chain for this bound wallet. If you
+                expected positions here, double-check that the wallet currently bound
+                to this session is the same wallet that holds the Solend deposit.
+              </AlertDescription>
+            </Alert>
+            {data.wallet_pubkey && (
+              <KeyValueRow
+                k="bound wallet"
+                v={<code className="text-foreground">{shortPubkey(data.wallet_pubkey, 6)}</code>}
+              />
+            )}
+          </div>
+        )}
+
+        {status === "wallet_not_bound" && (
+          <Alert>
+            <AlertTitle>No wallet bound to this session</AlertTitle>
+            <AlertDescription>
+              {data.reason ??
+                "Bind a wallet via the wallet-bind challenge on /chat before scanning Solend positions."}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {status === "rpc_error" && (
+          <Alert variant="destructive">
+            <AlertTitle>RPC error scanning Solend</AlertTitle>
+            <AlertDescription className="space-y-1 break-words">
+              <div>{data.reason ?? "Upstream RPC failed."}</div>
+              {data.phase && (
+                <div className="text-[11px] text-muted-foreground">
+                  phase: <code>{data.phase}</code>
+                </div>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {status === "decode_error" && (
+          <Alert variant="destructive">
+            <AlertTitle>Obligation decode failed</AlertTitle>
+            <AlertDescription className="space-y-1 break-words">
+              <div>{data.reason ?? "Obligation account bytes failed to decode."}</div>
+              {Array.isArray(data.decode_warnings) && data.decode_warnings.length > 0 && (
+                <ul className="text-[11px] font-mono space-y-0.5 mt-1">
+                  {data.decode_warnings.map((w, i) => (
+                    <li key={i} className="break-words">{w}</li>
+                  ))}
+                </ul>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        <RawOutputDetails output={output} />
+      </CardContent>
+    </Card>
+  );
+}
+
+function PositionRow({ position }: { position: SolendPositionEntry }) {
+  const isBorrow = position.kind === "borrow" || position.has_borrow === true;
+  const isDeposit = position.kind === "deposit";
+
+  return (
+    <div
+      className={`rounded-md border px-3 py-2 space-y-1 ${
+        isBorrow ? "border-amber-500/50 bg-amber-500/5" : "border-border"
+      }`}
+      data-testid={`position-row-${position.kind ?? "unknown"}`}
+    >
+      <div className="flex items-center justify-between text-[11px]">
+        <span className="uppercase tracking-wide text-muted-foreground">
+          {position.kind ?? "position"}
+          {position.is_usdc_main_pool_reserve && (
+            <span className="ml-2 text-foreground">· USDC main pool</span>
+          )}
+        </span>
+        {isBorrow && (
+          <Badge variant="outline" className="text-[10px] border-amber-500/60">
+            has borrow
+          </Badge>
+        )}
+      </div>
+
+      {position.obligation_pubkey && (
+        <KeyValueRow
+          k="obligation"
+          v={
+            <code className="text-foreground">
+              {shortPubkey(position.obligation_pubkey, 6)}
+            </code>
+          }
+        />
+      )}
+      {position.owner_pubkey && (
+        <KeyValueRow
+          k="owner"
+          v={
+            <code className="text-foreground">{shortPubkey(position.owner_pubkey, 6)}</code>
+          }
+        />
+      )}
+      {position.reserve_pubkey && (
+        <KeyValueRow
+          k="reserve"
+          v={
+            <code className="text-muted-foreground">
+              {shortPubkey(position.reserve_pubkey, 6)}
+            </code>
+          }
+        />
+      )}
+
+      {isDeposit && position.deposited_collateral_amount_raw != null && (
+        <KeyValueRow
+          k="cToken raw"
+          v={
+            <span className="font-mono text-foreground">
+              {position.deposited_collateral_amount_raw}
+            </span>
+          }
+        />
+      )}
+
+      {isDeposit && (
+        <KeyValueRow
+          k="supplied USDC"
+          v={
+            position.supplied_usdc_estimate_ui ? (
+              <span className="font-mono text-foreground">
+                {position.supplied_usdc_estimate_ui} USDC
+              </span>
+            ) : (
+              <span
+                className="text-muted-foreground italic"
+                title={position.estimate_unavailable_reason ?? undefined}
+              >
+                USDC estimate unavailable
+                {position.estimate_unavailable_reason && (
+                  <span className="ml-1 text-[10px]">
+                    (hover for reason)
+                  </span>
+                )}
+              </span>
+            )
+          }
+        />
+      )}
+
+      {isBorrow && position.borrowed_amount_raw != null && (
+        <KeyValueRow
+          k="borrowed (wad)"
+          v={
+            <span className="font-mono text-foreground break-all">
+              {position.borrowed_amount_raw}
+            </span>
+          }
+        />
+      )}
+    </div>
   );
 }
 
