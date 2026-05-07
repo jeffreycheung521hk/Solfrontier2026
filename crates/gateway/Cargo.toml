@@ -38,6 +38,7 @@ hex           = { workspace = true }
 rand          = { workspace = true }
 solana-sdk    = { workspace = true }
 solana-client = { workspace = true }
+solana-account-decoder = { workspace = true }
 solana-transaction-status = { workspace = true }
 spl-associated-token-account = { workspace = true }
 async-trait = { workspace = true }

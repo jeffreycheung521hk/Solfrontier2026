@@ -882,12 +882,70 @@ impl Tool for QuoteStub {
     }
 }
 
+struct SolendPositionStub;
+
+#[async_trait]
+impl Tool for SolendPositionStub {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "get_solend_position".into(),
+            description: "test-only Phase 6H Solend position scanner stub".into(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {},
+            }),
+            output_schema: json!({"type": "object"}),
+            required_capabilities: vec![],
+            supports_streaming: false,
+            timeout_ms: 8_000,
+        }
+    }
+
+    async fn execute(&self, _input: ToolInput) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            tool_name: "get_solend_position".into(),
+            success: true,
+            data: Some(json!({
+                "status":                       "ok",
+                "wallet_pubkey":                "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW",
+                "network":                      "mainnet",
+                "protocol":                     "Solend/Save",
+                "program_id":                   "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
+                "lending_market":               "lendingMarketStubForP5D2_____________________",
+                "usdc_main_pool_reserve":       "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw",
+                "usdc_main_pool_mint":          "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "obligation_count":             1,
+                "usdc_deposit_position_count":  1,
+                "positions": [{
+                    "kind":                            "deposit",
+                    "obligation_pubkey":               "obligationStubP5D2_____________________________",
+                    "owner_pubkey":                    "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW",
+                    "lending_market":                  "lendingMarketStubForP5D2_____________________",
+                    "reserve_pubkey":                  "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw",
+                    "is_usdc_main_pool_reserve":       true,
+                    "deposited_collateral_amount_raw": "5000000",
+                    "supplied_usdc_estimate_raw":      null,
+                    "estimate_unavailable_reason":     "stub",
+                    "has_borrow":                      false,
+                    "source":                          "obligation_scan",
+                }],
+                "decode_warnings":              [],
+                "dashboard_visibility_note":    "stub note",
+            })),
+            error: None,
+            duration_ms: 0,
+        })
+    }
+}
+
 fn registry_with_all_chat_tools() -> ToolRegistry {
     ToolRegistry::from_tools(vec![
         Arc::new(SolendDepositStub),
         Arc::new(JupiterSwapStub),
         Arc::new(BalancesStub),
         Arc::new(QuoteStub),
+        Arc::new(SolendPositionStub),
     ])
 }
 
@@ -1057,4 +1115,53 @@ async fn class_aa_insufficient_balance_returns_assistant_text_no_proposal() {
     // Wire-shape: no tool_dispatched fields on this 200 path.
     assert!(body["tool_name"].is_null());
     assert!(body["output"].is_null());
+}
+
+// Class AB — Phase 6H position-scan: NL prompt routes to
+// `get_solend_position` and the chat handler returns 200 dispatched
+// with the structured position output. The tool advertises
+// `required_capabilities: vec![]` so this turn cannot create an
+// approval, signing handoff, or broadcast — those wire-shape fields
+// are absent from the response.
+#[tokio::test]
+async fn class_ab_solend_position_query_dispatched_returns_200_with_output() {
+    let prov = scripted_tool_call("get_solend_position", json!({}));
+    let ctx = build_ctx_with_registry(Some(prov.clone()), registry_with_all_chat_tools()).await;
+    let req = authed_post(
+        chat_uri(&ctx.sid),
+        json!({"message":"Where is my Solend deposit?"}).to_string(),
+    );
+    let (status, body) = send(&ctx.router, req).await;
+    assert_eq!(status, StatusCode::OK, "body={body:#}");
+    assert_eq!(body["status"], "tool_dispatched");
+    assert_eq!(body["tool_name"], "get_solend_position");
+    let data = &body["output"]["data"];
+    assert_eq!(data["status"], "ok");
+    assert_eq!(
+        data["usdc_main_pool_reserve"],
+        "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"
+    );
+    assert_eq!(data["usdc_deposit_position_count"], 1);
+    let positions = data["positions"].as_array().unwrap();
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0]["kind"], "deposit");
+    assert_eq!(positions[0]["is_usdc_main_pool_reserve"], true);
+    assert_eq!(positions[0]["source"], "obligation_scan");
+    // Read-only invariant: this dispatched response must NOT contain
+    // approval / signing / broadcast / tx_signature fields, and must
+    // not surface a private key or signed-bytes payload.
+    let body_s = serde_json::to_string(&body).unwrap();
+    for forbidden in &[
+        "approval_request_id",
+        "signing_request_id",
+        "tx_signature",
+        "tx_bytes",
+        "signed_bytes",
+        "private_key",
+    ] {
+        assert!(
+            !body_s.contains(forbidden),
+            "read-only response must not contain `{forbidden}` field"
+        );
+    }
 }

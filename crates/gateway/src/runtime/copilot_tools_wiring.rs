@@ -31,6 +31,7 @@ use claw_tool_system::registry::ToolRegistry;
 use crate::external_wallet::ExternalWalletStore;
 use crate::integrations::jupiter::JupiterClient;
 use crate::tools::get_jupiter_quote::{GetJupiterQuoteTool, JupiterClientQuoteSource};
+use crate::tools::get_solend_position::{GetSolendPositionTool, RpcSolendPositionReader, SolendPositionReader};
 use crate::tools::get_wallet_balances::{GetWalletBalancesTool, RpcWalletBalanceReader};
 use crate::tools::jupiter_swap::SessionBoundWallet;
 
@@ -63,6 +64,25 @@ pub fn wire_get_jupiter_quote_tool(
 ) -> ToolRegistry {
     let source = Arc::new(JupiterClientQuoteSource::new(jupiter_client));
     let tool = Arc::new(GetJupiterQuoteTool::new(source));
+    registry.with_tool(tool)
+}
+
+/// Phase 6H — Register the read-only `get_solend_position` tool.
+///
+/// Reuses the daemon's shared `Arc<RpcPool>` (same pool the
+/// confirmation tracker and assembler use) so circuit-breaker state
+/// and endpoint selection stay consistent. Discovery uses
+/// `getProgramAccounts` with `dataSize == 1300` + memcmp on the owner
+/// field — a bounded scan, not a wide one.
+pub fn wire_get_solend_position_tool(
+    registry: ToolRegistry,
+    rpc_pool: Arc<claw_solana_core::rpc::RpcPool>,
+    external_wallet: ExternalWalletStore,
+) -> ToolRegistry {
+    let session_wallet: Arc<dyn SessionBoundWallet> = Arc::new(external_wallet);
+    let reader: Arc<dyn SolendPositionReader> =
+        Arc::new(RpcSolendPositionReader::new(rpc_pool));
+    let tool = Arc::new(GetSolendPositionTool::new(session_wallet, reader));
     registry.with_tool(tool)
 }
 
@@ -136,6 +156,27 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "get_jupiter_quote"),
             "registry must contain `get_jupiter_quote` after wiring; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn wire_get_solend_position_tool_registers_under_correct_name() {
+        let pool = Arc::new(RpcPool::new(RpcPoolConfig {
+            endpoints: vec![EndpointConfig {
+                url: "http://localhost:0".to_string(),
+                is_write_endpoint: false,
+                label: "phase6h-test".to_string(),
+            }],
+            failure_threshold: 3,
+            recovery_interval: Duration::from_secs(30),
+            request_timeout: Duration::from_millis(100),
+        }));
+        let wallet = ExternalWalletStore::new();
+        let registry = wire_get_solend_position_tool(ToolRegistry::new(), pool, wallet);
+        let names = registry.names();
+        assert!(
+            names.iter().any(|n| n == "get_solend_position"),
+            "registry must contain `get_solend_position` after wiring; got {names:?}"
         );
     }
 

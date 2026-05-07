@@ -133,6 +133,26 @@ pass either the canonical base58 mint pubkey OR the symbols \
 symbols to canonical mints. Use it when the user asks \"how much X \
 would I get for Y?\" or compares routes before deciding to swap. \
 \n\n\
+`get_solend_position` takes no inputs and returns a read-only scan \
+of the session-bound wallet's Solend / Save obligations on mainnet. \
+It uses `getProgramAccounts` with bounded filters (1300-byte data \
+size + memcmp on the owner field) — it does NOT sign, build a \
+transaction, broadcast, or create an approval. Call it when the user \
+asks \"where is my Solend deposit?\", \"show my Solend position\", \
+\"why doesn't the Solend dashboard show my 5 USDC?\", \"find my \
+Solend USDC obligation\", or anything that asks the assistant to \
+LOCATE / CONFIRM an existing on-chain Solend USDC position. Do NOT \
+call this tool when the user asks to MAKE a new deposit — that path \
+is `solend_deposit_usdc`. The tool reports the obligation pubkey, \
+the lending market, and any USDC-reserve deposits with their cToken \
+amounts; it does not invent a USDC value if the exchange-rate \
+decode is not available in this slice (it returns \
+`supplied_usdc_estimate_raw: null` with an explicit \
+`estimate_unavailable_reason` string). Be honest about uncertainty: \
+say \"I found the on-chain obligation at X with N USDC-reserve \
+deposit entries\" when found, or \"I found no Solend obligation \
+owned by this wallet\" when the scan returns empty. \
+\n\n\
 When the user makes a CONDITIONAL request (for example \"deposit \
 0.001 USDC into Solend if my balance is above 0.3\", or \"if I have \
 enough SOL, swap 0.001 SOL to USDC\"), call the appropriate \
@@ -159,6 +179,11 @@ pub const CHAT_TOOL_ALLOWLIST: &[&str] = &[
     "submit_jupiter_swap",
     "get_wallet_balances",
     "get_jupiter_quote",
+    // Phase 6H — read-only Solend / Save position scanner. Pure
+    // `getProgramAccounts` + obligation decode; no signing, no broadcast,
+    // no approval. Lets the assistant answer "where is my deposit?"
+    // without exposing withdraw.
+    "get_solend_position",
 ];
 
 /// Build a registry containing only the tools in [`CHAT_TOOL_ALLOWLIST`]

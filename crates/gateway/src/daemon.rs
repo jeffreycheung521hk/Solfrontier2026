@@ -555,7 +555,15 @@ impl GatewayDaemon {
                 quote_client,
             )
         };
-        info!("get_wallet_balances + get_jupiter_quote read-only chat tools active");
+        // Phase 6H — read-only Solend / Save position scanner. Reuses
+        // the shared `Arc<RpcPool>` so circuit-breaker state stays
+        // consistent with the assembler / confirmation tracker.
+        let registry = crate::runtime::copilot_tools_wiring::wire_get_solend_position_tool(
+            registry,
+            std::sync::Arc::new(rpc_pool.clone()),
+            external_wallet.clone(),
+        );
+        info!("get_wallet_balances + get_jupiter_quote + get_solend_position read-only chat tools active");
         // Phase 4C-6: Solend submit HTTP handler. Bridges the API trait
         // to the 4C-5 submit pipeline + 4C-6 lifecycle cache. No new
         // background task, no new blockhash/signer path — the handler
