@@ -374,6 +374,24 @@ pub fn assemble_solend_withdraw_tx_plan(
         }),
     });
 
+    // Phase 6I-J — collect the obligation's deposit reserves in EXACT
+    // on-chain order. Solend's
+    // `update_borrow_attribution_values(&mut obligation, deposit_reserve_infos)`
+    // walks `obligation.deposits` in lockstep with `accounts[12..]` and
+    // packs each entry back, so the order MUST match what was decoded
+    // from the obligation account. We do NOT dedupe (the on-chain
+    // obligation can carry the same pubkey at multiple deposit slots
+    // only via a Solend program bug, but if it ever does we faithfully
+    // reproduce that), and we do NOT include borrow reserves here —
+    // those are not consumed by the combined withdraw ix.
+    let deposit_reserves_in_order: Vec<Pubkey> = fresh
+        .snapshot
+        .obligation
+        .deposits
+        .iter()
+        .map(|d| d.reserve)
+        .collect();
+
     // 9. Build the single withdraw ix from the un-wired ix builder.
     let withdraw_ix = build_withdraw_obligation_collateral_and_redeem_reserve_collateral_instruction(
         WithdrawInstructionInputs {
@@ -392,6 +410,7 @@ pub fn assemble_solend_withdraw_tx_plan(
             reserve_liquidity_supply: reserve.liquidity_supply_pubkey,
             obligation_owner: session_wallet,
             user_transfer_authority: session_wallet,
+            deposit_reserves_in_order,
         },
     )
     .map_err(SolendWithdrawTxPlanError::WithdrawBuildFailed)?;
@@ -710,8 +729,16 @@ mod tests {
         assert_eq!(plan.refresh_instructions[1].data, vec![7u8]);
     }
 
+    /// Phase 6I-H: RefreshObligation must place the target USDC reserve
+    /// at slot 1 (the first slot after the obligation), NOT slot 2 as
+    /// the prior `[obligation, clock, ...reserves]` layout produced.
+    /// The Solend mainnet program iterates `obligation.deposits` and
+    /// expects accounts `[1 + i]` to match each deposit's reserve;
+    /// shifting by clock at slot 1 caused the live failure
+    /// `4YnQFUTm…` to interpret the clock sysvar as collateral 0's
+    /// reserve and reject it (`InvalidAccountOwner`).
     #[test]
-    fn withdraw_plan_refresh_obligation_account_list_includes_target_reserve() {
+    fn withdraw_plan_refresh_obligation_target_reserve_is_at_slot_one_no_clock() {
         let (owner, mint) = fresh_owner_and_mint();
         let fresh = fresh_withdraw_assembled(owner, mint, 5_000, 0, true, true, true);
         let plan = assemble_solend_withdraw_tx_plan(
@@ -724,16 +751,33 @@ mod tests {
         )
         .unwrap();
         let refresh_obl_ix = &plan.refresh_instructions[1];
-        // RefreshObligation account list: [obligation, clock, ...reserves].
-        // Target reserve must appear.
-        let reserve_appears = refresh_obl_ix
-            .accounts
-            .iter()
-            .any(|a| a.pubkey == fresh.reserve_pubkey);
-        assert!(
-            reserve_appears,
-            "RefreshObligation must reference the target reserve",
+        // Phase 6I-H: account list is exactly [obligation, target_reserve].
+        // The single-deposit USDC obligation produces a 2-account ix.
+        assert_eq!(
+            refresh_obl_ix.accounts.len(),
+            2,
+            "single-deposit USDC obligation: [obligation, usdc_reserve] only"
         );
+        assert_eq!(
+            refresh_obl_ix.accounts[0].pubkey, fresh.obligation_pubkey,
+            "slot 0 = obligation"
+        );
+        assert!(refresh_obl_ix.accounts[0].is_writable);
+        assert_eq!(
+            refresh_obl_ix.accounts[1].pubkey, fresh.reserve_pubkey,
+            "slot 1 = USDC reserve (NOT slot 2 as the buggy clock-shifted layout produced)"
+        );
+        // Phase 6I-K: reserves at slot 1+ are WRITABLE per Solend SDK
+        // (`update_borrow_attribution_values` packs each reserve back).
+        assert!(refresh_obl_ix.accounts[1].is_writable);
+        // No clock sysvar anywhere in the RefreshObligation account list.
+        for (i, a) in refresh_obl_ix.accounts.iter().enumerate() {
+            assert_ne!(
+                a.pubkey,
+                solana_sdk::sysvar::clock::id(),
+                "clock sysvar must not appear (slot={i})"
+            );
+        }
     }
 
     #[test]
