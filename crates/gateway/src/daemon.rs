@@ -292,6 +292,11 @@ impl GatewayDaemon {
         let pending_signing   = PendingSigningStore::new();
         let pending_jupiter_park = crate::integrations::jupiter_park::PendingJupiterParkStore::new();
         let pending_solend_park = crate::integrations::solend_park::SolendParkStore::new();
+        // Phase 6I-E — withdraw-all park store. Created here (alongside the
+        // deposit / Jupiter pending stores) so the chat tool wiring and
+        // the approval handler share one cloneable handle.
+        let pending_solend_withdraw_park =
+            crate::integrations::solend_withdraw_park::SolendWithdrawAllParkStore::new();
         // C4: Create binding repo and wire into ExternalWalletStore for
         // durable session-wallet binding persistence across restarts.
         let binding_repo = claw_state_store::WalletBindingRepository::new(db.pool().clone());
@@ -573,20 +578,30 @@ impl GatewayDaemon {
             std::sync::Arc::new(rpc_pool.clone()),
             external_wallet.clone(),
         );
-        // Phase 6I-D — withdraw-all execution PROPOSAL. Returns
-        // `awaiting_approval` with a parked intent (`approval_request_id`
-        // is the park-store key). NOT yet integrated with the daemon-wide
-        // ApprovalStore / approval-routing / JIT signing handoff —
-        // those are deferred to the follow-up slice. The withdraw-
-        // execution substrate (`solend::withdraw` +
-        // `solend_withdraw_tx_plan`) remains `#[cfg(test)]`-gated.
-        let solend_withdraw_all_park_store =
-            crate::integrations::solend_withdraw_park::SolendWithdrawAllParkStore::new();
+        // Phase 6I-D + 6I-E — withdraw-all execution PROPOSAL.
+        //
+        // 6I-D: returns `awaiting_approval` with a parked-intent-keyed
+        //       `approval_request_id` and inserts a parked withdraw
+        //       intent in `pending_solend_withdraw_park`.
+        //
+        // 6I-E (this slice): ALSO registers a real `ApprovalRequest` +
+        //       `ApprovalWorkflow` in the daemon-wide `ApprovalStore`
+        //       so the operator UI / approval-routing pipeline can
+        //       decide it; spawns a `run_solend_withdraw_resume_task`
+        //       per dispatch that awaits the operator decision and
+        //       performs a fresh re-fetch + four structural re-checks,
+        //       emitting typed audit events.
+        //
+        // Still deferred (next slice): the JIT signing-handoff route,
+        // the withdraw-execution substrate ungating, and the submit
+        // path. The resume task stops at `RecheckPassedReadyForJit`.
         let registry = crate::runtime::copilot_tools_wiring::wire_solend_withdraw_all_usdc_tool(
             registry,
             std::sync::Arc::new(rpc_pool.clone()),
             external_wallet.clone(),
-            solend_withdraw_all_park_store,
+            pending_solend_withdraw_park.clone(),
+            Some(approval_store.clone()),
+            Some(solend_audit_sink.clone()),
         );
         info!(
             "get_wallet_balances + get_jupiter_quote + get_solend_position + \
@@ -805,6 +820,7 @@ impl GatewayDaemon {
             pending_signing:      pending_signing.clone(),
             pending_jupiter_park: pending_jupiter_park.clone(),
             pending_solend_park:  pending_solend_park.clone(),
+            pending_solend_withdraw_park: pending_solend_withdraw_park.clone(),
             event_bus:            event_bus.clone(),
             audit:                audit_repo.clone(),
             _durable:             durable_state.clone(),
@@ -1593,6 +1609,10 @@ struct GatewayApprovalHandler {
     pending_signing:      PendingSigningStore,
     pending_jupiter_park: crate::integrations::jupiter_park::PendingJupiterParkStore,
     pending_solend_park:  crate::integrations::solend_park::SolendParkStore,
+    /// Phase 6I-E — withdraw-all park store. Same lifecycle as the other
+    /// pending stores; carried by the handler so `route_approval_outcome`
+    /// can deliver Approved/Rejected/Expired signals to the resume task.
+    pending_solend_withdraw_park: crate::integrations::solend_withdraw_park::SolendWithdrawAllParkStore,
     event_bus:            EventBus,
     audit:                AuditRepository,
     _durable:             DurablePendingState,
@@ -1671,6 +1691,7 @@ impl GatewayApprovalHandler {
             &self.pending_signing,
             &self.pending_jupiter_park,
             &self.pending_solend_park,
+            &self.pending_solend_withdraw_park,
             &self.alerts,
             maybe_request.as_ref(),
         );

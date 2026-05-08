@@ -708,6 +708,7 @@ async fn live_solend_deposit_e2e() {
         &PendingSigningStore::new(),
         &PendingJupiterParkStore::new(),
         &solend_park,
+        &claw_gateway::integrations::solend_withdraw_park::SolendWithdrawAllParkStore::new(),
         &AlertDispatcher::Disabled,
         approval_request.as_ref(),
     );

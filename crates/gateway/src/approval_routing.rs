@@ -11,6 +11,7 @@ use claw_types::approval::{ApprovalOutcome, ApprovalRequest, ApprovalWorkflowSta
 
 use crate::integrations::jupiter_park::PendingJupiterParkStore;
 use crate::integrations::solend_park::SolendParkStore;
+use crate::integrations::solend_withdraw_park::SolendWithdrawAllParkStore;
 use crate::pending_signing::PendingSigningStore;
 use crate::policy_alerting::AlertDispatcher;
 
@@ -38,6 +39,7 @@ pub fn route_approval_outcome(
     pending_signing: &PendingSigningStore,
     pending_jupiter_park: &PendingJupiterParkStore,
     pending_solend_park: &SolendParkStore,
+    pending_solend_withdraw_park: &SolendWithdrawAllParkStore,
     alerts: &AlertDispatcher,
     request: Option<&ApprovalRequest>,
 ) -> RoutingAction {
@@ -76,6 +78,10 @@ pub fn route_approval_outcome(
             pending_signing.signal(request_id, ApprovalWorkflowState::Expired);
             pending_jupiter_park.signal(request_id, ApprovalWorkflowState::Expired);
             pending_solend_park.signal(request_id, ApprovalWorkflowState::Expired);
+            // Phase 6I-E — Solend withdraw-all approvals route through their
+            // own park store (separate from deposit's). Same idempotency
+            // contract: signal returns false if the id isn't parked here.
+            pending_solend_withdraw_park.signal(request_id, ApprovalWorkflowState::Expired);
             RoutingAction::Signaled(ApprovalWorkflowState::Expired)
         }
 
@@ -83,6 +89,7 @@ pub fn route_approval_outcome(
             pending_signing.signal(request_id, ApprovalWorkflowState::Approved);
             pending_jupiter_park.signal(request_id, ApprovalWorkflowState::Approved);
             pending_solend_park.signal(request_id, ApprovalWorkflowState::Approved);
+            pending_solend_withdraw_park.signal(request_id, ApprovalWorkflowState::Approved);
             RoutingAction::Signaled(ApprovalWorkflowState::Approved)
         }
 
@@ -106,6 +113,7 @@ pub fn route_approval_outcome(
             pending_signing.signal(request_id, ApprovalWorkflowState::Rejected);
             pending_jupiter_park.signal(request_id, ApprovalWorkflowState::Rejected);
             pending_solend_park.signal(request_id, ApprovalWorkflowState::Rejected);
+            pending_solend_withdraw_park.signal(request_id, ApprovalWorkflowState::Rejected);
             RoutingAction::Signaled(ApprovalWorkflowState::Rejected)
         }
     }
@@ -179,7 +187,7 @@ mod tests {
         let outcome = ApprovalOutcome::StageAdvanced {
             completed_stage: 0, next_stage: 1, next_required_role: Some("treasury".into()),
         };
-        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &SolendWithdrawAllParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::NoSignal);
     }
 
@@ -190,7 +198,7 @@ mod tests {
         let outcome = ApprovalOutcome::QuorumProgress {
             stage: 0, approvals_so_far: 1, approvals_required: 2,
         };
-        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &SolendWithdrawAllParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::NoSignal);
     }
 
@@ -202,7 +210,7 @@ mod tests {
 
         let decision_rx = park_dummy(&pending, rid);
 
-        let action = route_approval_outcome(&ApprovalOutcome::Approved, rid, &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&ApprovalOutcome::Approved, rid, &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &SolendWithdrawAllParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Signaled(ApprovalWorkflowState::Approved));
 
         let state = decision_rx.await.expect("should have received signal");
@@ -217,7 +225,7 @@ mod tests {
         let sid = claw_types::session::SessionId::new();
         let req = fake_request(rid, sid);
 
-        let action = route_approval_outcome(&ApprovalOutcome::Rejected, rid, &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, Some(&req));
+        let action = route_approval_outcome(&ApprovalOutcome::Rejected, rid, &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &SolendWithdrawAllParkStore::new(), &alerts, Some(&req));
         assert_eq!(action, RoutingAction::Signaled(ApprovalWorkflowState::Rejected));
     }
 
@@ -228,7 +236,7 @@ mod tests {
         let outcome = ApprovalOutcome::RoleMismatch {
             required: "treasury".into(), provided: Some("risk".into()),
         };
-        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &SolendWithdrawAllParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Rejected);
     }
 
@@ -239,7 +247,7 @@ mod tests {
         let outcome = ApprovalOutcome::DuplicateOperator {
             operator_id: "alice".into(), stage: 0,
         };
-        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&outcome, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &SolendWithdrawAllParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Rejected);
     }
 
@@ -247,7 +255,7 @@ mod tests {
     fn already_decided_does_not_signal() {
         let pending = PendingSigningStore::new();
         let alerts = AlertDispatcher::default();
-        let action = route_approval_outcome(&ApprovalOutcome::AlreadyDecided, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&ApprovalOutcome::AlreadyDecided, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &SolendWithdrawAllParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Rejected);
     }
 
@@ -255,7 +263,7 @@ mod tests {
     fn not_found_does_not_signal() {
         let pending = PendingSigningStore::new();
         let alerts = AlertDispatcher::default();
-        let action = route_approval_outcome(&ApprovalOutcome::NotFound, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&ApprovalOutcome::NotFound, Uuid::new_v4(), &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &SolendWithdrawAllParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Rejected);
     }
 
@@ -269,13 +277,164 @@ mod tests {
         let rid = Uuid::new_v4();
         let decision_rx = park_dummy(&pending, rid);
 
-        let action = route_approval_outcome(&ApprovalOutcome::Expired, rid, &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &alerts, None);
+        let action = route_approval_outcome(&ApprovalOutcome::Expired, rid, &pending, &PendingJupiterParkStore::new(), &SolendParkStore::new(), &SolendWithdrawAllParkStore::new(), &alerts, None);
         assert_eq!(action, RoutingAction::Signaled(ApprovalWorkflowState::Expired));
 
         // Parked signing task receives Expired through the oneshot.
         let state = decision_rx.await.expect("should receive expired signal");
         assert_eq!(state, ApprovalWorkflowState::Expired);
         assert!(!state.is_approved(), "expired is not approved");
+    }
+
+    // ── Phase 6I-E — withdraw park signaling ─────────────────────────
+
+    /// `Approved` outcome must reach the parked withdraw resume-task
+    /// receiver via the withdraw park store. Mirrors the deposit
+    /// `approved_signals_pending_store` test but on the withdraw side.
+    #[tokio::test]
+    async fn approved_signals_solend_withdraw_park() {
+        use crate::integrations::solend_withdraw_park::{
+            ParkedSolendWithdrawAllIntent, SolendWithdrawAllParkStore,
+        };
+        use crate::lending::{CollateralTokenAmount, ProposedAction, ProtocolTag};
+        use chrono::Utc as ChronoUtc;
+        use solana_sdk::pubkey::Pubkey;
+
+        let pending = PendingSigningStore::new();
+        let alerts = AlertDispatcher::default();
+        let withdraw_park = SolendWithdrawAllParkStore::new();
+        let rid = Uuid::new_v4();
+        let mint = Pubkey::new_unique();
+        let intent = ParkedSolendWithdrawAllIntent {
+            intent_id: Uuid::new_v4(),
+            session_id: claw_types::session::SessionId::new(),
+            session_wallet: Pubkey::new_unique(),
+            obligation_pubkey: Pubkey::new_unique(),
+            lending_market: Pubkey::new_unique(),
+            reserve_pubkey: Pubkey::new_unique(),
+            reserve_mint: mint,
+            propose_time_deposited_collateral_raw: 100,
+            action: ProposedAction::Withdraw {
+                protocol: ProtocolTag::Solend,
+                reserve_mint: mint,
+                collateral_amount: CollateralTokenAmount::new(u64::MAX),
+            },
+            proposed_at: ChronoUtc::now(),
+            expires_at: ChronoUtc::now() + chrono::Duration::seconds(300),
+        };
+        let decision_rx = withdraw_park.park(rid, intent);
+
+        let action = route_approval_outcome(
+            &ApprovalOutcome::Approved,
+            rid,
+            &pending,
+            &PendingJupiterParkStore::new(),
+            &SolendParkStore::new(),
+            &withdraw_park,
+            &alerts,
+            None,
+        );
+        assert_eq!(action, RoutingAction::Signaled(ApprovalWorkflowState::Approved));
+        let state = decision_rx.await.expect("withdraw rx should receive Approved");
+        assert_eq!(state, ApprovalWorkflowState::Approved);
+    }
+
+    /// `Rejected` reaches the withdraw park.
+    #[tokio::test]
+    async fn rejected_signals_solend_withdraw_park() {
+        use crate::integrations::solend_withdraw_park::{
+            ParkedSolendWithdrawAllIntent, SolendWithdrawAllParkStore,
+        };
+        use crate::lending::{CollateralTokenAmount, ProposedAction, ProtocolTag};
+        use chrono::Utc as ChronoUtc;
+        use solana_sdk::pubkey::Pubkey;
+
+        let pending = PendingSigningStore::new();
+        let alerts = AlertDispatcher::default();
+        let withdraw_park = SolendWithdrawAllParkStore::new();
+        let rid = Uuid::new_v4();
+        let mint = Pubkey::new_unique();
+        let intent = ParkedSolendWithdrawAllIntent {
+            intent_id: Uuid::new_v4(),
+            session_id: claw_types::session::SessionId::new(),
+            session_wallet: Pubkey::new_unique(),
+            obligation_pubkey: Pubkey::new_unique(),
+            lending_market: Pubkey::new_unique(),
+            reserve_pubkey: Pubkey::new_unique(),
+            reserve_mint: mint,
+            propose_time_deposited_collateral_raw: 100,
+            action: ProposedAction::Withdraw {
+                protocol: ProtocolTag::Solend,
+                reserve_mint: mint,
+                collateral_amount: CollateralTokenAmount::new(u64::MAX),
+            },
+            proposed_at: ChronoUtc::now(),
+            expires_at: ChronoUtc::now() + chrono::Duration::seconds(300),
+        };
+        let decision_rx = withdraw_park.park(rid, intent);
+
+        let action = route_approval_outcome(
+            &ApprovalOutcome::Rejected,
+            rid,
+            &pending,
+            &PendingJupiterParkStore::new(),
+            &SolendParkStore::new(),
+            &withdraw_park,
+            &alerts,
+            None,
+        );
+        assert_eq!(action, RoutingAction::Signaled(ApprovalWorkflowState::Rejected));
+        let state = decision_rx.await.expect("withdraw rx should receive Rejected");
+        assert_eq!(state, ApprovalWorkflowState::Rejected);
+    }
+
+    /// `Expired` reaches the withdraw park.
+    #[tokio::test]
+    async fn expired_signals_solend_withdraw_park() {
+        use crate::integrations::solend_withdraw_park::{
+            ParkedSolendWithdrawAllIntent, SolendWithdrawAllParkStore,
+        };
+        use crate::lending::{CollateralTokenAmount, ProposedAction, ProtocolTag};
+        use chrono::Utc as ChronoUtc;
+        use solana_sdk::pubkey::Pubkey;
+
+        let pending = PendingSigningStore::new();
+        let alerts = AlertDispatcher::default();
+        let withdraw_park = SolendWithdrawAllParkStore::new();
+        let rid = Uuid::new_v4();
+        let mint = Pubkey::new_unique();
+        let intent = ParkedSolendWithdrawAllIntent {
+            intent_id: Uuid::new_v4(),
+            session_id: claw_types::session::SessionId::new(),
+            session_wallet: Pubkey::new_unique(),
+            obligation_pubkey: Pubkey::new_unique(),
+            lending_market: Pubkey::new_unique(),
+            reserve_pubkey: Pubkey::new_unique(),
+            reserve_mint: mint,
+            propose_time_deposited_collateral_raw: 100,
+            action: ProposedAction::Withdraw {
+                protocol: ProtocolTag::Solend,
+                reserve_mint: mint,
+                collateral_amount: CollateralTokenAmount::new(u64::MAX),
+            },
+            proposed_at: ChronoUtc::now(),
+            expires_at: ChronoUtc::now() + chrono::Duration::seconds(300),
+        };
+        let decision_rx = withdraw_park.park(rid, intent);
+
+        let action = route_approval_outcome(
+            &ApprovalOutcome::Expired,
+            rid,
+            &pending,
+            &PendingJupiterParkStore::new(),
+            &SolendParkStore::new(),
+            &withdraw_park,
+            &alerts,
+            None,
+        );
+        assert_eq!(action, RoutingAction::Signaled(ApprovalWorkflowState::Expired));
+        let state = decision_rx.await.expect("withdraw rx should receive Expired");
+        assert_eq!(state, ApprovalWorkflowState::Expired);
     }
 
     #[test]

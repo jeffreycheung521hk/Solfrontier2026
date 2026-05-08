@@ -2774,6 +2774,7 @@ mod tests {
             &PendingSigningStore::new(),
             &PendingJupiterParkStore::new(),
             &park_store,
+            &crate::integrations::solend_withdraw_park::SolendWithdrawAllParkStore::new(),
             &AlertDispatcher::default(),
             None,
         );
@@ -2816,6 +2817,7 @@ mod tests {
             &PendingSigningStore::new(),
             &PendingJupiterParkStore::new(),
             &park_store,
+            &crate::integrations::solend_withdraw_park::SolendWithdrawAllParkStore::new(),
             &AlertDispatcher::default(),
             None,
         );

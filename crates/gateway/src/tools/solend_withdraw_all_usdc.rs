@@ -82,9 +82,16 @@ use uuid::Uuid;
 use claw_tool_system::{errors::ToolError, tool::Tool};
 use claw_types::tool::{ToolInput, ToolOutput, ToolSpec};
 
+use claw_types::approval::{ApprovalRequest, ApprovalWorkflow};
+use claw_types::policy::PolicyVerdict;
+use claw_types::transaction::SimulationResult;
+
+use crate::approval_store::ApprovalStore;
 use crate::integrations::solend::raw::{decode_obligation, OBLIGATION_LEN};
+use crate::integrations::solend_submit::SolendAuditSink;
 use crate::integrations::solend_withdraw_park::{
-    ParkedSolendWithdrawAllIntent, SolendWithdrawAllParkStore,
+    run_solend_withdraw_resume_task, ParkedSolendWithdrawAllIntent,
+    SolendWithdrawAllParkStore,
 };
 use crate::lending::{CollateralTokenAmount, ProposedAction, ProtocolTag};
 use crate::tools::get_solend_position::{
@@ -165,6 +172,19 @@ pub struct SubmitSolendWithdrawAllUsdcTool {
     /// deposit's `approval_lease_seconds` — used for symmetry and so
     /// a future approval-routing slice can reuse the same value.
     approval_lease_seconds: u64,
+    /// Phase 6I-E — daemon-wide approval store. When wired, the tool
+    /// registers a real [`ApprovalRequest`] + [`ApprovalWorkflow`] in
+    /// the same store the operator UI / approval routing pipeline
+    /// reads from. Tests that don't need the routing path leave this
+    /// `None` (back-compat with Phase 6I-D unit tests).
+    approval_store: Option<ApprovalStore>,
+    /// Phase 6I-E — append-only audit sink shared with the resume
+    /// task. Production wires `AuditRepositorySink`. When wired, the
+    /// resume task is spawned on every successful park; without it,
+    /// the resume task is NOT spawned (the parked intent + approval
+    /// are still created, but the approve/reject decision is observed
+    /// only by the routing layer's signal — same as Phase 6I-D).
+    audit: Option<Arc<dyn SolendAuditSink>>,
 }
 
 impl SubmitSolendWithdrawAllUsdcTool {
@@ -186,12 +206,32 @@ impl SubmitSolendWithdrawAllUsdcTool {
             )
             .expect("hard-coded lending market pubkey parses"),
             approval_lease_seconds: APPROVAL_LEASE_SECONDS_DEFAULT,
+            approval_store: None,
+            audit: None,
         }
     }
 
     /// Test / config override of the approval lease.
     pub fn with_approval_lease_seconds(mut self, secs: u64) -> Self {
         self.approval_lease_seconds = secs;
+        self
+    }
+
+    /// Phase 6I-E — wire the daemon-wide approval store. When attached,
+    /// the tool registers a real `ApprovalRequest` + `ApprovalWorkflow`
+    /// on the happy path so the operator UI / approval routing
+    /// pipeline can decide it.
+    pub fn with_approval_store(mut self, approval_store: ApprovalStore) -> Self {
+        self.approval_store = Some(approval_store);
+        self
+    }
+
+    /// Phase 6I-E — wire the audit sink. When attached together with
+    /// the approval store, every happy-path dispatch spawns a resume
+    /// task that awaits the operator decision and emits structured
+    /// audit events on the fresh re-check outcome.
+    pub fn with_audit_sink(mut self, audit: Arc<dyn SolendAuditSink>) -> Self {
+        self.audit = Some(audit);
         self
     }
 }
@@ -410,13 +450,77 @@ impl Tool for SubmitSolendWithdrawAllUsdcTool {
             proposed_at,
             expires_at,
         };
-        if self.park_store.park(approval_request_id, parked).is_err() {
-            // UUID collision is essentially impossible; surface as a
-            // typed internal error so the LLM sees a stable, non-PII
-            // failure rather than a panic.
-            return Ok(decode_error_output(
-                "internal: failed to park withdraw intent (id collision)",
-            ));
+        // ── Phase 6I-E ─────────────────────────────────────────────────
+        // park returns the receiver half of the oneshot decision channel.
+        // We hand it to the spawned resume task below (if audit is
+        // wired); without that, the channel sender lives in the park
+        // entry and is dropped on `signal()` no-op or on `remove()`.
+        let decision_rx = self.park_store.park(approval_request_id, parked);
+
+        // Phase 6I-E ApprovalStore integration — when wired, register a
+        // real ApprovalRequest + Workflow with the same id we used to
+        // key the parked intent. The operator UI / `route_approval_outcome`
+        // pipeline can now decide this withdraw alongside deposit and
+        // Jupiter approvals.
+        if let Some(approval_store) = &self.approval_store {
+            let description = format!(
+                "Solend withdraw-all USDC: redeem all collateral from obligation {} \
+                 (owner {}). Requires your Phantom signature. No transaction is built \
+                 or signed until Sign click.",
+                obligation_pk, wallet_pk
+            );
+            let policy_verdict_wire = PolicyVerdict::RequiresHumanApproval {
+                reason: "Solend withdraw-all requires operator approval".to_string(),
+                rule_name: POLICY_RULE_NAME.to_string(),
+                required_approver_role: None,
+                approval_chain: None,
+            };
+            let approval_request = ApprovalRequest {
+                id: approval_request_id,
+                session_id: input.session_id.clone(),
+                transaction_id: intent_id,
+                description,
+                policy_verdict: policy_verdict_wire,
+                simulation: placeholder_simulation(),
+                requested_at: Utc::now(),
+                decided: false,
+                required_approver_role: None,
+            };
+            let workflow = ApprovalWorkflow::single_stage(
+                approval_request_id,
+                input.session_id.clone(),
+                None,
+            )
+            .with_lease_seconds(self.approval_lease_seconds);
+            approval_store.register(approval_request, workflow);
+        }
+
+        // Phase 6I-E resume task — spawn iff audit is wired. The task
+        // awaits the operator decision (delivered by
+        // `route_approval_outcome` via `park_store.signal()`), performs
+        // a fresh re-fetch + decode + four structural checks, and emits
+        // typed audit events. NO transaction build, NO signing handoff,
+        // NO broadcast — the (deferred) JIT signing-handoff route is
+        // the next slice.
+        if let Some(audit) = &self.audit {
+            let park = self.park_store.clone();
+            let reader = self.reader.clone();
+            let audit = audit.clone();
+            tokio::spawn(async move {
+                let _outcome = run_solend_withdraw_resume_task(
+                    approval_request_id,
+                    park,
+                    reader,
+                    audit,
+                    decision_rx,
+                )
+                .await;
+            });
+        } else {
+            // Without an audit sink, drop the receiver explicitly so a
+            // future `signal()` becomes a graceful no-op (the entry's
+            // sender is consumed but the receiver isn't held by anyone).
+            drop(decision_rx);
         }
 
         info!(
@@ -426,6 +530,8 @@ impl Tool for SubmitSolendWithdrawAllUsdcTool {
             wallet = %wallet_pk,
             obligation = %obligation_pk,
             collateral_raw = collateral_amount,
+            approval_store_wired = self.approval_store.is_some(),
+            audit_wired = self.audit.is_some(),
             "solend_withdraw_all_usdc: parked withdraw-all intent, returning awaiting_approval"
         );
 
@@ -571,6 +677,23 @@ fn policy_blocked_output(
         })),
         error: Some(format!("policy_blocked: {reason}")),
         duration_ms: 0,
+    }
+}
+
+/// Phase 6I-E — placeholder simulation attached to the registered
+/// `ApprovalRequest`. Mirrors deposit's helper. The actual simulation
+/// is run at sign-click time by the (deferred) JIT signing-handoff
+/// route; this struct exists only because `ApprovalRequest` requires
+/// a `SimulationResult` field for its current shape.
+fn placeholder_simulation() -> SimulationResult {
+    SimulationResult {
+        success: true,
+        error: None,
+        compute_units_used: None,
+        logs: vec![],
+        return_data: None,
+        account_diffs: vec![],
+        fee_lamports: None,
     }
 }
 

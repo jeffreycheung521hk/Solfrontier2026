@@ -110,32 +110,49 @@ pub fn wire_preview_solend_withdraw_all_tool(
     registry.with_tool(tool)
 }
 
-/// Phase 6I-D — Register the `solend_withdraw_all_usdc` execution tool.
+/// Phase 6I-D / 6I-E — Register the `solend_withdraw_all_usdc` execution tool.
 ///
-/// The tool returns `awaiting_approval` with a parked-intent-keyed
+/// Phase 6I-D: the tool returns `awaiting_approval` with a parked-intent-keyed
 /// `approval_request_id` and inserts a [`ParkedSolendWithdrawAllIntent`][1]
-/// into the supplied [`SolendWithdrawAllParkStore`]. It does NOT
-/// register with `ApprovalStore`, does NOT spawn a resume task, does
-/// NOT build / sign / broadcast a transaction. The follow-up slice
-/// will integrate the parked store with the approval-routing pipeline
-/// and add the JIT signing handoff.
+/// into the supplied [`SolendWithdrawAllParkStore`].
+///
+/// Phase 6I-E (this slice): when `approval_store` and `audit` are
+/// supplied, the tool ALSO:
+///   - registers a real [`claw_types::approval::ApprovalRequest`] +
+///     [`claw_types::approval::ApprovalWorkflow`] in the daemon-wide
+///     `ApprovalStore` so the operator approval UI / API can decide it,
+///   - spawns a [`crate::integrations::solend_withdraw_park::run_solend_withdraw_resume_task`]
+///     that awaits the operator decision, performs a fresh re-fetch +
+///     decode + four structural re-checks, and emits typed audit events.
+///
+/// What this slice still does NOT do (deferred to the next slice):
+///   - Does NOT build, sign, or broadcast any transaction.
+///   - Does NOT create a JIT signing handoff (the resume task stops at
+///     `RecheckPassedReadyForJit`; the prepare HTTP route + handoff is
+///     the next slice).
+///   - Does NOT ungate the `#[cfg(test)]` withdraw substrate.
 ///
 /// [1]: crate::integrations::solend_withdraw_park::ParkedSolendWithdrawAllIntent
+#[allow(clippy::too_many_arguments)]
 pub fn wire_solend_withdraw_all_usdc_tool(
     registry: ToolRegistry,
     rpc_pool: Arc<claw_solana_core::rpc::RpcPool>,
     external_wallet: ExternalWalletStore,
     park_store: SolendWithdrawAllParkStore,
+    approval_store: Option<crate::approval_store::ApprovalStore>,
+    audit: Option<Arc<dyn crate::integrations::solend_submit::SolendAuditSink>>,
 ) -> ToolRegistry {
     let session_wallet: Arc<dyn SessionBoundWallet> = Arc::new(external_wallet);
     let reader: Arc<dyn SolendPositionReader> =
         Arc::new(RpcSolendPositionReader::new(rpc_pool));
-    let tool = Arc::new(SubmitSolendWithdrawAllUsdcTool::new(
-        session_wallet,
-        reader,
-        park_store,
-    ));
-    registry.with_tool(tool)
+    let mut tool = SubmitSolendWithdrawAllUsdcTool::new(session_wallet, reader, park_store);
+    if let Some(s) = approval_store {
+        tool = tool.with_approval_store(s);
+    }
+    if let Some(a) = audit {
+        tool = tool.with_audit_sink(a);
+    }
+    registry.with_tool(Arc::new(tool))
 }
 
 #[cfg(test)]
@@ -249,8 +266,18 @@ mod tests {
         }));
         let wallet = ExternalWalletStore::new();
         let park = SolendWithdrawAllParkStore::new();
-        let registry =
-            wire_solend_withdraw_all_usdc_tool(ToolRegistry::new(), pool, wallet, park);
+        // Phase 6I-E: the wire helper now accepts optional ApprovalStore
+        // + audit sink. Both `None` here exercises the back-compat path
+        // (no ApprovalStore registration, no resume-task spawn) — same
+        // shape Phase 6I-D unit tests rely on.
+        let registry = wire_solend_withdraw_all_usdc_tool(
+            ToolRegistry::new(),
+            pool,
+            wallet,
+            park,
+            None,
+            None,
+        );
         let names = registry.names();
         assert!(
             names.iter().any(|n| n == "solend_withdraw_all_usdc"),
