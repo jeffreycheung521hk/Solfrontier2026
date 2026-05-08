@@ -19,6 +19,7 @@ import type {
   SolendJitPrepareResult,
   SolendRetrievalResult,
   SolendSubmitResult,
+  SolendWithdrawJitPrepareResult,
   TransactionProposal,
   Uuid,
   WalletSummary,
@@ -614,6 +615,77 @@ export async function prepareSolendSigning(
   // All of these carry the typed `SolendJitPrepareResult` body.
   if ([200, 404, 422, 502].includes(res.status)) {
     const body = (await res.json()) as SolendJitPrepareResult;
+    return { kind: "ok", response: body };
+  }
+
+  // 400 (malformed ids) and 503 (handler not wired) carry `{ error }`.
+  let errorText = "";
+  try {
+    const body = (await res.json()) as { error?: string };
+    errorText = body.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+  return { kind: "error", httpStatus: res.status, error: errorText };
+}
+
+// ── Phase 6I-G — Solend WITHDRAW JIT-prepare ────────────────────────────────
+//
+// Backend route added in Agent B Phase 6I-F:
+//   POST /sessions/:s/approvals/:a/solend-withdraw-jit/prepare
+//
+// Mirrors the deposit-side `prepareSolendSigning` envelope shape.
+// Frontend dispatches to this when the approval's policy verdict
+// rule_name identifies a withdraw flow; the resulting
+// `signing_request_id` is fed into the same existing
+// `getSolendSignature` / `submitSolendSignature` endpoints — only
+// the prepare URL differs from deposit.
+//
+// Showcase mode short-circuits to a synthetic Ready response so the
+// hook's existing showcase simulation continues to play out; no
+// network call is made and Phantom is never invoked.
+
+export type SolendWithdrawJitPrepareEnvelope =
+  | { kind: "ok"; response: SolendWithdrawJitPrepareResult }
+  | { kind: "error"; httpStatus: number; error: string };
+
+export async function prepareSolendWithdrawSigningHandoff(
+  sessionId: SessionId,
+  approvalRequestId: Uuid,
+): Promise<SolendWithdrawJitPrepareEnvelope> {
+  if (IS_SHOWCASE) {
+    return {
+      kind: "ok",
+      response: {
+        status: "ready",
+        approval_request_id: approvalRequestId,
+        signing_request_id: SHOWCASE_SIGNING_REQUEST_ID,
+        session_id: sessionId,
+        wallet: "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+        obligation_pubkey: "HcKrv5Jo5f6qvzSGhJVYTNSqwKudRizn6fxbjPW7M8SV",
+        reserve_pubkey: "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw",
+        last_valid_block_height: 393_666_166,
+        verified_slot: 415_571_900,
+        expires_at_unix_ms: Date.now() + 60_000,
+      },
+    };
+  }
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+
+  const res = await fetch(
+    `${GATEWAY_URL}/sessions/${sessionId}/approvals/${approvalRequestId}/solend-withdraw-jit/prepare`,
+    { method: "POST", headers, cache: "no-store" },
+  );
+
+  // 200 = Ready;
+  // 404 = NotFound | WithdrawIntentMissing;
+  // 422 = NotApproved | WalletMismatch | RecheckBlocked;
+  // 502 = SnapshotAssembleFailed | PlanAssemblyFailed | HandoffCreateFailed.
+  // All of these carry the typed `SolendWithdrawJitPrepareResult` body.
+  if ([200, 404, 422, 502].includes(res.status)) {
+    const body = (await res.json()) as SolendWithdrawJitPrepareResult;
     return { kind: "ok", response: body };
   }
 

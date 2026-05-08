@@ -29,7 +29,10 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { decideApproval } from "@/lib/api";
 import { IS_SHOWCASE } from "@/lib/mode";
-import { useSigningHandoff } from "@/lib/use-signing-handoff";
+import {
+  type SolendSigningAction,
+  useSigningHandoff,
+} from "@/lib/use-signing-handoff";
 import type {
   ApprovalWorkflowState,
   SessionId,
@@ -41,6 +44,10 @@ interface SigningFlowProps {
   approvalRequestId: Uuid;
   sessionId: SessionId;
   workflowState: ApprovalWorkflowState;
+  /** Phase 6I-G — selects the Solend prepare endpoint. Approval page
+   *  derives this from `request.policy_verdict.rule_name`. Defaults to
+   *  `"deposit"` so older callers (and showcase) keep their behavior. */
+  action?: SolendSigningAction;
 }
 
 type ApprovalUiState =
@@ -56,6 +63,7 @@ export function SigningFlow({
   approvalRequestId,
   sessionId,
   workflowState,
+  action = "deposit",
 }: SigningFlowProps) {
   // Track approval UI state separately from the workflow prop so we can
   // optimistically transition through `approving → approved` after a
@@ -73,9 +81,13 @@ export function SigningFlow({
   // Phase 6B Window 3: hook now takes approvalRequestId. The
   // signing_request_id is minted JIT inside signWithPhantom() on each
   // user click — no manual paste, no upfront polling.
+  //
+  // Phase 6I-G: `action` selects deposit vs withdraw_all prepare
+  // endpoint inside the hook. Default is "deposit" for back-compat.
   const { state: handoffState, signWithPhantom, reset } = useSigningHandoff(
     approval.kind === "approved" ? sessionId : null,
     approval.kind === "approved" ? approvalRequestId : null,
+    { action },
   );
 
   const handleApprove = useCallback(

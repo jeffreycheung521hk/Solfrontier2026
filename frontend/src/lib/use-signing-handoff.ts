@@ -60,15 +60,24 @@ import { signSolendTransaction } from "@/lib/phantom";
 import {
   getSolendSignature,
   prepareSolendSigning,
+  prepareSolendWithdrawSigningHandoff,
   submitSolendSignature,
 } from "@/lib/api";
 import type {
   SessionId,
   SigningHandoffState,
+  SolendJitPrepareResult,
   SolendRetrievalResult,
   SolendSubmitResult,
+  SolendWithdrawJitPrepareResult,
   Uuid,
 } from "@/lib/types";
+
+/// Phase 6I-G — which Solend pipeline this approval belongs to.
+/// Decided by the caller (e.g. `<SigningFlow>` reads
+/// `policy_verdict.rule_name` from the approval request) and passed
+/// into the hook so `signWithPhantom` calls the right prepare route.
+export type SolendSigningAction = "deposit" | "withdraw_all";
 
 // Phase 5G real on-chain hash, used by the showcase fixture so the
 // `finalized` state's Solscan link goes to a real Finalized tx.
@@ -84,6 +93,11 @@ export interface UseSigningHandoffOptions {
    *  is invoked — used by showcase mode so judges don't need Phantom
    *  installed. */
   usePhantom?: boolean;
+  /** Phase 6I-G — selects which Solend prepare endpoint to call.
+   *  Defaults to `"deposit"` for backward compatibility. The
+   *  `<SigningFlow>` component derives this from the approval's
+   *  policy verdict rule_name. */
+  action?: SolendSigningAction;
 }
 
 export interface UseSigningHandoffResult {
@@ -103,6 +117,7 @@ export function useSigningHandoff(
   options?: UseSigningHandoffOptions,
 ): UseSigningHandoffResult {
   const usePhantom = options?.usePhantom ?? !IS_SHOWCASE;
+  const action: SolendSigningAction = options?.action ?? "deposit";
 
   const [state, setState] = useState<SigningHandoffState>({ kind: "idle" });
 
@@ -280,9 +295,17 @@ export function useSigningHandoff(
     }
 
     // ── 1. POST .../prepare ────────────────────────────────────────────
+    //
+    // Phase 6I-G: dispatches to the deposit OR withdraw prepare
+    // endpoint based on `action`. Both endpoints return the same
+    // Ready shape (signing_request_id + blockhash + verified_slot)
+    // so steps 2-5 below are identical for both pipelines.
     let prepEnv;
     try {
-      prepEnv = await prepareSolendSigning(sid, aid);
+      prepEnv =
+        action === "withdraw_all"
+          ? await prepareSolendWithdrawSigningHandoff(sid, aid)
+          : await prepareSolendSigning(sid, aid);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "prepare network error";
       inFlightRef.current = false;
@@ -310,7 +333,17 @@ export function useSigningHandoff(
     const prep = prepEnv.response;
     if (prep.status !== "ready") {
       inFlightRef.current = false;
-      setState({ kind: "prepare_failed", reason: prepareFailureReason(prep) });
+      setState({
+        kind: "prepare_failed",
+        reason:
+          action === "withdraw_all"
+            ? withdrawPrepareFailureReason(
+                prep as Exclude<SolendWithdrawJitPrepareResult, { status: "ready" }>,
+              )
+            : prepareFailureReason(
+                prep as Exclude<SolendJitPrepareResult, { status: "ready" }>,
+              ),
+      });
       return;
     }
 
@@ -440,7 +473,7 @@ export function useSigningHandoff(
       }, POLL_INTERVAL_MS);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [usePhantom]);
+  }, [usePhantom, action]);
 
   return { state, signWithPhantom, reset };
 }
@@ -460,6 +493,32 @@ function prepareFailureReason(
       return "no JIT-ready entry exists for this approval — re-propose to refresh";
     case "wallet_mismatch":
       return `bound wallet differs from approval-time wallet (expected ${result.expected.slice(0, 8)}…, bound ${result.bound ? result.bound.slice(0, 8) + "…" : "none"})`;
+    case "handoff_create_failed":
+      return `handoff creation failed: ${result.error_type} — ${result.message}`;
+    case "not_found":
+      return "approval not found or does not belong to this session";
+  }
+}
+
+function withdrawPrepareFailureReason(
+  result: Exclude<
+    import("@/lib/types").SolendWithdrawJitPrepareResult,
+    { status: "ready" }
+  >,
+): string {
+  switch (result.status) {
+    case "not_approved":
+      return `approval workflow is ${result.state}, not approved`;
+    case "withdraw_intent_missing":
+      return "no parked withdraw intent exists for this approval — re-propose to refresh (or this approval was a deposit)";
+    case "wallet_mismatch":
+      return `bound wallet differs from approval-time wallet (expected ${result.expected.slice(0, 8)}…, bound ${result.bound ? result.bound.slice(0, 8) + "…" : "none"})`;
+    case "recheck_blocked":
+      return `fresh re-check blocked: ${result.reason}${result.detail ? ` — ${result.detail}` : ""}`;
+    case "snapshot_assemble_failed":
+      return `snapshot assemble failed: ${result.error_type} — ${result.message}`;
+    case "plan_assembly_failed":
+      return `plan assembly failed: ${result.error_type} — ${result.message}`;
     case "handoff_create_failed":
       return `handoff creation failed: ${result.error_type} — ${result.message}`;
     case "not_found":

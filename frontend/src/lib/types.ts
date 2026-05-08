@@ -478,3 +478,36 @@ export type SolendJitPrepareResult =
   | { status: "wallet_mismatch"; expected: string; bound: string | null }
   | { status: "handoff_create_failed"; error_type: string; message: string }
   | { status: "not_found" };
+
+// ── Phase 6I-G — Solend WITHDRAW JIT-prepare wire shape ─────────────────────
+//
+// Mirrors `SolendWithdrawJitPrepareResult` in
+// `crates/api/src/state.rs`. Tagged union by `status`. HTTP status
+// mapping (per `crates/api/src/routes/solend_withdraw_jit_signing.rs`):
+//   200  → "ready"
+//   404  → "withdraw_intent_missing" | "not_found"
+//   422  → "not_approved" | "wallet_mismatch" | "recheck_blocked"
+//   502  → "snapshot_assemble_failed" | "plan_assembly_failed" | "handoff_create_failed"
+// 400 / 503 / network errors are surfaced through the api.ts envelope as
+// `{ kind: "error", httpStatus, error }` rather than as a status variant.
+export type SolendWithdrawJitPrepareResult =
+  | {
+      status: "ready";
+      approval_request_id: Uuid;
+      signing_request_id: Uuid;
+      session_id: SessionId;
+      wallet: string;
+      obligation_pubkey: string;
+      reserve_pubkey: string;
+      last_valid_block_height: number;
+      verified_slot: number;
+      expires_at_unix_ms: number;
+    }
+  | { status: "not_approved"; state: string }
+  | { status: "withdraw_intent_missing" }
+  | { status: "wallet_mismatch"; expected: string; bound: string | null }
+  | { status: "recheck_blocked"; reason: string; detail?: string | null }
+  | { status: "snapshot_assemble_failed"; error_type: string; message: string }
+  | { status: "plan_assembly_failed"; error_type: string; message: string }
+  | { status: "handoff_create_failed"; error_type: string; message: string }
+  | { status: "not_found" };
