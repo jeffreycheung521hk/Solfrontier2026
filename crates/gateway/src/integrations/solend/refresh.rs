@@ -46,9 +46,23 @@
 //! - `LendingInstruction::RefreshObligation` — variant tag = 7,
 //!   single-byte ix data `[7]`, accounts:
 //!     1. obligation (writable)
-//!     2. clock sysvar (readonly)
-//!     3..N. each reserve referenced by obligation deposits + borrows
+//!     2..N. each reserve referenced by obligation deposits + borrows
 //!         (each readonly), in deposit-then-borrow order.
+//!
+//!   **Phase 6I-H correction:** the deployed mainnet `RefreshObligation`
+//!   handler does NOT take a clock sysvar account. It reads the clock
+//!   via `Clock::get()?` syscall and consumes accounts as
+//!   `[obligation, ...deposit_reserves, ...borrow_reserves]`. The earlier
+//!   layout in this comment (which placed clock at slot 1) was incorrect
+//!   and produced a live-mainnet failure on 2026-05-08
+//!   (tx `4YnQFUTm…`): the clock account at slot 1 was interpreted as
+//!   collateral 0's deposit reserve, which is not Solend-owned, and
+//!   `process_refresh_obligation` returned
+//!   `LendingError::InvalidAccountOwner` (custom 5). The same divergence
+//!   is what `withdraw.rs` already documents for the withdraw ix —
+//!   both `RefreshObligation` and the combined withdraw ix on the
+//!   `mainnet` branch read `Clock::get()?` and do NOT take it as an
+//!   account; only `RefreshReserve` keeps the clock account slot.
 //!
 //! Solend's program passes oracle slots even when they are the null
 //! sentinel; the program itself decides whether to read them. Callers
@@ -159,10 +173,23 @@ pub fn build_refresh_instructions(inputs: RefreshPlanInputs) -> RefreshPlan {
 
     let obligation_refreshed = obligation.as_ref().map(|o| o.obligation_pubkey);
     if let Some(o) = obligation {
+        // Phase 6I-H — the deployed mainnet `RefreshObligation` handler
+        // reads the clock via `Clock::get()?` syscall and does NOT take
+        // a clock account in its account list. Account layout is:
+        //
+        //   [0] obligation (writable)
+        //   [1..1 + N] referenced reserves in obligation order
+        //              (deposits first, then borrows; each readonly)
+        //
+        // Including a clock account here shifts the reserve list by one
+        // slot, causing `process_refresh_obligation` to interpret the
+        // clock sysvar as `obligation.deposits[0].deposit_reserve` and
+        // reject it with `LendingError::InvalidAccountOwner` (the
+        // sysvar is not owned by the lending program). See the failed
+        // live tx `4YnQFUTm…` for the original symptom.
         let mut accounts: Vec<AccountMeta> =
-            Vec::with_capacity(2 + o.referenced_reserves_in_order.len());
+            Vec::with_capacity(1 + o.referenced_reserves_in_order.len());
         accounts.push(AccountMeta::new(o.obligation_pubkey, false));
-        accounts.push(AccountMeta::new_readonly(sysvar::clock::id(), false));
         for r in &o.referenced_reserves_in_order {
             accounts.push(AccountMeta::new_readonly(*r, false));
         }
@@ -262,14 +289,19 @@ mod tests {
         assert_eq!(plan.instructions[1].accounts[0].pubkey, reserve_b);
 
         // Refresh-obligation ix comes last.
+        // Phase 6I-H: account list is [obligation, ...reserves]. The
+        // clock account that this test previously asserted at slot 1
+        // was the bug — see module doc-comment.
         let obl_ix = &plan.instructions[2];
         assert_eq!(obl_ix.data, vec![SOLEND_IX_TAG_REFRESH_OBLIGATION]);
-        assert_eq!(obl_ix.accounts.len(), 2 + 2); // obligation + clock + 2 reserves
+        assert_eq!(obl_ix.accounts.len(), 1 + 2); // obligation + 2 reserves (NO clock)
         assert_eq!(obl_ix.accounts[0].pubkey, obligation);
         assert!(obl_ix.accounts[0].is_writable);
-        assert_eq!(obl_ix.accounts[1].pubkey, sysvar::clock::id());
-        assert_eq!(obl_ix.accounts[2].pubkey, reserve_a);
-        assert_eq!(obl_ix.accounts[3].pubkey, reserve_b);
+        // Reserves start at slot 1 — multi-reserve order is preserved.
+        assert_eq!(obl_ix.accounts[1].pubkey, reserve_a);
+        assert!(!obl_ix.accounts[1].is_writable);
+        assert_eq!(obl_ix.accounts[2].pubkey, reserve_b);
+        assert!(!obl_ix.accounts[2].is_writable);
     }
 
     #[test]
@@ -287,9 +319,9 @@ mod tests {
     #[test]
     fn obligation_only_with_no_reserves_still_emits_refresh_obligation() {
         // Edge case: caller asks to refresh just the obligation against
-        // a snapshot of already-fresh reserves. (This is not the typical
-        // Slice 3 path — a real path would refresh reserves + obligation
-        // together — but the builder accepts it without policing.)
+        // a snapshot of already-fresh reserves. Phase 6I-H: account list
+        // is just [obligation] when no reserves are referenced — the
+        // clock account is no longer present.
         let obligation = Pubkey::new_unique();
         let plan = build_refresh_instructions(RefreshPlanInputs {
             solend_program_id: solend_program(),
@@ -301,8 +333,189 @@ mod tests {
         });
         assert_eq!(plan.instructions.len(), 1);
         assert_eq!(plan.instructions[0].data, vec![SOLEND_IX_TAG_REFRESH_OBLIGATION]);
-        assert_eq!(plan.instructions[0].accounts.len(), 2); // obligation + clock
+        assert_eq!(plan.instructions[0].accounts.len(), 1); // obligation only
+        assert_eq!(plan.instructions[0].accounts[0].pubkey, obligation);
         assert_eq!(plan.obligation_refreshed, Some(obligation));
+    }
+
+    // ── Phase 6I-H regression tests ──────────────────────────────────────
+
+    /// RefreshObligation account list length is exactly
+    /// `1 + referenced_reserves.len()`. Locks against any reintroduction
+    /// of the clock-as-account bug or any other slot insertion.
+    #[test]
+    fn refresh_obligation_account_list_length_is_one_plus_reserves() {
+        let obligation = Pubkey::new_unique();
+        let r0 = Pubkey::new_unique();
+        let r1 = Pubkey::new_unique();
+        let r2 = Pubkey::new_unique();
+
+        for (label, reserves, expected_len) in [
+            ("0 reserves", vec![], 1),
+            ("1 reserve", vec![r0], 2),
+            ("2 reserves", vec![r0, r1], 3),
+            ("3 reserves", vec![r0, r1, r2], 4),
+        ] {
+            let plan = build_refresh_instructions(RefreshPlanInputs {
+                solend_program_id: solend_program(),
+                reserves: vec![],
+                obligation: Some(ObligationRefreshInput {
+                    obligation_pubkey: obligation,
+                    referenced_reserves_in_order: reserves,
+                }),
+            });
+            let obl_ix = plan
+                .instructions
+                .iter()
+                .find(|i| i.data == vec![SOLEND_IX_TAG_REFRESH_OBLIGATION])
+                .expect("RefreshObligation ix present");
+            assert_eq!(
+                obl_ix.accounts.len(),
+                expected_len,
+                "[{label}] account list length"
+            );
+        }
+    }
+
+    /// Slot 0 is the obligation; slot 1 is the FIRST referenced reserve
+    /// (NOT the clock sysvar).
+    #[test]
+    fn refresh_obligation_slot_zero_is_obligation_slot_one_is_first_reserve() {
+        let obligation = Pubkey::new_unique();
+        let first_reserve = Pubkey::new_unique();
+        let second_reserve = Pubkey::new_unique();
+        let plan = build_refresh_instructions(RefreshPlanInputs {
+            solend_program_id: solend_program(),
+            reserves: vec![],
+            obligation: Some(ObligationRefreshInput {
+                obligation_pubkey: obligation,
+                referenced_reserves_in_order: vec![first_reserve, second_reserve],
+            }),
+        });
+        let obl_ix = &plan.instructions[0];
+        assert_eq!(obl_ix.accounts[0].pubkey, obligation, "slot 0 = obligation");
+        assert!(obl_ix.accounts[0].is_writable);
+        assert_eq!(obl_ix.accounts[1].pubkey, first_reserve, "slot 1 = first reserve (no clock)");
+        assert!(!obl_ix.accounts[1].is_writable);
+        assert_eq!(obl_ix.accounts[2].pubkey, second_reserve, "slot 2 = second reserve");
+    }
+
+    /// Phase 6I-H regression guard. `sysvar::clock::id()` MUST NOT
+    /// appear anywhere in the RefreshObligation account list. The
+    /// deployed Solend program reads the clock via `Clock::get()?`
+    /// syscall and rejects the sysvar account if supplied.
+    #[test]
+    fn refresh_obligation_must_not_contain_clock_sysvar() {
+        let obligation = Pubkey::new_unique();
+        let r = Pubkey::new_unique();
+        let plan = build_refresh_instructions(RefreshPlanInputs {
+            solend_program_id: solend_program(),
+            reserves: vec![],
+            obligation: Some(ObligationRefreshInput {
+                obligation_pubkey: obligation,
+                referenced_reserves_in_order: vec![r],
+            }),
+        });
+        let obl_ix = &plan.instructions[0];
+        for (i, a) in obl_ix.accounts.iter().enumerate() {
+            assert_ne!(
+                a.pubkey,
+                sysvar::clock::id(),
+                "clock sysvar must not appear in RefreshObligation accounts (slot={i})"
+            );
+        }
+    }
+
+    /// HcKrv5Jo / Solend Main Pool USDC fixture: the on-chain obligation
+    /// has a single deposit on the USDC reserve. After the fix, the
+    /// reserve must land at account[1] of the RefreshObligation ix
+    /// (NOT account[2] as the buggy [obligation, clock, reserve...]
+    /// layout produced).
+    #[test]
+    fn hckrv5jo_usdc_reserve_is_at_slot_one_not_slot_two() {
+        let obligation = Pubkey::from_str("HcKrv5Jo5f6qvzSGhJVYTNSqwKudRizn6fxbjPW7M8SV")
+            .unwrap();
+        let usdc_reserve = Pubkey::from_str("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw")
+            .unwrap();
+        let plan = build_refresh_instructions(RefreshPlanInputs {
+            solend_program_id: solend_program(),
+            reserves: vec![],
+            obligation: Some(ObligationRefreshInput {
+                obligation_pubkey: obligation,
+                // Single deposit on the USDC reserve, no borrows — same
+                // shape Phase 6H reports for HcKrv5Jo.
+                referenced_reserves_in_order: vec![usdc_reserve],
+            }),
+        });
+        let obl_ix = &plan.instructions[0];
+        assert_eq!(obl_ix.accounts.len(), 2, "[obligation, usdc_reserve] only");
+        assert_eq!(obl_ix.accounts[0].pubkey, obligation);
+        assert_eq!(
+            obl_ix.accounts[1].pubkey, usdc_reserve,
+            "USDC reserve must be at slot 1 (the first slot the Solend program iterates as collateral 0)"
+        );
+    }
+
+    /// Multi-reserve obligation: order is preserved verbatim, with no
+    /// gaps and no reordering. A future change that sorts or
+    /// deduplicates inside the builder would break this.
+    #[test]
+    fn refresh_obligation_preserves_multi_reserve_order_exactly() {
+        let obligation = Pubkey::new_unique();
+        let reserves: Vec<Pubkey> = (0..5).map(|_| Pubkey::new_unique()).collect();
+        let plan = build_refresh_instructions(RefreshPlanInputs {
+            solend_program_id: solend_program(),
+            reserves: vec![],
+            obligation: Some(ObligationRefreshInput {
+                obligation_pubkey: obligation,
+                referenced_reserves_in_order: reserves.clone(),
+            }),
+        });
+        let obl_ix = &plan.instructions[0];
+        assert_eq!(obl_ix.accounts.len(), 1 + 5);
+        assert_eq!(obl_ix.accounts[0].pubkey, obligation);
+        for (i, expected) in reserves.iter().enumerate() {
+            assert_eq!(
+                obl_ix.accounts[1 + i].pubkey,
+                *expected,
+                "reserve order mismatch at index {i}"
+            );
+        }
+    }
+
+    /// RefreshReserve still includes the clock sysvar at slot 3.
+    /// Phase 6I-H must NOT regress the RefreshReserve shape — the live
+    /// failure happened at RefreshObligation only; RefreshReserve in
+    /// the same failed tx succeeded with the existing layout.
+    #[test]
+    fn refresh_reserve_still_includes_clock_sysvar_unchanged() {
+        let pyth = Pubkey::new_unique();
+        let switchboard = Pubkey::new_unique();
+        let reserve = Pubkey::new_unique();
+        let plan = build_refresh_instructions(RefreshPlanInputs {
+            solend_program_id: solend_program(),
+            reserves: vec![ReserveRefreshInput {
+                reserve_pubkey: reserve,
+                pyth_oracle: pyth,
+                switchboard_oracle: switchboard,
+            }],
+            obligation: None,
+        });
+        let res_ix = plan
+            .instructions
+            .iter()
+            .find(|i| i.data == vec![SOLEND_IX_TAG_REFRESH_RESERVE])
+            .expect("RefreshReserve ix present");
+        assert_eq!(res_ix.accounts.len(), 4, "RefreshReserve still has 4 accounts");
+        assert_eq!(res_ix.accounts[0].pubkey, reserve);
+        assert!(res_ix.accounts[0].is_writable);
+        assert_eq!(res_ix.accounts[1].pubkey, pyth);
+        assert_eq!(res_ix.accounts[2].pubkey, switchboard);
+        assert_eq!(
+            res_ix.accounts[3].pubkey,
+            sysvar::clock::id(),
+            "RefreshReserve slot 3 must remain the clock sysvar (Phase 6I-H scope is RefreshObligation only)"
+        );
     }
 
     #[test]
