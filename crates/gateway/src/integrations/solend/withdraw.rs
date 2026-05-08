@@ -118,7 +118,7 @@
 //! |  1 | destination_collateral (= user's c-token ATA, intermediary)  | yes | no  |
 //! |  2 | reserve (the WITHDRAW reserve)                                | yes | no  |
 //! |  3 | obligation                                                    | yes | no  |
-//! |  4 | lending_market                                                | no  | no  |
+//! |  4 | lending_market                                                | **yes** | no  |
 //! |  5 | lending_market_authority (PDA)                                | no  | no  |
 //! |  6 | destination_liquidity (= user's underlying ATA, USDC out)     | yes | no  |
 //! |  7 | reserve_collateral_mint (c-token mint; burned)                | yes | no  |
@@ -280,7 +280,13 @@ pub fn build_withdraw_obligation_collateral_and_redeem_reserve_collateral_instru
     accounts.push(AccountMeta::new(inputs.destination_collateral, false));           // 1
     accounts.push(AccountMeta::new(inputs.reserve, false));                          // 2
     accounts.push(AccountMeta::new(inputs.obligation, false));                       // 3
-    accounts.push(AccountMeta::new_readonly(inputs.lending_market, false));          // 4
+    // Slot 4 lending_market is WRITABLE per Solend SDK + processor.
+    // Phase 6I-K (parity audit) — `_redeem_reserve_collateral` calls
+    // `LendingMarket::pack(lending_market, lending_market_info.data.borrow_mut())?`
+    // for rate-limiter / accumulated-fees updates. The earlier
+    // `new_readonly` produced a live `ReadonlyDataModified` failure
+    // (tx `5W3PzXnR…`) when the rate limiter fired.
+    accounts.push(AccountMeta::new(inputs.lending_market, false));                   // 4 — writable
     accounts.push(AccountMeta::new_readonly(lending_market_authority, false));       // 5
     accounts.push(AccountMeta::new(inputs.destination_liquidity, false));            // 6
     accounts.push(AccountMeta::new(inputs.reserve_collateral_mint, false));          // 7
@@ -476,7 +482,7 @@ mod tests {
             (1, expected_destination_collateral, true, false),
             (2, expected_reserve, true, false),
             (3, expected_obligation, true, false),
-            (4, expected_lending_market, false, false),
+            (4, expected_lending_market, true, false), // Phase 6I-K: writable
             (5, expected_pda, false, false),
             (6, expected_destination_liquidity, true, false),
             (7, expected_reserve_collateral_mint, true, false),
@@ -749,6 +755,30 @@ mod tests {
         }
     }
 
+    /// Phase 6I-K parity-audit guard. Solend SDK constructs the
+    /// withdraw ix with `AccountMeta::new(lending_market_pubkey, false)`
+    /// (writable). The deployed processor's `_redeem_reserve_collateral`
+    /// helper calls `LendingMarket::pack` after rate-limiter updates,
+    /// so the slot-4 writable flag is load-bearing.
+    #[test]
+    fn slot_4_lending_market_is_writable_non_signer() {
+        let inputs = valid_inputs();
+        let expected_lending_market = inputs.lending_market;
+        let ix = build_withdraw_obligation_collateral_and_redeem_reserve_collateral_instruction(
+            inputs,
+        )
+        .unwrap();
+        assert_eq!(ix.accounts[4].pubkey, expected_lending_market);
+        assert!(
+            ix.accounts[4].is_writable,
+            "slot 4 lending_market must be writable (Solend mainnet processor packs it)"
+        );
+        assert!(
+            !ix.accounts[4].is_signer,
+            "slot 4 lending_market must not be a signer"
+        );
+    }
+
     /// Phase 6I-J — HcKrv5Jo concrete fixture. Single-deposit
     /// obligation withdrawing from the same reserve it has a deposit
     /// on. The intentional duplicate at slot 2 (withdraw_reserve)
@@ -793,6 +823,12 @@ mod tests {
         assert!(ix.accounts[2].is_writable);
         // Obligation at slot 3.
         assert_eq!(ix.accounts[3].pubkey, obligation);
+        // Phase 6I-K: lending_market at slot 4 is WRITABLE.
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            Pubkey::from_str("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY").unwrap()
+        );
+        assert!(ix.accounts[4].is_writable, "Phase 6I-K: slot 4 lending_market is writable");
         // SPL Token at slot 11 (NO Clock).
         let spl_token = Pubkey::from_str(SPL_TOKEN_PROGRAM_ID_BS58).unwrap();
         assert_eq!(ix.accounts[11].pubkey, spl_token);

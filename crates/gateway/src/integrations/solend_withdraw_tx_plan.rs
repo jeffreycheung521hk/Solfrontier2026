@@ -767,7 +767,9 @@ mod tests {
             refresh_obl_ix.accounts[1].pubkey, fresh.reserve_pubkey,
             "slot 1 = USDC reserve (NOT slot 2 as the buggy clock-shifted layout produced)"
         );
-        assert!(!refresh_obl_ix.accounts[1].is_writable);
+        // Phase 6I-K: reserves at slot 1+ are WRITABLE per Solend SDK
+        // (`update_borrow_attribution_values` packs each reserve back).
+        assert!(refresh_obl_ix.accounts[1].is_writable);
         // No clock sysvar anywhere in the RefreshObligation account list.
         for (i, a) in refresh_obl_ix.accounts.iter().enumerate() {
             assert_ne!(

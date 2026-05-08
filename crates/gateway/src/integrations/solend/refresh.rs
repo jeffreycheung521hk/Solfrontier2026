@@ -47,7 +47,11 @@
 //!   single-byte ix data `[7]`, accounts:
 //!     1. obligation (writable)
 //!     2..N. each reserve referenced by obligation deposits + borrows
-//!         (each readonly), in deposit-then-borrow order.
+//!         (each WRITABLE per Solend SDK), in deposit-then-borrow order.
+//!         The deployed processor passes `&accounts[1..]` into
+//!         `update_borrow_attribution_values`, which can pack each
+//!         reserve back; readonly here is a latent
+//!         `ReadonlyDataModified` risk — see Phase 6I-K parity audit.
 //!
 //!   **Phase 6I-H correction:** the deployed mainnet `RefreshObligation`
 //!   handler does NOT take a clock sysvar account. It reads the clock
@@ -190,8 +194,18 @@ pub fn build_refresh_instructions(inputs: RefreshPlanInputs) -> RefreshPlan {
         let mut accounts: Vec<AccountMeta> =
             Vec::with_capacity(1 + o.referenced_reserves_in_order.len());
         accounts.push(AccountMeta::new(o.obligation_pubkey, false));
+        // Phase 6I-K parity audit: Solend SDK's `refresh_obligation`
+        // emits `AccountMeta::new(reserve_pubkey, false)` (writable)
+        // for each referenced reserve. The deployed processor calls
+        // `update_borrow_attribution_values(&accounts[1..])`, which
+        // can pack each deposit reserve back. The Phase 6I-H readonly
+        // flag passed live RefreshObligation against HcKrv5Jo only
+        // because the rate-limiter / attribution-update path didn't
+        // fire for that single-deposit, no-borrow obligation; it is a
+        // latent ReadonlyDataModified bug for any future obligation
+        // that hits the pack path. The fix matches Solend SDK exactly.
         for r in &o.referenced_reserves_in_order {
-            accounts.push(AccountMeta::new_readonly(*r, false));
+            accounts.push(AccountMeta::new(*r, false));
         }
         instructions.push(Instruction {
             program_id: solend_program_id,
@@ -298,10 +312,11 @@ mod tests {
         assert_eq!(obl_ix.accounts[0].pubkey, obligation);
         assert!(obl_ix.accounts[0].is_writable);
         // Reserves start at slot 1 — multi-reserve order is preserved.
+        // Phase 6I-K: each reserve is WRITABLE per Solend SDK.
         assert_eq!(obl_ix.accounts[1].pubkey, reserve_a);
-        assert!(!obl_ix.accounts[1].is_writable);
+        assert!(obl_ix.accounts[1].is_writable);
         assert_eq!(obl_ix.accounts[2].pubkey, reserve_b);
-        assert!(!obl_ix.accounts[2].is_writable);
+        assert!(obl_ix.accounts[2].is_writable);
     }
 
     #[test]
@@ -396,8 +411,10 @@ mod tests {
         assert_eq!(obl_ix.accounts[0].pubkey, obligation, "slot 0 = obligation");
         assert!(obl_ix.accounts[0].is_writable);
         assert_eq!(obl_ix.accounts[1].pubkey, first_reserve, "slot 1 = first reserve (no clock)");
-        assert!(!obl_ix.accounts[1].is_writable);
+        // Phase 6I-K: reserves at slot 1+ are WRITABLE per Solend SDK.
+        assert!(obl_ix.accounts[1].is_writable);
         assert_eq!(obl_ix.accounts[2].pubkey, second_reserve, "slot 2 = second reserve");
+        assert!(obl_ix.accounts[2].is_writable);
     }
 
     /// Phase 6I-H regression guard. `sysvar::clock::id()` MUST NOT
@@ -456,6 +473,38 @@ mod tests {
         );
     }
 
+    /// Phase 6I-K parity-audit guard. Solend SDK's `refresh_obligation`
+    /// constructor emits each reserve at slot 1+ as
+    /// `AccountMeta::new(reserve, false)` — i.e. writable. The deployed
+    /// processor passes `&accounts[1..]` into
+    /// `update_borrow_attribution_values`, which can pack each reserve
+    /// back. The earlier Phase 6I-H readonly flag was a latent
+    /// `ReadonlyDataModified` risk that just happened not to fire for
+    /// the single-deposit no-borrow HcKrv5Jo obligation.
+    #[test]
+    fn refresh_obligation_reserves_are_writable_per_solend_sdk() {
+        let obligation = Pubkey::new_unique();
+        let r0 = Pubkey::new_unique();
+        let r1 = Pubkey::new_unique();
+        let plan = build_refresh_instructions(RefreshPlanInputs {
+            solend_program_id: solend_program(),
+            reserves: vec![],
+            obligation: Some(ObligationRefreshInput {
+                obligation_pubkey: obligation,
+                referenced_reserves_in_order: vec![r0, r1],
+            }),
+        });
+        let obl_ix = &plan.instructions[0];
+        assert_eq!(obl_ix.accounts.len(), 3);
+        assert!(obl_ix.accounts[0].is_writable, "slot 0 obligation writable");
+        assert!(obl_ix.accounts[1].is_writable, "slot 1 reserve writable (Solend SDK)");
+        assert!(obl_ix.accounts[2].is_writable, "slot 2 reserve writable (Solend SDK)");
+        // None of the slots are signers.
+        for (i, a) in obl_ix.accounts.iter().enumerate() {
+            assert!(!a.is_signer, "slot {i} must not be a signer");
+        }
+    }
+
     /// Multi-reserve obligation: order is preserved verbatim, with no
     /// gaps and no reordering. A future change that sorts or
     /// deduplicates inside the builder would break this.
@@ -479,6 +528,12 @@ mod tests {
                 obl_ix.accounts[1 + i].pubkey,
                 *expected,
                 "reserve order mismatch at index {i}"
+            );
+            // Phase 6I-K: each reserve writable per Solend SDK.
+            assert!(
+                obl_ix.accounts[1 + i].is_writable,
+                "reserve at slot {} must be writable",
+                1 + i
             );
         }
     }
