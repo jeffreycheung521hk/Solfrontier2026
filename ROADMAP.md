@@ -2,7 +2,7 @@
 
 **Product:** Off-chain, LLM-driven transaction control plane for Solana DeFi. Fail-closed by design.
 
-**Updated:** 2026-05-02 &nbsp;·&nbsp; **Companion:** [`ARCHITECTURE.md`](ARCHITECTURE.md), [`docs/proofs/PHASE5_CLOSEOUT.md`](docs/proofs/PHASE5_CLOSEOUT.md), [`docs/proofs/INDEX.md`](docs/proofs/INDEX.md)
+**Updated:** 2026-05-09 &nbsp;·&nbsp; **Companion:** [`ARCHITECTURE.md`](ARCHITECTURE.md), [`docs/proofs/PHASE5_CLOSEOUT.md`](docs/proofs/PHASE5_CLOSEOUT.md), [`docs/proofs/INDEX.md`](docs/proofs/INDEX.md)
 
 > **Maturity reminder.** This is a hackathon prototype with verified mainnet behaviour at controlled-test-wallet amounts (0.001 USDC). Nothing on this roadmap implies the system is currently production-deployed or audited.
 
@@ -30,10 +30,11 @@
 | Phase 3 *(original "Enterprise control plane" framing)* | ⏳ Replaced — rebranded into Phases 7 & 8 below |
 | **Phase 4 — Solend Lending Rail** | **✅ Done — mainnet finalized** |
 | **Phase 5 — LLM-Guided Solend Flow** | **✅ Done — mainnet finalized** |
-| Phase 6 — Hackathon Demo UX / Phantom Frontend | 📋 In progress (current focus) |
+| **Phase 6 — Stage 1 Tail: Canonical Intent Proof** | 📋 In progress (current focus) |
 | Phase 7 — DAO / Treasury Adapters (Squads etc.) | 📋 Planned |
 | Phase 8 — MPC / Enterprise Signing | 📋 Planned |
 | Phase 9 — Research Directions | 🔬 |
+| Long-term Vision — Stage 2: Strong Action-Binding + Autonomous Execution | 🔬 Strategic direction |
 
 ---
 
@@ -156,19 +157,140 @@ The complete safety model, slice-by-slice components, and three-incident fail-cl
 
 ---
 
-## Phase 6 — Hackathon Demo UX / Phantom Frontend 📋
+## Phase 6 — Stage 1 Tail: Canonical Intent Proof 📋
 
-**Current focus.** Make the Phase 5G proof demo-able through a browser, not the command line.
+### Goal
+
+Complete the trust story for today's human-in-the-loop execution path by making the LLM-parsed intent **tamper-evident**. The user's instruction, its expiry, and its action parameters get committed as a canonical hash; the same transaction records the hash on-chain alongside the action; any backend mutation between LLM output and Phantom signing is caught by frontend re-hash before signing.
+
+> **Stage 1 Tail is tamper-evident, not yet fully action-enforcing.** The on-chain record proves "user signed this intent hash"; it does **not** prove the action ix bytes correspond to the hash. Real-time tamper defense lives in frontend re-hash + user canonical preview + atomic `record_intent` + action ix in one tx. Strong action-binding (program decodes action ix / pre-post balance bracket) is Stage 2.
+
+### Boundary — now / now / now / now / now
+
+- **Now:** user gives instruction (NL).
+- **Now:** assistant proposes (canonical intent struct + canonical hash).
+- **Now:** human reviews canonical preview and approves.
+- **Now:** Phantom signs.
+- **Now:** daemon submits.
+
+The user is present, awake, and in the loop. There is no later-execution component in Stage 1 Tail.
+
+### What this is NOT
+
+- ❌ Not autonomous daemon trigger.
+- ❌ Not authorize-now / execute-later.
+- ❌ Not Stage 2 Authorization PDA (no conditions, no executor field, no escrow).
+- ❌ Not delegated-wallet model.
+- ❌ Not Pyth multi-feed conditions.
+- ❌ Not full on-chain action enforcement (the chain does **not** decode the Solend / Jupiter action ix bytes).
+
+### Mainnet evidence used for Hackathon submission
+
+Stage 1 Tail's Hackathon submission uses these existing finalized mainnet txs as ground truth. They predate Stage 1 Tail's safety layer, but they prove the underlying execution rails work on mainnet. **Stage 1 Tail does not require new mainnet runs in the Hackathon window** — the new safety layer is demonstrated on devnet (see § Devnet demo scope) and promoted to mainnet post-Hackathon.
+
+| Evidence | Tx | Notes |
+|---|---|---|
+| Phase 4C — Solend USDC deposit baseline (daemon-driven) | [`2QqSfDq…pxALs`](https://solscan.io/tx/2QqSfDq53a34WDXVkvZeyW59eFJcxZtkQtjZw25CoUizEmzDjahusKvBT8eNb4XdpKYwrgGcTyBwYXgth5wpxALs) | Slot 415,475,589. Proof: [`SOLEND_USDC_DEPOSIT_PHASE4C_E2E.md`](docs/proofs/SOLEND_USDC_DEPOSIT_PHASE4C_E2E.md). |
+| Phase 5G — LLM-guided Solend deposit | [`4M4ezLgm…Py3y`](https://solscan.io/tx/4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y) | Slot 415,571,964. Proof: [`LLM_SOLEND_MAINNET_E2E_PHASE5G.md`](docs/proofs/LLM_SOLEND_MAINNET_E2E_PHASE5G.md). |
+| Jupiter A1 — daemon-driven Phantom-signed swap | tx in [`a1_execute_tx_signature.txt`](docs/proofs/a1_execute_tx_signature.txt) | Proof: [`JUPITER_LIVE_MAINNET_PROOF.md`](docs/proofs/JUPITER_LIVE_MAINNET_PROOF.md). |
+| Jupiter A2 — LLM-driven Phantom-signed swap | tx in [`a2_execute_tx_signature.txt`](docs/proofs/a2_execute_tx_signature.txt) | NL → OpenAI → daemon → Phantom → mainnet. |
+| Solend withdraw (controlled wallet) | [`3tMpTSEnm…EZPJZ`](https://solscan.io/tx/3tMpTSEnmvszjSwgow43KMd4dLqnZwwSvnTbHkcPsCiyfizLf2h7kcMc1M7LwokHLC3SBPzpTfykjsc48z8EZPJZ) | Observed live; proof doc entry pending before submission. |
+
+### Devnet demo scope
+
+The new Stage 1 Tail safety layer is demonstrated on **devnet** during the Hackathon window. Mainnet promotion is post-Hackathon.
 
 | Item | Status |
 |---|---|
-| `/chat` page — natural-language entry, strict `ChatResponse` state-machine rendering | 🟡 Day 1 skeleton landed (b7b6996); polish + live-mode wiring remain |
-| `useSigningHandoff` hook — poll `GET /sessions/:id/solend-signatures/:request_id` | 📋 Day 2 |
-| Phantom integration in `/approval/[id]` — wallet connect, sign session-wallet slot, auto-submit | 📋 Day 2 |
-| Wallet header — connect/disconnect, current USDC + Solend balance | 📋 Day 2-3 |
-| Audit timeline visualisation — render the append-only chain as a flow diagram | 📋 Day 3 (stretch) |
-| Recorded demo video — 3-minute walkthrough with mainnet tx as the closer | 📋 Day 6-7 |
-| Devpost / Frontier submission writeup | 📋 Day 7 |
+| Canonical intent schema (Borsh) — closed schema, no extra fields | 📋 |
+| `expires_at_slot` included in canonical intent hash | 📋 (see § Expiry) |
+| Rust ↔ TypeScript hash parity test (CI-blocking) | 📋 |
+| `record_intent` Solana program deployed to devnet | 📋 |
+| Atomic transaction: `record_intent` ix + action ix in one tx | 📋 |
+| Frontend canonical preview UI (NL → struct → hash → human-readable summary) | 📋 |
+| Frontend re-hash before signing (mismatch → refuse to sign) | 📋 |
+| Phantom integration in `/approval/[id]` | 🟡 Day 1 chat skeleton landed (b7b6996); preview + sign integration remain |
+| Attack demo mode (compile-time gated) | 📋 (see § Attack demo mode) |
+| Recorded demo video — uses mainnet evidence + devnet Stage 1 Tail safety demo | 📋 |
+| Devpost / Frontier submission writeup | 📋 |
+
+### Tamper-evident security model
+
+Six checkpoints, layered. None of them claim "the chain decodes the action ix"; that is Stage 2.
+
+| Checkpoint | Where | Catches |
+|---|---|---|
+| Hash computed at LLM-output earliest point | Backend, immediately after schema validation | Sets the ground-truth hash |
+| Closed-schema validator | Backend, before user sees anything | Hallucinated / extra fields from the LLM |
+| Frontend re-hash | Browser, before passing tx to Phantom | Backend mutation of struct between LLM output and Phantom |
+| User canonical preview review | Browser, before clicking Sign | Backend giving a consistent-but-fake (struct, hash) pair |
+| Atomic `record_intent` + action in one tx | Solana runtime | Separating the intent commit from the action |
+| On-chain re-hash inside `record_intent` | Solana program | Client-supplied hash that does not match the supplied struct |
+| Persistent Intent PDA | On-chain forever | Forensic / audit trail post-execution |
+
+The on-chain record is **forensic proof** ("this user committed to this hash at this slot, in the same tx as this action_type"), not a real-time action validator. Real-time tamper defense lives in the browser-side re-hash and the user's review of the canonical preview.
+
+### Intent PDA — minimal fields
+
+```
+Seeds: [b"intent", schema_version (u8), user (Pubkey), intent_id ([u8; 16])]
+```
+
+| Field | Type | Mutable? |
+|---|---|---|
+| `schema_version` | `u8` (v1 = 1) | ❌ |
+| `intent_id` | `[u8; 16]` | ❌ |
+| `user` | `Pubkey` | ❌ |
+| `canonical_intent_hash` | `[u8; 32]` | ❌ |
+| `action_type` | `u8` (SolendDeposit / SolendWithdraw / JupiterSwap) | ❌ |
+| `expires_at_slot` | `u64` | ❌ |
+| `created_at_slot` | `u64` | ❌ |
+| `bump` | `u8` | ❌ |
+
+Structured action params (amount, destination, etc.) are **not** stored on-chain — they are committed in the canonical hash. The PDA is intentionally small and version-extensible via `schema_version` in the seeds (so a future v2 PDA at the same `intent_id` is a different account, no collision).
+
+### Expiry
+
+- **`expires_at_slot` is part of the canonical intent hash.** Any change to expiry changes the hash; expiry cannot be silently extended without invalidating the hash.
+- **Three fail-closed gates:**
+  1. **Frontend approval gate** — UI rejects approval if `current_slot >= expires_at_slot`; expired intent shown as greyed-out / explicit "expired" state.
+  2. **Backend submit-time check** — daemon refuses to submit a tx whose intent is past expiry, regardless of when the user signed.
+  3. **On-chain `record_intent` ix** — program rejects if `Clock.slot >= expires_at_slot`.
+- An expired intent is rejected at the earliest gate it hits; no later-stage retry on expiry failure.
+
+### Attack demo mode
+
+Demonstrates the tamper-evident model live: backend mutates struct after LLM output; frontend re-hash catches the mismatch; signing is refused.
+
+- **Compile-time gated.** `#[cfg(feature = "demo-attack")]`. Production builds **must not** include this feature.
+- **Not env-variable gated.** The toggle is a build-time decision, not a runtime decision; production binaries cannot accidentally enable it.
+- **Devnet only.** Not exposed in any mainnet-targeting build.
+- **What the demo proves:** the **frontend** defense (re-hash mismatch → refuse to sign). The on-chain part of the flow does not even fire because the tx is never signed. Demo narration must say: "frontend re-hash + atomicity catches the tamper here; the on-chain PDA is the post-execution forensic record, not a real-time blocker."
+
+### Post-Hackathon follow-up
+
+These items are flagged for the post-Hackathon credibility track. They are **not** part of Hackathon Stage 1 Tail delivery and not promised in the submission.
+
+- **Current-HEAD Jupiter rehearsal** through the same chat-tool path as Phase 5G — consolidates Jupiter into the unified pipeline; A1 / A2 already prove Jupiter mainnet capability.
+- **Mainnet `record_intent` program deployment** — devnet first; mainnet is one deliberate deploy after audit-style review.
+- **Mainnet atomic-tx rehearsal** for Solend deposit, Solend withdraw, and Jupiter swap, each with `record_intent` ix appended.
+- **Solend withdraw proof doc** — the `3tMpTSEnm…EZPJZ` tx is observed live; a formal `docs/proofs/` entry is pending and required before the next mainnet submission cycle.
+- **Stage 2 strong action-binding** — program inspects next ix via `instructions_sysvar`; pre/post balance bracket; full action-payload binding.
+- **Stage 2 execute-later flow** — conditions engine, Authorization PDA, delegated executor, escrow. See § Stage 2 preview below.
+
+### Stage 2 preview (out of scope for Hackathon)
+
+| Stage 1 Tail (this Hackathon) | Stage 2 (post-Hackathon) |
+|---|---|
+| Tamper-evident commit | Strong action-binding (program decodes / brackets the action ix) |
+| User signs, daemon submits, all in same session | User authorises now; daemon executes later when conditions match |
+| No on-chain conditions | Pyth multi-feed AND/OR conditions |
+| No Authorization PDA | Authorization PDA with executor, conditions, escrow |
+| No delegated wallet | Delegated keypair under hard bounds |
+| No autonomous execution | Conditional autonomous execution within bounds |
+| Real-time defense via frontend + atomicity | Real-time defense via on-chain action-payload validation |
+
+Stage 2 specs are drafted but not implemented; nothing about Stage 2 is promised in the Hackathon submission.
 
 ---
 
@@ -210,9 +332,47 @@ Listed for transparency about long-term intent. Not deliverables; not on a near-
 | Direction | Notes |
 |---|---|
 | Policy DSL (declarative configuration language for rules) | 🔬 — current TOML rules cover the demonstrated shapes; a DSL is justified once rule complexity exceeds TOML's expressiveness |
-| Sandboxed agent budgets (per-agent compute / spend / call quotas, kill switch) | 🔬 — hard isolation requires deeper supervisor work |
+| Sandboxed agent budgets (per-agent compute / spend / call quotas, kill switch) | 🔬 — Stage 2 introduces bounded delegation; the broader per-agent supervisor remains research |
 | Cross-protocol risk modelling (net exposure, health-factor simulation, rebalancing planner) | 🔬 — touches read-side aggregation across multiple protocols |
-| Programmable agent observers (cron-driven, on-chain event triggers) | 🔬 — currently single-shot intent execution |
+| Programmable agent observers (cron-driven, on-chain event triggers) | 🔬 — Stage 2 introduces Pyth-backed conditions; on-chain event triggers and multi-position planning remain research |
+| Long-running daemon hardening (multi-day uptime, restart recovery for watch rules, multi-position health-factor planning) | 🔬 — required to take the Stage 2 personal-risk-guard direction beyond demo |
+
+---
+
+## Long-term Vision — Stage 2: Strong Action-Binding + Autonomous Execution 🔬
+
+Stage 1 Tail (Phase 6) gives a **tamper-evident** intent commit. Stage 2 extends it in two directions:
+
+1. **Strong action-binding.** The on-chain program inspects the action ix in the same tx (via `instructions_sysvar`), enforces input/output mints, brackets pre-and-post token balances, and rejects when the action ix bytes do not correspond to the canonical hash. This converts forensic proof into real-time on-chain enforcement.
+2. **Authorize-now / execute-later.** Conditions engine (Pyth multi-feed, AND/OR), Authorization PDA, delegated executor keypair under hard bounds, optional PDA escrow. The user authorises once; the daemon executes later when conditions hold; the program independently re-verifies every condition and every action constraint before any execution lands.
+
+**Personal risk guard — the consumer-shaped direction.** A 24-hour-running daemon that watches a single user's positions and, within hard bounds the user has set, prevents foreseeable losses while the user is asleep. The Alice scenario (rules like *"if SOL < $80 AND BTC > $70k, swap up to 50 USDC"*) is the demo cut for this direction; full multi-position health-factor planning is research-direction.
+
+**How this relates to Stage 1 Tail.**
+
+| Aspect | Stage 1 Tail (this Hackathon) | Stage 2 |
+|---|---|---|
+| Trigger | User NL message, present | Watch rule on observed state, asleep |
+| Action-binding | Tamper-evident (forensic) | Strong (real-time on-chain enforcement) |
+| Default action | Propose, human signs, daemon submits | Execute under bounds, notify after |
+| Trust boundary | Main wallet, human signs | Delegated keypair under hard caps |
+| Tamper defense | Frontend re-hash + atomicity | Frontend re-hash + atomicity + on-chain action-ix validation |
+
+**What the Hackathon proves about Stage 2:**
+
+- Closed-schema LLM parsing + canonical hash + atomic on-chain commit (Stage 1 Tail) is the substrate. Stage 2 reuses it.
+- Policy engine + fail-closed substrate (Phases 2–5) reuse cleanly as the Stage 2 bounds enforcer.
+- Append-only audit gives the morning-summary timeline for autonomous-execution mode.
+
+**What the Hackathon does NOT prove:**
+
+- **Strong action-binding** — the chain does not yet decode action ix bytes. Stage 2 work.
+- **Real user delegation flow** — Stage 2; needs real third-party user authorisation UX with consent / disclosure / recovery design.
+- **Distribution.** *How does the target user find ClawSolana?* The hardest remaining problem after the technical work; not yet attempted.
+- **Long-running daemon hardening** (multi-day uptime, restart recovery, multi-position planning) — listed under Phase 9; not built.
+- **Cross-protocol risk modelling** — explicitly 🔬.
+
+**M1 deliverable:** a written-down **capability boundary white paper** — what the system can and cannot do, with mainnet evidence references and an explicit not-yet-done section. The honesty of the boundary is the product, not just its capabilities.
 
 ---
 
@@ -261,7 +421,12 @@ Mainnet-proven via Phantom bridge.
 
 This section exists for honest credibility. **None of the items below are claimed complete.**
 
-- **Production frontend UI** — Day 1 of the chat skeleton just landed; full Phantom-integrated demo loop is in flight.
+- **Production frontend UI** — Day 1 of the chat skeleton just landed; full Phantom-integrated demo loop is in flight under Phase 6.
+- **Stage 1 Tail mainnet promotion** — `record_intent` program is devnet-scoped during the Hackathon. Mainnet deployment + atomic-tx mainnet rehearsals (Solend deposit / withdraw / Jupiter swap) are post-Hackathon credibility work, not in this submission.
+- **Solend withdraw proof doc** — withdraw mainnet tx [`3tMpTSEnm…EZPJZ`](https://solscan.io/tx/3tMpTSEnmvszjSwgow43KMd4dLqnZwwSvnTbHkcPsCiyfizLf2h7kcMc1M7LwokHLC3SBPzpTfykjsc48z8EZPJZ) is observed live; a formal `docs/proofs/` entry is pending before submission.
+- **Current-HEAD Jupiter rehearsal** through the unified Phase 5G chat-tool path — A1 / A2 already prove Jupiter mainnet capability, but the consolidated route is post-Hackathon.
+- **Strong action-binding (Stage 2)** — the chain does not yet decode the action ix; tamper-evidence is forensic, not real-time on-chain. Stage 2 design only.
+- **Conditional autonomous execution (Stage 2)** — Authorization PDA, conditions engine, delegated executor, escrow. Stage 2 design only; not built, not promised.
 - **Squads multisig integration** — designed-around but not built. Phase 7.
 - **MPC / hardware signing adapters** — Fireblocks, Turnkey, Fordefi, Ledger are all 📋. Phase 8.
 - **Policy DSL and sandboxed agent budgets** — research directions, not on a near-term schedule.
@@ -269,20 +434,37 @@ This section exists for honest credibility. **None of the items below are claime
 - **Multi-protocol composition** (e.g., swap-then-deposit in one chat turn) — current chat surface dispatches one tool per turn, by design. Composing intents while preserving the one-turn-per-LLM-invocation invariant is a Phase 7+ design problem.
 - **Anthropic mainnet parity** — provider path is wired and unit-test green; mainnet proof using `claude-sonnet-4-6` has not been run.
 - **Larger amounts** — every mainnet proof on this roadmap used controlled-test-wallet amounts (1,000 raw USDC = 0.001 USDC), bounded by hard caps in the harness. The system has not been exercised at production-scale balances.
+- **Distribution / go-to-market** — the Stage 2 personal-risk-guard direction needs an answer to "how does the target user find this product." Not yet attempted; flagged as the hardest remaining problem after the technical work.
+- **Capability boundary white paper** — written-down list of what ClawSolana can and cannot do (with mainnet evidence and explicit not-yet-done sections). Targeted as the Stage 2 M1 deliverable; not started.
 
 ---
 
 ## Current Hackathon Focus
 
-Frontier hackathon submission (deadline 2026-05-11 06:59 UTC). The technical depth is sealed at Phase 5G; remaining work is making it visible:
+Frontier hackathon submission (deadline 2026-05-11 06:59 UTC). Strategy is **D' — mainnet evidence on existing finalized txs, devnet evidence on the Stage 1 Tail safety layer**. No new mainnet rehearsals are required for this submission window.
 
-1. **Build `/chat` UI** — natural-language entry, render the typed `ChatResponse` state machine. *(Day 1 skeleton committed; live-mode polish + balance display remaining.)*
-2. **Connect approval → Phantom signing → finalized status** — `useSigningHandoff` hook, Phantom integration in `/approval/[id]`, lifecycle progress display.
-3. **Run one final live mainnet demo** through the new UI — the same flow Phase 5G proved, but via the browser instead of the test harness.
-4. **Record a 3-minute demo video** — show fail-closed defense record, mainnet finalization, open-source verifiability.
-5. **Devpost submission** — reuse `PITCH.md` (already in Devpost format); add screenshots and demo video.
+**Mainnet evidence (existing, no new runs needed):**
 
-The mainnet proof is in. The work that remains is the storytelling layer.
+1. Phase 4C Solend deposit baseline — finalized tx [`2QqSfDq…pxALs`](https://solscan.io/tx/2QqSfDq53a34WDXVkvZeyW59eFJcxZtkQtjZw25CoUizEmzDjahusKvBT8eNb4XdpKYwrgGcTyBwYXgth5wpxALs).
+2. Phase 5G LLM-guided Solend deposit — finalized tx [`4M4ezLgm…Py3y`](https://solscan.io/tx/4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y).
+3. Jupiter A1 / A2 — daemon-driven and LLM-driven Phantom-signed Jupiter swaps. See [`docs/proofs/`](docs/proofs/).
+4. Solend withdraw — observed live tx [`3tMpTSEnm…EZPJZ`](https://solscan.io/tx/3tMpTSEnmvszjSwgow43KMd4dLqnZwwSvnTbHkcPsCiyfizLf2h7kcMc1M7LwokHLC3SBPzpTfykjsc48z8EZPJZ); proof doc entry pending before submission.
+
+**Devnet deliverables (Stage 1 Tail safety layer):**
+
+5. Canonical intent schema (Borsh, closed-schema, `expires_at_slot` in hash).
+6. Rust ↔ TypeScript hash parity test (CI-blocking).
+7. `record_intent` program deployed to devnet.
+8. Atomic tx demo: `record_intent` ix + action ix in one tx (Solend deposit on devnet).
+9. Frontend canonical preview UI + frontend re-hash before signing.
+10. Attack demo mode (compile-time gated; tamper → hash mismatch → refuse signing).
+
+**Common deliverables:**
+
+11. **3-minute demo video** — open with mainnet evidence (existing finalized txs); show Stage 1 Tail safety layer live on devnet (canonical preview, attack demo, atomic tx); close with Stage 2 preview (autonomous execution + strong action-binding) and capability boundary statement.
+12. **Devpost submission** — reuse `PITCH.md`; add demo video, screenshots, and link to ROADMAP Stage 1 Tail / Stage 2 framing.
+
+The Phase 5G mainnet proof is in. Stage 1 Tail completes the trust story for the present-tense execution path. Stage 2 (autonomous execution + strong on-chain action-binding) is the post-Hackathon credibility track and is **not** promised in this submission.
 
 ---
 
@@ -290,9 +472,11 @@ The mainnet proof is in. The work that remains is the storytelling layer.
 
 These have not changed since project inception, and Phases 4–5 strengthen rather than weaken them.
 
-1. **Human signs, AI proposes.** No phase ever introduces auto-signing. The user always holds the keys.
+1. **Human signs, AI proposes.** No phase ever introduces auto-signing on the main wallet. The user always holds the main-wallet keys. Stage 1 Tail keeps this fully intact: every action is signed by the user in Phantom, in the same session as the natural-language request.[^inv1]
 2. **Compile-time safety first.** Every pipeline stage uses typestate enforcement. If it compiles, it's safe.
 3. **Fail-closed on ambiguity.** If the AI isn't sure, it asks. If a policy check fails, the action is blocked. If an oracle is stale, the proposal is rejected at the policy stage.
 4. **Audit everything.** Every proposal, simulation, policy decision, approval, and signature — logged with a full append-only trail.
 5. **Control plane first, adapters second.** The pipeline and policy engine are the product. Protocol integrations (Solend, Jupiter, Orca, future) are downstream applications.
 6. **No silent fallback.** Missing credentials surface a typed error, not a degraded mode. No automatic retry on broadcast failure. Three documented mainnet failure modes were stopped, not retried.
+
+[^inv1]: *Stage 2 footnote (out of Hackathon scope).* Stage 2 introduces a separate, user-authorised **delegated keypair** with hard bounds (max balance, expiry, per-trigger cap, action whitelist) for the autonomous-execution direction. The main wallet remains under INV-1: AI proposes, human signs. The delegated keypair is a distinct trust boundary that the user explicitly opts into and can revoke at any time. The bound itself — what the delegated keypair can / cannot do — is the safety claim, not "no auto-signing ever." Stage 2 is design only at submission time.
