@@ -16,6 +16,7 @@ members = [
     "bins/claw",
     "bins/keygen",
     "bins/sign-pending",
+    "programs/clawsol-intent",
 ]
 
 [workspace.package]
