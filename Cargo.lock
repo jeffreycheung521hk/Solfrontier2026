@@ -1149,10 +1149,13 @@ dependencies = [
 name = "claw-types"
 version = "0.1.0"
 dependencies = [
+ "borsh 1.6.0",
+ "bs58",
  "chrono",
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "toml 0.8.23",
  "uuid",
