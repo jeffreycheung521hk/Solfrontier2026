@@ -64,23 +64,30 @@
 //!   account list.
 //! - `LendingInstruction` variant: tag byte = 15.
 //! - Payload: `collateral_amount: u64` (little-endian, per SPL `Pack`).
-//! - **12 accounts** in the exact order produced below.
+//! - **13 accounts** in the exact order produced below.
 //! - `lending_market_authority` is derived as a PDA from
 //!   `(lending_market, program_id)` with seed
 //!   `[&lending_market.to_bytes()]` — the builder derives this
 //!   internally; caller does NOT supply it.
 //!
-//! ### Divergence note (mirroring deposit's Slice 3D(ii) finding)
+//! ### Phase 6I-I correction
 //!
-//! The `master` branch of the same repo carries an older shape that
-//! includes the Clock sysvar in the account list. The deployed mainnet
-//! program does NOT take Clock as an account — it reads Clock via
-//! `Clock::get()?` syscall. Pinning this builder to the `mainnet`
-//! branch's 12-account layout is load-bearing. The structural test
-//! [`tests::no_clock_sysvar_in_account_list`] guards against
-//! accidental drift.
+//! Phase 5H-A originally documented this builder as 12 accounts with
+//! Clock omitted, citing a then-unverified claim that the deployed
+//! mainnet handler reads Clock via `Clock::get()?` syscall. That
+//! claim was wrong for the combined withdraw ix — only
+//! `RefreshObligation` reads Clock via syscall (the Phase 6I-H fix
+//! verified that). The deployed Solend mainnet program at
+//! `So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo` expects the Clock
+//! sysvar account at slot 11 of `WithdrawObligationCollateralAndRedeemReserveCollateral`
+//! per Solend's `solana-program-library` `mainnet` branch
+//! `token-lending/sdk/src/instruction.rs`. The 12-account layout
+//! produced a live failure on 2026-05-08:
+//! `InstructionError(3, NotEnoughAccountKeys)` — the Solend handler
+//! advanced past the SPL Token program (slot 11 in the buggy layout),
+//! tried to read slot 12 for Clock, and ran out of accounts.
 //!
-//! Withdraw also does NOT take any oracle account in the ix list —
+//! Withdraw still does NOT take any oracle account in the ix list —
 //! the oracle reading happened at refresh time and is cached in the
 //! obligation's per-deposit accounting. The structural test
 //! [`tests::no_oracle_accounts_in_account_list`] guards this.
@@ -100,13 +107,12 @@
 //! |  8 | reserve_liquidity_supply (source underlying)                  | yes | no  |
 //! |  9 | obligation_owner                                              | no  | **yes** |
 //! | 10 | user_transfer_authority                                       | no  | **yes** |
-//! | 11 | spl_token program                                             | no  | no  |
-//!
-//! Clock is NOT in the account list; the handler reads it via
-//! `Clock::get()?` sysvar syscall.
+//! | 11 | clock sysvar                                                  | no  | no  |
+//! | 12 | spl_token program                                             | no  | no  |
 
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::sysvar;
 
 use super::deposit::SPL_TOKEN_PROGRAM_ID_BS58;
 use crate::lending::CollateralTokenAmount;
@@ -210,10 +216,13 @@ pub fn build_withdraw_obligation_collateral_and_redeem_reserve_collateral_instru
     data.push(SOLEND_IX_TAG_WITHDRAW_OBLIGATION_COLLATERAL_AND_REDEEM_RESERVE_COLLATERAL);
     data.extend_from_slice(&inputs.collateral_amount.raw().to_le_bytes());
 
-    // Account list — order is load-bearing; matches the cited Solend
-    // mainnet branch source verbatim (12 accounts, no Clock sysvar
-    // in the list, no oracle accounts in the list). Writable vs
-    // readonly and signer vs non-signer flags also match the source.
+    // Account list — order is load-bearing; matches the Solend mainnet
+    // branch source verbatim (13 accounts, Clock sysvar at slot 11,
+    // SPL Token program at slot 12, no oracle accounts in the list).
+    // Writable vs readonly and signer vs non-signer flags also match
+    // the source. See module doc-comment "Phase 6I-I correction" for
+    // the 2026-05-08 NotEnoughAccountKeys failure that motivated
+    // adding Clock at slot 11.
     let accounts = vec![
         AccountMeta::new(inputs.source_collateral, false),                    // 0
         AccountMeta::new(inputs.destination_collateral, false),               // 1
@@ -226,7 +235,8 @@ pub fn build_withdraw_obligation_collateral_and_redeem_reserve_collateral_instru
         AccountMeta::new(inputs.reserve_liquidity_supply, false),             // 8
         AccountMeta::new_readonly(inputs.obligation_owner, true),             // 9 — signer
         AccountMeta::new_readonly(inputs.user_transfer_authority, true),      // 10 — signer
-        AccountMeta::new_readonly(spl_token_program_id, false),               // 11
+        AccountMeta::new_readonly(sysvar::clock::id(), false),                // 11 — Clock sysvar
+        AccountMeta::new_readonly(spl_token_program_id, false),               // 12
     ];
 
     Ok(Instruction {
@@ -304,15 +314,20 @@ mod tests {
     }
 
     #[test]
-    fn account_count_is_12() {
+    fn account_count_is_13() {
+        // Phase 6I-I: Solend mainnet
+        // WithdrawObligationCollateralAndRedeemReserveCollateral has
+        // 13 accounts (Clock at slot 11, SPL Token at slot 12). The
+        // earlier 12-account shape produced a NotEnoughAccountKeys
+        // failure on 2026-05-08 — see module doc.
         let ix = build_withdraw_obligation_collateral_and_redeem_reserve_collateral_instruction(
             valid_inputs(),
         )
         .unwrap();
         assert_eq!(
             ix.accounts.len(),
-            12,
-            "Solend mainnet WithdrawObligationCollateralAndRedeemReserveCollateral has 12 accounts"
+            13,
+            "Solend mainnet WithdrawObligationCollateralAndRedeemReserveCollateral has 13 accounts"
         );
     }
 
@@ -360,6 +375,7 @@ mod tests {
 
         // Per-slot pubkey + flag assertions, matching the Solend
         // mainnet-branch matrix in this file's module doc.
+        // Phase 6I-I: slot 11 is Clock sysvar; SPL Token shifted to slot 12.
         let exp = [
             // (index, pubkey, writable, signer)
             (0usize, expected_source_collateral, true, false),
@@ -373,7 +389,8 @@ mod tests {
             (8, expected_reserve_liquidity_supply, true, false),
             (9, expected_obligation_owner, false, true),         // signer
             (10, expected_user_transfer_authority, false, true), // signer
-            (11, expected_spl_token, false, false),
+            (11, sysvar::clock::id(), false, false),             // Phase 6I-I: Clock sysvar
+            (12, expected_spl_token, false, false),
         ];
         for (idx, pk, wr, sg) in exp {
             let a = &ix.accounts[idx];
@@ -448,25 +465,73 @@ mod tests {
         assert_eq!(encoded, WITHDRAW_ALL_COLLATERAL_AMOUNT_SENTINEL_RAW);
     }
 
+    /// Phase 6I-I regression guard. The deployed Solend mainnet
+    /// `WithdrawObligationCollateralAndRedeemReserveCollateral`
+    /// handler EXPECTS Clock at account slot 11. Removing it produces
+    /// `NotEnoughAccountKeys` because the handler advances past Clock
+    /// looking for the SPL Token program at slot 12.
+    ///
+    /// (This test inverts the original `no_clock_sysvar_in_account_list`
+    /// guard, which incorrectly enforced the absence of Clock based on
+    /// a misread of the source. The 2026-05-08 live failure
+    /// `InstructionError(3, NotEnoughAccountKeys)` proved Clock IS
+    /// required here. Note the asymmetry with `RefreshObligation`,
+    /// which the Phase 6I-H fix verified does NOT take Clock as an
+    /// account — only this combined withdraw ix does.)
     #[test]
-    fn no_clock_sysvar_in_account_list() {
-        // Slice 3D(ii)'s deposit-side lesson: pinning to the mainnet
-        // branch means Clock is read via `Clock::get()?` syscall,
-        // NOT taken as an account. A future refactor that
-        // accidentally reintroduces Clock here would fail mainnet
-        // simulation with `LendingError::InvalidTokenProgram` or a
-        // similar misclassification. Lock structurally.
+    fn clock_sysvar_is_at_slot_11_required_by_solend_mainnet() {
         let ix = build_withdraw_obligation_collateral_and_redeem_reserve_collateral_instruction(
             valid_inputs(),
         )
         .unwrap();
-        for (i, a) in ix.accounts.iter().enumerate() {
-            assert_ne!(
-                a.pubkey,
-                sysvar::clock::id(),
-                "Clock sysvar must not appear in withdraw accounts (idx={i})"
-            );
-        }
+        assert_eq!(
+            ix.accounts.len(),
+            13,
+            "withdraw ix must have exactly 13 accounts"
+        );
+        assert_eq!(
+            ix.accounts[11].pubkey,
+            sysvar::clock::id(),
+            "Clock sysvar must be at slot 11 (per Solend mainnet branch token-lending/sdk/src/instruction.rs)"
+        );
+        assert!(
+            !ix.accounts[11].is_writable,
+            "Clock sysvar at slot 11 must be readonly"
+        );
+        assert!(
+            !ix.accounts[11].is_signer,
+            "Clock sysvar at slot 11 must NOT be a signer"
+        );
+        // Clock appears exactly once (no accidental duplicate).
+        let clock_occurrences = ix
+            .accounts
+            .iter()
+            .filter(|a| a.pubkey == sysvar::clock::id())
+            .count();
+        assert_eq!(
+            clock_occurrences, 1,
+            "Clock sysvar must appear exactly once in the withdraw account list"
+        );
+    }
+
+    /// Phase 6I-I — the SPL Token program now lives at slot 12, after
+    /// Clock at slot 11. A reordering that swaps these two would still
+    /// have 13 accounts and pass the count check; this test guards the
+    /// specific (Clock, SPL Token) ordering.
+    #[test]
+    fn spl_token_program_is_at_slot_12_after_clock() {
+        let ix = build_withdraw_obligation_collateral_and_redeem_reserve_collateral_instruction(
+            valid_inputs(),
+        )
+        .unwrap();
+        let expected_spl_token =
+            Pubkey::from_str(SPL_TOKEN_PROGRAM_ID_BS58).unwrap();
+        assert_eq!(
+            ix.accounts[12].pubkey, expected_spl_token,
+            "SPL Token program must be at slot 12 (after Clock at slot 11)"
+        );
+        assert!(!ix.accounts[12].is_writable);
+        assert!(!ix.accounts[12].is_signer);
     }
 
     #[test]
@@ -475,14 +540,12 @@ mod tests {
         // `RefreshReserve` having posted the oracle-derived state
         // into the reserve account. The withdraw ix itself does NOT
         // take pyth or switchboard oracle accounts. Lock structurally
-        // so a future refactor that accidentally adds oracles (e.g.
-        // by mistakenly mirroring deposit's 14-account shape) is
+        // so a future refactor that accidentally adds oracles is
         // caught.
         //
-        // We use the input pubkeys we control to assert the account
-        // list is exactly the 12 we expect — none of the slots
-        // matches a "spare" oracle pubkey that would indicate a
-        // mis-shape.
+        // Phase 6I-I: the canonical length is exactly 13 (Clock at
+        // slot 11, SPL Token at slot 12). Any extra account is
+        // structural drift.
         let pyth_unique = Pubkey::new_unique();
         let switchboard_unique = Pubkey::new_unique();
         let inputs = valid_inputs();
@@ -500,9 +563,34 @@ mod tests {
                 "no oracle should leak into withdraw accounts (idx={i})"
             );
         }
-        // Also: total length is exactly 12 — any extra account is
-        // structural drift.
-        assert_eq!(ix.accounts.len(), 12);
+        assert_eq!(ix.accounts.len(), 13);
+    }
+
+    /// Phase 6I-I regression guard. The signer set must remain exactly
+    /// `[obligation_owner @ slot 9, user_transfer_authority @ slot 10]`
+    /// — adding Clock at slot 11 must NOT have promoted Clock or any
+    /// other slot to a signer. This locks the user-wallet-only signer
+    /// invariant.
+    #[test]
+    fn signer_set_unchanged_only_slots_nine_and_ten() {
+        let inputs = valid_inputs();
+        let ix = build_withdraw_obligation_collateral_and_redeem_reserve_collateral_instruction(
+            inputs,
+        )
+        .unwrap();
+        let signer_indices: Vec<usize> = ix
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.is_signer)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            signer_indices,
+            vec![9, 10],
+            "signer slots must remain [9, 10] (obligation_owner, user_transfer_authority); \
+             Clock at slot 11 must NOT be a signer, SPL Token at slot 12 must NOT be a signer"
+        );
     }
 
     // Note: a `no_signer_field_in_proposed_action_withdraw`
