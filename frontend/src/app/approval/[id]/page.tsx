@@ -8,7 +8,31 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatRelative, shortPubkey } from "@/lib/format";
 import { LeaseCountdown } from "@/components/lease-countdown";
 import { SigningFlow } from "@/components/signing-flow";
-import type { ApprovalStage, ApprovalWorkflow, StageDecision } from "@/lib/types";
+import type { SolendSigningAction } from "@/lib/use-signing-handoff";
+import type {
+  ApprovalStage,
+  ApprovalWorkflow,
+  PolicyVerdict,
+  StageDecision,
+} from "@/lib/types";
+
+/// Phase 6I-G — known stable rule names emitted by the backend for
+/// each Solend pipeline. We default to `"deposit"` for any other rule
+/// name so adding new signed-action tools doesn't accidentally route
+/// through the withdraw prepare endpoint.
+const SOLEND_WITHDRAW_RULE_NAMES = new Set<string>([
+  "solend-withdraw-all-explicit-obligation",
+]);
+
+function actionFromPolicyVerdict(v: PolicyVerdict): SolendSigningAction {
+  // PolicyVerdict's `requires_human_approval` / `approved` / `rejected`
+  // variants all carry `rule_name`; `simulation_required` and
+  // `simulation_failed` do not. The narrowing here keeps TS strict.
+  if ("rule_name" in v && SOLEND_WITHDRAW_RULE_NAMES.has(v.rule_name)) {
+    return "withdraw_all";
+  }
+  return "deposit";
+}
 
 export default async function ApprovalChainPage({
   params,
@@ -18,6 +42,7 @@ export default async function ApprovalChainPage({
   const { id } = await params;
   const { request, workflow, proposal } = await fetchApproval(id);
   const title = proposal?.description ?? request.description;
+  const signingAction = actionFromPolicyVerdict(request.policy_verdict);
 
   return (
     <div className="space-y-8">
@@ -48,6 +73,7 @@ export default async function ApprovalChainPage({
             approvalRequestId={request.id}
             sessionId={request.session_id}
             workflowState={workflow.state}
+            action={signingAction}
           />
         </TabsContent>
 
