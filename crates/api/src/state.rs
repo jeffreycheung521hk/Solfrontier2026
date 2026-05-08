@@ -905,6 +905,100 @@ impl SolendJitPrepareHandlerRef {
     }
 }
 
+// ── Phase 6I-F — Solend WITHDRAW JIT-prepare ───────────────────────────────
+//
+// Mirrors the deposit JIT-prepare types above but scoped to withdraw-all.
+// The withdraw flow has narrower preconditions (no obligation Keypair,
+// no preflight outcome, no transient pubkey) so the result enum has
+// dedicated typed-rejection arms for the withdraw re-check.
+
+/// Wire shape returned by the withdraw JIT-prepare route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SolendWithdrawJitPrepareResult {
+    /// Fresh withdraw signing handoff created. The frontend now uses
+    /// `signing_request_id` with the existing GET retrieve / POST
+    /// submit endpoints (the same endpoints deposit uses) to drive
+    /// Phantom + finalize.
+    Ready {
+        approval_request_id: uuid::Uuid,
+        signing_request_id: uuid::Uuid,
+        session_id: SessionId,
+        wallet: String,
+        obligation_pubkey: String,
+        reserve_pubkey: String,
+        last_valid_block_height: u64,
+        verified_slot: u64,
+        expires_at_unix_ms: i64,
+    },
+    /// Workflow exists for this session but is not in `Approved` state.
+    NotApproved { state: String },
+    /// No parked withdraw intent found under this `approval_request_id`
+    /// (resume task never persisted, lazy-swept, or this was a deposit
+    /// approval).
+    WithdrawIntentMissing,
+    /// Currently-bound session wallet differs from the wallet captured
+    /// in the parked withdraw intent.
+    WalletMismatch {
+        expected: String,
+        bound: Option<String>,
+    },
+    /// Fresh re-check at prepare time blocked the withdraw. `reason` is
+    /// one of the stable constants in
+    /// `crate::integrations::solend_withdraw_park` (e.g.
+    /// `owner_mismatch`, `borrow_appeared`, `no_usdc_deposit`,
+    /// `obligation_not_found`).
+    RecheckBlocked {
+        reason: String,
+        detail: Option<String>,
+    },
+    /// Plan assembly rejected the inputs (typically a snapshot drift
+    /// between resume re-check and prepare).
+    PlanAssemblyFailed {
+        error_type: String,
+        message: String,
+    },
+    /// `create_withdraw_signing_handoff` returned a typed error.
+    HandoffCreateFailed { error_type: String, message: String },
+    /// Fresh snapshot assembly failed (RPC error, etc.).
+    SnapshotAssembleFailed {
+        error_type: String,
+        message: String,
+    },
+    /// Indistinguishable variant for: workflow not found OR workflow
+    /// session_id does not match the path session.
+    NotFound,
+}
+
+/// Backend seam for the withdraw prepare route. Concrete implementation
+/// lives in `claw-gateway`; the route handler calls through this trait
+/// so `claw-api` stays gateway-agnostic.
+pub trait SolendWithdrawJitPrepareHandler: Send + Sync + 'static {
+    fn prepare(
+        &self,
+        session_id: &SessionId,
+        approval_request_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = SolendWithdrawJitPrepareResult> + Send + '_>>;
+}
+
+/// Cloneable reference to a `SolendWithdrawJitPrepareHandler`.
+#[derive(Clone)]
+pub struct SolendWithdrawJitPrepareHandlerRef(pub Arc<dyn SolendWithdrawJitPrepareHandler>);
+
+impl SolendWithdrawJitPrepareHandlerRef {
+    pub fn new(inner: Arc<dyn SolendWithdrawJitPrepareHandler>) -> Self {
+        Self(inner)
+    }
+
+    pub async fn prepare(
+        &self,
+        session_id: &SessionId,
+        approval_request_id: uuid::Uuid,
+    ) -> SolendWithdrawJitPrepareResult {
+        self.0.prepare(session_id, approval_request_id).await
+    }
+}
+
 // ── Phase 5D.2 — User-facing chat route ─────────────────────────────────────
 //
 // The chat route invokes a strict one-turn conversational handler. The HTTP
@@ -1028,6 +1122,14 @@ pub struct AppState {
     /// signing handoff at user-click time. `None` when Solend
     /// integration isn't wired.
     pub solend_jit_prepare:  Option<SolendJitPrepareHandlerRef>,
+    /// Phase 6I-F: backend seam for the WITHDRAW JIT-prepare route. Same
+    /// click-time-blockhash design as deposit, but scoped to the
+    /// withdraw-all flow: looks up a parked
+    /// `ParkedSolendWithdrawAllIntent`, re-fetches the obligation,
+    /// re-runs the four structural invariants, assembles a
+    /// `SolendWithdrawTxPlan`, and parks an unsigned tx in the shared
+    /// `SolendSigningStore`. `None` when Solend integration isn't wired.
+    pub solend_withdraw_jit_prepare: Option<SolendWithdrawJitPrepareHandlerRef>,
     /// Wallet ownership challenge-response.
     pub wallet_challenges:   WalletChallengeHandlerRef,
     /// Bearer token for API authentication (legacy single-token mode).

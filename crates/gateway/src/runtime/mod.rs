@@ -24,4 +24,5 @@ pub mod copilot_tools_wiring;
 pub mod solend_jit_prepare_wiring;
 pub mod solend_submit_wiring;
 pub mod solend_wiring;
+pub mod solend_withdraw_jit_prepare_wiring;
 pub mod tool_output_explainer;

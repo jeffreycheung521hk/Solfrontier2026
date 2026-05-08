@@ -985,6 +985,67 @@ impl GatewayDaemon {
             ))
         };
 
+        // Phase 6I-F — withdraw JIT-prepare handler. Same pattern as
+        // deposit's prepare above, but reads from
+        // `pending_solend_withdraw_park` and uses the WITHDRAW plan
+        // assembler. Reuses the same blockhash provider, signing store,
+        // and audit sink so `submit_signed_solend_transaction` accepts
+        // the parked unsigned tx without further changes.
+        let solend_withdraw_jit_prepare_ref: Option<
+            claw_api::state::SolendWithdrawJitPrepareHandlerRef,
+        > = {
+            let blockhash_provider: std::sync::Arc<
+                dyn crate::integrations::solend_signing::RecentBlockhashProvider,
+            > = std::sync::Arc::new(
+                crate::integrations::solend_signing::ClawBlockhashProvider::new(
+                    blockhash_mgr.clone(),
+                ),
+            );
+            let external_wallet_ref: std::sync::Arc<
+                dyn crate::tools::jupiter_swap::SessionBoundWallet,
+            > = std::sync::Arc::new(external_wallet.clone());
+            // Phase 6H scanner's reader trait — single `getAccountInfo`
+            // for the obligation pubkey at prepare-time re-check.
+            let obligation_reader: std::sync::Arc<
+                dyn crate::tools::get_solend_position::SolendPositionReader,
+            > = std::sync::Arc::new(
+                crate::tools::get_solend_position::RpcSolendPositionReader::new(
+                    std::sync::Arc::new(rpc_pool.clone()),
+                ),
+            );
+            // Production fresh-snapshot assembler — same one the deposit
+            // tool uses, scoped via the
+            // `SolendWithdrawFreshSnapshot` adapter.
+            let fetcher: std::sync::Arc<
+                dyn crate::integrations::solend::SolanaAccountFetcher,
+            > = std::sync::Arc::new(
+                crate::integrations::solend::ClawRpcPoolAccountFetcher::new(
+                    rpc_pool.clone(),
+                    claw_types::solana::CommitmentLevel::Confirmed,
+                ),
+            );
+            let fresh_snapshot: std::sync::Arc<
+                dyn crate::runtime::solend_withdraw_jit_prepare_wiring::SolendWithdrawFreshSnapshot,
+            > = std::sync::Arc::new(
+                crate::integrations::solend::SolendSnapshotAssembler::new(fetcher),
+            );
+            let prepare_handler =
+                crate::runtime::solend_withdraw_jit_prepare_wiring::GatewaySolendWithdrawJitPrepareHandler::new(
+                    approval_store.clone(),
+                    external_wallet_ref,
+                    pending_solend_withdraw_park.clone(),
+                    obligation_reader,
+                    fresh_snapshot,
+                    pending_solend_signing.clone(),
+                    blockhash_provider,
+                    solend_audit_sink.clone(),
+                    config.policy.approval_lease_seconds,
+                );
+            Some(claw_api::state::SolendWithdrawJitPrepareHandlerRef::new(
+                std::sync::Arc::new(prepare_handler),
+            ))
+        };
+
         let app_state = AppState {
             session_mgr:       session_ref,
             message_handler:   message_handler_ref,
@@ -993,6 +1054,8 @@ impl GatewayDaemon {
             wallet_signatures: wallet_sig_handler_ref,
             solend_signatures: solend_sig_handler_ref,
             solend_jit_prepare: solend_jit_prepare_ref,
+            // Phase 6I-F: withdraw JIT-prepare handler wired below.
+            solend_withdraw_jit_prepare: solend_withdraw_jit_prepare_ref,
             wallet_challenges: wallet_challenge_handler_ref,
             auth_token:        AuthToken::new(api_token),
             operator_registry: operator_registry.clone(),

@@ -58,6 +58,7 @@ use crate::{
         sessions::{close_session, list_sessions, open_session},
         solend_jit_signing::prepare_solend_signing,
         solend_signatures::{get_solend_signature, submit_solend_signature},
+        solend_withdraw_jit_signing::prepare_solend_withdraw_signing,
         wallets::list_wallets,
         wallet_challenges::{create_wallet_challenge, confirm_wallet_challenge},
         wallet_signatures::{bind_wallet, list_wallet_signatures, submit_wallet_signature},
@@ -105,6 +106,16 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         .route(
             "/sessions/:session_id/approvals/:approval_request_id/solend-signing/prepare",
             post(prepare_solend_signing),
+        )
+        // Phase 6I-F — Solend WITHDRAW JIT signing-handoff prepare. The
+        // frontend calls this on the user's Sign-click for an approved
+        // withdraw-all proposal. Reuses the same blockhash provider,
+        // signing store, and Phase 6D / 6E submit + confirmation
+        // pipeline as deposit; the route differs only in which parked
+        // intent it consumes and which plan assembler it invokes.
+        .route(
+            "/sessions/:session_id/approvals/:approval_request_id/solend-withdraw-jit/prepare",
+            post(prepare_solend_withdraw_signing),
         )
         // Phase 5D.2 — user-facing chat route. Body limit is enforced
         // at the framework layer via `DefaultBodyLimit::max(4096)`;

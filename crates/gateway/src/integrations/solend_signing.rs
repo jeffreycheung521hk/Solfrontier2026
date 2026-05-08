@@ -87,6 +87,7 @@ use crate::integrations::solend_submit::{
     SolendAuditSink, AUDIT_EVENT_HANDOFF_CREATED, AUDIT_EVENT_HANDOFF_FAILED,
 };
 use crate::integrations::solend_tx_plan::SolendDepositTxPlan;
+use crate::integrations::solend_withdraw_tx_plan::SolendWithdrawTxPlan;
 use crate::lending::ProposedAction;
 
 // ── Blockhash provider seam ─────────────────────────────────────────────────
@@ -703,6 +704,154 @@ pub async fn create_signing_handoff(
                 "simulation_slot":                  summary.simulation_slot,
                 "last_valid_block_height":          summary.last_valid_block_height,
                 "obligation_signer_backend_partial": summary.obligation_signer_backend_partial,
+            }),
+        )
+        .await;
+
+    Ok(summary)
+}
+
+// ── Phase 6I-F — Solend WITHDRAW signing handoff ─────────────────────────────
+
+/// Phase 6I-F — turn a freshly-assembled [`SolendWithdrawTxPlan`] into
+/// a parked [`ParkedSolendSigning`] entry.
+///
+/// Withdraw differs from deposit in three load-bearing ways, all handled
+/// here:
+///
+///   1. **No obligation `Keypair`.** Withdraw spends an existing
+///      obligation, so `plan.obligation_signer_required` is always
+///      `false` and `plan.transient_obligation_pubkey` is always
+///      `None`. We assert the contract and skip the partial-sign step
+///      entirely. The parked entry's `obligation_keypair` is `None`;
+///      `parked_obligation_signature` is `None`. The submit verifier
+///      treats both as "no backend partial signature expected" and
+///      relies solely on the message-hash bit-equal check + the
+///      session-wallet fee-payer invariant — exactly what the
+///      deposit's `obligation_signer_backend_partial = false` path
+///      already does.
+///   2. **No preflight outcome required.** Phase 6I-E does not run
+///      structural preflight on withdraw; the `simulation_slot` /
+///      `units_consumed` fields on the parked entry are recorded as
+///      `None`. The submit verifier does not require these.
+///   3. **No transient-obligation-pubkey replacement.** Withdraw plans
+///      never embed a placeholder, so the message can be compiled
+///      directly from the cloned instruction groups.
+///
+/// Everything else mirrors `create_signing_handoff` exactly: fresh
+/// blockhash via the injected provider, session-wallet as strict fee
+/// payer, message compiled once, transaction serialized once,
+/// bincode-parked under a fresh `signing_request_id`. The same
+/// [`SolendSigningStore`] is reused — the submit pipeline
+/// ([`crate::integrations::solend_submit::submit_signed_solend_transaction`])
+/// is action-agnostic at the bytes level and accepts the parked
+/// entry without further changes.
+///
+/// Audit emits `solend_handoff_created` with `action: "Withdraw"` so
+/// the same dashboards that watch deposit handoffs can disambiguate.
+pub async fn create_withdraw_signing_handoff(
+    plan: &SolendWithdrawTxPlan,
+    signing_store: &SolendSigningStore,
+    blockhash_provider: &dyn RecentBlockhashProvider,
+    audit: &dyn SolendAuditSink,
+    signing_lease_seconds: u64,
+) -> Result<SigningHandoffSummary, SigningHandoffError> {
+    // ── 0. Plan-shape contract for withdraw ─────────────────────────────────
+    if plan.obligation_signer_required {
+        return Err(SigningHandoffError::UnexpectedTransientObligation);
+    }
+    if plan.transient_obligation_pubkey.is_some() {
+        return Err(SigningHandoffError::UnexpectedTransientObligation);
+    }
+
+    // ── 1. Fresh blockhash ──────────────────────────────────────────────────
+    let (recent_blockhash, last_valid_block_height) =
+        blockhash_provider.latest_blockhash().await.map_err(|e| {
+            SigningHandoffError::BlockhashFetchFailed(format!("{e}"))
+        })?;
+
+    // ── 2. Concatenate instruction groups (setup → refresh → withdraw) ──────
+    let mut all_ixs = Vec::with_capacity(
+        plan.setup_instructions.len()
+            + plan.refresh_instructions.len()
+            + plan.withdraw_instructions.len(),
+    );
+    all_ixs.extend(plan.setup_instructions.iter().cloned());
+    all_ixs.extend(plan.refresh_instructions.iter().cloned());
+    all_ixs.extend(plan.withdraw_instructions.iter().cloned());
+
+    // ── 3. Compile message — session_wallet strictly as fee payer ───────────
+    let message = Message::new(&all_ixs, Some(&plan.session_wallet));
+
+    // ── 4. Unsigned transaction with the fresh blockhash applied ────────────
+    let mut transaction = Transaction::new_unsigned(message);
+    transaction.message.recent_blockhash = recent_blockhash;
+
+    // ── 5. Serialize ─────────────────────────────────────────────────────────
+    let tx_bytes = bincode::serialize(&transaction).map_err(|e| {
+        SigningHandoffError::SerializationFailed(format!("bincode serialize: {e}"))
+    })?;
+
+    let signing_request_id = Uuid::new_v4();
+    let now = Utc::now();
+    let expires_at = now + Duration::seconds(signing_lease_seconds as i64);
+
+    let parked = ParkedSolendSigning {
+        intent_id: plan.intent_id,
+        session_id: plan.session_id.clone(),
+        session_wallet: plan.session_wallet,
+        action: plan.action.clone(),
+        verified_slot: plan.verified_slot,
+        simulation_slot: None,
+        units_consumed: None,
+        tx_bytes,
+        recent_blockhash,
+        last_valid_block_height,
+        // Withdraw never holds a backend obligation Keypair.
+        obligation_keypair: None,
+        parked_obligation_signature: None,
+        proposed_at: now,
+        expires_at,
+    };
+
+    let summary = signing_store.park(signing_request_id, parked);
+    info!(
+        signing_request_id = %signing_request_id,
+        intent_id = %plan.intent_id,
+        wallet = %plan.session_wallet,
+        verified_slot = plan.verified_slot,
+        last_valid_block_height = summary.last_valid_block_height,
+        "solend WITHDRAW signing handoff parked (no broadcast)"
+    );
+
+    audit
+        .append_solend_event(
+            AUDIT_EVENT_HANDOFF_CREATED,
+            signing_request_id.to_string(),
+            Some(plan.session_id.to_string()),
+            claw_state_store::audit::AuditSeverity::Info,
+            serde_json::json!({
+                "signing_request_id":               signing_request_id,
+                "intent_id":                        plan.intent_id,
+                "session_id":                       plan.session_id.to_string(),
+                "session_wallet":                   plan.session_wallet.to_string(),
+                "protocol":                         "Solend",
+                "action":                           "Withdraw",
+                "asset":                            "USDC",
+                // For Withdraw, `amount_raw()` is the cToken collateral
+                // amount (typically `u64::MAX` sentinel for withdraw-all).
+                "collateral_amount_raw":            plan.action.amount_raw(),
+                "obligation_pubkey":                plan
+                    .accounts_summary
+                    .obligation_pubkey
+                    .to_string(),
+                "reserve_pubkey":                   plan
+                    .accounts_summary
+                    .reserve_pubkey
+                    .to_string(),
+                "verified_slot":                    plan.verified_slot,
+                "last_valid_block_height":          summary.last_valid_block_height,
+                "obligation_signer_backend_partial": false,
             }),
         )
         .await;
