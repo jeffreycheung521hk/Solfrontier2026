@@ -18,6 +18,7 @@
 pub mod agent;
 pub mod alert;
 pub mod approval;
+pub mod canonical_intent;
 pub mod errors;
 pub mod events;
 pub mod messages;
@@ -35,6 +36,10 @@ pub mod wallet;
 pub use agent::{AgentCommand, AgentResponse, AgentRole};
 pub use alert::{Alert, AlertSeverity};
 pub use approval::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
+pub use canonical_intent::{
+    canonical_bytes, canonical_hash, validate_not_expired, CanonicalIntent, IntentAction,
+    IntentValidationError, PubkeyBytes, PubkeyParseError, STAGE1_TAIL_SCHEMA_VERSION,
+};
 pub use errors::ClawError;
 pub use events::GatewayEvent;
 pub use messages::{InboundMessage, MessageContent, OutboundContent, OutboundMessage};
