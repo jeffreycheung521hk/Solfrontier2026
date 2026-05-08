@@ -374,6 +374,24 @@ pub fn assemble_solend_withdraw_tx_plan(
         }),
     });
 
+    // Phase 6I-J — collect the obligation's deposit reserves in EXACT
+    // on-chain order. Solend's
+    // `update_borrow_attribution_values(&mut obligation, deposit_reserve_infos)`
+    // walks `obligation.deposits` in lockstep with `accounts[12..]` and
+    // packs each entry back, so the order MUST match what was decoded
+    // from the obligation account. We do NOT dedupe (the on-chain
+    // obligation can carry the same pubkey at multiple deposit slots
+    // only via a Solend program bug, but if it ever does we faithfully
+    // reproduce that), and we do NOT include borrow reserves here —
+    // those are not consumed by the combined withdraw ix.
+    let deposit_reserves_in_order: Vec<Pubkey> = fresh
+        .snapshot
+        .obligation
+        .deposits
+        .iter()
+        .map(|d| d.reserve)
+        .collect();
+
     // 9. Build the single withdraw ix from the un-wired ix builder.
     let withdraw_ix = build_withdraw_obligation_collateral_and_redeem_reserve_collateral_instruction(
         WithdrawInstructionInputs {
@@ -392,6 +410,7 @@ pub fn assemble_solend_withdraw_tx_plan(
             reserve_liquidity_supply: reserve.liquidity_supply_pubkey,
             obligation_owner: session_wallet,
             user_transfer_authority: session_wallet,
+            deposit_reserves_in_order,
         },
     )
     .map_err(SolendWithdrawTxPlanError::WithdrawBuildFailed)?;
