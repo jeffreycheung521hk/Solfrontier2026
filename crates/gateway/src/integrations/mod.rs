@@ -19,16 +19,21 @@ pub mod solend_signing;
 pub mod solend_submit;
 pub mod solend_tx_plan;
 
-// Phase 5H-C — un-wired Solend WITHDRAW transaction PLAN assembler.
+// Phase 5H-C / 6I-F — Solend WITHDRAW transaction PLAN assembler.
 //
-// `solend_withdraw_tx_plan` is intentionally NOT `pub mod`. It is
-// declared only under `#[cfg(test)]` so its deterministic tests run
-// under `cargo test -p claw-gateway --lib solend`. Production builds
-// exclude this file entirely; no symbol from it is reachable from any
-// tool, runtime, park, signing, submit, or chat code path.
-//
-// Mirrors the test-only-module posture introduced in Phase 5H-A for
-// `integrations/solend/withdraw.rs`. Phase 5H-D will flip both gates
-// together when the `solend_withdraw_usdc` tool is wired.
-#[cfg(test)]
-mod solend_withdraw_tx_plan;
+// Phase 5H-C kept this `#[cfg(test)] mod` so production builds excluded
+// the file entirely. Phase 6I-F flips the gate to `pub mod` because the
+// withdraw JIT-prepare handler (Phase 6I-F gateway runtime) calls
+// `assemble_solend_withdraw_tx_plan` at user Sign-click time. Public
+// surface stays narrow: only the assembler entry point and its typed
+// plan / accounts-summary / error are usable from outside this module.
+pub mod solend_withdraw_tx_plan;
+
+// Phase 6I-D — Solend withdraw-all park store. Holds parked intents
+// keyed by `approval_request_id` for the chat tool's awaiting_approval
+// path. Production-callable; carries no transaction bytes / blockhashes
+// / signer handles. The withdraw EXECUTION substrate
+// (`solend::withdraw` + `solend_withdraw_tx_plan`) remains
+// `#[cfg(test)]`-gated; the resume / JIT signing / submit pipeline is
+// deferred to a follow-up slice.
+pub mod solend_withdraw_park;

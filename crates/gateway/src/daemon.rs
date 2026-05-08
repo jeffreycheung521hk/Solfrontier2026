@@ -292,6 +292,11 @@ impl GatewayDaemon {
         let pending_signing   = PendingSigningStore::new();
         let pending_jupiter_park = crate::integrations::jupiter_park::PendingJupiterParkStore::new();
         let pending_solend_park = crate::integrations::solend_park::SolendParkStore::new();
+        // Phase 6I-E — withdraw-all park store. Created here (alongside the
+        // deposit / Jupiter pending stores) so the chat tool wiring and
+        // the approval handler share one cloneable handle.
+        let pending_solend_withdraw_park =
+            crate::integrations::solend_withdraw_park::SolendWithdrawAllParkStore::new();
         // C4: Create binding repo and wire into ExternalWalletStore for
         // durable session-wallet binding persistence across restarts.
         let binding_repo = claw_state_store::WalletBindingRepository::new(db.pool().clone());
@@ -573,9 +578,34 @@ impl GatewayDaemon {
             std::sync::Arc::new(rpc_pool.clone()),
             external_wallet.clone(),
         );
+        // Phase 6I-D + 6I-E — withdraw-all execution PROPOSAL.
+        //
+        // 6I-D: returns `awaiting_approval` with a parked-intent-keyed
+        //       `approval_request_id` and inserts a parked withdraw
+        //       intent in `pending_solend_withdraw_park`.
+        //
+        // 6I-E (this slice): ALSO registers a real `ApprovalRequest` +
+        //       `ApprovalWorkflow` in the daemon-wide `ApprovalStore`
+        //       so the operator UI / approval-routing pipeline can
+        //       decide it; spawns a `run_solend_withdraw_resume_task`
+        //       per dispatch that awaits the operator decision and
+        //       performs a fresh re-fetch + four structural re-checks,
+        //       emitting typed audit events.
+        //
+        // Still deferred (next slice): the JIT signing-handoff route,
+        // the withdraw-execution substrate ungating, and the submit
+        // path. The resume task stops at `RecheckPassedReadyForJit`.
+        let registry = crate::runtime::copilot_tools_wiring::wire_solend_withdraw_all_usdc_tool(
+            registry,
+            std::sync::Arc::new(rpc_pool.clone()),
+            external_wallet.clone(),
+            pending_solend_withdraw_park.clone(),
+            Some(approval_store.clone()),
+            Some(solend_audit_sink.clone()),
+        );
         info!(
             "get_wallet_balances + get_jupiter_quote + get_solend_position + \
-             preview_solend_withdraw_all read-only chat tools active"
+             preview_solend_withdraw_all + solend_withdraw_all_usdc chat tools active"
         );
         // Phase 4C-6: Solend submit HTTP handler. Bridges the API trait
         // to the 4C-5 submit pipeline + 4C-6 lifecycle cache. No new
@@ -790,6 +820,7 @@ impl GatewayDaemon {
             pending_signing:      pending_signing.clone(),
             pending_jupiter_park: pending_jupiter_park.clone(),
             pending_solend_park:  pending_solend_park.clone(),
+            pending_solend_withdraw_park: pending_solend_withdraw_park.clone(),
             event_bus:            event_bus.clone(),
             audit:                audit_repo.clone(),
             _durable:             durable_state.clone(),
@@ -954,6 +985,67 @@ impl GatewayDaemon {
             ))
         };
 
+        // Phase 6I-F — withdraw JIT-prepare handler. Same pattern as
+        // deposit's prepare above, but reads from
+        // `pending_solend_withdraw_park` and uses the WITHDRAW plan
+        // assembler. Reuses the same blockhash provider, signing store,
+        // and audit sink so `submit_signed_solend_transaction` accepts
+        // the parked unsigned tx without further changes.
+        let solend_withdraw_jit_prepare_ref: Option<
+            claw_api::state::SolendWithdrawJitPrepareHandlerRef,
+        > = {
+            let blockhash_provider: std::sync::Arc<
+                dyn crate::integrations::solend_signing::RecentBlockhashProvider,
+            > = std::sync::Arc::new(
+                crate::integrations::solend_signing::ClawBlockhashProvider::new(
+                    blockhash_mgr.clone(),
+                ),
+            );
+            let external_wallet_ref: std::sync::Arc<
+                dyn crate::tools::jupiter_swap::SessionBoundWallet,
+            > = std::sync::Arc::new(external_wallet.clone());
+            // Phase 6H scanner's reader trait — single `getAccountInfo`
+            // for the obligation pubkey at prepare-time re-check.
+            let obligation_reader: std::sync::Arc<
+                dyn crate::tools::get_solend_position::SolendPositionReader,
+            > = std::sync::Arc::new(
+                crate::tools::get_solend_position::RpcSolendPositionReader::new(
+                    std::sync::Arc::new(rpc_pool.clone()),
+                ),
+            );
+            // Production fresh-snapshot assembler — same one the deposit
+            // tool uses, scoped via the
+            // `SolendWithdrawFreshSnapshot` adapter.
+            let fetcher: std::sync::Arc<
+                dyn crate::integrations::solend::SolanaAccountFetcher,
+            > = std::sync::Arc::new(
+                crate::integrations::solend::ClawRpcPoolAccountFetcher::new(
+                    rpc_pool.clone(),
+                    claw_types::solana::CommitmentLevel::Confirmed,
+                ),
+            );
+            let fresh_snapshot: std::sync::Arc<
+                dyn crate::runtime::solend_withdraw_jit_prepare_wiring::SolendWithdrawFreshSnapshot,
+            > = std::sync::Arc::new(
+                crate::integrations::solend::SolendSnapshotAssembler::new(fetcher),
+            );
+            let prepare_handler =
+                crate::runtime::solend_withdraw_jit_prepare_wiring::GatewaySolendWithdrawJitPrepareHandler::new(
+                    approval_store.clone(),
+                    external_wallet_ref,
+                    pending_solend_withdraw_park.clone(),
+                    obligation_reader,
+                    fresh_snapshot,
+                    pending_solend_signing.clone(),
+                    blockhash_provider,
+                    solend_audit_sink.clone(),
+                    config.policy.approval_lease_seconds,
+                );
+            Some(claw_api::state::SolendWithdrawJitPrepareHandlerRef::new(
+                std::sync::Arc::new(prepare_handler),
+            ))
+        };
+
         let app_state = AppState {
             session_mgr:       session_ref,
             message_handler:   message_handler_ref,
@@ -962,6 +1054,8 @@ impl GatewayDaemon {
             wallet_signatures: wallet_sig_handler_ref,
             solend_signatures: solend_sig_handler_ref,
             solend_jit_prepare: solend_jit_prepare_ref,
+            // Phase 6I-F: withdraw JIT-prepare handler wired below.
+            solend_withdraw_jit_prepare: solend_withdraw_jit_prepare_ref,
             wallet_challenges: wallet_challenge_handler_ref,
             auth_token:        AuthToken::new(api_token),
             operator_registry: operator_registry.clone(),
@@ -1578,6 +1672,10 @@ struct GatewayApprovalHandler {
     pending_signing:      PendingSigningStore,
     pending_jupiter_park: crate::integrations::jupiter_park::PendingJupiterParkStore,
     pending_solend_park:  crate::integrations::solend_park::SolendParkStore,
+    /// Phase 6I-E — withdraw-all park store. Same lifecycle as the other
+    /// pending stores; carried by the handler so `route_approval_outcome`
+    /// can deliver Approved/Rejected/Expired signals to the resume task.
+    pending_solend_withdraw_park: crate::integrations::solend_withdraw_park::SolendWithdrawAllParkStore,
     event_bus:            EventBus,
     audit:                AuditRepository,
     _durable:             DurablePendingState,
@@ -1656,6 +1754,7 @@ impl GatewayApprovalHandler {
             &self.pending_signing,
             &self.pending_jupiter_park,
             &self.pending_solend_park,
+            &self.pending_solend_withdraw_park,
             &self.alerts,
             maybe_request.as_ref(),
         );
