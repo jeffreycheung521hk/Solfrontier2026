@@ -1201,6 +1201,8 @@ name = "clawsol-intent"
 version = "0.1.0"
 dependencies = [
  "borsh 1.6.0",
+ "claw-types",
+ "hex",
  "solana-program",
  "solana-program-test",
  "solana-sdk",
