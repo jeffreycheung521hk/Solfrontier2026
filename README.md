@@ -80,6 +80,40 @@ Three live failure modes. Three correct rejections. Each one diagnosed, calibrat
 | OpenAI + Anthropic provider support (env-gated, fail-closed) | Live, OpenAI mainnet proven; Anthropic unit-test green |
 | Rate limiting, compute budget optimization, retry/rebroadcast | Live |
 
+## Natural-Language Command Samples
+
+The `/chat` surface accepts open-ended natural-language requests; it does not
+present a fixed set of buttons. The samples below show the kinds of intents
+the LLM dispatcher recognises today.
+
+**Read-only / discovery**
+- `Show my Solend position.`
+- `Where is my Solend USDC deposit?`
+- `Preview withdraw-all for Solend obligation HcKrv5Jo5f6qvzSGhJVYTNSqwKudRizn6fxbjPW7M8SV`
+- `How much USDC would I get for 0.001 SOL?`
+
+**Solend deposit proposal**
+- `Deposit 0.001 USDC into Solend.`
+- `Propose a 0.001 USDC Solend deposit. Don't approve, sign, or broadcast.`
+
+**Solend withdraw-all proposal**
+- `Withdraw all USDC from Solend obligation HcKrv5Jo5f6qvzSGhJVYTNSqwKudRizn6fxbjPW7M8SV`
+
+**Jupiter**
+- `Quote 0.001 SOL to USDC.`
+- `Swap 0.001 SOL to USDC with 0.5% slippage.`
+
+**Safety / refusal examples**
+- `Withdraw 5 USDC from Solend.` — assistant explains that partial Solend
+  withdraw is not supported yet; only withdraw-all by explicit obligation
+  is supported.
+- `Deposit 0.001 USDC into Solend and approve it, sign it, and broadcast it
+  for me.` — assistant explains that it can propose only; human approval
+  and Phantom signing remain required.
+
+These are examples, not buttons. The chat surface intentionally keeps the
+prompt box open-ended so users can type their own request.
+
 ## Quickstart
 
 ```bash

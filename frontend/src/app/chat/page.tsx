@@ -52,11 +52,6 @@ type BindState =
 // we don't burn a round-trip on a known-rejection.
 const MAX_MESSAGE_CHARS = 4000;
 
-const SUGGESTED_PROMPTS = [
-  "Deposit 0.001 USDC into Solend.",
-  "Propose a 0.001 USDC Solend deposit. Don't approve, sign, or broadcast.",
-];
-
 export default function ChatPage() {
   const [sessionId, setSessionId] = useState<SessionId | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
@@ -237,12 +232,7 @@ export default function ChatPage() {
           <CardTitle className="text-base">Conversation</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          {messages.length === 0 && (
-            <EmptyState
-              onSelect={(prompt) => setInput(prompt)}
-              disabled={!sessionId}
-            />
-          )}
+          {messages.length === 0 && <EmptyState />}
           <ul className="space-y-3">
             {messages.map((m) => (
               <li key={m.id}>
@@ -270,7 +260,7 @@ export default function ChatPage() {
                 ? walletPubkey === null
                   ? "Connect Phantom and bind your wallet first"
                   : "Bind your wallet to the session before sending"
-                : "Type a request — e.g. 'Deposit 0.001 USDC into Solend'"
+                : "Type a natural-language DeFi request"
           }
           disabled={!sessionId || liveBindBlocked}
           className="w-full rounded-md border bg-background px-3 py-2 text-sm font-sans
@@ -461,32 +451,13 @@ function SessionStatus({
   );
 }
 
-function EmptyState({
-  onSelect,
-  disabled,
-}: {
-  onSelect: (prompt: string) => void;
-  disabled: boolean;
-}) {
+function EmptyState() {
   return (
-    <div className="rounded-md border border-dashed bg-muted/30 px-4 py-6 space-y-3">
+    <div className="rounded-md border border-dashed bg-muted/30 px-4 py-6">
       <p className="text-sm text-muted-foreground">
-        Try one of these to see the LLM dispatch shape:
+        Type a natural-language DeFi request below. The assistant proposes only;
+        approval and wallet signing stay human-controlled.
       </p>
-      <div className="flex flex-wrap gap-2">
-        {SUGGESTED_PROMPTS.map((prompt) => (
-          <button
-            key={prompt}
-            type="button"
-            onClick={() => onSelect(prompt)}
-            disabled={disabled}
-            className="text-left text-sm rounded-md border bg-background px-3 py-2
-                       hover:border-foreground/30 transition-colors disabled:opacity-50"
-          >
-            {prompt}
-          </button>
-        ))}
-      </div>
     </div>
   );
 }
