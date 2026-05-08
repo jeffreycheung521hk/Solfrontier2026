@@ -8,6 +8,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatRelative, shortPubkey } from "@/lib/format";
 import { LeaseCountdown } from "@/components/lease-countdown";
 import { SigningFlow } from "@/components/signing-flow";
+import { CanonicalIntentPreview } from "@/components/canonical-intent-preview";
+import {
+  EXPECTED_FIXTURE_HASHES,
+  fixtureJupiterSwap,
+  fixtureSolendDeposit,
+  fixtureSolendWithdrawAll,
+} from "@/lib/canonical-intent";
 import type { SolendSigningAction } from "@/lib/use-signing-handoff";
 import type {
   ApprovalStage,
@@ -64,6 +71,7 @@ export default async function ApprovalChainPage({
         <TabsList>
           <TabsTrigger value="live">Current workflow</TabsTrigger>
           <TabsTrigger value="flow">Demo flow (showcase)</TabsTrigger>
+          <TabsTrigger value="canonical">Canonical intent (Stage 1 Tail)</TabsTrigger>
         </TabsList>
 
         <TabsContent value="live" className="pt-4 space-y-6">
@@ -86,6 +94,38 @@ export default async function ApprovalChainPage({
           <ChainSnapshot title="2. Risk approved, treasury quorum in progress" workflow={showcase.stageTwo} />
           <ChainSnapshot title="3. All stages cleared — approved, ready to sign" workflow={showcase.approved} />
           <ChainSnapshot title="4. Alternative: lease expired before CFO decided" workflow={showcase.expired} />
+        </TabsContent>
+
+        <TabsContent value="canonical" className="pt-4 space-y-6">
+          <Alert className="border-amber-500/40">
+            <AlertTitle className="text-sm">Stage 1 Tail demo (fixtures)</AlertTitle>
+            <AlertDescription className="text-xs space-y-1">
+              <span className="block">
+                These three previews mirror the committed Rust fixtures in
+                <code className="mx-1">crates/types/src/canonical_intent.rs</code>.
+                Each preview re-computes the canonical SHA-256 hash locally
+                (Borsh + Web Crypto) and checks it against the hash baked
+                into the Rust crate. Production integration of canonical-
+                intent metadata into live approvals is pending Stage 1 Tail
+                B2/I — once the backend supplies <code>canonical_intent</code>
+                + <code>canonical_hash</code> alongside the approval payload,
+                this same component will render here in the live tab and
+                refuse to sign on hash mismatch.
+              </span>
+            </AlertDescription>
+          </Alert>
+          <CanonicalIntentPreview
+            intent={fixtureSolendDeposit()}
+            expectedHashHex={EXPECTED_FIXTURE_HASHES.solend_deposit}
+          />
+          <CanonicalIntentPreview
+            intent={fixtureSolendWithdrawAll()}
+            expectedHashHex={EXPECTED_FIXTURE_HASHES.solend_withdraw_all}
+          />
+          <CanonicalIntentPreview
+            intent={fixtureJupiterSwap()}
+            expectedHashHex={EXPECTED_FIXTURE_HASHES.jupiter_swap}
+          />
         </TabsContent>
       </Tabs>
 
