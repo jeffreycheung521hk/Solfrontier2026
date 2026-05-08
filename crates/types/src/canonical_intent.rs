@@ -283,6 +283,117 @@ pub fn validate_not_expired(
     }
 }
 
+// ── Backend metadata snapshot (Stage 1 Tail) ───────────────────────────────
+
+/// Discriminator for the action variant a canonical intent encodes.
+///
+/// Used by [`CanonicalIntentMetadata`] so backend layers can route /
+/// log on action type without carrying the full action payload (which
+/// includes possibly-large pubkey lists). Keep in lockstep with
+/// [`IntentAction`] — adding a new variant there MUST add a matching
+/// arm here AND bump [`STAGE1_TAIL_SCHEMA_VERSION`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalIntentActionType {
+    SolendDeposit,
+    SolendWithdrawAll,
+    JupiterSwap,
+}
+
+impl CanonicalIntentActionType {
+    /// Stable wire-string for audit / observability. Matches the
+    /// serde tag on `IntentAction` (`#[serde(tag = "kind",
+    /// rename_all = "snake_case")]`).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SolendDeposit => "solend_deposit",
+            Self::SolendWithdrawAll => "solend_withdraw_all",
+            Self::JupiterSwap => "jupiter_swap",
+        }
+    }
+}
+
+impl IntentAction {
+    /// Project an [`IntentAction`] to its [`CanonicalIntentActionType`]
+    /// without cloning any payload fields.
+    pub const fn action_type(&self) -> CanonicalIntentActionType {
+        match self {
+            Self::SolendDeposit { .. } => CanonicalIntentActionType::SolendDeposit,
+            Self::SolendWithdrawAll { .. } => CanonicalIntentActionType::SolendWithdrawAll,
+            Self::JupiterSwap { .. } => CanonicalIntentActionType::JupiterSwap,
+        }
+    }
+}
+
+/// Minimal, lossless backend snapshot of a canonical intent.
+///
+/// Backend stores (approval store, signing store, etc.) frequently
+/// need a small piece of canonical-intent context for fail-closed
+/// expiry checks, audit logs, and cross-surface correlation, but
+/// SHOULD NOT carry the full [`CanonicalIntent`] payload around. This
+/// struct captures the bare minimum:
+///
+///   - `intent_id`             — for cross-surface correlation
+///   - `canonical_intent_hash` — for tamper-evidence binding
+///   - `expires_at_slot`       — for fail-closed expiry
+///   - `action_type`           — for routing / observability
+///   - `schema_version`        — so a future schema change cannot be
+///                                silently reinterpreted by older code
+///
+/// Backwards compatibility: existing approval / signing code that does
+/// not yet emit canonical intents carries this as `Option<…>` and
+/// continues to behave as before when the option is `None`. The
+/// expiry gate ([`crate`] consumer side) treats `None` as "no
+/// canonical-intent constraint" — pre-canonical-intent flows pass
+/// through unchanged. Once all callers have been migrated, this can
+/// become non-optional, but that is an explicit follow-up slice
+/// decision, not a Stage 1 Tail concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalIntentMetadata {
+    pub schema_version: u8,
+    pub intent_id: [u8; 16],
+    pub canonical_intent_hash: [u8; 32],
+    pub expires_at_slot: u64,
+    pub action_type: CanonicalIntentActionType,
+}
+
+impl CanonicalIntentMetadata {
+    /// Project a [`CanonicalIntent`] to its backend metadata
+    /// snapshot. The hash is computed once via [`canonical_hash`];
+    /// subsequent equality checks against future hashes of the same
+    /// intent require byte-identical Borsh layout (which is the whole
+    /// point of the canonical-bytes contract).
+    pub fn from_intent(intent: &CanonicalIntent) -> Self {
+        Self {
+            schema_version: intent.schema_version,
+            intent_id: intent.intent_id,
+            canonical_intent_hash: canonical_hash(intent),
+            expires_at_slot: intent.expires_at_slot,
+            action_type: intent.action.action_type(),
+        }
+    }
+
+    /// Returns `Ok(())` iff `current_slot < self.expires_at_slot`.
+    /// Same exclusive-boundary semantics as
+    /// [`validate_not_expired`]. The metadata-form helper exists so
+    /// expiry-gate code paths that only carry the snapshot (not the
+    /// full intent) can fail closed without re-deriving the hash.
+    pub fn validate_not_expired(
+        &self,
+        current_slot: u64,
+    ) -> Result<(), IntentValidationError> {
+        if current_slot < self.expires_at_slot {
+            Ok(())
+        } else {
+            Err(IntentValidationError::Expired {
+                current: current_slot,
+                expires: self.expires_at_slot,
+            })
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -668,5 +779,92 @@ mod tests {
             PubkeyBytes::from_base58(&short),
             Err(PubkeyParseError::WrongLength(31))
         ));
+    }
+
+    // ── Metadata projection (Stage 1 Tail) ──────────────────────────────
+
+    #[test]
+    fn action_type_label_matches_serde_tag() {
+        assert_eq!(CanonicalIntentActionType::SolendDeposit.label(), "solend_deposit");
+        assert_eq!(
+            CanonicalIntentActionType::SolendWithdrawAll.label(),
+            "solend_withdraw_all"
+        );
+        assert_eq!(CanonicalIntentActionType::JupiterSwap.label(), "jupiter_swap");
+    }
+
+    #[test]
+    fn intent_action_action_type_round_trip() {
+        assert_eq!(
+            fixture_solend_deposit().action.action_type(),
+            CanonicalIntentActionType::SolendDeposit
+        );
+        assert_eq!(
+            fixture_solend_withdraw_all().action.action_type(),
+            CanonicalIntentActionType::SolendWithdrawAll
+        );
+        assert_eq!(
+            fixture_jupiter_swap().action.action_type(),
+            CanonicalIntentActionType::JupiterSwap
+        );
+    }
+
+    #[test]
+    fn metadata_from_intent_captures_all_fields() {
+        for fixture in [
+            fixture_solend_deposit(),
+            fixture_solend_withdraw_all(),
+            fixture_jupiter_swap(),
+        ] {
+            let meta = CanonicalIntentMetadata::from_intent(&fixture);
+            assert_eq!(meta.schema_version, fixture.schema_version);
+            assert_eq!(meta.intent_id, fixture.intent_id);
+            assert_eq!(meta.expires_at_slot, fixture.expires_at_slot);
+            assert_eq!(meta.action_type, fixture.action.action_type());
+            // Hash projected through the metadata equals the canonical
+            // hash of the original intent — same bytes, same SHA-256.
+            assert_eq!(meta.canonical_intent_hash, canonical_hash(&fixture));
+        }
+    }
+
+    #[test]
+    fn metadata_validate_not_expired_matches_intent_helper() {
+        let intent = fixture_solend_deposit();
+        let meta = CanonicalIntentMetadata::from_intent(&intent);
+        let exp = intent.expires_at_slot;
+        // Both helpers agree at every boundary.
+        assert_eq!(
+            meta.validate_not_expired(exp - 1),
+            validate_not_expired(&intent, exp - 1)
+        );
+        assert_eq!(meta.validate_not_expired(exp), validate_not_expired(&intent, exp));
+        assert_eq!(
+            meta.validate_not_expired(exp + 100),
+            validate_not_expired(&intent, exp + 100)
+        );
+    }
+
+    #[test]
+    fn metadata_round_trip_through_serde_json() {
+        let intent = fixture_jupiter_swap();
+        let meta = CanonicalIntentMetadata::from_intent(&intent);
+        let json = serde_json::to_string(&meta).unwrap();
+        let decoded: CanonicalIntentMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta, decoded);
+    }
+
+    #[test]
+    fn metadata_json_unknown_field_fails_closed() {
+        // deny_unknown_fields on the metadata struct rejects extras.
+        let intent = fixture_solend_deposit();
+        let meta = CanonicalIntentMetadata::from_intent(&intent);
+        let json = serde_json::to_string(&meta).unwrap();
+        let injected = json.replacen(
+            "\"action_type\":",
+            "\"injected\":\"x\",\"action_type\":",
+            1,
+        );
+        let res: Result<CanonicalIntentMetadata, _> = serde_json::from_str(&injected);
+        assert!(res.is_err(), "unknown field must be rejected");
     }
 }

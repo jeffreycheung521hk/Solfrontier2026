@@ -6,6 +6,10 @@
 pub mod approval_audit;
 pub mod approval_routing;
 pub mod approval_store;
+// Stage 1 Tail — canonical-intent expiry gate. Standalone helper +
+// tests; production wiring (calling into approval-decision /
+// signing-prepare / submit-verify paths) is pending Prompt I.
+pub mod canonical_intent_gate;
 pub mod integrations;
 pub mod completion_metadata;
 pub mod config;

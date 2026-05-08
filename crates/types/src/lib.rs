@@ -37,7 +37,8 @@ pub use agent::{AgentCommand, AgentResponse, AgentRole};
 pub use alert::{Alert, AlertSeverity};
 pub use approval::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 pub use canonical_intent::{
-    canonical_bytes, canonical_hash, validate_not_expired, CanonicalIntent, IntentAction,
+    canonical_bytes, canonical_hash, validate_not_expired, CanonicalIntent,
+    CanonicalIntentActionType, CanonicalIntentMetadata, IntentAction,
     IntentValidationError, PubkeyBytes, PubkeyParseError, STAGE1_TAIL_SCHEMA_VERSION,
 };
 pub use errors::ClawError;
