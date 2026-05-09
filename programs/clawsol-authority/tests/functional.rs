@@ -232,6 +232,22 @@ fn execute_action_instruction(
     input_amount_raw: u64,
     execution_nonce: u64,
 ) -> Instruction {
+    // J4: when the test's authz uses the Jupiter action type, the
+    // on-chain `process_execute_action` requires a non-None
+    // `JupiterBoundaryProof` with the canonical sibling-ix list and
+    // the right destination. We attach a default-passing proof here
+    // so existing tests that target NON-Jupiter-boundary properties
+    // (lifecycle, P2/P3 gates) keep working without each test having
+    // to construct a verbose proof. Jupiter-boundary negative tests
+    // bypass this wrapper and call `raw_execute_action_instruction`
+    // directly with an explicit `Some(jupiter_proof)`.
+    let jupiter_proof = if action_type
+        == clawsol_authority::state::Stage2ActionType::JupiterBuySolWithUsdc.to_u8()
+    {
+        Some(default_jupiter_boundary_proof(delegated_wallet, &rule_id))
+    } else {
+        None
+    };
     raw_execute_action_instruction(
         program_id,
         executor,
@@ -244,8 +260,110 @@ fn execute_action_instruction(
         input_amount_raw,
         execution_nonce,
         default_solend_proof(),
-        None,
+        None, // solend_boundary_proof: Option<SolendBoundaryProof>
+        jupiter_proof,
     )
+}
+
+/// A canonical "passing Jupiter boundary proof" built from
+/// `(delegated_wallet, rule_id)`. Returns a fresh value per call so
+/// negative tests can mutate one field without affecting others.
+///
+/// **J4 deferral note.** This proof's `destination_pre_snapshot.amount`,
+/// `destination_post_snapshot.amount`, and `min_output_amount_raw`
+/// values are intentionally placeholders (0). The J4 verifier does
+/// NOT consume them for any balance-delta computation; the future
+/// trustless balance bracket slice will replace the snapshot fields
+/// with on-chain SPL Token unpacks.
+fn default_jupiter_boundary_proof(
+    delegated_wallet: &Pubkey,
+    rule_id: &[u8; 16],
+) -> clawsol_authority::jupiter_boundary::JupiterBoundaryProof {
+    use clawsol_authority::jupiter_boundary::{
+        JupiterBoundaryProof, JupiterSiblingIxDescriptor, JupiterTokenAccountFixture,
+        ATA_PROGRAM_ID, COMPUTE_BUDGET_PROGRAM_ID, JUPITER_V6_PROGRAM_ID_MAINNET,
+        SPL_TOKEN_PROGRAM_ID,
+    };
+    let destination = fx_destination(rule_id);
+    let dest_mint = fx_destination_mint(rule_id);
+    let input_mint = fx_input_mint(rule_id);
+    let in_ata = fx_in_ata(rule_id);
+    let out_ata = fx_out_ata(rule_id);
+    JupiterBoundaryProof {
+        jupiter_program_id: JUPITER_V6_PROGRAM_ID_MAINNET,
+        expected_destination_token_account: destination,
+        expected_destination_mint: dest_mint,
+        expected_input_mint: input_mint,
+        delegated_input_token_account: in_ata,
+        delegated_output_token_account: out_ata,
+        destination_pre_snapshot: JupiterTokenAccountFixture {
+            address: destination,
+            mint: dest_mint,
+            owner: *delegated_wallet,
+            amount: 0,
+        },
+        destination_post_snapshot: JupiterTokenAccountFixture {
+            address: destination,
+            mint: dest_mint,
+            owner: *delegated_wallet,
+            amount: 0,
+        },
+        min_output_amount_raw: 0,
+        sibling_instructions: vec![
+            JupiterSiblingIxDescriptor {
+                program_id: COMPUTE_BUDGET_PROGRAM_ID,
+                variant_byte: 2,
+                writable_accounts: vec![],
+            },
+            JupiterSiblingIxDescriptor {
+                program_id: ATA_PROGRAM_ID,
+                variant_byte: 1,
+                writable_accounts: vec![destination, *delegated_wallet],
+            },
+            JupiterSiblingIxDescriptor {
+                program_id: JUPITER_V6_PROGRAM_ID_MAINNET,
+                variant_byte: 0xE5,
+                writable_accounts: vec![in_ata, out_ata],
+            },
+            JupiterSiblingIxDescriptor {
+                program_id: SPL_TOKEN_PROGRAM_ID,
+                variant_byte: 9, // CloseAccount on the wSOL ATA
+                writable_accounts: vec![out_ata, *delegated_wallet],
+            },
+        ],
+    }
+}
+
+/// Deterministic destination-mint pubkey derived per `rule_id`.
+fn fx_destination_mint(rule_id: &[u8; 16]) -> Pubkey {
+    let mut b = [0u8; 32];
+    b[0] = 0x4D; // 'M' for "mint"
+    b[16..32].copy_from_slice(rule_id);
+    Pubkey::new_from_array(b)
+}
+
+/// Deterministic input-mint pubkey derived per `rule_id`.
+fn fx_input_mint(rule_id: &[u8; 16]) -> Pubkey {
+    let mut b = [0u8; 32];
+    b[0] = 0x49; // 'I' for "input"
+    b[16..32].copy_from_slice(rule_id);
+    Pubkey::new_from_array(b)
+}
+
+/// Deterministic input ATA pubkey derived per `rule_id`.
+fn fx_in_ata(rule_id: &[u8; 16]) -> Pubkey {
+    let mut b = [0u8; 32];
+    b[0] = 0x69; // 'i' for "in_ata"
+    b[16..32].copy_from_slice(rule_id);
+    Pubkey::new_from_array(b)
+}
+
+/// Deterministic output ATA pubkey derived per `rule_id`.
+fn fx_out_ata(rule_id: &[u8; 16]) -> Pubkey {
+    let mut b = [0u8; 32];
+    b[0] = 0x6F; // 'o' for "out_ata"
+    b[16..32].copy_from_slice(rule_id);
+    Pubkey::new_from_array(b)
 }
 
 fn build_program_test(program_id: Pubkey) -> ProgramTest {
@@ -1044,6 +1162,7 @@ async fn execute_rejects_missing_executor_signature() {
         execution_nonce: 1,
         condition_proof: default_solend_proof(),
         solend_boundary_proof: None,
+        jupiter_boundary_proof: None,
     })
     .unwrap();
     let ix = Instruction {
@@ -1116,6 +1235,7 @@ async fn execute_rejects_wrong_pda() {
         condition_proof: default_solend_proof(),
         // owner-mismatch fires before the P4 boundary, so None is fine.
         solend_boundary_proof: None,
+        jupiter_boundary_proof: None,
     })
     .unwrap();
     let ix = Instruction {
@@ -1177,6 +1297,7 @@ async fn execute_rejects_wrong_user_account() {
         condition_proof: default_solend_proof(),
         // PDA-derivation mismatch fires before the P4 boundary check.
         solend_boundary_proof: None,
+        jupiter_boundary_proof: None,
     })
     .unwrap();
     let ix = Instruction {
@@ -2169,9 +2290,10 @@ async fn p3_scenario_a_solend_condition_true_succeeds_and_mutates_state() {
     };
 
     ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    // Action defaults to Jupiter via setup_execute_authz, so the
-    // P4 Solend boundary gate is skipped (action_type != Solend).
-    // None is the correct value here.
+    // Action defaults to Jupiter via setup_execute_authz, so the P4
+    // Solend boundary gate is skipped (action_type != Solend), but
+    // J4 requires a Jupiter boundary proof; supply a default-passing
+    // one so this P3-condition test reaches the state-mutation path.
     let ix = raw_execute_action_instruction(
         &program_id,
         &fx.executor.pubkey(),
@@ -2185,6 +2307,10 @@ async fn p3_scenario_a_solend_condition_true_succeeds_and_mutates_state() {
         1,
         proof,
         None,
+        Some(default_jupiter_boundary_proof(
+            &fx.delegated_wallet,
+            &RULE_ID_P3_SOLEND_TRUE,
+        )),
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2246,6 +2372,7 @@ async fn p3_scenario_a_solend_condition_false_fails_before_mutation() {
         // P3 ConditionNotMet fires before the P4 boundary check, so
         // None is fine here.
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2299,7 +2426,8 @@ async fn p3_scenario_b_three_pyth_conditions_true_succeeds_and_mutates_state() {
     };
 
     ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    // Jupiter action via default setup; P4 boundary is skipped.
+    // Jupiter action via default setup; P4 boundary is skipped, J4
+    // requires a Jupiter boundary proof to reach state mutation.
     let ix = raw_execute_action_instruction(
         &program_id,
         &fx.executor.pubkey(),
@@ -2313,6 +2441,10 @@ async fn p3_scenario_b_three_pyth_conditions_true_succeeds_and_mutates_state() {
         1,
         proof,
         None,
+        Some(default_jupiter_boundary_proof(
+            &fx.delegated_wallet,
+            &RULE_ID_P3_PYTH_BASKET_TRUE,
+        )),
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2381,6 +2513,7 @@ async fn p3_scenario_b_one_condition_false_fails_before_mutation() {
         1,
         proof,
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2430,6 +2563,7 @@ async fn p3_missing_condition_proof_fails_before_mutation() {
         1,
         proof,
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2491,6 +2625,7 @@ async fn p3_stale_pyth_proof_fails_before_mutation() {
         1,
         proof,
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2545,6 +2680,7 @@ async fn p3_wrong_pyth_feed_id_fails_before_mutation() {
         1,
         proof,
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2602,6 +2738,7 @@ async fn p3_excessive_pyth_confidence_fails_before_mutation() {
         1,
         proof,
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2660,6 +2797,7 @@ async fn p3_partial_pyth_verification_fails_before_mutation() {
         1,
         proof,
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     // Locate the verification_level byte inside the serialized
     // PythPriceSnapshot — last byte of the snapshot (after price/exp/
@@ -2747,6 +2885,7 @@ async fn p3_stale_solend_reserve_fails_before_mutation() {
         1,
         proof,
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2802,6 +2941,7 @@ async fn p3_unsupported_solend_formula_version_fails_before_mutation() {
         1,
         proof,
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2857,6 +2997,7 @@ async fn p3_invalid_condition_logic_byte_fails_borsh_decode() {
         1,
         proof,
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     // The condition_logic byte sits at offset 67 inside ix.data
     // (1 enum tag + 66 bytes of fixed P2 fields). Pinned by the
@@ -2949,6 +3090,7 @@ async fn p3_p2_revoked_authorization_still_fails_before_condition_verification()
         1,
         proof,
         None,
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -3069,6 +3211,7 @@ async fn execute_solend_expect_failure(
         1,
         default_solend_proof(),
         Some(proof),
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -3115,6 +3258,7 @@ async fn p4_valid_solend_boundary_succeeds_and_mutates_state() {
         1,
         default_solend_proof(),
         Some(proof),
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -3163,6 +3307,7 @@ async fn p4_solend_action_without_boundary_proof_fails_before_mutation() {
         1,
         default_solend_proof(),
         None, // Solend action without boundary proof
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -3613,6 +3758,7 @@ async fn p4_p3_condition_false_fails_before_p4_boundary() {
         1,
         condition_proof,
         Some(boundary_proof),
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -3757,6 +3903,7 @@ async fn p4_replay_after_completed_still_green_for_solend() {
         1,
         default_solend_proof(),
         Some(proof.clone()),
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix1],
@@ -3783,6 +3930,7 @@ async fn p4_replay_after_completed_still_green_for_solend() {
         2,
         default_solend_proof(),
         Some(proof),
+        None, // jupiter_boundary_proof (J4)
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix2],
@@ -3849,4 +3997,703 @@ async fn p4_oversized_sibling_list_fails_before_mutation() {
         "oversized sibling list must fail",
     )
     .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Stage 2 J4 — Jupiter bracket sibling-instruction verifier tests
+// ─────────────────────────────────────────────────────────────────────
+//
+// Coverage required by J4:
+//   - Jupiter action with valid skeleton proof succeeds and mutates
+//     state (sibling-verifier-only success — explicitly NOT a full
+//     trustless balance bracket).
+//   - Jupiter action with no boundary proof fails before mutation.
+//   - P3 condition false fails before reaching the J4 boundary.
+//   - Illegal sibling program rejected before mutation.
+//   - Fake Jupiter program id rejected before mutation.
+//   - Unexpected writable destination toucher rejected before mutation.
+//   - Malicious SPL Token Approve in middle band rejected before mutation.
+//   - Wrong relative ordering (duplicate swap) rejected before mutation.
+//   - Wrong destination_token_account rejected before mutation.
+//   - Oversized sibling list rejected before mutation.
+//   - Solend action does NOT require a Jupiter proof (Solend boundary
+//     stays the only relevant gate for SolendWithdrawAllDelegated).
+//   - Revoked authorization still fails before reaching the J4 boundary.
+//   - Already-completed (replay) still fails before reaching the J4 boundary.
+//
+// Every negative test asserts AuthorizationRecord is unmutated using
+// the existing `assert_no_mutation_after_failure` helper (re-used from
+// the P4 block).
+
+const RULE_ID_J4_HAPPY: [u8; 16] = [0xF8; 16];
+const RULE_ID_J4_PROOF_MISSING: [u8; 16] = [0xF9; 16];
+const RULE_ID_J4_P3_FALSE: [u8; 16] = [0xFA; 16];
+const RULE_ID_J4_ILLEGAL_SIBLING: [u8; 16] = [0xFB; 16];
+const RULE_ID_J4_FAKE_PROGRAM: [u8; 16] = [0xFC; 16];
+const RULE_ID_J4_UNEXPECTED_WRITABLE: [u8; 16] = [0xFD; 16];
+const RULE_ID_J4_MAL_TOKEN: [u8; 16] = [0xFE; 16];
+const RULE_ID_J4_DUP_SWAP: [u8; 16] = [0xFF; 16];
+const RULE_ID_J4_WRONG_DEST: [u8; 16] = [0xB1; 16];
+const RULE_ID_J4_OVERSIZED: [u8; 16] = [0xB2; 16];
+const RULE_ID_J4_SOLEND_INDEPENDENT: [u8; 16] = [0xB3; 16];
+const RULE_ID_J4_REVOKED: [u8; 16] = [0xB4; 16];
+const RULE_ID_J4_COMPLETED: [u8; 16] = [0xB5; 16];
+
+/// Helper: drives a Jupiter execute with a custom proof-mutator and
+/// asserts the on-chain failure surfaces `expected` AND that the
+/// AuthorizationRecord stays unmutated (used_amount_raw=0, completed=
+/// false, execution_nonce=0, last_execution_slot=0). Mirrors the
+/// P4-block `execute_solend_expect_failure` helper.
+async fn execute_jupiter_expect_failure<F>(
+    ctx: &mut ProgramTestContext,
+    program_id: Pubkey,
+    fx: &ExecuteFixture,
+    rule_id: [u8; 16],
+    proof_mutator: F,
+    expected: AuthorityError,
+    failure_label: &'static str,
+) where
+    F: FnOnce(&mut clawsol_authority::jupiter_boundary::JupiterBoundaryProof),
+{
+    let mut proof = default_jupiter_boundary_proof(&fx.delegated_wallet, &rule_id);
+    proof_mutator(&mut proof);
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        rule_id,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        1,
+        1,
+        default_solend_proof(),
+        None,
+        Some(proof),
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err(failure_label);
+    assert_custom_err(err, expected);
+    assert_no_mutation_after_failure(ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn j4_valid_jupiter_boundary_skeleton_succeeds_and_mutates_state() {
+    // **Note:** this is the sibling-verifier-only success test for J4.
+    // J4 does NOT implement the trustless balance bracket; the
+    // `min_output_amount_raw` field on the proof is intentionally not
+    // enforced here. Renamed accordingly so the deferral is visible.
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_HAPPY,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_J4_HAPPY,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        default_solend_proof(),
+        None,
+        Some(default_jupiter_boundary_proof(
+            &fx.delegated_wallet,
+            &RULE_ID_J4_HAPPY,
+        )),
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("J4 sibling-verifier happy path must succeed");
+
+    let acc = ctx.banks_client.get_account(fx.pda).await.unwrap().unwrap();
+    let record = AuthorizationRecord::try_from_slice(&acc.data).unwrap();
+    assert_eq!(record.used_amount_raw, 5_000_000);
+    assert!(record.completed);
+    assert_eq!(record.execution_nonce, 1);
+    assert!(record.last_execution_slot > 0);
+}
+
+#[tokio::test]
+async fn j4_jupiter_action_without_boundary_proof_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_PROOF_MISSING,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_J4_PROOF_MISSING,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        1,
+        1,
+        default_solend_proof(),
+        None,
+        None, // J4: missing Jupiter proof on a Jupiter action
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("missing Jupiter proof must fail");
+    assert_custom_err(err, AuthorityError::JupiterBoundaryProofMissing);
+    assert_no_mutation_after_failure(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn j4_p3_condition_false_fails_before_jupiter_boundary() {
+    // Verifies the P3 → J4 ordering: a false P3 condition fails with
+    // ConditionNotMet, NOT JupiterBoundaryProofMissing. The Jupiter
+    // gate runs strictly after P3.
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_P3_FALSE,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    // A condition that returns false (Lt 1 bps when APR is ~100 bps).
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Solend {
+            condition: solend_apr_lt_condition(1),
+            snapshot: fresh_solend_snapshot(clock.slot),
+        }],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_J4_P3_FALSE,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        1,
+        1,
+        proof,
+        None,
+        // Even if a valid Jupiter proof is supplied, P3 fails first.
+        Some(default_jupiter_boundary_proof(
+            &fx.delegated_wallet,
+            &RULE_ID_J4_P3_FALSE,
+        )),
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("P3 false must fail before J4 gate");
+    assert_custom_err(err, AuthorityError::ConditionNotMet);
+    assert_no_mutation_after_failure(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn j4_illegal_sibling_program_rejected_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_ILLEGAL_SIBLING,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    execute_jupiter_expect_failure(
+        &mut ctx,
+        program_id,
+        &fx,
+        RULE_ID_J4_ILLEGAL_SIBLING,
+        |proof| {
+            // Insert an unknown program id at the head of the middle band.
+            proof.sibling_instructions.insert(
+                0,
+                clawsol_authority::jupiter_boundary::JupiterSiblingIxDescriptor {
+                    program_id: Pubkey::new_from_array([0x99; 32]),
+                    variant_byte: 0,
+                    writable_accounts: vec![],
+                },
+            );
+        },
+        AuthorityError::JupiterIllegalSiblingInstruction,
+        "unknown program in middle band must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j4_fake_jupiter_program_id_rejected_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_FAKE_PROGRAM,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    execute_jupiter_expect_failure(
+        &mut ctx,
+        program_id,
+        &fx,
+        RULE_ID_J4_FAKE_PROGRAM,
+        |proof| {
+            // Replace the proof's pinned `jupiter_program_id` with a
+            // look-alike pubkey. The Gate-2 program-id check fires.
+            proof.jupiter_program_id = Pubkey::new_from_array([0xCA; 32]);
+        },
+        AuthorityError::JupiterProgramIdMismatch,
+        "fake Jupiter program id must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j4_unexpected_writable_destination_toucher_rejected_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_UNEXPECTED_WRITABLE,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    execute_jupiter_expect_failure(
+        &mut ctx,
+        program_id,
+        &fx,
+        RULE_ID_J4_UNEXPECTED_WRITABLE,
+        |proof| {
+            // Inject an ATA-class ix that writes an unrecognised pubkey.
+            proof.sibling_instructions.insert(
+                1,
+                clawsol_authority::jupiter_boundary::JupiterSiblingIxDescriptor {
+                    program_id: clawsol_authority::jupiter_boundary::ATA_PROGRAM_ID,
+                    variant_byte: 1,
+                    writable_accounts: vec![Pubkey::new_from_array([0xEA; 32])],
+                },
+            );
+        },
+        AuthorityError::JupiterUnexpectedWritableAccount,
+        "unexpected writable account must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j4_malicious_token_transfer_between_brackets_rejected_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_MAL_TOKEN,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    execute_jupiter_expect_failure(
+        &mut ctx,
+        program_id,
+        &fx,
+        RULE_ID_J4_MAL_TOKEN,
+        |proof| {
+            // Insert an SPL Token Approve (variant 4) — a delegation
+            // attack — between Compute Budget and the swap. Variant
+            // gate catches it even though the writable account is
+            // legitimate.
+            proof.sibling_instructions.insert(
+                1,
+                clawsol_authority::jupiter_boundary::JupiterSiblingIxDescriptor {
+                    program_id: clawsol_authority::jupiter_boundary::SPL_TOKEN_PROGRAM_ID,
+                    variant_byte: 4, // Approve
+                    writable_accounts: vec![proof.delegated_input_token_account],
+                },
+            );
+        },
+        AuthorityError::JupiterIllegalSiblingInstruction,
+        "Approve in middle band must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j4_wrong_relative_order_rejected_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_DUP_SWAP,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    execute_jupiter_expect_failure(
+        &mut ctx,
+        program_id,
+        &fx,
+        RULE_ID_J4_DUP_SWAP,
+        |proof| {
+            // Duplicate the Jupiter swap descriptor — second swap fails
+            // the relative-ordering state machine.
+            let swap = proof
+                .sibling_instructions
+                .iter()
+                .find(|ix| {
+                    ix.program_id
+                        == clawsol_authority::jupiter_boundary::JUPITER_V6_PROGRAM_ID_MAINNET
+                })
+                .unwrap()
+                .clone();
+            let swap_idx = proof
+                .sibling_instructions
+                .iter()
+                .position(|ix| {
+                    ix.program_id
+                        == clawsol_authority::jupiter_boundary::JUPITER_V6_PROGRAM_ID_MAINNET
+                })
+                .unwrap();
+            proof.sibling_instructions.insert(swap_idx + 1, swap);
+        },
+        AuthorityError::JupiterInstructionOrderInvalid,
+        "duplicate swap must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j4_wrong_destination_account_rejected_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_WRONG_DEST,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    execute_jupiter_expect_failure(
+        &mut ctx,
+        program_id,
+        &fx,
+        RULE_ID_J4_WRONG_DEST,
+        |proof| {
+            // The proof's expected_destination_token_account points
+            // somewhere other than AuthorizationRecord.destination.
+            proof.expected_destination_token_account =
+                Pubkey::new_from_array([0xCD; 32]);
+        },
+        AuthorityError::JupiterDestinationMismatch,
+        "wrong destination must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j4_oversized_sibling_list_rejected_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_OVERSIZED,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    execute_jupiter_expect_failure(
+        &mut ctx,
+        program_id,
+        &fx,
+        RULE_ID_J4_OVERSIZED,
+        |proof| {
+            for _ in 0..clawsol_authority::jupiter_boundary::MAX_JUPITER_SIBLING_INSTRUCTIONS
+            {
+                proof.sibling_instructions.push(
+                    clawsol_authority::jupiter_boundary::JupiterSiblingIxDescriptor {
+                        program_id:
+                            clawsol_authority::jupiter_boundary::COMPUTE_BUDGET_PROGRAM_ID,
+                        variant_byte: 0,
+                        writable_accounts: vec![],
+                    },
+                );
+            }
+        },
+        AuthorityError::JupiterSiblingListTooLarge,
+        "oversized sibling list must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j4_solend_action_does_not_require_jupiter_proof() {
+    // A Solend authz with a valid Solend boundary proof and `None` for
+    // `jupiter_boundary_proof` succeeds. The Jupiter boundary gate
+    // is scoped strictly to JupiterBuySolWithUsdc actions; Solend
+    // executions never enter it.
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_SOLEND_INDEPENDENT,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let proof = default_solend_boundary_proof(
+        &fx.delegated_wallet,
+        &RULE_ID_J4_SOLEND_INDEPENDENT,
+    );
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_J4_SOLEND_INDEPENDENT,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        default_solend_proof(),
+        Some(proof),
+        None, // Solend action: jupiter_boundary_proof MUST be None
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("Solend execute must not require a Jupiter proof");
+
+    let acc = ctx.banks_client.get_account(fx.pda).await.unwrap().unwrap();
+    let record = AuthorizationRecord::try_from_slice(&acc.data).unwrap();
+    assert!(record.completed);
+}
+
+#[tokio::test]
+async fn j4_revoked_authorization_still_fails_before_jupiter_boundary() {
+    // P2 step 11 (revoked) fires before the J4 boundary; the failure
+    // surfaces AuthorizationRevoked, NOT a Jupiter-class error.
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_REVOKED,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    // Revoke the authorization first.
+    let revoke_ix = revoke_authorization_instruction(
+        &program_id,
+        &ctx.payer.pubkey(),
+        SCHEMA_VERSION,
+        RULE_ID_J4_REVOKED,
+    );
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[revoke_ix],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("revoke");
+
+    execute_jupiter_expect_failure(
+        &mut ctx,
+        program_id,
+        &fx,
+        RULE_ID_J4_REVOKED,
+        |_proof| { /* unmodified valid proof */ },
+        AuthorityError::AuthorizationRevoked,
+        "revoked authz must fail before J4 gate",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j4_completed_replay_still_fails_before_jupiter_boundary() {
+    // P2 step 12 (completed) fires before the J4 boundary; the
+    // second-execute failure surfaces AuthorizationCompleted, NOT a
+    // Jupiter-class error.
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_J4_COMPLETED,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    // First execute succeeds.
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix1 = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_J4_COMPLETED,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        default_solend_proof(),
+        None,
+        Some(default_jupiter_boundary_proof(
+            &fx.delegated_wallet,
+            &RULE_ID_J4_COMPLETED,
+        )),
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix1],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("first execute");
+
+    // Second execute on the completed authz fails BEFORE the J4 gate.
+    ctx.warp_to_slot(50).expect("warp_to_slot");
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix2 = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_J4_COMPLETED,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        1,
+        2,
+        default_solend_proof(),
+        None,
+        Some(default_jupiter_boundary_proof(
+            &fx.delegated_wallet,
+            &RULE_ID_J4_COMPLETED,
+        )),
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix2],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("second execute on completed authz must fail");
+    assert_custom_err(err, AuthorityError::AuthorizationCompleted);
+
+    // FIRST execute's mutations stuck; SECOND did not advance.
+    let acc = ctx.banks_client.get_account(fx.pda).await.unwrap().unwrap();
+    let record = AuthorizationRecord::try_from_slice(&acc.data).unwrap();
+    assert!(record.completed);
+    assert_eq!(record.execution_nonce, 1);
 }

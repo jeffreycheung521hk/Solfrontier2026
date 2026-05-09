@@ -24,6 +24,7 @@ use crate::condition_verifier::{
     SolendSupplyAprCondition,
 };
 use crate::derive_authorization_pda;
+use crate::jupiter_boundary::JupiterBoundaryProof;
 use crate::solend_boundary::SolendBoundaryProof;
 
 /// Maximum number of proof-conditions per `ExecuteAction`. Bounded so a
@@ -140,23 +141,28 @@ pub enum AuthorityInstruction {
     /// constructed on-chain from `Clock::get()` so a hostile executor
     /// cannot bypass freshness gates by padding the proof.
     ///
-    /// **Wire-shape note (P3 + P4).** Each slice grows the variant by
-    /// trailing fields, append-only:
+    /// **Wire-shape note (P3 + P4 + J4).** Each slice grows the variant
+    /// by trailing fields, append-only:
     ///
     /// - P3 appended `condition_proof: ConditionProofPayload`.
     /// - P4 appended `solend_boundary_proof: Option<SolendBoundaryProof>`
     ///   (Borsh: 1 byte `Option` tag, then body if `Some`).
+    /// - J4 appends `jupiter_boundary_proof: Option<JupiterBoundaryProof>`
+    ///   after the Solend proof (Borsh: 1 byte `Option` tag, then body
+    ///   if `Some`). Reorder is a wire break.
     ///
     /// The Borsh enum tag stays at `3`. A pinned-length test in
-    /// `lib.rs::tests` (`execute_action_borsh_field_order_is_pinned_through_p4`)
+    /// `lib.rs::tests` (`execute_action_borsh_field_order_is_pinned_through_j4`)
     /// is updated alongside each change so any future field addition
     /// fails loudly.
     ///
     /// `solend_boundary_proof` is `Some(_)` when `action_type ==
     /// Stage2ActionType::SolendWithdrawAllDelegated` and `None`
-    /// otherwise. The on-chain `process_execute_action` enforces this
-    /// pairing — supplying `None` for a Solend action fails closed
-    /// with `SolendBoundaryProofMissing`.
+    /// otherwise. `jupiter_boundary_proof` is `Some(_)` when
+    /// `action_type == Stage2ActionType::JupiterBuySolWithUsdc` and
+    /// `None` otherwise. The on-chain `process_execute_action`
+    /// enforces both pairings — supplying `None` for a Jupiter action
+    /// fails closed with `JupiterBoundaryProofMissing`.
     ///
     /// Variant order MUST stay append-only: this is the 4th variant
     /// (Borsh `u8` ordinal `3`) and a future-added variant goes after,
@@ -176,6 +182,7 @@ pub enum AuthorityInstruction {
         execution_nonce: u64,
         condition_proof: ConditionProofPayload,
         solend_boundary_proof: Option<SolendBoundaryProof>,
+        jupiter_boundary_proof: Option<JupiterBoundaryProof>,
     },
 }
 
@@ -279,6 +286,13 @@ pub fn close_authorization_instruction(
 ///   otherwise. The on-chain processor enforces this — see
 ///   [`SolendBoundaryProof`] and the boundary verifier in
 ///   `solend_boundary.rs`.
+/// - `jupiter_boundary_proof` MUST be `Some(_)` when `action_type ==
+///   Stage2ActionType::JupiterBuySolWithUsdc`, and `None` otherwise.
+///   The on-chain processor enforces this — see
+///   [`JupiterBoundaryProof`] and the boundary verifier in
+///   `jupiter_boundary.rs`. **J4 implements only the
+///   sibling-instruction verifier; the trustless balance bracket is
+///   deferred — see `jupiter_boundary.rs` module docs.**
 #[allow(clippy::too_many_arguments)]
 pub fn execute_action_instruction(
     program_id: &Pubkey,
@@ -293,6 +307,7 @@ pub fn execute_action_instruction(
     execution_nonce: u64,
     condition_proof: ConditionProofPayload,
     solend_boundary_proof: Option<SolendBoundaryProof>,
+    jupiter_boundary_proof: Option<JupiterBoundaryProof>,
 ) -> Instruction {
     let (authz_pda, _bump) =
         derive_authorization_pda(program_id, schema_version, user, &rule_id);
@@ -305,6 +320,7 @@ pub fn execute_action_instruction(
         execution_nonce,
         condition_proof,
         solend_boundary_proof,
+        jupiter_boundary_proof,
     })
     .expect("borsh serialization of AuthorityInstruction is infallible");
 

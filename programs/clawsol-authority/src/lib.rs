@@ -86,6 +86,7 @@ use solana_program::{
 pub mod condition_verifier;
 pub mod error;
 pub mod instruction;
+pub mod jupiter_boundary;
 pub mod solend_boundary;
 pub mod state;
 
@@ -97,6 +98,7 @@ use crate::error::AuthorityError;
 use crate::instruction::{
     AuthorityInstruction, ConditionProofPayload, ProofCondition, MAX_PROOF_CONDITIONS,
 };
+use crate::jupiter_boundary::{verify_jupiter_boundary_skeleton, JupiterBoundaryProof};
 use crate::solend_boundary::{verify_solend_delegated_boundary, SolendBoundaryProof};
 use crate::state::{
     AuthorizationRecord, Stage2ActionType, STAGE2_AUTHORITY_SCHEMA_VERSION,
@@ -157,6 +159,7 @@ pub fn process_instruction(
             execution_nonce,
             condition_proof,
             solend_boundary_proof,
+            jupiter_boundary_proof,
         } => process_execute_action(
             program_id,
             accounts,
@@ -168,6 +171,7 @@ pub fn process_instruction(
             execution_nonce,
             condition_proof,
             solend_boundary_proof,
+            jupiter_boundary_proof,
         ),
     }
 }
@@ -473,16 +477,27 @@ fn process_close_authorization(
 
 /// Execute the action authorised by an existing authorization PDA
 /// (Stage 2 P2 boundary + P3 condition gate + P4 Solend delegated
-/// withdraw boundary).
+/// withdraw boundary + J4 Jupiter sibling-instruction verifier
+/// skeleton).
 ///
 /// All `AuthorizationRecord` checks the spec demands run here. The
 /// processor performs **no** Solend / Jupiter CPI — Solend variant-15
-/// CPI and Jupiter sibling-ix sysvar verification are deferred to P5+
-/// (see TODOs). P4 adds the deterministic Solend boundary gate: when
-/// `record.allowed_action_type == SolendWithdrawAllDelegated`, the
-/// supplied `SolendBoundaryProof` is verified before any state
-/// mutation. For other action types (Jupiter), the Solend boundary
-/// gate is skipped and the supplied proof MUST be `None`.
+/// CPI and the Jupiter route execution itself remain deferred. P4
+/// added the deterministic Solend boundary gate (active only for
+/// `SolendWithdrawAllDelegated`); J4 adds the deterministic Jupiter
+/// sibling-instruction verifier (active only for
+/// `JupiterBuySolWithUsdc`). For each action type the *other* boundary
+/// proof MUST be `None`; if a hostile executor attaches the wrong
+/// proof, that proof is ignored at this layer (the future
+/// trustless-bracket slice will harden the pairing further).
+///
+/// **J4 deferral.** The Jupiter boundary verifier in this slice is the
+/// sibling-instruction part only (per-class allowlist + relative
+/// ordering + writable-set check). The trustless pre/post balance
+/// bracket — `checked_sub(post.amount, pre.amount) >=
+/// min_output_amount_raw` against on-chain SPL Token unpacks — is
+/// explicitly deferred. See `jupiter_boundary.rs` module docs and the
+/// `executor_supplied_pre_balance_is_not_trusted` test.
 ///
 /// Boundary ordering (cheap → expensive, fail closed at the first
 /// mismatch):
@@ -493,9 +508,11 @@ fn process_close_authorization(
 ///   4. Cap / nonce / replay checks (input_amount, monotone nonce,
 ///      same-slot replay)
 ///   5. Condition verification (P3)
-///   6. **Solend delegated boundary (P4 — this slice; runs only for
+///   6. **Solend delegated boundary (P4 — runs only for
 ///       `Stage2ActionType::SolendWithdrawAllDelegated`)**
-///   7. State mutation (one-shot v1)
+///   7. **Jupiter sibling-ix boundary (J4 — runs only for
+///       `Stage2ActionType::JupiterBuySolWithUsdc`)**
+///   8. State mutation (one-shot v1)
 ///
 /// Checks → Checks → Effects: every gate above must pass before
 /// `used_amount_raw`, `completed`, `execution_nonce`, and
@@ -518,6 +535,7 @@ fn process_execute_action(
     execution_nonce: u64,
     condition_proof: ConditionProofPayload,
     solend_boundary_proof: Option<SolendBoundaryProof>,
+    jupiter_boundary_proof: Option<JupiterBoundaryProof>,
 ) -> ProgramResult {
     let account_iter = &mut accounts.iter();
     let executor_account = next_account_info(account_iter)?;
@@ -724,9 +742,9 @@ fn process_execute_action(
     // Active only for SolendWithdrawAllDelegated. For Jupiter actions
     // (or any future non-Solend action), the boundary proof MUST be
     // `None` — if a hostile executor attaches a Solend proof to a
-    // Jupiter execute, we ignore it (rather than treat it as a
-    // tampered Jupiter call), because P4 is scoped strictly to
-    // Solend. P5+ will land the Jupiter pre/post bracket gate here.
+    // Jupiter execute, we ignore it at this layer (rather than treat
+    // it as a tampered Jupiter call) because P4 is scoped strictly to
+    // Solend.
     //
     // For Solend, the proof MUST be `Some(_)`; missing fails closed
     // with `SolendBoundaryProofMissing`.
@@ -738,10 +756,41 @@ fn process_execute_action(
             .ok_or(AuthorityError::SolendBoundaryProofMissing)?;
         verify_solend_delegated_boundary(&record, proof)?;
     }
-    // For non-Solend actions in this slice, `solend_boundary_proof`
-    // is intentionally not consumed. (Jupiter pre/post bracket lives
-    // in a separate P5+ slice.)
+    // For non-Solend actions, `solend_boundary_proof` is intentionally
+    // not consumed.
     let _ = &solend_boundary_proof;
+
+    // ── Jupiter sibling-instruction boundary gate (J4) ──────────────────
+    //
+    // Active only for JupiterBuySolWithUsdc. For Solend (or any future
+    // non-Jupiter action), the Jupiter boundary proof MUST be `None`;
+    // if a hostile executor attaches one to a Solend execute, we
+    // ignore it at this layer (rather than treat it as a tampered
+    // Solend call) because J4 is scoped strictly to Jupiter.
+    //
+    // For Jupiter, the proof MUST be `Some(_)`; missing fails closed
+    // with `JupiterBoundaryProofMissing`.
+    //
+    // **J4 deferral.** The verifier called below validates ONLY the
+    // sibling-instruction list (per-class allowlist + relative
+    // ordering + writable-set check). The trustless pre/post balance
+    // bracket (`checked_sub(post.amount, pre.amount) >=
+    // min_output_amount_raw` against on-chain SPL Token unpacks) is
+    // explicitly deferred to a future slice — see
+    // `jupiter_boundary.rs` module docs. Pre-allocated error codes
+    // `JupiterPostBalanceUnderflow` and `JupiterBalanceDeltaTooSmall`
+    // are reserved for that slice and stay append-only here.
+    if record.allowed_action_type
+        == crate::state::Stage2ActionType::JupiterBuySolWithUsdc.to_u8()
+    {
+        let proof = jupiter_boundary_proof
+            .as_ref()
+            .ok_or(AuthorityError::JupiterBoundaryProofMissing)?;
+        verify_jupiter_boundary_skeleton(&record, proof)?;
+    }
+    // For non-Jupiter actions, `jupiter_boundary_proof` is
+    // intentionally not consumed.
+    let _ = &jupiter_boundary_proof;
 
     // ── State mutations (one-shot v1) ───────────────────────────────────
     record.used_amount_raw = new_used;
@@ -1160,6 +1209,9 @@ mod tests {
             condition_proof: dummy_solend_proof(),
             // Jupiter action: solend_boundary_proof MUST be None.
             solend_boundary_proof: None,
+            // J4: jupiter_boundary_proof field. Round-trip with None
+            // here; another test exercises Some(_).
+            jupiter_boundary_proof: None,
         };
         let bytes = borsh::to_vec(&original).unwrap();
         let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
@@ -1181,6 +1233,7 @@ mod tests {
             execution_nonce: 1,
             condition_proof: dummy_pyth_proof(),
             solend_boundary_proof: None,
+            jupiter_boundary_proof: None,
         };
         let bytes = borsh::to_vec(&original).unwrap();
         let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
@@ -1214,6 +1267,63 @@ mod tests {
             execution_nonce: 1,
             condition_proof: dummy_solend_proof(),
             solend_boundary_proof: Some(proof),
+            jupiter_boundary_proof: None,
+        };
+        let bytes = borsh::to_vec(&original).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn execute_action_borsh_roundtrip_with_jupiter_boundary_proof() {
+        // J4 wire shape: append-only `Option<JupiterBoundaryProof>`
+        // after `solend_boundary_proof`. Roundtrip with a
+        // representative proof (the proof's structural details are
+        // exercised in jupiter_boundary::tests).
+        use crate::jupiter_boundary::{
+            JupiterBoundaryProof, JupiterSiblingIxDescriptor, JupiterTokenAccountFixture,
+            JUPITER_V6_PROGRAM_ID_MAINNET,
+        };
+        let dest = Pubkey::new_from_array([0xCC; 32]);
+        let mint = Pubkey::new_from_array([0x12; 32]);
+        let in_ata = Pubkey::new_from_array([0x21; 32]);
+        let out_ata = Pubkey::new_from_array([0x22; 32]);
+        let proof = JupiterBoundaryProof {
+            jupiter_program_id: JUPITER_V6_PROGRAM_ID_MAINNET,
+            expected_destination_token_account: dest,
+            expected_destination_mint: mint,
+            expected_input_mint: Pubkey::new_from_array([0x11; 32]),
+            delegated_input_token_account: in_ata,
+            delegated_output_token_account: out_ata,
+            destination_pre_snapshot: JupiterTokenAccountFixture {
+                address: dest,
+                mint,
+                owner: Pubkey::new_from_array([0xDD; 32]),
+                amount: 0,
+            },
+            destination_post_snapshot: JupiterTokenAccountFixture {
+                address: dest,
+                mint,
+                owner: Pubkey::new_from_array([0xDD; 32]),
+                amount: 0,
+            },
+            min_output_amount_raw: 1_000,
+            sibling_instructions: vec![JupiterSiblingIxDescriptor {
+                program_id: JUPITER_V6_PROGRAM_ID_MAINNET,
+                variant_byte: 0xE5,
+                writable_accounts: vec![],
+            }],
+        };
+        let original = AuthorityInstruction::ExecuteAction {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0xAB; 16],
+            canonical_rule_hash: [0xCD; 32],
+            action_type: Stage2ActionType::JupiterBuySolWithUsdc.to_u8(),
+            input_amount_raw: 5_000_000,
+            execution_nonce: 1,
+            condition_proof: dummy_solend_proof(),
+            solend_boundary_proof: None,
+            jupiter_boundary_proof: Some(proof),
         };
         let bytes = borsh::to_vec(&original).unwrap();
         let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
@@ -1272,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_action_borsh_field_order_is_pinned_through_p4() {
+    fn execute_action_borsh_field_order_is_pinned_through_j4() {
         // Borsh: enum tag is `u8` ordinal in declaration order, then
         // variant body in declared field order, integers little-endian,
         // fixed `[u8; N]` arrays raw. ExecuteAction is the 4th variant
@@ -1280,7 +1390,8 @@ mod tests {
         // ExecuteAction=3). The first 67 bytes — through `execution_nonce`
         // — are the pinned P2 prefix; bytes 67..72 are P3's empty
         // `condition_proof`; byte 72 is P4's `Option` tag (None) for
-        // `solend_boundary_proof`.
+        // `solend_boundary_proof`; byte 73 is J4's `Option` tag (None)
+        // for `jupiter_boundary_proof`.
         let proof = ConditionProofPayload {
             condition_logic: ConditionLogic::All,
             conditions: vec![],
@@ -1295,6 +1406,7 @@ mod tests {
             execution_nonce: 0x1112_1314_1516_1718,
             condition_proof: proof,
             solend_boundary_proof: None,
+            jupiter_boundary_proof: None,
         };
         let bytes = borsh::to_vec(&ix).unwrap();
         // Pinned P2 prefix (unchanged) — 67 bytes through execution_nonce.
@@ -1326,14 +1438,22 @@ mod tests {
             "bytes 67..p3_end = condition_proof (Borsh-encoded ConditionProofPayload)",
         );
         // P4 trailing byte — the borsh `Option` tag (0 = None) for
-        // solend_boundary_proof. Future fields append after this.
+        // solend_boundary_proof.
         assert_eq!(
             bytes[p3_end], 0,
             "byte p3_end = solend_boundary_proof Option tag (0 = None)"
         );
+        // J4 trailing byte — the borsh `Option` tag (0 = None) for
+        // jupiter_boundary_proof. Future fields append after this.
+        assert_eq!(
+            bytes[p3_end + 1],
+            0,
+            "byte p3_end+1 = jupiter_boundary_proof Option tag (0 = None)"
+        );
         // Total length pin: 67 (P2 prefix) + 1 + 4 (P3 empty proof:
-        // ConditionLogic byte + Vec<u32 len>) + 1 (P4 Option None tag).
-        assert_eq!(bytes.len(), 67 + 1 + 4 + 1);
+        // ConditionLogic byte + Vec<u32 len>) + 1 (P4 Option None) + 1
+        // (J4 Option None).
+        assert_eq!(bytes.len(), 67 + 1 + 4 + 1 + 1);
     }
 
     #[test]
@@ -1372,6 +1492,7 @@ mod tests {
                 conditions: vec![],
             },
             solend_boundary_proof: None,
+            jupiter_boundary_proof: None,
         })
         .unwrap();
         assert_eq!(execute[0], 3, "ExecuteAction tag = 3");
@@ -1431,6 +1552,22 @@ mod tests {
         assert_eq!(AuthorityError::SolendInstructionOrderInvalid as u32, 43);
         assert_eq!(AuthorityError::SolendDuplicateOrConflictingInstruction as u32, 44);
         assert_eq!(AuthorityError::SolendBoundaryVerificationFailed as u32, 45);
+        // J4 Jupiter boundary verifier (append-only).
+        assert_eq!(AuthorityError::JupiterBoundaryProofMissing as u32, 46);
+        assert_eq!(AuthorityError::JupiterBoundaryVerificationFailed as u32, 47);
+        assert_eq!(AuthorityError::JupiterIllegalSiblingInstruction as u32, 48);
+        assert_eq!(AuthorityError::JupiterInstructionOrderInvalid as u32, 49);
+        assert_eq!(AuthorityError::JupiterProgramIdMismatch as u32, 50);
+        assert_eq!(AuthorityError::JupiterUnexpectedWritableAccount as u32, 51);
+        assert_eq!(AuthorityError::JupiterDestinationMismatch as u32, 52);
+        assert_eq!(AuthorityError::JupiterTokenAccountInvalid as u32, 53);
+        assert_eq!(AuthorityError::JupiterMintMismatch as u32, 54);
+        // J4-reserved (deferred trustless balance bracket).
+        assert_eq!(AuthorityError::JupiterPostBalanceUnderflow as u32, 55);
+        assert_eq!(AuthorityError::JupiterBalanceDeltaTooSmall as u32, 56);
+        assert_eq!(AuthorityError::JupiterSiblingListTooLarge as u32, 57);
+        assert_eq!(AuthorityError::JupiterBracketCheckpointMissing as u32, 58);
+        assert_eq!(AuthorityError::JupiterBracketCheckpointConsumed as u32, 59);
     }
 
     #[test]

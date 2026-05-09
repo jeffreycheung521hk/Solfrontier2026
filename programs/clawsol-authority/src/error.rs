@@ -169,6 +169,85 @@ pub enum AuthorityError {
 
     #[error("Solend boundary verification failed (catch-all for malformed descriptors / cap violations)")]
     SolendBoundaryVerificationFailed = 45,
+
+    // ── Stage 2 Jupiter Bracket Verifier (J4 — append-only at codes 46+) ──
+    //
+    // Discriminants 46..=58 are appended for the Jupiter bracket
+    // sibling-instruction verifier introduced in J4. Numeric values are
+    // part of the on-chain wire shape (encoded into
+    // `ProgramError::Custom`) and MUST stay append-only — never reorder
+    // or renumber.
+    //
+    // J4 deliberately implements ONLY the sibling-instruction verifier.
+    // The trustless pre/post balance bracket (dual-instruction
+    // checkpoint PDA model from STAGE2_JUPITER_BRACKET_ALT_FEASIBILITY
+    // § 4.1) is explicitly DEFERRED to a future slice — any code path
+    // that accepts an executor-supplied `pre_balance` would be a
+    // violation. The `JupiterBracketCheckpointMissing` /
+    // `JupiterBracketCheckpointConsumed` codes are pre-allocated here
+    // as part of an append-only contract so the future bracket slice
+    // can wire them without renumbering anything else.
+
+    #[error("execute_action for JupiterBuySolWithUsdc requires a JupiterBoundaryProof payload")]
+    JupiterBoundaryProofMissing = 46,
+
+    #[error("Jupiter boundary verification failed (catch-all for malformed descriptors / cap violations)")]
+    JupiterBoundaryVerificationFailed = 47,
+
+    #[error("sibling instruction's program_id is not in the Jupiter per-class allowlist")]
+    JupiterIllegalSiblingInstruction = 48,
+
+    #[error("sibling instructions violate the Jupiter setup → swap → cleanup → other → tip relative ordering")]
+    JupiterInstructionOrderInvalid = 49,
+
+    #[error("Jupiter swap sibling instruction's program_id does not equal the pinned Jupiter v6 mainnet program id")]
+    JupiterProgramIdMismatch = 50,
+
+    #[error("a sibling instruction marks an unexpected account as writable (outside the deterministic allowed-writable set)")]
+    JupiterUnexpectedWritableAccount = 51,
+
+    #[error("Jupiter boundary proof's destination_token_account does not match AuthorizationRecord.destination")]
+    JupiterDestinationMismatch = 52,
+
+    #[error("token-account fixture is not a recognized SPL Token account shape (owner / size / discriminator)")]
+    JupiterTokenAccountInvalid = 53,
+
+    #[error("token-account fixture's mint does not match the canonical action's expected mint")]
+    JupiterMintMismatch = 54,
+
+    /// Reserved for the dual-instruction balance-bracket slice — when
+    /// `checked_sub(post_balance, pre_balance)` underflows, the bracket
+    /// MUST surface this exact code rather than silently saturating.
+    /// J4 does not yet wire a balance bracket; this discriminant is
+    /// pre-allocated to keep the future slice append-only.
+    #[error("post_balance < pre_balance — reserved for future trustless balance bracket")]
+    JupiterPostBalanceUnderflow = 55,
+
+    /// Reserved for the dual-instruction balance-bracket slice — when
+    /// `delta < min_output_amount_raw`, the bracket MUST surface this
+    /// exact code. J4 does not yet wire a balance bracket; this
+    /// discriminant is pre-allocated to keep the future slice
+    /// append-only.
+    #[error("post_balance - pre_balance < min_output_amount_raw — reserved for future trustless balance bracket")]
+    JupiterBalanceDeltaTooSmall = 56,
+
+    #[error("Jupiter sibling instruction list exceeds MAX_JUPITER_SIBLING_INSTRUCTIONS")]
+    JupiterSiblingListTooLarge = 57,
+
+    /// Reserved for the dual-instruction balance-bracket slice —
+    /// `PostJupiterBracketCheck` (or the post-bracket phase of
+    /// `ExecuteAction`) finds no matching `JupiterBracketCheckpoint`
+    /// PDA for the current authorization. J4 does not yet create
+    /// checkpoint PDAs; this discriminant is pre-allocated.
+    #[error("Jupiter bracket checkpoint PDA missing — reserved for future trustless balance bracket")]
+    JupiterBracketCheckpointMissing = 58,
+
+    /// Reserved for the dual-instruction balance-bracket slice — the
+    /// checkpoint PDA was already consumed by an earlier
+    /// `PostJupiterBracketCheck` and cannot be reused. J4 does not yet
+    /// wire a balance bracket; this discriminant is pre-allocated.
+    #[error("Jupiter bracket checkpoint already consumed — reserved for future trustless balance bracket")]
+    JupiterBracketCheckpointConsumed = 59,
 }
 
 impl From<AuthorityError> for ProgramError {
