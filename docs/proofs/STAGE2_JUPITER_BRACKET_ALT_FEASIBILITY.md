@@ -808,4 +808,504 @@ Working tree clean except this new untracked file. (Worktree was created clean f
 
 ---
 
+## 19. Acceptance-Checklist Addendum (2026-05-09)
+
+This section was appended after the initial commit (`b8a096c`) to address
+additional acceptance criteria. Sections 1-18 above are unchanged. The
+addendum covers:
+
+- 19.1 Physical-limit analysis broken down by route hop count (1-hop / 2-hop / 3-hop).
+- 19.2 Sizing-fixtures JSON schema template (no fake numbers; live measurement is a future slice).
+- 19.3 Malicious-sibling enumeration with per-attack detection.
+- 19.4 Balance-bracket revert semantics.
+- 19.5 Oracle-freshness gate cross-reference (P3 condition_verifier; do not duplicate).
+- 19.6 Future QA matrix (revoke race, Pyth self-post).
+- 19.7 Acceptance-checklist compliance map.
+
+### 19.1 Physical-Limit Analysis by Route Hop Count
+
+The byte/CU estimates in §§ 7.2 and 8.2 used a single representative
+route. The route hop count is one of the largest variables; this
+section breaks down the expected pressure by hop class. **All numbers
+below are estimates from public schema knowledge plus repo precedent
+— not measurements. Live measurement is required to confirm the
+classification (Green/Yellow/Red below).**
+
+#### 19.1.1 Definitions
+
+- **Hop:** one DEX swap leg in the Jupiter route. A 1-hop route is
+  USDC → wSOL through a single pool (e.g. Whirlpool USDC/wSOL). A
+  2-hop route adds one intermediate token. A 3-hop route adds two.
+- **Route class:** the (input mint, output mint) pair plus the
+  Jupiter-chosen path. For Scenario B (USDC → wSOL) a 1-hop direct
+  route is usually available because the pair is highly liquid;
+  Jupiter may still pick 2-hop or 3-hop routes if intermediate
+  liquidity gives better execution.
+- **Classification scale:**
+  - **Green** — fits comfortably; ≥ 200 bytes byte-budget headroom AND
+    ≥ 300,000 CU compute headroom.
+  - **Yellow** — fits but tight; 50-200 bytes headroom AND/OR
+    100,000-300,000 CU headroom. Implementation requires tx-size
+    canary alerts and CU-budget monitoring.
+  - **Red** — does not fit, OR fits with < 50 bytes / < 100,000 CU
+    margin. Per spec § 6.3.2, Red routes are **preview-only**; no
+    degraded-safety fallback is acceptable.
+
+#### 19.1.2 Per-Hop Pressure Estimate
+
+| Route hops | Jupiter swap-ix bytes (est.) | Jupiter route-account count (est.) | Wrapped tx bytes (est.) | Est. CU | Classification (est.) |
+|---|---|---|---|---|---|
+| 1-hop | ~120-150 | ~12-18 | ~950-1,000 | ~400K-600K | **Green (estimate)** |
+| 2-hop | ~180-220 | ~22-30 | ~1,050-1,120 | ~600K-900K | **Yellow (estimate)** |
+| 3-hop | ~260-320 | ~35-45 | ~1,180-1,260 | ~900K-1,300K | **Red-likely (estimate)** |
+
+The 3-hop estimate puts wrapped tx bytes at or above the 1,232-byte
+cap, depending on the specific DEX combination chosen by Jupiter. CU
+also pushes against the 1,400,000 ceiling for 3-hop routes.
+
+**The implementation MUST measure** the actual values per hop class
+(see § 19.2 schema) before declaring any class Green or Yellow. This
+report cannot make that classification without live data.
+
+#### 19.1.3 What the Daemon Should Do Per Class
+
+- **Green class:** daemon proceeds normally. Monitor tx-bytes and
+  CU-actual against estimates as a regression canary.
+- **Yellow class:** daemon proceeds but elevates audit severity to
+  Warn. Operator dashboard shows "tight margin" badge. If margin
+  shrinks below threshold across two executions, fall back to next
+  lower hop class via `maxAccounts` reduction.
+- **Red class:** daemon refuses to construct the execute tx. Returns
+  `ConditionalSwapPreviewOnly` to the chat surface. Frontend shows
+  "Route too large for this pair under Stage 2 constraints; preview
+  only" per spec § 6.3.2 visibility requirement.
+
+The classification is **per-attempt**, not per-rule, because Jupiter's
+route choice can shift between proposal time and execute time.
+
+### 19.2 Sizing-Fixtures JSON Schema Template
+
+**No `docs/proofs/stage2_jupiter_sizing_fixtures.json` is being written
+in this slice** because no live measurement was run. Per the prompt's
+"do not fake this file" instruction, the schema below is the template
+the future measurement slice MUST populate.
+
+```jsonc
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Stage 2 Jupiter sizing fixtures. Populated only by the env-gated measurement harness (CLAW_STAGE2_JUPITER_MEASUREMENT_ENABLED=1). Each entry records ONE live-measurement run.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "measurement_run_at",
+    "live_api_called",
+    "live_rpc_called",
+    "harness_commit_sha",
+    "fixtures"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "measurement_run_at": {
+      "type": "string",
+      "format": "date-time",
+      "$comment": "UTC ISO-8601 timestamp"
+    },
+    "live_api_called": {
+      "type": "boolean",
+      "$comment": "true iff the harness called api.jup.ag during this run"
+    },
+    "live_rpc_called": {
+      "type": "boolean",
+      "$comment": "true iff the harness called any Solana RPC during this run"
+    },
+    "harness_commit_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+    "jupiter_api_version": { "type": "string", "enum": ["v1", "v2"] },
+    "jupiter_endpoint": { "type": "string", "format": "uri" },
+    "fixtures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "label",
+          "input_mint",
+          "output_mint",
+          "input_amount_raw",
+          "max_accounts",
+          "restrict_intermediate_tokens",
+          "route_class_observed",
+          "static_account_count",
+          "alt_loaded_account_count",
+          "alt_count",
+          "serialized_v0_byte_size",
+          "estimated_compute_units",
+          "classification"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "$comment": "Human-readable, e.g. 'scenarioB-usdc-to-wsol-1hop-maxAccts58'"
+          },
+          "input_mint": { "type": "string", "$comment": "base58 pubkey" },
+          "output_mint": { "type": "string", "$comment": "base58 pubkey" },
+          "input_amount_raw": { "type": "integer", "minimum": 1 },
+          "max_accounts": { "type": "integer", "minimum": 1, "maximum": 64 },
+          "restrict_intermediate_tokens": { "type": "boolean", "const": true },
+          "route_class_observed": {
+            "type": "string",
+            "enum": ["1-hop", "2-hop", "3-hop", "n-hop"],
+            "$comment": "Set to 'n-hop' for 4+; record actual hop count in route_hops_actual"
+          },
+          "route_hops_actual": { "type": "integer", "minimum": 1 },
+          "static_account_count": { "type": "integer", "minimum": 0, "maximum": 64 },
+          "alt_loaded_account_count": { "type": "integer", "minimum": 0 },
+          "alt_count": {
+            "type": "integer",
+            "minimum": 0,
+            "$comment": "Number of distinct ALTs referenced by this tx"
+          },
+          "serialized_v0_byte_size": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1232,
+            "$comment": "After bracket wrapping; before signing. Must be <= PACKET_DATA_SIZE."
+          },
+          "estimated_compute_units": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1400000,
+            "$comment": "From simulateTransaction or static estimate. Must be <= MAX_COMPUTE_UNIT_LIMIT."
+          },
+          "quoted_output_amount_raw": { "type": "integer", "minimum": 0 },
+          "classification": {
+            "type": "string",
+            "enum": ["green", "yellow", "red"],
+            "$comment": "Per § 19.1.1 thresholds"
+          },
+          "blockers_observed": {
+            "type": "array",
+            "items": { "type": "string" },
+            "$comment": "Free-text observations for the implementation slice"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+The harness MUST record one fixture row per `(maxAccounts, route_class)`
+combination tested. Recommended initial run: Scenario B (USDC → wSOL,
+5,000,000 raw input) at `maxAccounts ∈ {64, 58, 55, 52, 50, 48}`,
+with Jupiter free to pick the route class.
+
+### 19.3 Malicious-Sibling Enumeration with Detection
+
+§ 5 above defines the per-class state machine and writable-account
+check. This subsection enumerates the specific attack patterns that
+the bracket MUST detect, mapped to the specific defence:
+
+#### 19.3.1 Inserted Token Transfer Between pre/post
+
+**Attack.** Daemon (compromised) inserts `spl_token::transfer(input_ata
+→ attacker_ata, max_drain)` between Jupiter setup and swap.
+
+**Detection.** § 5.3 writable-account check. `attacker_ata` is
+**writable** in the inserted ix but is **not in
+`allowed_writable_set`** (not the delegated input/output ATA, not the
+destination, not derivable as an ATA from any canonical mint, not in
+the Jupiter swap ix's own account list). The bracket rejects with
+`SiblingIxUnknownWritableAccount`.
+
+**Subtlety.** A no-op transfer to the wallet's own ATA (`input_ata →
+input_ata, 0`) passes the writable check but moves zero balance —
+caught by the post-check balance delta gate (§ 4.1).
+
+#### 19.3.2 Fake Jupiter Program ID
+
+**Attack.** Daemon swaps the legitimate Jupiter v6 program id in the
+swap ix for a malicious clone (e.g. an attacker-deployed program at a
+similar-looking pubkey).
+
+**Detection.** § 5.2 per-class allowlist. The bracket pins
+`JUPITER_V6_PROGRAM_ID` as a const constant in `clawsol-authority`
+(future module `jupiter_boundary.rs`); any middle ix whose
+`program_id` is not in the allowlist is rejected with
+`SiblingIxUnknownProgramId`. The malicious clone is not in the
+allowlist.
+
+**Subtlety.** This requires the constant to be parity-asserted against
+the gateway's existing Jupiter pin. A deployment-time mismatch would
+make the bracket reject ALL Jupiter swaps. The spec calls out this
+parity requirement; the future module MUST include a parity test.
+
+#### 19.3.3 Extra Writable Token-Account Toucher
+
+**Attack.** Daemon inserts an SPL Token-class ix that writes to a
+recognised account but with attacker semantics (e.g.
+`spl_token::approve(input_ata, attacker, max_amount)` — establishes
+a delegate that can later drain).
+
+**Detection.** § 5.3 writable-account check passes (input_ata is
+allowed-writable). **However**, the per-class rules MUST also
+constrain *which Token-program ix variants* are allowed. The Token
+class allowlist (sub-spec for the future `jupiter_boundary.rs`):
+
+- **Allowed ix variants:** `Transfer`, `TransferChecked`,
+  `CloseAccount` (only on wSOL ATA), `SyncNative`.
+- **Rejected ix variants:** `Approve`, `Revoke`, `MintTo`, `Burn`,
+  `SetAuthority`, `FreezeAccount`, `ThawAccount`, `InitializeAccount*`
+  (Jupiter setup uses ATA program for account init, not Token program
+  init).
+
+The `spl_token::approve` attack is rejected at the variant check.
+
+**Implementation note.** The variant check requires decoding the ix
+data's first byte (Token program uses `u8` discriminator at byte 0 of
+ix.data). Bracket reads `ix.data[0]` and compares to the allowlist of
+discriminator bytes for allowed variants.
+
+#### 19.3.4 Reordered Setup / Swap / Cleanup
+
+**Attack.** Daemon reorders middle ixs so that, e.g., cleanup runs
+before swap (closing the wSOL ATA before the swap finishes), or two
+swap ixs appear (an extra swap to drain output ATA back into a
+different mint).
+
+**Detection.** § 5.4 ordering verification. The state machine cursor
+walks middle ixs in order: `compute_budget → setup → swap → cleanup
+→ other → tip`. Any backward transition (e.g. cleanup followed by
+swap) is rejected with `SiblingIxOrderingViolation`.
+
+**Detection of duplicate swap.** The state machine permits exactly
+one `swap` transition. A second Jupiter-class top-level ix at the
+swap position is rejected with `SiblingIxDuplicateSwap`.
+
+#### 19.3.5 Hidden DEX Routing Outside Jupiter
+
+**Attack.** Daemon inserts a top-level Whirlpool ix between Jupiter
+setup and Jupiter swap, attempting to route through a malicious pool
+without going through Jupiter's aggregation.
+
+**Detection.** § 5.2 per-class allowlist. Whirlpool's program id is
+NOT in the bracket's allowlist (only Jupiter v6 is the allowed
+swap-class program). The Whirlpool ix is rejected with
+`SiblingIxUnknownProgramId`.
+
+**Important nuance.** Whirlpool program-id calls inside Jupiter's
+swap ix (via CPI) are fine — they appear inside the swap ix's
+account list and are executed as a CPI from Jupiter, not as a
+top-level ix. The bracket's check is on **top-level** ix
+program_ids only; CPI calls are out of the instructions sysvar's
+visibility window per Solana docs.
+
+#### 19.3.6 Inserted ComputeBudget Override
+
+**Attack.** Daemon inserts a `ComputeBudgetProgram::SetComputeUnitPrice`
+with an absurdly high value, draining the delegated wallet's SOL via
+priority fees.
+
+**Detection.** § 5.2 allows ComputeBudget ixs in any number; the
+attack is **not detected by the sibling-ix verifier**. Defence
+instead lives at the **gas-budget layer** — the daemon-side check
+that priority fee × CU limit ≤ `[delegated_wallet.gas_policy].fee_buffer_sol`
+before submission. This is daemon-side defence-in-depth, not bracket
+defence.
+
+**Future hardening.** A bracket-side cap (e.g. reject any
+`SetComputeUnitPrice` with value > 100,000 microlamports) could be
+added. Out of v1 scope; documented for v1.5+.
+
+#### 19.3.7 Detection-Failure Modes
+
+If any of the above attacks is **not** detected by the bracket:
+- Tx still rolls back if the post-check balance delta fails (e.g.
+  drain ix succeeds but post-check `(pre_in - post_in) >
+  max_input_amount_raw` triggers). This is the bracket's
+  defence-of-last-resort.
+- If the attack also satisfies the balance bracket (e.g. delegated
+  approval is established but no immediate drain), the user is
+  exposed to a future drain by the attacker until they revoke. The
+  revoke path is then the recovery mechanism. This is the residual
+  risk class that the variant-check (§ 19.3.3) is designed to close.
+
+### 19.4 Balance-Bracket Revert Semantics
+
+The post_check_v2 ix performs the following gates. **Any single gate
+failure causes the entire transaction to revert atomically — no
+partial state changes commit.**
+
+```text
+post_check_v2 gates (executed in order; first failure short-circuits):
+
+  1. Reload AuthorizationRecord PDA. Assert pending_check flag set
+     (proves pre_check ran in the same tx). If not set:
+       → revert tx with PostCheckPreFlightMissing.
+
+  2. Read post_in_balance from delegated input ATA.
+     Read post_out_balance from destination ATA.
+
+  3. Compute consumed_in = pre_in_balance - post_in_balance. If
+     post_in_balance > pre_in_balance (token came back to source):
+       → revert tx with PostCheckBalanceInversion.
+
+  4. Assert consumed_in <= action.max_input_amount_raw. If exceeded:
+       → revert tx with PostCheckOverInput.
+
+  5. Assert (used_amount_raw + consumed_in) <= max_input_amount_raw.
+     (Belt-and-braces against multi-execute drain on multi-use rules
+     — not relevant for one_shot v1, but enforced anyway.)
+       → revert tx with PostCheckOverRemainingCap.
+
+  6. Compute received_out = post_out_balance - pre_out_balance.
+     If received_out < min_output_amount_raw_adverse_bound:
+       → revert tx with PostCheckMinOutNotMet.
+
+     (min_output_amount_raw_adverse_bound is computed from the
+     canonical_intent's slippage_bps and the adverse-bound Pyth
+     reference price recorded by pre_check. See § 7.2 of
+     STAGE2_PYTH_ADAPTER_RESEARCH.md.)
+
+  7. Assert destination_account == AuthorizationRecord.destination.
+     If mismatch:
+       → revert tx with PostCheckDestinationMismatch.
+
+  8. Re-introspect instructions sysvar (defence-in-depth):
+       - assert middle ixs are unchanged from pre_check's recorded
+         classification (per-class allowlist + ordering + writable set
+         all re-validated).
+     If diverged:
+       → revert tx with PostCheckSiblingIxDiverged.
+
+  9. State updates (only if all above gates pass):
+       - used_amount_raw += consumed_in
+       - if one_shot: completed = true
+       - last_execution_slot = Clock.slot
+       - clear pending_check flag
+
+ 10. Emit `swap_executed_v2` log event.
+```
+
+**Critical property.** "Revert" here means Solana transaction-level
+revert: every account write in every ix in the same tx is undone. The
+Jupiter swap does **not** commit unless `post_check_v2` succeeds end
+to end. **Jupiter success alone is not sufficient** — the bracket's
+post-check is the final gate.
+
+This satisfies the prompt's "Must define post_check min_out failure:
+if output balance delta < min_output_amount_raw, revert whole tx"
+requirement explicitly via gate 6 above.
+
+### 19.5 Oracle-Freshness Gate Cross-Reference (P3 / O3)
+
+The Stage 2 Jupiter execute path **does not implement Pyth verification
+itself**. It consumes the existing condition-verifier from P3
+([programs/clawsol-authority/src/condition_verifier.rs](../../programs/clawsol-authority/src/condition_verifier.rs)
+— `evaluate_condition` and friends).
+
+The verifier already enforces, for each Pyth condition:
+
+| Gate | Verifier error variant | Source |
+|---|---|---|
+| `snapshot.feed_id != condition.feed_id` | `PythFeedIdMismatch` | Mirrors Pyth SDK `GetPriceError::MismatchedFeedId` |
+| `snapshot.publish_time` older than `condition.max_age_seconds` | `PythPriceTooOld` | Mirrors Pyth SDK `GetPriceError::PriceTooOld` |
+| `snapshot.verification_level != Full` | `PythVerificationLevelInsufficient` | Spec § 7.1, audit U-5 |
+| `(conf * 10_000) / abs(price) > max_confidence_bps` | `PythConfidenceTooWide` | Spec § 7.1 confidence-ratio gate |
+| Exponent out of range | `PythExponentOutOfRange` | i128 overflow guard |
+| Compute overflow on i128 multiply | `PythComputeOverflow` | i128 multiply guard |
+| Boundary direction (`Lt`/`Lte` vs adverse-bound mismatch) | `PythBoundDirectionInvalid` | Spec § 7.1 adverse-bound discipline |
+
+`pre_check_v2` invokes `condition_verifier::evaluate_condition` for each
+condition in the rule's `conditions[]` (3 for Scenario B). On any
+verifier error, `pre_check_v2` propagates and the tx reverts before
+any state mutation.
+
+**The Jupiter slice does NOT duplicate the Pyth gates.** It calls
+the existing P3 verifier. This is consistent with the spec's
+"cross-cutting invariants" discipline (§ 10) and avoids double-
+maintenance of the same checks across P3 and J-impl slices.
+
+**The Jupiter slice DOES need to:**
+- Pass `EvalCondition` instances reconstructed from the canonical
+  rule's `conditions[]` (already covered by P3's interface).
+- Pass `EvalSnapshot` instances built from the `PriceUpdateV2`
+  accounts in `accounts[..]` (snapshot construction is a small
+  adapter; not duplication of the verifier).
+- Pass the `Clock` reference (for `publish_time` age check).
+
+The verifier's existing tests cover the gate semantics; the Jupiter
+slice's tests will cover the snapshot-construction adapter.
+
+**O3 reference.** The branch `stage2/o3-oracle-rate-verifiers` (visible
+via `git branch -a`) is the oracle/rate-verifier substrate that landed
+the verifier. P3 then consumed it in `process_execute_action`. The
+Jupiter slice consumes the same surface.
+
+### 19.6 Future QA Matrix
+
+These items are **out of J-prep scope** but should be tracked as
+test/implementation prerequisites for the post-J slices:
+
+| Item | Slice owner | Type |
+|---|---|---|
+| Revoke vs in-flight execute race window | W2 / E2E rehearsal slice | Devnet timing test |
+| Pyth self-post tx confirmation latency vs trigger SLO | Pyth daemon slice | Devnet timing test |
+| Sponsored-feed-lapse fallback to self-post (cost + tx count) | Pyth daemon slice | Devnet rehearsal |
+| `lite-api.jup.ag` sunset re-confirmation | Mainnet rehearsal pre-flight | Doc fetch + portal verification |
+| ALT count tolerance > 4 | Jupiter measurement slice | Live `simulateTransaction` |
+| `load_instruction_at_checked` CU cost | Jupiter measurement slice | Devnet CU profile |
+| Watcher offline UX (5-minute threshold) | S7 slice | E2E behavioural test |
+| Force-tick endpoint absent in production builds | Release-engineering check | Build artefact diff |
+| Solend variant-15 13-account ordering | P5 / Solend slice | Program unit test |
+| Solend `SLOTS_PER_YEAR` daemon-vs-program parity | P5 / Solend slice | Parity-fixture test |
+
+**Revoke race specifically.** Per spec § 8.2 the residual risk is
+bounded by `max_input_amount_raw` (per-trigger cap) and the user's main
+wallet is unaffected. Devnet rehearsal MUST exercise the race before
+mainnet:
+- Submit `revoke_authorization` and `execute_action_v2` in adjacent
+  slots; observe ordering on a few hundred attempts.
+- Confirm post-revoke `execute_action_v2` fails with
+  `AuthorizationRevoked` in the cases where revoke lands first.
+- Confirm post-execute `revoke` reclaims residual delegated-wallet
+  funds in the cases where execute lands first.
+- Audit trail must contain both txs with correct ordering.
+
+This is W2/E2E work, not a J-prep gating item.
+
+**Pyth self-post.** Already covered in §§ 9 / 12 above and in
+`STAGE2_PYTH_ADAPTER_RESEARCH.md` § 8.2 / § 11.6. Default v1 plan:
+separate prerequisite tx. Same-tx not plausible for 3-feed Scenario B.
+
+### 19.7 Acceptance-Checklist Compliance Map
+
+| Checklist item | Where addressed |
+|---|---|
+| Official-docs confirmation date | § 3 (2026-05-09 throughout); § 17 source list |
+| Jupiter API path pinned or rejected | § 3.1 (v2 `/swap/v2/build` pinned; v1 emergency-fallback only) |
+| Ultra exclusion or docs-changed mark | § 3.1 (Ultra excluded; rationale: `/order → /execute` returns finalised tx) |
+| Tx shape pre_check → middle → post_check | § 4.1 (textual) + § 4.2 (variant trade-off) + § 4.3 (decision: variant A) |
+| Account Budget Table | § 6.1 |
+| Serialized Byte Budget Table | § 7.2 + § 19.1.2 (per-hop band) |
+| Compute Unit pressure table | § 8.2 + § 19.1.2 (per-hop band) |
+| Sibling-Instruction Verification strategy | § 5 (per-class state machine) + § 19.3 (per-attack catalog) |
+| Decision Matrix (Ready / Needs measurement / Needs spec / Preview) | § 15 (overall: Needs measurement) |
+| Open Blockers | § 13 |
+| Production Jupiter path not modified | § 2.3 |
+| Frontend not modified | § 2.3 |
+| Watcher / daemon runtime not modified | § 2.3 |
+| No signing / send / broadcast / live exec | § 2.3 + § 18 |
+| Measurement harness env-gated, default self-skip | § 14 |
+| `api.jup.ag` mention in docs only | § 17 (cited in sources, no production code added) |
+| 1-hop / 2-hop / 3-hop route pressure | § 19.1.2 |
+| Sizing-fixtures schema if no measurement run | § 19.2 (template; no fake data) |
+| Malicious-sibling examples with detection | § 19.3 |
+| post_check min_out failure → revert whole tx | § 19.4 gate 6 |
+| Don't rely on Jupiter success alone | § 4.5 + § 19.4 (bracket post-check is final gate) |
+| Pyth gates: stale / confidence / mismatch / Full | § 19.5 (cross-reference to P3 condition_verifier; no duplication) |
+| Revoke race as future W2/E2E test | § 19.6 (out of J-prep scope; devnet rehearsal item) |
+| Pyth self-post as separate tx by default | §§ 9 / 12 / 19.6 |
+| `stage2_jupiter_sizing_fixtures.json` only if measurement run | § 19.2 (template only; no fake file) |
+
+---
+
 **End of feasibility report.**
