@@ -1870,11 +1870,18 @@ mod tests {
     /// A "comment line" is any line whose first non-whitespace
     /// character starts a `//` (covers `//`, `///`, `//!`).
     fn production_executable_source() -> String {
-        let src = include_str!("solend_cpi_builder.rs");
+        // Normalize CRLF → LF before scanning so the marker split below
+        // works on Windows checkouts (where `core.autocrlf` rewrites
+        // line endings to CRLF on the working tree). Without this, the
+        // `\n`-only marker fails to match, the function falls back to
+        // the whole file, and the self-grep tests find their own
+        // pattern strings inside the test section.
+        let src_raw = include_str!("solend_cpi_builder.rs");
+        let src = src_raw.replace("\r\n", "\n");
         let test_marker = "#[cfg(test)]\nmod tests";
         let prod_section = match src.find(test_marker) {
             Some(idx) => &src[..idx],
-            None => src,
+            None => &src[..],
         };
         prod_section
             .lines()
@@ -1918,7 +1925,11 @@ mod tests {
         // the documented signer/bump policy section so future readers
         // see the P5b-2 prerequisite explicitly. We grep for the
         // landmark sentence.
-        let src = include_str!("solend_cpi_builder.rs");
+        //
+        // Normalize CRLF → LF so the multiline grep below works on
+        // Windows checkouts (where `core.autocrlf` rewrites line
+        // endings to CRLF in the working tree).
+        let src = include_str!("solend_cpi_builder.rs").replace("\r\n", "\n");
         assert!(
             src.contains("Signer / bump policy for P5b-2"),
             "module docs must carry the Signer / bump policy section",
