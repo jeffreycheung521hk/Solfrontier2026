@@ -60,6 +60,7 @@
 //! answer with no error is the worst-case failure mode and we'd rather
 //! return a [`VerifierError`].
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use core::cmp::Ordering;
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -104,7 +105,11 @@ pub const PYTH_MAX_EXPONENT_DIFF: i32 = 18;
 /// canonical type (`Lt = 0`, `Lte = 1`, `Gt = 2`, `Gte = 3`); reorder
 /// is a wire break and is caught by the parity test in
 /// `tests::mirror_enum_parity`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Borsh-serializable so `ConditionProofPayload` (instruction.rs) can
+/// carry a `Comparison` directly into the on-chain processor with
+/// canonical-ordinal parity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub enum Comparison {
     Lt,
     Lte,
@@ -137,7 +142,7 @@ impl Comparison {
 /// Adverse-bound discipline for Pyth. Mirror of
 /// `claw_types::stage2_watch_rule::BoundMode`. See spec § 7.1 and
 /// `STAGE2_PYTH_ADAPTER_RESEARCH.md` § 4.1 / § 7.1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub enum BoundMode {
     /// `(price - confidence)` is the lhs of `>` checks.
     AdverseLowerForGt,
@@ -160,7 +165,7 @@ pub enum BoundMode {
 /// [`VerifierError::UnsupportedRateKind`] per spec § 7.2 / research
 /// § 0 / § 4.1 (APY needs a higher CU envelope and a separate fixture
 /// set; the demo is not gated on it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub enum RateKind {
     Apr,
     Apy,
@@ -169,14 +174,14 @@ pub enum RateKind {
 /// Pyth verification level. Mirror of
 /// `claw_types::stage2_watch_rule::VerificationLevel`. v1 supports
 /// `Full` only (audit U-5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub enum VerificationLevel {
     Full,
 }
 
 /// How a rule's `conditions[..]` are combined. Mirror of
 /// `claw_types::stage2_watch_rule::ConditionLogic`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub enum ConditionLogic {
     /// AND — every condition must hold.
     All,
@@ -284,7 +289,7 @@ impl core::fmt::Display for VerifierError {
 /// the caller layer.
 ///
 /// [`Condition`]: ../../../../crates/types/src/stage2_watch_rule.rs
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct PythPriceCondition {
     pub feed_id: [u8; 32],
     pub comparison: Comparison,
@@ -311,7 +316,7 @@ pub struct PythPriceCondition {
 ///   - `publish_time: i64` (Unix seconds)
 ///   - `feed_id: [u8; 32]`
 ///   - `verification_level: VerificationLevel` (post-decode)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct PythPriceSnapshot {
     pub feed_id: [u8; 32],
     pub price_mantissa: i64,
@@ -325,7 +330,7 @@ pub struct PythPriceSnapshot {
 /// from the snapshot so a single decoded snapshot can be re-evaluated
 /// at multiple wall-clock points by tests / replay tooling without
 /// mutating the snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct PythVerificationContext {
     pub current_unix_time: i64,
 }
@@ -334,7 +339,7 @@ pub struct PythVerificationContext {
 
 /// Pure-Rust projection of
 /// `claw_types::stage2_watch_rule::Condition::SolendReserveSupplyRate`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct SolendSupplyAprCondition {
     pub comparison: Comparison,
     pub threshold_bps: u32,
@@ -351,7 +356,7 @@ pub struct SolendSupplyAprCondition {
 /// exactly as Solend stores them on the wire (`u8` percents for the
 /// kinked-rate boundary points, `u64` percent for `super_max_borrow_rate`
 /// — width preserved per audit C-3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct SolendReserveSnapshot {
     /// Liquidity available for new borrows. Base units of underlying
     /// token (e.g. raw USDC lamports for the USDC reserve).
@@ -386,7 +391,7 @@ pub struct SolendReserveSnapshot {
 
 /// Verification-time context for a Solend snapshot. Separated for the
 /// same reason as [`PythVerificationContext`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct SolendVerificationContext {
     pub current_slot: u64,
 }

@@ -19,7 +19,55 @@ use solana_program::{
     system_program,
 };
 
+use crate::condition_verifier::{
+    ConditionLogic, PythPriceCondition, PythPriceSnapshot, SolendReserveSnapshot,
+    SolendSupplyAprCondition,
+};
 use crate::derive_authorization_pda;
+
+/// Maximum number of proof-conditions per `ExecuteAction`. Bounded so a
+/// hostile or buggy executor cannot inflate compute / wire size, and so
+/// the `Vec<ProofCondition>` length is always small enough to evaluate
+/// inside the BPF compute budget. Picked at 8 to comfortably cover
+/// Stage 2 Scenario B (3 Pyth conditions) with headroom for future
+/// composite rules without bumping.
+pub const MAX_PROOF_CONDITIONS: usize = 8;
+
+/// Per-condition proof payload supplied by the executor.
+///
+/// Important: the executor does NOT supply the verification *context*
+/// here — `current_unix_time` (Pyth) and `current_slot` (Solend) are
+/// constructed on-chain from `Clock::get()` inside the processor. A
+/// hostile executor cannot fabricate a fresh-looking timestamp by
+/// padding the proof; the program clobbers any such field with the
+/// chain-derived values.
+///
+/// Borsh enum tag: `Pyth = 0`, `Solend = 1`. Append-only.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofCondition {
+    Pyth {
+        condition: PythPriceCondition,
+        snapshot: PythPriceSnapshot,
+    },
+    Solend {
+        condition: SolendSupplyAprCondition,
+        snapshot: SolendReserveSnapshot,
+    },
+}
+
+/// Top-level condition-proof payload bundled into `ExecuteAction`.
+///
+/// Bind to the rule via `canonical_rule_hash` (already in the existing
+/// `ExecuteAction` args). The proof itself is NOT hashed — it would be
+/// chicken-and-egg, since the proof contains fresh oracle snapshots
+/// the rule cannot know in advance. The hash binds the *committed
+/// thresholds + condition shape*; the proof carries the *runtime
+/// numbers* the program checks against those thresholds.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ConditionProofPayload {
+    pub condition_logic: ConditionLogic,
+    pub conditions: Vec<ProofCondition>,
+}
 
 /// Instruction payload accepted by `process_instruction`.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
@@ -61,22 +109,40 @@ pub enum AuthorityInstruction {
 
     /// Execute the action authorised by an existing authorization PDA.
     ///
-    /// P2 lands the boundary skeleton only — the processor performs every
-    /// `AuthorizationRecord` check the spec requires (signer, owner, PDA
+    /// P3 wires the O3 condition verifier into the boundary skeleton
+    /// established by P2. The processor still performs every
+    /// `AuthorizationRecord` check from P2 (signer, owner, PDA
     /// derivation, schema_version, rule_id, user, executor, rule hash,
     /// action_type, expiry, revoked, completed, input cap, monotone
-    /// nonce, same-slot replay) and applies the one-shot state mutation
-    /// (`used_amount_raw += input_amount_raw`, `completed = true`,
-    /// `execution_nonce = arg.execution_nonce`,
-    /// `last_execution_slot = current_slot`). It does **not** yet:
+    /// nonce, same-slot replay) and applies the one-shot state
+    /// mutation (`used_amount_raw += input_amount_raw`,
+    /// `completed = true`, `execution_nonce = arg.execution_nonce`,
+    /// `last_execution_slot = current_slot`). On top of that, P3 adds
+    /// a fail-closed condition gate: every `ProofCondition` in
+    /// `condition_proof.conditions` is evaluated through
+    /// `condition_verifier::evaluate_condition`, the per-condition
+    /// booleans are folded with the supplied `condition_logic`, and
+    /// the action only mutates state if the fold returns `true`.
     ///
-    /// - inspect or evaluate the rule's conditions[..] (Stage 2 O3),
-    /// - verify a sibling Solend `RefreshReserve` ix (Stage 2 P3),
-    /// - verify Jupiter `swap` sibling ix via the instructions sysvar
-    ///   (Stage 2 P4),
-    /// - take a token-balance pre/post bracket,
-    /// - sweep funds (Stage 2 spec § 8.1 steps 2–3 — handled by Revoke
-    ///   in a future slice).
+    /// **Boundary preservation.** P3 still does NOT:
+    ///
+    /// - perform any Solend / Jupiter CPI (deferred — P4+),
+    /// - verify Jupiter sibling-ix via the instructions sysvar (P4+),
+    /// - take a token-balance pre/post bracket (P4+),
+    /// - parse live Pyth / Solend account data (deferred — P5+),
+    /// - sweep funds on revoke (Stage 2 spec § 8.1 steps 2–3).
+    ///
+    /// The condition snapshots in `condition_proof` are supplied by
+    /// the executor; the program does NOT independently fetch oracle
+    /// data in this slice. Verification contexts (`current_unix_time`,
+    /// `current_slot`) are NOT taken from the proof — they are
+    /// constructed on-chain from `Clock::get()` so a hostile executor
+    /// cannot bypass freshness gates by padding the proof.
+    ///
+    /// **Wire-shape note (P3).** This variant grows by one trailing
+    /// field (`condition_proof`); the Borsh enum tag stays at `3`. A
+    /// pinned-length test in `lib.rs::tests` is updated alongside this
+    /// change so any future field addition fails loudly.
     ///
     /// Variant order MUST stay append-only: this is the 4th variant
     /// (Borsh `u8` ordinal `3`) and a future-added variant goes after,
@@ -86,7 +152,7 @@ pub enum AuthorityInstruction {
     ///   0. `[signer]`           executor          — must equal authz.executor
     ///   1. `[writable]`         authz_pda         — existing PDA
     ///   2. `[]`                 user              — must equal authz.user (readonly)
-    ///   3. `[]`                 delegated_wallet  — readonly placeholder (P3+ wires CPI)
+    ///   3. `[]`                 delegated_wallet  — readonly placeholder (P4+ wires CPI)
     ExecuteAction {
         schema_version: u8,
         rule_id: [u8; 16],
@@ -94,6 +160,7 @@ pub enum AuthorityInstruction {
         action_type: u8,
         input_amount_raw: u64,
         execution_nonce: u64,
+        condition_proof: ConditionProofPayload,
     },
 }
 
@@ -186,8 +253,11 @@ pub fn close_authorization_instruction(
 
 /// Build an `ExecuteAction` instruction for off-chain tx builders and
 /// tests. The account list is pinned to the same order the on-chain
-/// processor reads (executor, authz_pda, user, delegated_wallet); P3+
+/// processor reads (executor, authz_pda, user, delegated_wallet); P4+
 /// will append Solend / Jupiter accounts after `delegated_wallet`.
+///
+/// `condition_proof` is the deterministic per-condition payload the
+/// program evaluates before mutating state — see [`ConditionProofPayload`].
 #[allow(clippy::too_many_arguments)]
 pub fn execute_action_instruction(
     program_id: &Pubkey,
@@ -200,6 +270,7 @@ pub fn execute_action_instruction(
     action_type: u8,
     input_amount_raw: u64,
     execution_nonce: u64,
+    condition_proof: ConditionProofPayload,
 ) -> Instruction {
     let (authz_pda, _bump) =
         derive_authorization_pda(program_id, schema_version, user, &rule_id);
@@ -210,6 +281,7 @@ pub fn execute_action_instruction(
         action_type,
         input_amount_raw,
         execution_nonce,
+        condition_proof,
     })
     .expect("borsh serialization of AuthorityInstruction is infallible");
 

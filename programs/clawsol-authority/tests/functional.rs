@@ -16,11 +16,18 @@
 
 use borsh::BorshDeserialize;
 use clawsol_authority::{
+    condition_verifier::{
+        BoundMode, Comparison, ConditionLogic, PythPriceCondition, PythPriceSnapshot,
+        RateKind, SolendReserveSnapshot, SolendSupplyAprCondition, VerificationLevel,
+        SOLEND_WAD, SUPPORTED_SOLEND_FORMULA_VERSION,
+    },
     derive_authorization_pda,
     error::AuthorityError,
     instruction::{
         close_authorization_instruction, create_authorization_instruction,
-        execute_action_instruction, revoke_authorization_instruction, AuthorityInstruction,
+        execute_action_instruction as raw_execute_action_instruction,
+        revoke_authorization_instruction, AuthorityInstruction, ConditionProofPayload,
+        ProofCondition,
     },
     state::{
         AuthorizationRecord, Stage2ActionType, STAGE2_AUTHORITY_SCHEMA_VERSION,
@@ -70,6 +77,78 @@ const RULE_ID_EXEC_ZERO_AMT: [u8; 16] = [0xEB; 16];
 const RULE_ID_EXEC_OVER_CAP: [u8; 16] = [0xEC; 16];
 const RULE_ID_EXEC_BAD_NONCE: [u8; 16] = [0xED; 16];
 const RULE_ID_EXEC_REPLAY: [u8; 16] = [0xEE; 16];
+
+/// A canonical "Scenario A passes" Solend proof: low-utilisation
+/// reserve fixture, threshold of 1000 bps. The verifier's own tests
+/// already prove this fires under the same numbers; here it acts as a
+/// stand-in proof for every P2 boundary test that doesn't care about
+/// the condition gate but still has to supply a structurally-valid
+/// payload after P3 lands.
+///
+/// Returns a fresh value so callers can cheaply mutate one field for
+/// negative tests without affecting other call sites.
+fn default_solend_proof() -> ConditionProofPayload {
+    ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Solend {
+            condition: SolendSupplyAprCondition {
+                comparison: Comparison::Lt,
+                threshold_bps: 1_000,
+                rate_kind: RateKind::Apr,
+                formula_version: SUPPORTED_SOLEND_FORMULA_VERSION,
+                max_reserve_staleness_slots: 16,
+            },
+            snapshot: SolendReserveSnapshot {
+                available_amount: 5_000_000_000_000,
+                borrowed_amount_wads: 5_000_000_000_000u128 * SOLEND_WAD,
+                min_borrow_rate_pct: 0,
+                optimal_borrow_rate_pct: 4,
+                max_borrow_rate_pct: 30,
+                super_max_borrow_rate_pct: 300,
+                optimal_utilization_rate_pct: 80,
+                max_utilization_rate_pct: 95,
+                protocol_take_rate_pct: 20,
+                // last_update_slot is set to the current slot at call time
+                // by the proof builder; tests that need staleness just
+                // override this field.
+                last_update_slot: 0,
+                stale_flag: false,
+            },
+        }],
+    }
+}
+
+/// P2 wrapper around the new 11-arg ExecuteAction builder, supplying a
+/// `default_solend_proof()` so existing P2 boundary tests keep their
+/// 10-arg call shape. New P3 tests bypass this wrapper and call
+/// `raw_execute_action_instruction` directly with their own proof.
+#[allow(clippy::too_many_arguments)]
+fn execute_action_instruction(
+    program_id: &Pubkey,
+    executor: &Pubkey,
+    user: &Pubkey,
+    delegated_wallet: &Pubkey,
+    schema_version: u8,
+    rule_id: [u8; 16],
+    canonical_rule_hash: [u8; 32],
+    action_type: u8,
+    input_amount_raw: u64,
+    execution_nonce: u64,
+) -> Instruction {
+    raw_execute_action_instruction(
+        program_id,
+        executor,
+        user,
+        delegated_wallet,
+        schema_version,
+        rule_id,
+        canonical_rule_hash,
+        action_type,
+        input_amount_raw,
+        execution_nonce,
+        default_solend_proof(),
+    )
+}
 
 fn build_program_test(program_id: Pubkey) -> ProgramTest {
     ProgramTest::new(
@@ -797,6 +876,7 @@ async fn execute_rejects_missing_executor_signature() {
         action_type: fx.action_type,
         input_amount_raw: 5_000_000,
         execution_nonce: 1,
+        condition_proof: default_solend_proof(),
     })
     .unwrap();
     let ix = Instruction {
@@ -866,6 +946,7 @@ async fn execute_rejects_wrong_pda() {
         action_type: fx.action_type,
         input_amount_raw: 5_000_000,
         execution_nonce: 1,
+        condition_proof: default_solend_proof(),
     })
     .unwrap();
     let ix = Instruction {
@@ -924,6 +1005,7 @@ async fn execute_rejects_wrong_user_account() {
         action_type: fx.action_type,
         input_amount_raw: 5_000_000,
         execution_nonce: 1,
+        condition_proof: default_solend_proof(),
     })
     .unwrap();
     let ix = Instruction {
@@ -1716,4 +1798,990 @@ impl BanksClientErrorExt for solana_program_test::BanksClientError {
             other => panic!("unexpected BanksClientError variant: {other:?}"),
         }
     }
+}
+
+// ── Stage 2 P3: condition gate tests ────────────────────────────────────────
+//
+// These tests prove every documented P3 failure mode fails closed BEFORE
+// state mutation. Each negative case reloads the AuthorizationRecord
+// after the failed tx and asserts (`assert_authz_unmutated`) that
+// `used_amount_raw == 0`, `completed == false`, `execution_nonce == 0`,
+// `last_execution_slot == 0` — i.e. the boundary skeleton genuinely
+// gated mutation behind the condition verifier.
+
+// Distinct rule_ids to avoid PDA collisions across the P3 test set.
+const RULE_ID_P3_SOLEND_TRUE: [u8; 16] = [0xF3; 16];
+const RULE_ID_P3_SOLEND_FALSE: [u8; 16] = [0xF4; 16];
+const RULE_ID_P3_PYTH_BASKET_TRUE: [u8; 16] = [0xF5; 16];
+const RULE_ID_P3_PYTH_BASKET_FALSE: [u8; 16] = [0xF6; 16];
+const RULE_ID_P3_MISSING_PROOF: [u8; 16] = [0xF7; 16];
+const RULE_ID_P3_STALE_PYTH: [u8; 16] = [0xF8; 16];
+const RULE_ID_P3_WRONG_FEED: [u8; 16] = [0xF9; 16];
+const RULE_ID_P3_EXCESS_CONF: [u8; 16] = [0xFA; 16];
+const RULE_ID_P3_PARTIAL_VERIF: [u8; 16] = [0xFB; 16];
+const RULE_ID_P3_STALE_SOLEND: [u8; 16] = [0xFC; 16];
+const RULE_ID_P3_BAD_FORMULA: [u8; 16] = [0xFD; 16];
+const RULE_ID_P3_BAD_LOGIC: [u8; 16] = [0xFE; 16];
+const RULE_ID_P3_REVOKED_VS_GATE: [u8; 16] = [0x53; 16];
+
+// Mirror BTC/ETH/SOL feed ids from claw_types fixture B (same bytes the
+// verifier's own internal tests use). Repeated here to avoid a runtime
+// dep on `claw-types` from the on-chain crate's Cargo.toml.
+const BTC_USD_FEED_ID: [u8; 32] = [
+    0xe6, 0x2d, 0xf6, 0xc8, 0xb4, 0xa8, 0x5f, 0xe1, 0xa6, 0x7d, 0xb4, 0x4d, 0xc1, 0x2d, 0xe5,
+    0xdb, 0x33, 0x0f, 0x7a, 0xc6, 0x6b, 0x72, 0xdc, 0x65, 0x8a, 0xfe, 0xdf, 0x0f, 0x4a, 0x41,
+    0x5b, 0x43,
+];
+const ETH_USD_FEED_ID: [u8; 32] = [
+    0xff, 0x61, 0x49, 0x1a, 0x93, 0x11, 0x12, 0xdd, 0xf1, 0xbd, 0x81, 0x47, 0xcd, 0x1b, 0x64,
+    0x13, 0x75, 0xf7, 0x9f, 0x58, 0x25, 0x12, 0x6d, 0x66, 0x54, 0x80, 0x87, 0x46, 0x34, 0xfd,
+    0x0a, 0xce,
+];
+const SOL_USD_FEED_ID: [u8; 32] = [
+    0xef, 0x0d, 0x8b, 0x6f, 0xda, 0x2c, 0xeb, 0xa4, 0x1d, 0xa1, 0x5d, 0x40, 0x95, 0xd1, 0xda,
+    0x39, 0x2a, 0x0d, 0x2f, 0x8e, 0xd0, 0xc6, 0xc7, 0xbc, 0x0f, 0x4c, 0xfa, 0xc8, 0xc2, 0x80,
+    0xb5, 0x6d,
+];
+
+/// Fetch the on-chain Clock so test snapshots can be built relative to
+/// the same `unix_timestamp` / `slot` the program will see in
+/// `Clock::get()`.
+async fn current_clock(ctx: &mut ProgramTestContext) -> solana_sdk::clock::Clock {
+    let acct = ctx
+        .banks_client
+        .get_account(solana_sdk::sysvar::clock::id())
+        .await
+        .expect("get_account for clock sysvar")
+        .expect("clock sysvar account exists");
+    bincode::deserialize::<solana_sdk::clock::Clock>(&acct.data).expect("Clock decode")
+}
+
+/// Solend "low-utilisation reserve, current slot" snapshot — the verifier's
+/// own tests prove this fixture is fresh and well-formed.
+fn fresh_solend_snapshot(last_update_slot: u64) -> SolendReserveSnapshot {
+    SolendReserveSnapshot {
+        available_amount: 5_000_000_000_000,
+        borrowed_amount_wads: 5_000_000_000_000u128 * SOLEND_WAD,
+        min_borrow_rate_pct: 0,
+        optimal_borrow_rate_pct: 4,
+        max_borrow_rate_pct: 30,
+        super_max_borrow_rate_pct: 300,
+        optimal_utilization_rate_pct: 80,
+        max_utilization_rate_pct: 95,
+        protocol_take_rate_pct: 20,
+        last_update_slot,
+        stale_flag: false,
+    }
+}
+
+fn solend_apr_lt_condition(threshold_bps: u32) -> SolendSupplyAprCondition {
+    SolendSupplyAprCondition {
+        comparison: Comparison::Lt,
+        threshold_bps,
+        rate_kind: RateKind::Apr,
+        formula_version: SUPPORTED_SOLEND_FORMULA_VERSION,
+        max_reserve_staleness_slots: 1_000_000,
+    }
+}
+
+fn pyth_btc_gt_75k_condition() -> PythPriceCondition {
+    PythPriceCondition {
+        feed_id: BTC_USD_FEED_ID,
+        comparison: Comparison::Gt,
+        threshold_mantissa: 7_500_000,
+        threshold_exponent: -2,
+        max_age_seconds: u32::MAX, // freshness controlled by snapshot age
+        max_confidence_bps: 50,
+        verification_level_required: VerificationLevel::Full,
+        bound_mode: BoundMode::AdverseLowerForGt,
+    }
+}
+
+fn pyth_eth_gt_2300_condition() -> PythPriceCondition {
+    PythPriceCondition {
+        feed_id: ETH_USD_FEED_ID,
+        comparison: Comparison::Gt,
+        threshold_mantissa: 230_000,
+        threshold_exponent: -2,
+        max_age_seconds: u32::MAX,
+        max_confidence_bps: 50,
+        verification_level_required: VerificationLevel::Full,
+        bound_mode: BoundMode::AdverseLowerForGt,
+    }
+}
+
+fn pyth_sol_lt_90_condition() -> PythPriceCondition {
+    PythPriceCondition {
+        feed_id: SOL_USD_FEED_ID,
+        comparison: Comparison::Lt,
+        threshold_mantissa: 9_000,
+        threshold_exponent: -2,
+        max_age_seconds: u32::MAX,
+        max_confidence_bps: 50,
+        verification_level_required: VerificationLevel::Full,
+        bound_mode: BoundMode::AdverseUpperForLt,
+    }
+}
+
+fn pyth_snapshot(
+    feed_id: [u8; 32],
+    price_mantissa: i64,
+    conf: u64,
+    publish_time: i64,
+) -> PythPriceSnapshot {
+    PythPriceSnapshot {
+        feed_id,
+        price_mantissa,
+        price_exponent: -8,
+        conf,
+        publish_time,
+        verification_level: VerificationLevel::Full,
+    }
+}
+
+/// Reload the PDA after a failed tx and assert no mutation happened —
+/// every replay-protection field is still in the zero state set at
+/// `create_authorization` time.
+async fn assert_authz_unmutated(ctx: &mut ProgramTestContext, pda: Pubkey) {
+    let account = ctx
+        .banks_client
+        .get_account(pda)
+        .await
+        .expect("get_account")
+        .expect("PDA must still exist (failed tx must NOT close)");
+    let record = AuthorizationRecord::try_from_slice(&account.data)
+        .expect("decode AuthorizationRecord");
+    assert_eq!(
+        record.used_amount_raw, 0,
+        "used_amount_raw must NOT advance on a failed condition"
+    );
+    assert!(
+        !record.completed,
+        "completed must NOT flip on a failed condition"
+    );
+    assert_eq!(
+        record.execution_nonce, 0,
+        "execution_nonce must NOT advance on a failed condition"
+    );
+    assert_eq!(
+        record.last_execution_slot, 0,
+        "last_execution_slot must NOT advance on a failed condition"
+    );
+    assert!(
+        !record.revoked,
+        "revoked must NOT flip on a failed condition (P3 doesn't revoke)"
+    );
+}
+
+#[tokio::test]
+async fn p3_scenario_a_solend_condition_true_succeeds_and_mutates_state() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_SOLEND_TRUE,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Solend {
+            condition: solend_apr_lt_condition(1_000), // 10% threshold
+            snapshot: fresh_solend_snapshot(clock.slot),
+        }],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_SOLEND_TRUE,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("Scenario A condition-true must succeed");
+
+    let acc = ctx.banks_client.get_account(fx.pda).await.unwrap().unwrap();
+    let record = AuthorizationRecord::try_from_slice(&acc.data).unwrap();
+    assert_eq!(record.used_amount_raw, 5_000_000);
+    assert!(record.completed);
+    assert_eq!(record.execution_nonce, 1);
+    assert!(record.last_execution_slot > 0);
+}
+
+#[tokio::test]
+async fn p3_scenario_a_solend_condition_false_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_SOLEND_FALSE,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    // Threshold 1 bps — APR is ~100 bps under low utilisation, so Lt
+    // 1 bps does NOT fire.
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Solend {
+            condition: solend_apr_lt_condition(1),
+            snapshot: fresh_solend_snapshot(clock.slot),
+        }],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_SOLEND_FALSE,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("Lt 1bps under ~100bps APR must NOT fire");
+    assert_custom_err(err, AuthorityError::ConditionNotMet);
+    assert_authz_unmutated(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p3_scenario_b_three_pyth_conditions_true_succeeds_and_mutates_state() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_PYTH_BASKET_TRUE,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    let now_unix = clock.unix_timestamp;
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![
+            ProofCondition::Pyth {
+                condition: pyth_btc_gt_75k_condition(),
+                // BTC = 75,001.23 with -8 exp → adverse-lower well above 75000
+                snapshot: pyth_snapshot(BTC_USD_FEED_ID, 7_500_123_000_000, 100, now_unix),
+            },
+            ProofCondition::Pyth {
+                condition: pyth_eth_gt_2300_condition(),
+                snapshot: pyth_snapshot(ETH_USD_FEED_ID, 232_000_000_000, 100, now_unix),
+            },
+            ProofCondition::Pyth {
+                condition: pyth_sol_lt_90_condition(),
+                // SOL = 89.50 with -8 exp → adverse-upper still < 90
+                snapshot: pyth_snapshot(SOL_USD_FEED_ID, 8_950_000_000, 100, now_unix),
+            },
+        ],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_PYTH_BASKET_TRUE,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("Scenario B all-three-conditions-true must succeed");
+
+    let acc = ctx.banks_client.get_account(fx.pda).await.unwrap().unwrap();
+    let record = AuthorizationRecord::try_from_slice(&acc.data).unwrap();
+    assert_eq!(record.used_amount_raw, 5_000_000);
+    assert!(record.completed);
+    assert_eq!(record.execution_nonce, 1);
+}
+
+#[tokio::test]
+async fn p3_scenario_b_one_condition_false_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_PYTH_BASKET_FALSE,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    let now_unix = clock.unix_timestamp;
+    // ETH = 2,290 < 2300 → ETH condition fails; All-fold returns false.
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![
+            ProofCondition::Pyth {
+                condition: pyth_btc_gt_75k_condition(),
+                snapshot: pyth_snapshot(BTC_USD_FEED_ID, 7_500_123_000_000, 100, now_unix),
+            },
+            ProofCondition::Pyth {
+                condition: pyth_eth_gt_2300_condition(),
+                snapshot: pyth_snapshot(ETH_USD_FEED_ID, 229_000_000_000, 100, now_unix),
+            },
+            ProofCondition::Pyth {
+                condition: pyth_sol_lt_90_condition(),
+                snapshot: pyth_snapshot(SOL_USD_FEED_ID, 8_950_000_000, 100, now_unix),
+            },
+        ],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_PYTH_BASKET_FALSE,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("ETH-miss under All-logic must fail");
+    assert_custom_err(err, AuthorityError::ConditionNotMet);
+    assert_authz_unmutated(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p3_missing_condition_proof_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_MISSING_PROOF,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_MISSING_PROOF,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("empty proof must fail");
+    assert_custom_err(err, AuthorityError::MissingConditionProof);
+    assert_authz_unmutated(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p3_stale_pyth_proof_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_STALE_PYTH,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    // 30 s window, snapshot 1 hour old.
+    let mut cond = pyth_btc_gt_75k_condition();
+    cond.max_age_seconds = 30;
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Pyth {
+            condition: cond,
+            snapshot: pyth_snapshot(
+                BTC_USD_FEED_ID,
+                7_500_123_000_000,
+                100,
+                clock.unix_timestamp - 3_600,
+            ),
+        }],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_STALE_PYTH,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("stale Pyth must fail");
+    assert_custom_err(err, AuthorityError::PythSnapshotStale);
+    assert_authz_unmutated(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p3_wrong_pyth_feed_id_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_WRONG_FEED,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Pyth {
+            condition: pyth_btc_gt_75k_condition(), // expects BTC feed
+            // ...but snapshot.feed_id is SOL.
+            snapshot: pyth_snapshot(SOL_USD_FEED_ID, 8_950_000_000, 100, clock.unix_timestamp),
+        }],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_WRONG_FEED,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("wrong feed_id must fail");
+    assert_custom_err(err, AuthorityError::PythFeedIdMismatch);
+    assert_authz_unmutated(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p3_excessive_pyth_confidence_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_EXCESS_CONF,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    let cond = pyth_btc_gt_75k_condition();
+    let price = 7_500_100_000_000i64;
+    // conf = 1% of price → 100 bps, exceeds the 50-bps gate.
+    let conf = (price as u64) / 100;
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Pyth {
+            condition: cond,
+            snapshot: pyth_snapshot(BTC_USD_FEED_ID, price, conf, clock.unix_timestamp),
+        }],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_EXCESS_CONF,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("excess confidence must fail");
+    assert_custom_err(err, AuthorityError::PythConfidenceTooWide);
+    assert_authz_unmutated(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p3_partial_pyth_verification_fails_before_mutation() {
+    // The mirror VerificationLevel only declares `Full` (audit U-5);
+    // any byte > 0 in that slot is structurally invalid. We construct
+    // an ExecuteAction whose serialised bytes carry a deliberately-
+    // out-of-range verification_level byte and confirm Borsh
+    // deserialization in the program rejects it (mapped to
+    // `ProgramError::InvalidInstructionData`). State must NOT
+    // mutate.
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_PARTIAL_VERIF,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Pyth {
+            condition: pyth_btc_gt_75k_condition(),
+            snapshot: pyth_snapshot(BTC_USD_FEED_ID, 7_500_123_000_000, 100, clock.unix_timestamp),
+        }],
+    };
+    let ix_base = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_PARTIAL_VERIF,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    // Locate the verification_level byte inside the serialized
+    // PythPriceSnapshot — last byte of the snapshot (after price/exp/
+    // conf/publish_time). We re-encode the proof and look for the
+    // first 0x00 that corresponds to the snapshot's `verification_level`
+    // field. Simpler: tail-scan and replace the LAST `0x00` byte (the
+    // final byte of the conditions Vec body for the single condition,
+    // which is the snapshot.verification_level slot).
+    let mut data = ix_base.data.clone();
+    let last_byte = data.len() - 1;
+    assert_eq!(
+        data[last_byte], 0,
+        "verification_level slot must be 0 (Full) before tampering"
+    );
+    data[last_byte] = 0xFF; // out of range — Borsh rejects
+    let tampered = Instruction {
+        program_id: ix_base.program_id,
+        accounts: ix_base.accounts.clone(),
+        data,
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[tampered],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("invalid verification_level byte must fail Borsh decode");
+    let tx_err = err.unwrap();
+    match tx_err {
+        TransactionError::InstructionError(_, InstructionError::InvalidInstructionData) => {}
+        other => panic!(
+            "expected InvalidInstructionData on partial-verification byte, got {other:?}"
+        ),
+    }
+    assert_authz_unmutated(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p3_stale_solend_reserve_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_STALE_SOLEND,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    // Warp far enough that snapshot's last_update_slot (= 0) is
+    // beyond max_reserve_staleness_slots = 16 from the current slot.
+    ctx.warp_to_slot(100).expect("warp_to_slot");
+
+    let mut cond = solend_apr_lt_condition(1_000);
+    cond.max_reserve_staleness_slots = 16;
+    let mut snap = fresh_solend_snapshot(0); // very old
+    snap.last_update_slot = 0;
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Solend {
+            condition: cond,
+            snapshot: snap,
+        }],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_STALE_SOLEND,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("stale Solend reserve must fail");
+    assert_custom_err(err, AuthorityError::SolendReserveStale);
+    assert_authz_unmutated(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p3_unsupported_solend_formula_version_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_BAD_FORMULA,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    let mut cond = solend_apr_lt_condition(1_000);
+    cond.formula_version = SUPPORTED_SOLEND_FORMULA_VERSION + 1; // unsupported
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Solend {
+            condition: cond,
+            snapshot: fresh_solend_snapshot(clock.slot),
+        }],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_BAD_FORMULA,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("unsupported formula_version must fail");
+    assert_custom_err(err, AuthorityError::SolendFormulaVersionUnsupported);
+    assert_authz_unmutated(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p3_invalid_condition_logic_byte_fails_borsh_decode() {
+    // Build a structurally-valid ExecuteAction, then corrupt the
+    // condition_logic byte at the appropriate offset to a value out
+    // of range. Borsh-deserialization fails at the program level →
+    // `ProgramError::InvalidInstructionData`. State must NOT mutate.
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_BAD_LOGIC,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let clock = current_clock(&mut ctx).await;
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Solend {
+            condition: solend_apr_lt_condition(1_000),
+            snapshot: fresh_solend_snapshot(clock.slot),
+        }],
+    };
+    let ix_base = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_BAD_LOGIC,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    // The condition_logic byte sits at offset 67 inside ix.data
+    // (1 enum tag + 66 bytes of fixed P2 fields). Pinned by the
+    // unit test `execute_action_borsh_field_order_is_pinned_through_p3`.
+    let mut data = ix_base.data.clone();
+    assert_eq!(
+        data[67], 0,
+        "condition_logic byte must be 0 (All) before tampering"
+    );
+    data[67] = 0xFF;
+    let tampered = Instruction {
+        program_id: ix_base.program_id,
+        accounts: ix_base.accounts.clone(),
+        data,
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[tampered],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("invalid condition_logic byte must fail Borsh decode");
+    let tx_err = err.unwrap();
+    match tx_err {
+        TransactionError::InstructionError(_, InstructionError::InvalidInstructionData) => {}
+        other => panic!("expected InvalidInstructionData, got {other:?}"),
+    }
+    assert_authz_unmutated(&mut ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p3_p2_revoked_authorization_still_fails_before_condition_verification() {
+    // P2 boundary check (AuthorizationRevoked) must fire before P3's
+    // condition gate. We supply a perfectly-valid passing proof so
+    // the only reason for failure is the revoke flag.
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P3_REVOKED_VS_GATE,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    // Revoke first.
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let revoke_ix = revoke_authorization_instruction(
+        &program_id,
+        &ctx.payer.pubkey(),
+        SCHEMA_VERSION,
+        RULE_ID_P3_REVOKED_VS_GATE,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[revoke_ix],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let clock = current_clock(&mut ctx).await;
+    let proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Solend {
+            condition: solend_apr_lt_condition(1_000),
+            snapshot: fresh_solend_snapshot(clock.slot),
+        }],
+    };
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P3_REVOKED_VS_GATE,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        proof,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("revoked authz must reject before condition gate");
+    // Critically: the error MUST be the P2 AuthorizationRevoked code,
+    // NOT a P3 condition error — the boundary order is preserved.
+    assert_custom_err(err, AuthorityError::AuthorizationRevoked);
+
+    // The PDA's revoked flag is true, but used_amount/completed/etc
+    // remain at zero — the failed execute did not mutate the
+    // execution-tracking fields.
+    let acc = ctx.banks_client.get_account(fx.pda).await.unwrap().unwrap();
+    let record = AuthorizationRecord::try_from_slice(&acc.data).unwrap();
+    assert!(record.revoked, "revoke must have flipped the flag");
+    assert_eq!(record.used_amount_raw, 0);
+    assert!(!record.completed);
+    assert_eq!(record.execution_nonce, 0);
+    assert_eq!(record.last_execution_slot, 0);
 }

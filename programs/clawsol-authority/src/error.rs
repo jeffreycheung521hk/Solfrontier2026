@@ -80,6 +80,46 @@ pub enum AuthorityError {
 
     #[error("execute_action rejected: same-slot replay (current_slot == record.last_execution_slot)")]
     SameSlotReplay = 21,
+
+    // ── Stage 2 P3 condition gate ───────────────────────────────────────
+    //
+    // Discriminants 22..=31 are appended for the condition-verifier
+    // wiring inside ExecuteAction. Numeric values are part of the
+    // on-chain wire shape (encoded into `ProgramError::Custom`) and
+    // MUST stay append-only — never reorder or renumber. A specific
+    // variant per condition_verifier failure mode lets daemon logs
+    // attribute fail-closed events to the precise gate that tripped,
+    // which we want for live mainnet forensics.
+
+    #[error("execute_action requires a non-empty condition proof payload")]
+    MissingConditionProof = 22,
+
+    #[error("condition proof carries 0 conditions or exceeds MAX_PROOF_CONDITIONS")]
+    ConditionCountMismatch = 23,
+
+    #[error("condition_logic fold over the proof results returned false")]
+    ConditionNotMet = 24,
+
+    #[error("condition verifier rejected the proof (catch-all for unmapped VerifierError variants)")]
+    ConditionVerificationFailed = 25,
+
+    #[error("Pyth snapshot is older than condition.max_age_seconds (or future-dated)")]
+    PythSnapshotStale = 26,
+
+    #[error("Pyth snapshot feed_id does not match the condition's feed_id")]
+    PythFeedIdMismatch = 27,
+
+    #[error("Pyth snapshot verification_level is below the required Full level (audit U-5)")]
+    PythVerificationLevelInsufficient = 28,
+
+    #[error("Pyth snapshot confidence/price ratio exceeds condition.max_confidence_bps")]
+    PythConfidenceTooWide = 29,
+
+    #[error("Solend condition.formula_version is not supported by this program build")]
+    SolendFormulaVersionUnsupported = 30,
+
+    #[error("Solend reserve snapshot is older than condition.max_reserve_staleness_slots, or stale_flag is set")]
+    SolendReserveStale = 31,
 }
 
 impl From<AuthorityError> for ProgramError {

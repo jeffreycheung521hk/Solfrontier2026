@@ -1202,6 +1202,7 @@ dependencies = [
 name = "clawsol-authority"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "borsh 1.6.0",
  "claw-types",
  "solana-program",

@@ -88,8 +88,14 @@ pub mod error;
 pub mod instruction;
 pub mod state;
 
+use crate::condition_verifier::{
+    evaluate_condition, evaluate_condition_logic, EvalCondition, EvalSnapshot,
+    PythVerificationContext, SolendVerificationContext, VerifierError,
+};
 use crate::error::AuthorityError;
-use crate::instruction::AuthorityInstruction;
+use crate::instruction::{
+    AuthorityInstruction, ConditionProofPayload, ProofCondition, MAX_PROOF_CONDITIONS,
+};
 use crate::state::{
     AuthorizationRecord, Stage2ActionType, STAGE2_AUTHORITY_SCHEMA_VERSION,
 };
@@ -147,6 +153,7 @@ pub fn process_instruction(
             action_type,
             input_amount_raw,
             execution_nonce,
+            condition_proof,
         } => process_execute_action(
             program_id,
             accounts,
@@ -156,6 +163,7 @@ pub fn process_instruction(
             action_type,
             input_amount_raw,
             execution_nonce,
+            condition_proof,
         ),
     }
 }
@@ -460,20 +468,32 @@ fn process_close_authorization(
 }
 
 /// Execute the action authorised by an existing authorization PDA
-/// (Stage 2 P2 boundary skeleton).
+/// (Stage 2 P2 boundary + P3 condition gate).
 ///
 /// All `AuthorizationRecord` checks the spec demands run here. The
-/// processor performs **no** CPI — Solend variant-15 and Jupiter
-/// sibling-ix verification are deferred to P3 / P4 (see TODOs). The
-/// happy-path mutation is the one-shot v1 set: `used_amount_raw +=
-/// input_amount_raw`, `completed = true`, `execution_nonce` advances
-/// by one, `last_execution_slot = clock.slot`.
+/// processor performs **no** Solend / Jupiter CPI — variant-15 and
+/// sibling-ix verification are deferred to P4+ (see TODOs). P3 adds
+/// the deterministic condition gate: every supplied
+/// `ProofCondition` is verified through `condition_verifier`, the
+/// per-condition booleans are folded with the supplied
+/// `condition_logic`, and state mutation is gated on a `true` fold.
+///
+/// Boundary ordering (cheap → expensive, fail closed at the first
+/// mismatch):
+///   1. Account-level checks (signer, owner, PDA derivation)
+///   2. Record-shape checks (schema_version, rule_id, user, executor,
+///      hash, action_type)
+///   3. Lifecycle checks (expiry, revoked, completed)
+///   4. Cap / nonce / replay checks (input_amount, monotone nonce,
+///      same-slot replay)
+///   5. **Condition verification (P3 — this slice)**
+///   6. State mutation (one-shot v1)
 ///
 /// Accounts (in order):
 ///   0. `[signer]`   executor          — must equal record.executor
 ///   1. `[writable]` authorization_pda — owned by this program
 ///   2. `[]`         user              — must equal record.user
-///   3. `[]`         delegated_wallet  — readonly placeholder for P3+
+///   3. `[]`         delegated_wallet  — readonly placeholder for P4+
 #[allow(clippy::too_many_arguments)]
 fn process_execute_action(
     program_id: &Pubkey,
@@ -484,6 +504,7 @@ fn process_execute_action(
     action_type: u8,
     input_amount_raw: u64,
     execution_nonce: u64,
+    condition_proof: ConditionProofPayload,
 ) -> ProgramResult {
     let account_iter = &mut accounts.iter();
     let executor_account = next_account_info(account_iter)?;
@@ -630,6 +651,61 @@ fn process_execute_action(
         return Err(AuthorityError::SameSlotReplay.into());
     }
 
+    // ── Condition gate (P3) ─────────────────────────────────────────────
+    //
+    // Cheap structural checks first:
+    //   - non-empty conditions vec (MissingConditionProof)
+    //   - count within MAX_PROOF_CONDITIONS (ConditionCountMismatch)
+    // Then per-condition verifier dispatch using on-chain Clock-derived
+    // verification contexts (the proof-supplied contexts are intentionally
+    // unused — see ProofCondition doc comment). Finally fold the
+    // per-condition booleans with the supplied condition_logic.
+    //
+    // Failures map to the most specific AuthorityError variant we have,
+    // with a catch-all (ConditionVerificationFailed) for VerifierError
+    // shapes that don't have a direct discriminant. State is NOT mutated
+    // until this whole block succeeds.
+    if condition_proof.conditions.is_empty() {
+        return Err(AuthorityError::MissingConditionProof.into());
+    }
+    if condition_proof.conditions.len() > MAX_PROOF_CONDITIONS {
+        return Err(AuthorityError::ConditionCountMismatch.into());
+    }
+
+    let pyth_ctx = PythVerificationContext {
+        current_unix_time: clock.unix_timestamp,
+    };
+    let solend_ctx = SolendVerificationContext {
+        current_slot: clock.slot,
+    };
+
+    // Fixed-size buffer keyed off MAX_PROOF_CONDITIONS so we don't
+    // allocate inside the hot path. The verified prefix length equals
+    // condition_proof.conditions.len().
+    let mut results: [bool; MAX_PROOF_CONDITIONS] = [false; MAX_PROOF_CONDITIONS];
+    for (i, proof_cond) in condition_proof.conditions.iter().enumerate() {
+        let (eval_cond, eval_snap) = match *proof_cond {
+            ProofCondition::Pyth { condition, snapshot } => (
+                EvalCondition::Pyth(condition),
+                EvalSnapshot::Pyth(snapshot, pyth_ctx),
+            ),
+            ProofCondition::Solend { condition, snapshot } => (
+                EvalCondition::Solend(condition),
+                EvalSnapshot::Solend(snapshot, solend_ctx),
+            ),
+        };
+        let outcome = evaluate_condition(&eval_cond, &eval_snap)
+            .map_err(map_verifier_error_to_authority_error)?;
+        results[i] = outcome;
+    }
+
+    let n = condition_proof.conditions.len();
+    let combined =
+        evaluate_condition_logic(condition_proof.condition_logic, &results[..n]);
+    if !combined {
+        return Err(AuthorityError::ConditionNotMet.into());
+    }
+
     // ── State mutations (one-shot v1) ───────────────────────────────────
     record.used_amount_raw = new_used;
     record.completed = true;
@@ -640,7 +716,8 @@ fn process_execute_action(
         .serialize(&mut &mut authz_pda_account.data.borrow_mut()[..])
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
-    // TODO(Stage 2 O3): verify watch-rule conditions before accepting execution
+    // TODO(Stage 2 P4): Solend variant-15 refresh + withdraw CPI
+    // TODO(Stage 2 P4): Jupiter sibling-ix sysvar verification
     // TODO(Stage 2): revoke-and-sweep handler
 
     solana_program::log::sol_log_data(&[
@@ -666,6 +743,36 @@ fn process_execute_action(
     Ok(())
 }
 
+/// Translate a `condition_verifier::VerifierError` into the most
+/// specific `AuthorityError` discriminant we expose on the wire. The
+/// fine-grained mapping lets daemon logs attribute fail-closed events
+/// to the precise gate that tripped (audit-trail value); shapes
+/// without a dedicated discriminant fold into
+/// [`AuthorityError::ConditionVerificationFailed`].
+fn map_verifier_error_to_authority_error(err: VerifierError) -> ProgramError {
+    let mapped = match err {
+        VerifierError::PythFeedIdMismatch => AuthorityError::PythFeedIdMismatch,
+        VerifierError::PythPriceTooOld => AuthorityError::PythSnapshotStale,
+        VerifierError::PythVerificationLevelInsufficient => {
+            AuthorityError::PythVerificationLevelInsufficient
+        }
+        VerifierError::PythConfidenceTooWide => AuthorityError::PythConfidenceTooWide,
+        VerifierError::SolendFormulaVersionUnsupported => {
+            AuthorityError::SolendFormulaVersionUnsupported
+        }
+        VerifierError::SolendReserveStale => AuthorityError::SolendReserveStale,
+        VerifierError::PythExponentOutOfRange
+        | VerifierError::PythComputeOverflow
+        | VerifierError::BoundDirectionMismatch
+        | VerifierError::UnsupportedComparison
+        | VerifierError::UnsupportedRateKind
+        | VerifierError::SolendInvalidReserveConfig
+        | VerifierError::SolendComputeOverflow
+        | VerifierError::SolendThresholdOverflow => AuthorityError::ConditionVerificationFailed,
+    };
+    mapped.into()
+}
+
 /// Pure, deterministic PDA derivation for off-chain tx builders and
 /// tests. Seeds: `["authz", [schema_version], user.as_ref(), rule_id]`.
 pub fn derive_authorization_pda(
@@ -687,6 +794,72 @@ pub fn derive_authorization_pda(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::condition_verifier::{
+        BoundMode, Comparison, ConditionLogic, PythPriceCondition, PythPriceSnapshot,
+        RateKind, SolendReserveSnapshot, SolendSupplyAprCondition, VerificationLevel,
+        SUPPORTED_SOLEND_FORMULA_VERSION,
+    };
+    use crate::instruction::{ConditionProofPayload, ProofCondition};
+
+    /// Build a minimal one-element ConditionProofPayload for tests that
+    /// only need a structurally-valid payload. The Solend snapshot is the
+    /// "low utilisation" fixture with very high threshold so the
+    /// evaluator returns true; concrete numeric mainnet fidelity is the
+    /// job of the verifier's own fixture tests.
+    fn dummy_solend_proof() -> ConditionProofPayload {
+        ConditionProofPayload {
+            condition_logic: ConditionLogic::All,
+            conditions: vec![ProofCondition::Solend {
+                condition: SolendSupplyAprCondition {
+                    comparison: Comparison::Lt,
+                    threshold_bps: 1_000,
+                    rate_kind: RateKind::Apr,
+                    formula_version: SUPPORTED_SOLEND_FORMULA_VERSION,
+                    max_reserve_staleness_slots: 16,
+                },
+                snapshot: SolendReserveSnapshot {
+                    available_amount: 5_000_000_000_000,
+                    borrowed_amount_wads: 5_000_000_000_000u128
+                        * crate::condition_verifier::SOLEND_WAD,
+                    min_borrow_rate_pct: 0,
+                    optimal_borrow_rate_pct: 4,
+                    max_borrow_rate_pct: 30,
+                    super_max_borrow_rate_pct: 300,
+                    optimal_utilization_rate_pct: 80,
+                    max_utilization_rate_pct: 95,
+                    protocol_take_rate_pct: 20,
+                    last_update_slot: 0,
+                    stale_flag: false,
+                },
+            }],
+        }
+    }
+
+    fn dummy_pyth_proof() -> ConditionProofPayload {
+        ConditionProofPayload {
+            condition_logic: ConditionLogic::All,
+            conditions: vec![ProofCondition::Pyth {
+                condition: PythPriceCondition {
+                    feed_id: [0xAB; 32],
+                    comparison: Comparison::Gt,
+                    threshold_mantissa: 100,
+                    threshold_exponent: -2,
+                    max_age_seconds: 30,
+                    max_confidence_bps: 50,
+                    verification_level_required: VerificationLevel::Full,
+                    bound_mode: BoundMode::AdverseLowerForGt,
+                },
+                snapshot: PythPriceSnapshot {
+                    feed_id: [0xAB; 32],
+                    price_mantissa: 1_000,
+                    price_exponent: -2,
+                    conf: 1,
+                    publish_time: 0,
+                    verification_level: VerificationLevel::Full,
+                },
+            }],
+        }
+    }
 
     #[test]
     fn pda_seeds_are_deterministic() {
@@ -947,6 +1120,7 @@ mod tests {
             action_type: Stage2ActionType::JupiterBuySolWithUsdc.to_u8(),
             input_amount_raw: 5_000_000,
             execution_nonce: 1,
+            condition_proof: dummy_solend_proof(),
         };
         let bytes = borsh::to_vec(&original).unwrap();
         let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
@@ -954,13 +1128,90 @@ mod tests {
     }
 
     #[test]
-    fn execute_action_borsh_field_order_is_pinned() {
+    fn execute_action_borsh_roundtrip_pyth_proof() {
+        // Coverage for the second ProofCondition variant — PythPrice
+        // body with a representative snapshot. Borsh-roundtrips (no
+        // semantic verifier evaluation here; that's the verifier's
+        // own test set).
+        let original = AuthorityInstruction::ExecuteAction {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0x10; 16],
+            canonical_rule_hash: [0x20; 32],
+            action_type: Stage2ActionType::JupiterBuySolWithUsdc.to_u8(),
+            input_amount_raw: 1,
+            execution_nonce: 1,
+            condition_proof: dummy_pyth_proof(),
+        };
+        let bytes = borsh::to_vec(&original).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn condition_proof_payload_borsh_roundtrip_preserves_logic_and_conditions() {
+        // Pin the proof payload's own borsh shape: enum tag for
+        // ConditionLogic at byte 0 (All=0, Any=1), then a u32-LE Vec
+        // length, then per-condition variant bodies. We don't anchor
+        // the byte-by-byte body here (that's the verifier's job), but
+        // we DO assert structural invariants the program relies on.
+        let proof = ConditionProofPayload {
+            condition_logic: ConditionLogic::Any,
+            conditions: vec![],
+        };
+        let bytes = borsh::to_vec(&proof).unwrap();
+        assert_eq!(bytes[0], 1, "ConditionLogic::Any ordinal must be 1");
+        assert_eq!(
+            &bytes[1..5],
+            &0u32.to_le_bytes()[..],
+            "Vec<ProofCondition> length is u32 little-endian (Borsh spec)",
+        );
+
+        let decoded = ConditionProofPayload::try_from_slice(&bytes).unwrap();
+        assert_eq!(decoded, proof);
+
+        // Non-empty case: ensure round-trip preserves both variants.
+        let mixed = ConditionProofPayload {
+            condition_logic: ConditionLogic::All,
+            conditions: vec![
+                dummy_pyth_proof().conditions.into_iter().next().unwrap(),
+                dummy_solend_proof().conditions.into_iter().next().unwrap(),
+            ],
+        };
+        let bytes = borsh::to_vec(&mixed).unwrap();
+        assert_eq!(bytes[0], 0, "ConditionLogic::All ordinal must be 0");
+        let decoded = ConditionProofPayload::try_from_slice(&bytes).unwrap();
+        assert_eq!(decoded, mixed);
+    }
+
+    #[test]
+    fn condition_proof_invalid_logic_byte_fails_borsh_deserialize() {
+        // Construct a payload whose first byte (ConditionLogic enum
+        // tag) is out of range. Borsh enum deserialization rejects
+        // unknown tags; the program-level mapping is
+        // `ProgramError::InvalidInstructionData`.
+        let mut bytes = borsh::to_vec(&ConditionProofPayload {
+            condition_logic: ConditionLogic::All,
+            conditions: vec![],
+        })
+        .unwrap();
+        bytes[0] = 0xFF; // out of range
+        assert!(ConditionProofPayload::try_from_slice(&bytes).is_err());
+    }
+
+    #[test]
+    fn execute_action_borsh_field_order_is_pinned_through_p3() {
         // Borsh: enum tag is `u8` ordinal in declaration order, then
         // variant body in declared field order, integers little-endian,
         // fixed `[u8; N]` arrays raw. ExecuteAction is the 4th variant
         // (CreateAuthorization=0, Revoke=1, CloseAuthorization=2,
-        // ExecuteAction=3). Anchor every byte so a future reorder is
-        // loud.
+        // ExecuteAction=3). The first 67 bytes — through `execution_nonce`
+        // — are pinned for forward compatibility with P2; the trailing
+        // bytes are P3's appended `condition_proof: ConditionProofPayload`.
+        let proof = ConditionProofPayload {
+            condition_logic: ConditionLogic::All,
+            conditions: vec![],
+        };
+        let proof_bytes = borsh::to_vec(&proof).unwrap();
         let ix = AuthorityInstruction::ExecuteAction {
             schema_version: 0x01,
             rule_id: [0x22; 16],
@@ -968,10 +1219,10 @@ mod tests {
             action_type: 0x02,
             input_amount_raw: 0x0102_0304_0506_0708,
             execution_nonce: 0x1112_1314_1516_1718,
+            condition_proof: proof,
         };
         let bytes = borsh::to_vec(&ix).unwrap();
-        // Total: 1 (tag) + 1 + 16 + 32 + 1 + 8 + 8 = 67 bytes
-        assert_eq!(bytes.len(), 67);
+        // Pinned P2 prefix (unchanged) — 67 bytes through execution_nonce.
         assert_eq!(bytes[0], 0x03, "byte 0 = enum tag (ExecuteAction = 3)");
         assert_eq!(bytes[1], 0x01, "byte 1 = schema_version");
         assert_eq!(&bytes[2..18], &[0x22u8; 16][..], "bytes 2..18 = rule_id");
@@ -991,6 +1242,16 @@ mod tests {
             &0x1112_1314_1516_1718u64.to_le_bytes()[..],
             "bytes 59..67 = execution_nonce (LE u64)"
         );
+        // P3 trailing bytes — the borsh-encoded ConditionProofPayload
+        // appended after `execution_nonce`.
+        assert_eq!(
+            &bytes[67..],
+            &proof_bytes[..],
+            "bytes 67.. = condition_proof (Borsh-encoded ConditionProofPayload)",
+        );
+        // Total length pin: 67 + ConditionLogic (1) + Vec<u32 len> (4)
+        // for the empty conditions vec.
+        assert_eq!(bytes.len(), 67 + 1 + 4);
     }
 
     #[test]
@@ -1024,6 +1285,10 @@ mod tests {
             action_type: Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
             input_amount_raw: 1,
             execution_nonce: 1,
+            condition_proof: ConditionProofPayload {
+                condition_logic: ConditionLogic::All,
+                conditions: vec![],
+            },
         })
         .unwrap();
         assert_eq!(execute[0], 3, "ExecuteAction tag = 3");
@@ -1057,6 +1322,92 @@ mod tests {
         assert_eq!(AuthorityError::InputAmountExceeded as u32, 19);
         assert_eq!(AuthorityError::ExecutionNonceMismatch as u32, 20);
         assert_eq!(AuthorityError::SameSlotReplay as u32, 21);
+        // P3 condition gate (append-only).
+        assert_eq!(AuthorityError::MissingConditionProof as u32, 22);
+        assert_eq!(AuthorityError::ConditionCountMismatch as u32, 23);
+        assert_eq!(AuthorityError::ConditionNotMet as u32, 24);
+        assert_eq!(AuthorityError::ConditionVerificationFailed as u32, 25);
+        assert_eq!(AuthorityError::PythSnapshotStale as u32, 26);
+        assert_eq!(AuthorityError::PythFeedIdMismatch as u32, 27);
+        assert_eq!(AuthorityError::PythVerificationLevelInsufficient as u32, 28);
+        assert_eq!(AuthorityError::PythConfidenceTooWide as u32, 29);
+        assert_eq!(AuthorityError::SolendFormulaVersionUnsupported as u32, 30);
+        assert_eq!(AuthorityError::SolendReserveStale as u32, 31);
+    }
+
+    #[test]
+    fn map_verifier_error_covers_every_variant() {
+        // If condition_verifier::VerifierError grows a new variant,
+        // the match in `map_verifier_error_to_authority_error` becomes
+        // non-exhaustive at compile time. This test additionally
+        // pins the runtime mapping so a renumbered AuthorityError
+        // discriminant fails loudly here too.
+        let cases = [
+            (
+                VerifierError::PythFeedIdMismatch,
+                AuthorityError::PythFeedIdMismatch,
+            ),
+            (
+                VerifierError::PythPriceTooOld,
+                AuthorityError::PythSnapshotStale,
+            ),
+            (
+                VerifierError::PythVerificationLevelInsufficient,
+                AuthorityError::PythVerificationLevelInsufficient,
+            ),
+            (
+                VerifierError::PythConfidenceTooWide,
+                AuthorityError::PythConfidenceTooWide,
+            ),
+            (
+                VerifierError::SolendFormulaVersionUnsupported,
+                AuthorityError::SolendFormulaVersionUnsupported,
+            ),
+            (
+                VerifierError::SolendReserveStale,
+                AuthorityError::SolendReserveStale,
+            ),
+            (
+                VerifierError::PythExponentOutOfRange,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::PythComputeOverflow,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::BoundDirectionMismatch,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::UnsupportedComparison,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::UnsupportedRateKind,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::SolendInvalidReserveConfig,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::SolendComputeOverflow,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::SolendThresholdOverflow,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+        ];
+        for (verr, expected) in cases {
+            let got = map_verifier_error_to_authority_error(verr);
+            assert_eq!(
+                got,
+                ProgramError::Custom(expected as u32),
+                "verifier {verr:?} -> {expected:?}",
+            );
+        }
     }
 
     #[test]

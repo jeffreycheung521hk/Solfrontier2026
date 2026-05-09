@@ -27,6 +27,11 @@ solana-program-test = "=2.1.21"
 solana-sdk          = { workspace = true }
 tokio               = { workspace = true }
 borsh               = { version = "1", features = ["derive"] }
+# `bincode` is used solely by `tests/functional.rs::current_clock` to
+# deserialize the Clock sysvar account bytes — solana-program-test 2.1.x
+# exposes `BanksClient::get_account` (raw bytes) rather than a typed
+# `get_sysvar`, so the tests decode Clock locally. DEV-only.
+bincode             = { workspace = true }
 # Discriminator-parity test only — proves that this crate's
 # `Stage2ActionType` discriminator values agree with the canonical
 # `WatchRuleActionType` defined in the substrate types crate.
