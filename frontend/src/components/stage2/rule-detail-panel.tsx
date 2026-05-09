@@ -35,6 +35,9 @@ interface RuleDetailPanelProps {
   lifecycle: Stage2RuleLifecycleEvent[];
   nowMs: bigint;
   onDryRunTick: (ruleIdHex: string) => void;
+  /** A3: when the dashboard's data source is the read-only API,
+   *  the dry-run force tick is hidden entirely. */
+  realModeEnabled?: boolean;
 }
 
 export function RuleDetailPanel({
@@ -43,6 +46,7 @@ export function RuleDetailPanel({
   lifecycle,
   nowMs,
   onDryRunTick,
+  realModeEnabled = false,
 }: RuleDetailPanelProps) {
   if (selected === null) {
     return (
@@ -115,10 +119,20 @@ export function RuleDetailPanel({
           </div>
           <div className="grid sm:grid-cols-2 gap-3">
             <RevokeRuleSkeleton ruleIdHex={selected.rule_id_hex} />
-            <ForceTickControl
-              selectedRuleIdHex={selected.rule_id_hex}
-              onDryRunTick={onDryRunTick}
-            />
+            {realModeEnabled ? (
+              <div
+                className="text-[11px] text-muted-foreground italic"
+                data-testid="force-tick-hidden-api-mode"
+              >
+                Force Tick is demo-only and unavailable in read-only API
+                mode.
+              </div>
+            ) : (
+              <ForceTickControl
+                selectedRuleIdHex={selected.rule_id_hex}
+                onDryRunTick={onDryRunTick}
+              />
+            )}
           </div>
         </div>
       </CardContent>

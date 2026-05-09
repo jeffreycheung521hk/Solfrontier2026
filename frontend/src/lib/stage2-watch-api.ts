@@ -595,3 +595,394 @@ export function applyMockForceTickDryRun(
       : `dry-run advanced ${target.status} → ${nextStatus}`,
   };
 }
+
+// ── A3 — read-only API adapter skeleton ───────────────────────────────────
+//
+// Adds a `Stage2DashboardSource` selector ("mock" | "api") and a unified
+// entry point `getStage2DashboardData(options)` that the dashboard page
+// calls regardless of which source is active. Mock mode keeps the A2
+// behavior intact. API mode attempts a single GET against a future
+// read-only endpoint (`/api/stage2/dashboard`) whose route handler does
+// NOT yet exist — the call is expected to 404 and the adapter surfaces
+// that cleanly via a typed `unavailable` result so the UI can render a
+// "Backend pending / API unavailable" banner without crashing.
+//
+// SAFETY rules upheld in this section:
+//   - GET only. No POST / PUT / DELETE.
+//   - No mutation, signing, broadcast, transaction submit, RPC.
+//   - No credentials, wallet pubkeys, or session secrets in the request.
+//   - Endpoint is a relative path on the same origin — no external URL,
+//     no Solana RPC URL, no Jupiter / Solend / Pyth RPC.
+//   - The fetch call below is the ONLY `fetch(` call site in the
+//     dashboard code path. The safety grep gate guards against
+//     accidental fan-out.
+//
+// TODO (route-wiring slice): replace the unavailable-by-default behavior
+// once a backend handler at `/api/stage2/dashboard` is added. The wire
+// shape consumed by `validateApiResponse` below is the contract that
+// future handler must satisfy.
+
+export type Stage2DashboardSource = "mock" | "api";
+
+export interface Stage2DashboardRequest {
+  source: Stage2DashboardSource;
+  /** Only consulted when `source === "mock"`. */
+  mockMode?: Stage2DataMode;
+  /** Caller may pass an `AbortSignal` to cancel an in-flight fetch
+   *  (e.g. on unmount or rapid refresh). Mock-mode ignores the signal. */
+  signal?: AbortSignal;
+}
+
+/// Tagged union surfacing the three outcomes the dashboard renders.
+/// `fetched_at_ms` is the wall-clock time the adapter resolved — used
+/// by the page's "last refreshed" stamp.
+export type Stage2DashboardApiResult =
+  | {
+      kind: "ok";
+      data: Stage2DashboardData;
+      source: Stage2DashboardSource;
+      fetched_at_ms: bigint;
+    }
+  | {
+      kind: "unavailable";
+      reason: string;
+      httpStatus?: number;
+      source: "api";
+      fetched_at_ms: bigint;
+    }
+  | {
+      kind: "validation_error";
+      reason: string;
+      source: "api";
+      fetched_at_ms: bigint;
+    };
+
+/// Future read-only endpoint. **The backend handler does NOT exist in
+/// this slice.** Adding the handler is out of scope; once it lands, the
+/// response MUST conform to the wire shape consumed by
+/// `validateApiResponse` below.
+export const STAGE2_DASHBOARD_API_PATH = "/api/stage2/dashboard";
+
+export async function getStage2DashboardData(
+  options: Stage2DashboardRequest,
+): Promise<Stage2DashboardApiResult> {
+  const fetched_at_ms = BigInt(Date.now());
+  if (options.source === "mock") {
+    return {
+      kind: "ok",
+      data: getMockDashboard(options.mockMode ?? "healthy"),
+      source: "mock",
+      fetched_at_ms,
+    };
+  }
+
+  // ── source === "api" ────────────────────────────────────────────────
+  // Read-only future endpoint; route not added in this slice.
+  let res: Response;
+  try {
+    res = await fetch(STAGE2_DASHBOARD_API_PATH, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: options.signal,
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+  } catch (err) {
+    // AbortError isn't a true "unavailable" — re-throw so the caller's
+    // own cleanup path handles it.
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw err;
+    }
+    return {
+      kind: "unavailable",
+      reason:
+        err instanceof Error
+          ? `network error: ${err.message}`
+          : "network error",
+      source: "api",
+      fetched_at_ms,
+    };
+  }
+
+  if (!res.ok) {
+    // Most relevant case in this slice: 404, because the route is
+    // intentionally absent. We still surface other non-2xx as
+    // unavailable rather than crashing the dashboard.
+    return {
+      kind: "unavailable",
+      reason: `backend returned HTTP ${res.status}`,
+      httpStatus: res.status,
+      source: "api",
+      fetched_at_ms,
+    };
+  }
+
+  let raw: unknown;
+  try {
+    raw = await res.json();
+  } catch (err) {
+    return {
+      kind: "validation_error",
+      reason:
+        err instanceof Error
+          ? `response is not valid JSON: ${err.message}`
+          : "response is not valid JSON",
+      source: "api",
+      fetched_at_ms,
+    };
+  }
+
+  const validated = validateApiResponse(raw);
+  if (validated.kind === "error") {
+    return {
+      kind: "validation_error",
+      reason: validated.reason,
+      source: "api",
+      fetched_at_ms,
+    };
+  }
+  return {
+    kind: "ok",
+    data: validated.data,
+    source: "api",
+    fetched_at_ms,
+  };
+}
+
+// ── API wire shape validator ──────────────────────────────────────────────
+//
+// The future API will serialise bigints as decimal strings (JSON has no
+// native bigint). The validator coerces them back to bigint and refuses
+// the payload if any required field is missing / wrong-type / unknown
+// enum. The full canonical `WatchRule` shape is intentionally NOT parsed
+// here — the dashboard's `<RuleDetailPanel>` already renders a graceful
+// "rule not in payload" fallback for any rule whose canonical preview
+// can't be drawn. A future slice can teach the validator the full shape.
+
+const KNOWN_RULE_STATUSES: ReadonlySet<Stage2WatchRuleStatus> = new Set<
+  Stage2WatchRuleStatus
+>(["active", "condition_met", "executing", "completed", "expired", "revoked", "failed"]);
+
+const KNOWN_ACTION_TYPES: ReadonlySet<Stage2WatchRuleSummary["action_type"]> =
+  new Set<Stage2WatchRuleSummary["action_type"]>([
+    "solend_withdraw_all_delegated",
+    "jupiter_buy_sol_with_usdc",
+  ]);
+
+type Validated =
+  | { kind: "ok"; data: Stage2DashboardData }
+  | { kind: "error"; reason: string };
+
+function validateApiResponse(raw: unknown): Validated {
+  if (raw === null || typeof raw !== "object") {
+    return { kind: "error", reason: "top-level payload is not an object" };
+  }
+  const obj = raw as Record<string, unknown>;
+
+  const healthResult = parseHealth(obj.health);
+  if (healthResult.kind === "error") return healthResult;
+
+  if (!Array.isArray(obj.rules)) {
+    return { kind: "error", reason: "`rules` is not an array" };
+  }
+  const rules: Stage2WatchRuleSummary[] = [];
+  for (let i = 0; i < obj.rules.length; i++) {
+    const r = parseRuleSummary(obj.rules[i], i);
+    if (r.kind === "error") return r;
+    rules.push(r.value);
+  }
+
+  const lifecycleResult = parseLifecycleMap(obj.lifecycle_by_rule_id);
+  if (lifecycleResult.kind === "error") return lifecycleResult;
+
+  return {
+    kind: "ok",
+    data: {
+      health: healthResult.value,
+      rules,
+      lifecycle_by_rule_id: lifecycleResult.value,
+      // Full canonical rule deep-parse deferred to a future slice; the
+      // dashboard renders a graceful "not in payload" fallback.
+      rule_by_rule_id: {},
+    },
+  };
+}
+
+function parseHealth(
+  raw: unknown,
+):
+  | { kind: "ok"; value: Stage2WatcherHealth }
+  | { kind: "error"; reason: string } {
+  if (raw === null || typeof raw !== "object") {
+    return { kind: "error", reason: "`health` is not an object" };
+  }
+  const o = raw as Record<string, unknown>;
+  if (typeof o.enabled !== "boolean") {
+    return { kind: "error", reason: "`health.enabled` is not boolean" };
+  }
+  if (typeof o.is_offline !== "boolean") {
+    return { kind: "error", reason: "`health.is_offline` is not boolean" };
+  }
+  return {
+    kind: "ok",
+    value: {
+      enabled: o.enabled,
+      last_successful_tick_at_ms: parseOptionalBigInt(
+        o.last_successful_tick_at_ms,
+      ),
+      last_tick_started_at_ms: parseOptionalBigInt(o.last_tick_started_at_ms),
+      last_tick_finished_at_ms: parseOptionalBigInt(o.last_tick_finished_at_ms),
+      last_tick_duration_ms: parseOptionalBigInt(o.last_tick_duration_ms),
+      last_error: parseOptionalString(o.last_error),
+      active_rule_count: parseBigInt(o.active_rule_count) ?? BigInt(0),
+      stale_rule_count: parseBigInt(o.stale_rule_count) ?? BigInt(0),
+      in_flight_rule_count: parseBigInt(o.in_flight_rule_count) ?? BigInt(0),
+      expired_count_last_tick: parseNumber(o.expired_count_last_tick) ?? 0,
+      condition_met_count_last_tick:
+        parseNumber(o.condition_met_count_last_tick) ?? 0,
+      transient_error_count_last_tick:
+        parseNumber(o.transient_error_count_last_tick) ?? 0,
+      terminal_error_count_last_tick:
+        parseNumber(o.terminal_error_count_last_tick) ?? 0,
+      failed_count_last_tick: parseNumber(o.failed_count_last_tick) ?? 0,
+      offline_threshold_ms:
+        parseBigInt(o.offline_threshold_ms) ?? BigInt(60_000),
+      stale_threshold_ms: parseBigInt(o.stale_threshold_ms) ?? BigInt(20_000),
+      is_offline: o.is_offline,
+    },
+  };
+}
+
+function parseRuleSummary(
+  raw: unknown,
+  i: number,
+):
+  | { kind: "ok"; value: Stage2WatchRuleSummary }
+  | { kind: "error"; reason: string } {
+  if (raw === null || typeof raw !== "object") {
+    return { kind: "error", reason: `rules[${i}] is not an object` };
+  }
+  const o = raw as Record<string, unknown>;
+  const status = o.status;
+  if (
+    typeof status !== "string" ||
+    !KNOWN_RULE_STATUSES.has(status as Stage2WatchRuleStatus)
+  ) {
+    return {
+      kind: "error",
+      reason: `rules[${i}].status "${String(status)}" is not a known Stage2WatchRuleStatus`,
+    };
+  }
+  const action_type = o.action_type;
+  if (
+    typeof action_type !== "string" ||
+    !KNOWN_ACTION_TYPES.has(
+      action_type as Stage2WatchRuleSummary["action_type"],
+    )
+  ) {
+    return {
+      kind: "error",
+      reason: `rules[${i}].action_type "${String(action_type)}" is not a known action`,
+    };
+  }
+  if (typeof o.rule_id_hex !== "string") {
+    return { kind: "error", reason: `rules[${i}].rule_id_hex is not a string` };
+  }
+  if (typeof o.canonical_rule_hash_hex !== "string") {
+    return {
+      kind: "error",
+      reason: `rules[${i}].canonical_rule_hash_hex is not a string`,
+    };
+  }
+  return {
+    kind: "ok",
+    value: {
+      rule_id_hex: o.rule_id_hex,
+      canonical_rule_hash_hex: o.canonical_rule_hash_hex,
+      status: status as Stage2WatchRuleStatus,
+      action_type: action_type as Stage2WatchRuleSummary["action_type"],
+      expires_at_slot: parseBigInt(o.expires_at_slot) ?? BigInt(0),
+      last_checked_slot: parseOptionalBigInt(o.last_checked_slot),
+      last_successful_tick_at_ms: parseOptionalBigInt(
+        o.last_successful_tick_at_ms,
+      ),
+      last_error: parseOptionalString(o.last_error),
+      created_at_ms: parseBigInt(o.created_at_ms) ?? BigInt(0),
+      updated_at_ms: parseBigInt(o.updated_at_ms) ?? BigInt(0),
+    },
+  };
+}
+
+function parseLifecycleMap(
+  raw: unknown,
+):
+  | { kind: "ok"; value: Record<string, Stage2RuleLifecycleEvent[]> }
+  | { kind: "error"; reason: string } {
+  if (raw === null || raw === undefined) {
+    return { kind: "ok", value: {} };
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      kind: "error",
+      reason: "`lifecycle_by_rule_id` is not an object",
+    };
+  }
+  const out: Record<string, Stage2RuleLifecycleEvent[]> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(v)) {
+      return {
+        kind: "error",
+        reason: `lifecycle_by_rule_id["${k}"] is not an array`,
+      };
+    }
+    const events: Stage2RuleLifecycleEvent[] = [];
+    for (let i = 0; i < v.length; i++) {
+      const e = v[i];
+      if (e === null || typeof e !== "object") {
+        return {
+          kind: "error",
+          reason: `lifecycle_by_rule_id["${k}"][${i}] is not an object`,
+        };
+      }
+      const eo = e as Record<string, unknown>;
+      if (typeof eo.label !== "string") {
+        return {
+          kind: "error",
+          reason: `lifecycle_by_rule_id["${k}"][${i}].label is not a string`,
+        };
+      }
+      events.push({
+        at_ms: parseBigInt(eo.at_ms) ?? BigInt(0),
+        label: eo.label,
+        detail: parseOptionalString(eo.detail),
+      });
+    }
+    out[k] = events;
+  }
+  return { kind: "ok", value: out };
+}
+
+function parseBigInt(v: unknown): bigint | null {
+  if (typeof v === "bigint") return v;
+  if (typeof v === "number" && Number.isFinite(v))
+    return BigInt(Math.trunc(v));
+  if (typeof v === "string" && /^-?\d+$/.test(v)) return BigInt(v);
+  return null;
+}
+
+function parseOptionalBigInt(v: unknown): bigint | null {
+  if (v === null || v === undefined) return null;
+  return parseBigInt(v);
+}
+
+function parseNumber(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && /^-?\d+$/.test(v)) return Number(v);
+  return null;
+}
+
+function parseOptionalString(v: unknown): string | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "string") return v;
+  return null;
+}
