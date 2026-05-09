@@ -89,6 +89,7 @@ pub mod instruction;
 pub mod jupiter_boundary;
 pub mod solend_account_decode;
 pub mod solend_boundary;
+pub mod solend_cpi_builder;
 pub mod state;
 
 use crate::condition_verifier::{

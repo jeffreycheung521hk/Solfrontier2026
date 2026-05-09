@@ -297,6 +297,35 @@ pub enum AuthorityError {
 
     #[error("SPL token account data length is not the native 165-byte SPL Token Account size (Token-2022 not supported by this slice)")]
     SolendTokenAccountInvalidLength = 72,
+
+    // ── Stage 2 P5b-1 Solend CPI Builder Boundary Errors ────────────────
+    //
+    // Discriminants 73..=78 are appended for the Solend CPI builder
+    // shadow-mapping validator introduced in P5b-1 (`solend_cpi_builder.rs`).
+    // Numeric values are part of the on-chain wire shape (encoded into
+    // `ProgramError::Custom`) and MUST stay append-only — never reorder
+    // or renumber. P5b-1 is a builder + shadow-mapping substrate slice;
+    // it issues no CPI, no `invoke`, no `invoke_signed`, no transaction
+    // construction. P5b-2 will land same-tx Refresh + Withdraw CPI and
+    // re-use these errors at the boundary.
+
+    #[error("Solend CPI account-list parse / order is invalid (fewer than the required base accounts, or a slot is in the wrong position)")]
+    SolendCpiAccountOrderInvalid = 73,
+
+    #[error("Solend CPI sysvar slot does not match the canonical Sysvar pubkey, or a base slot is masquerading as a sysvar")]
+    SolendCpiSysvarMismatch = 74,
+
+    #[error("Solend CPI token-program slot is not the canonical native SPL Token program id")]
+    SolendCpiTokenProgramMismatch = 75,
+
+    #[error("Solend CPI withdraw rejected: live cToken `amount` is zero (drained position) — fail closed before building withdraw bytes")]
+    SolendCpiZeroCollateralAmount = 76,
+
+    #[error("Solend CPI oracle verification not yet implemented — P5b-1 fail-closed gate (P5b-2 prerequisite)")]
+    SolendCpiOracleUnverified = 77,
+
+    #[error("Solend CPI builder invariant failed (catch-all for malformed account-info shape, missing signer flag, etc.)")]
+    SolendCpiBuilderInvariantFailed = 78,
 }
 
 impl From<AuthorityError> for ProgramError {
