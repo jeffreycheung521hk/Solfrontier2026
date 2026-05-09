@@ -80,6 +80,29 @@ Three live failure modes. Three correct rejections. Each one diagnosed, calibrat
 | OpenAI + Anthropic provider support (env-gated, fail-closed) | Live, OpenAI mainnet proven; Anthropic unit-test green |
 | Rate limiting, compute budget optimization, retry/rebroadcast | Live |
 
+## Protocol Standards In Use
+
+Stage 2 work pins protocol assumptions to official sources before live execution
+is claimed:
+
+- **Pyth**: Solana price conditions target Pyth Pull Oracle /
+  `pyth-solana-receiver-sdk` `PriceUpdateV2`, with feed-id verification,
+  `verification_level == Full`, bounded confidence, integer math, and a
+  30-second freshness target for trading triggers.
+- **Solend / Save**: Solend execution is delegated-position-only. The system
+  must not touch a user's existing main-wallet obligation. Withdraw paths are
+  designed around Solend mainnet token-lending semantics: refresh and withdraw
+  in the same transaction, delegated-wallet-owned obligation, and derived supply
+  APR from reserve primitives rather than a non-existent on-chain supply-APY
+  helper.
+- **Jupiter**: Existing Jupiter JIT code uses the production `api.jup.ag`
+  path and v0 / ALT transaction assembly. Stage 2 conditional Jupiter execution
+  is not claimed yet: the next Jupiter slice must explicitly pin Swap API V2
+  Router `/build`, account for `tipInstruction` and `blockhashWithMetadata`,
+  measure ALT / transaction-size feasibility, and prove sibling-instruction
+  verification fits. If it does not fit safely, Jupiter conditional buy remains
+  preview-only.
+
 ## Natural-Language Command Samples
 
 The `/chat` surface accepts open-ended natural-language requests; it does not
