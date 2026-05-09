@@ -120,6 +120,55 @@ pub enum AuthorityError {
 
     #[error("Solend reserve snapshot is older than condition.max_reserve_staleness_slots, or stale_flag is set")]
     SolendReserveStale = 31,
+
+    // ── Stage 2 Solend Boundary Errors (P4 — append-only at codes 32+) ──
+
+    #[error("execute_action for SolendWithdrawAllDelegated requires a SolendBoundaryProof payload")]
+    SolendBoundaryProofMissing = 32,
+
+    /// Reserved for future Solend action types this build does not
+    /// know how to verify. Not currently triggered by any code path —
+    /// the only Stage 2 Solend action in v1 is
+    /// `SolendWithdrawAllDelegated`, which the boundary verifier
+    /// fully covers.
+    #[error("Solend action type is not supported by this build of the boundary verifier")]
+    UnsupportedSolendAction = 33,
+
+    #[error("supplied solend_program_id does not equal SOLEND_PROGRAM_ID_MAINNET")]
+    SolendProgramMismatch = 34,
+
+    #[error("obligation account-level owner is not the Solend program")]
+    SolendObligationOwnerMismatch = 35,
+
+    #[error("Obligation.owner field does not equal AuthorizationRecord.delegated_wallet")]
+    SolendObligationAuthorityMismatch = 36,
+
+    #[error("Obligation.owner field equals AuthorizationRecord.user (main wallet) — Stage 2 hard-rejects main-wallet obligations")]
+    SolendMainWalletObligationRejected = 37,
+
+    #[error("sibling Withdraw targets our obligation but a different reserve")]
+    SolendReserveMismatch = 38,
+
+    #[error("supplied lending_market does not match expected (obligation/proof/sibling cross-check)")]
+    SolendLendingMarketMismatch = 39,
+
+    #[error("supplied destination does not match expected (AuthorizationRecord.destination or sibling cross-check)")]
+    SolendDestinationMismatch = 40,
+
+    #[error("required Solend RefreshReserve sibling instruction targeting expected reserve is missing")]
+    SolendRefreshMissing = 41,
+
+    #[error("required Solend WithdrawObligationCollateralAndRedeemReserveCollateral sibling instruction targeting expected obligation is missing")]
+    SolendWithdrawMissing = 42,
+
+    #[error("RefreshReserve must appear before WithdrawObligationCollateralAndRedeemReserveCollateral in the same transaction")]
+    SolendInstructionOrderInvalid = 43,
+
+    #[error("duplicate or conflicting Solend instruction for the expected obligation/reserve in the same transaction")]
+    SolendDuplicateOrConflictingInstruction = 44,
+
+    #[error("Solend boundary verification failed (catch-all for malformed descriptors / cap violations)")]
+    SolendBoundaryVerificationFailed = 45,
 }
 
 impl From<AuthorityError> for ProgramError {

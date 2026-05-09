@@ -29,6 +29,11 @@ use clawsol_authority::{
         revoke_authorization_instruction, AuthorityInstruction, ConditionProofPayload,
         ProofCondition,
     },
+    solend_boundary::{
+        ObligationFixture, SiblingIxDescriptor, SolendBoundaryProof, MAX_SIBLING_INSTRUCTIONS,
+        SOLEND_PROGRAM_ID_MAINNET, SOLEND_VARIANT_REFRESH_RESERVE,
+        SOLEND_VARIANT_WITHDRAW_OBLIGATION_COLLATERAL_AND_REDEEM,
+    },
     state::{
         AuthorizationRecord, Stage2ActionType, STAGE2_AUTHORITY_SCHEMA_VERSION,
     },
@@ -118,10 +123,102 @@ fn default_solend_proof() -> ConditionProofPayload {
     }
 }
 
-/// P2 wrapper around the new 11-arg ExecuteAction builder, supplying a
-/// `default_solend_proof()` so existing P2 boundary tests keep their
-/// 10-arg call shape. New P3 tests bypass this wrapper and call
-/// `raw_execute_action_instruction` directly with their own proof.
+/// Deterministic destination derived per `rule_id`. Used by both
+/// `setup_execute_authz` (when creating the authz) and the test
+/// wrapper (when building a passing Solend boundary proof) so the
+/// proof's `destination_pubkey` matches `record.destination` without
+/// having to thread the destination through every call site.
+fn fx_destination(rule_id: &[u8; 16]) -> Pubkey {
+    let mut b = [0u8; 32];
+    b[0] = 0x44; // 'D' for "destination"
+    b[16..32].copy_from_slice(rule_id);
+    Pubkey::new_from_array(b)
+}
+
+/// Deterministic obligation pubkey derived per `rule_id`.
+fn fx_obligation(rule_id: &[u8; 16]) -> Pubkey {
+    let mut b = [0u8; 32];
+    b[0] = 0x4F; // 'O' for "obligation"
+    b[16..32].copy_from_slice(rule_id);
+    Pubkey::new_from_array(b)
+}
+
+/// Deterministic reserve pubkey derived per `rule_id`.
+fn fx_reserve(rule_id: &[u8; 16]) -> Pubkey {
+    let mut b = [0u8; 32];
+    b[0] = 0x52; // 'R' for "reserve"
+    b[16..32].copy_from_slice(rule_id);
+    Pubkey::new_from_array(b)
+}
+
+/// Deterministic lending-market pubkey derived per `rule_id`.
+fn fx_lending_market(rule_id: &[u8; 16]) -> Pubkey {
+    let mut b = [0u8; 32];
+    b[0] = 0x4C; // 'L' for "lending market"
+    b[16..32].copy_from_slice(rule_id);
+    Pubkey::new_from_array(b)
+}
+
+/// A canonical "passing Solend boundary proof" built from
+/// `(delegated_wallet, rule_id)`. Returns a fresh value per call so
+/// negative tests can mutate one field without affecting others.
+fn default_solend_boundary_proof(
+    delegated_wallet: &Pubkey,
+    rule_id: &[u8; 16],
+) -> SolendBoundaryProof {
+    let reserve = fx_reserve(rule_id);
+    let obligation = fx_obligation(rule_id);
+    let lending_market = fx_lending_market(rule_id);
+    let destination = fx_destination(rule_id);
+    SolendBoundaryProof {
+        solend_program_id: SOLEND_PROGRAM_ID_MAINNET,
+        obligation_pubkey: obligation,
+        obligation: ObligationFixture {
+            account_owner_program: SOLEND_PROGRAM_ID_MAINNET,
+            obligation_authority: *delegated_wallet,
+            lending_market,
+        },
+        reserve_pubkey: reserve,
+        lending_market_pubkey: lending_market,
+        destination_pubkey: destination,
+        sibling_instructions: vec![
+            SiblingIxDescriptor {
+                program_id: SOLEND_PROGRAM_ID_MAINNET,
+                variant_byte: SOLEND_VARIANT_REFRESH_RESERVE,
+                target_reserve: Some(reserve),
+                target_obligation: None,
+                target_lending_market: None,
+                target_destination: None,
+            },
+            SiblingIxDescriptor {
+                program_id: SOLEND_PROGRAM_ID_MAINNET,
+                variant_byte: SOLEND_VARIANT_WITHDRAW_OBLIGATION_COLLATERAL_AND_REDEEM,
+                target_reserve: Some(reserve),
+                target_obligation: Some(obligation),
+                target_lending_market: Some(lending_market),
+                target_destination: Some(destination),
+            },
+        ],
+    }
+}
+
+/// Test-side ExecuteAction builder for tests that are NOT exercising
+/// the Solend boundary. The wrapper supplies a structurally-valid P3
+/// `condition_proof` and unconditionally passes `None` for the P4
+/// `solend_boundary_proof`. This deliberately does **not** auto-attach
+/// a passing Solend boundary proof — passing fake valid proofs
+/// everywhere would hide the new gate and let P1/P2/P3 regressions
+/// silently slip past it.
+///
+/// Per the test-action-type convention adopted at P4 landing:
+///
+/// - `setup_execute_authz` defaults to
+///   `Stage2ActionType::JupiterBuySolWithUsdc`. Existing P1/P2/P3
+///   tests therefore exercise the Jupiter action path; the program
+///   skips the Solend boundary gate and `None` is the correct value.
+/// - P4 boundary tests opt in by using `setup_execute_authz_solend`
+///   (Solend action) and call `raw_execute_action_instruction`
+///   directly with an explicit `Some(boundary_proof)`.
 #[allow(clippy::too_many_arguments)]
 fn execute_action_instruction(
     program_id: &Pubkey,
@@ -147,6 +244,7 @@ fn execute_action_instruction(
         input_amount_raw,
         execution_nonce,
         default_solend_proof(),
+        None,
     )
 }
 
@@ -730,16 +828,35 @@ async fn close_before_revoke_or_expiry_rejected() {
 /// Inputs every ExecuteAction setup needs: rule_id, the authz hash the
 /// user signed, the executor keypair the daemon signs with, and the
 /// (writable) PDA the processor mutates.
+///
+/// `destination` is captured here in P4 so test-side P4 boundary
+/// proofs can pin against `record.destination` without re-deriving
+/// from the rule_id. The same pubkey is supplied by `fx_destination`
+/// during create-authz time and is reused by the boundary proof
+/// builder during execute time.
+///
+/// `destination` and `expires_at_slot` are intentionally captured
+/// even though most current call sites rebuild them from `rule_id`
+/// helpers — keeping them on the fixture documents the create-time
+/// values and lets future tests assert against them without
+/// recomputing.
+#[allow(dead_code)]
 struct ExecuteFixture {
     pda: Pubkey,
     executor: Keypair,
     delegated_wallet: Pubkey,
+    destination: Pubkey,
     canonical_rule_hash: [u8; 32],
     action_type: u8,
     max_input_amount_raw: u64,
     expires_at_slot: u64,
 }
 
+/// Default `setup_execute_authz`. Action type is
+/// `Stage2ActionType::JupiterBuySolWithUsdc` so existing P1/P2/P3
+/// tests do NOT trip the new P4 Solend boundary gate. Tests that
+/// specifically need a Solend authz call `setup_execute_authz_solend`
+/// instead.
 async fn setup_execute_authz(
     ctx: &mut ProgramTestContext,
     program_id: Pubkey,
@@ -747,10 +864,56 @@ async fn setup_execute_authz(
     max_input_amount_raw: u64,
     expires_at_slot: u64,
 ) -> ExecuteFixture {
+    setup_execute_authz_with_action(
+        ctx,
+        program_id,
+        rule_id,
+        max_input_amount_raw,
+        expires_at_slot,
+        Stage2ActionType::JupiterBuySolWithUsdc.to_u8(),
+    )
+    .await
+}
+
+/// Solend-action variant of [`setup_execute_authz`]. Used by the P4
+/// boundary tests that DO need to exercise the Solend gate. Callers
+/// MUST attach an explicit `solend_boundary_proof` via
+/// `raw_execute_action_instruction` — the wrapper
+/// `execute_action_instruction` always passes `None`.
+async fn setup_execute_authz_solend(
+    ctx: &mut ProgramTestContext,
+    program_id: Pubkey,
+    rule_id: &[u8; 16],
+    max_input_amount_raw: u64,
+    expires_at_slot: u64,
+) -> ExecuteFixture {
+    setup_execute_authz_with_action(
+        ctx,
+        program_id,
+        rule_id,
+        max_input_amount_raw,
+        expires_at_slot,
+        Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
+    )
+    .await
+}
+
+async fn setup_execute_authz_with_action(
+    ctx: &mut ProgramTestContext,
+    program_id: Pubkey,
+    rule_id: &[u8; 16],
+    max_input_amount_raw: u64,
+    expires_at_slot: u64,
+    action_type: u8,
+) -> ExecuteFixture {
     let executor = Keypair::new();
     let delegated_wallet = Pubkey::new_unique();
+    // Destination is deterministic per rule_id so the test-side
+    // `default_solend_boundary_proof` can rebuild a matching proof
+    // for Solend tests without threading destination through every
+    // call site.
+    let destination = fx_destination(rule_id);
     let canonical_rule_hash = dummy_canonical_hash(rule_id);
-    let action_type = Stage2ActionType::SolendWithdrawAllDelegated.to_u8();
     let (pda, _) = derive_authorization_pda(
         &program_id,
         SCHEMA_VERSION,
@@ -768,7 +931,7 @@ async fn setup_execute_authz(
         canonical_rule_hash,
         action_type,
         max_input_amount_raw,
-        Pubkey::new_unique(),
+        destination,
         expires_at_slot,
     );
     ctx.last_blockhash = ctx
@@ -791,6 +954,7 @@ async fn setup_execute_authz(
         pda,
         executor,
         delegated_wallet,
+        destination,
         canonical_rule_hash,
         action_type,
         max_input_amount_raw,
@@ -869,6 +1033,8 @@ async fn execute_rejects_missing_executor_signature() {
     .await;
 
     // Hand-roll the ix so executor account is NOT marked signer.
+    // The MissingExecutorSignature gate (P2 step 1) fires before the
+    // P4 Solend boundary check, so passing `None` here is fine.
     let data = borsh::to_vec(&AuthorityInstruction::ExecuteAction {
         schema_version: SCHEMA_VERSION,
         rule_id: RULE_ID_EXEC_NO_SIG,
@@ -877,6 +1043,7 @@ async fn execute_rejects_missing_executor_signature() {
         input_amount_raw: 5_000_000,
         execution_nonce: 1,
         condition_proof: default_solend_proof(),
+        solend_boundary_proof: None,
     })
     .unwrap();
     let ix = Instruction {
@@ -947,6 +1114,8 @@ async fn execute_rejects_wrong_pda() {
         input_amount_raw: 5_000_000,
         execution_nonce: 1,
         condition_proof: default_solend_proof(),
+        // owner-mismatch fires before the P4 boundary, so None is fine.
+        solend_boundary_proof: None,
     })
     .unwrap();
     let ix = Instruction {
@@ -1006,6 +1175,8 @@ async fn execute_rejects_wrong_user_account() {
         input_amount_raw: 5_000_000,
         execution_nonce: 1,
         condition_proof: default_solend_proof(),
+        // PDA-derivation mismatch fires before the P4 boundary check.
+        solend_boundary_proof: None,
     })
     .unwrap();
     let ix = Instruction {
@@ -1348,9 +1519,10 @@ async fn execute_rejects_action_type_mismatch() {
     )
     .await;
     fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
-    // Authz was created with SolendWithdrawAllDelegated. Try to execute
-    // as JupiterBuySolWithUsdc.
-    let wrong_action = Stage2ActionType::JupiterBuySolWithUsdc.to_u8();
+    // setup_execute_authz defaults to JupiterBuySolWithUsdc (per the
+    // P4 test-action-type convention). Try to execute as
+    // SolendWithdrawAllDelegated to trip the action_type gate.
+    let wrong_action = Stage2ActionType::SolendWithdrawAllDelegated.to_u8();
     assert_ne!(wrong_action, fx.action_type);
 
     ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -1997,6 +2169,9 @@ async fn p3_scenario_a_solend_condition_true_succeeds_and_mutates_state() {
     };
 
     ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    // Action defaults to Jupiter via setup_execute_authz, so the
+    // P4 Solend boundary gate is skipped (action_type != Solend).
+    // None is the correct value here.
     let ix = raw_execute_action_instruction(
         &program_id,
         &fx.executor.pubkey(),
@@ -2009,6 +2184,7 @@ async fn p3_scenario_a_solend_condition_true_succeeds_and_mutates_state() {
         5_000_000,
         1,
         proof,
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2067,6 +2243,9 @@ async fn p3_scenario_a_solend_condition_false_fails_before_mutation() {
         5_000_000,
         1,
         proof,
+        // P3 ConditionNotMet fires before the P4 boundary check, so
+        // None is fine here.
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2120,6 +2299,7 @@ async fn p3_scenario_b_three_pyth_conditions_true_succeeds_and_mutates_state() {
     };
 
     ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    // Jupiter action via default setup; P4 boundary is skipped.
     let ix = raw_execute_action_instruction(
         &program_id,
         &fx.executor.pubkey(),
@@ -2132,6 +2312,7 @@ async fn p3_scenario_b_three_pyth_conditions_true_succeeds_and_mutates_state() {
         5_000_000,
         1,
         proof,
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2199,6 +2380,7 @@ async fn p3_scenario_b_one_condition_false_fails_before_mutation() {
         5_000_000,
         1,
         proof,
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2247,6 +2429,7 @@ async fn p3_missing_condition_proof_fails_before_mutation() {
         5_000_000,
         1,
         proof,
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2307,6 +2490,7 @@ async fn p3_stale_pyth_proof_fails_before_mutation() {
         5_000_000,
         1,
         proof,
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2360,6 +2544,7 @@ async fn p3_wrong_pyth_feed_id_fails_before_mutation() {
         5_000_000,
         1,
         proof,
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2416,6 +2601,7 @@ async fn p3_excessive_pyth_confidence_fails_before_mutation() {
         5_000_000,
         1,
         proof,
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2473,6 +2659,7 @@ async fn p3_partial_pyth_verification_fails_before_mutation() {
         5_000_000,
         1,
         proof,
+        None,
     );
     // Locate the verification_level byte inside the serialized
     // PythPriceSnapshot — last byte of the snapshot (after price/exp/
@@ -2559,6 +2746,7 @@ async fn p3_stale_solend_reserve_fails_before_mutation() {
         5_000_000,
         1,
         proof,
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2613,6 +2801,7 @@ async fn p3_unsupported_solend_formula_version_fails_before_mutation() {
         5_000_000,
         1,
         proof,
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2667,6 +2856,7 @@ async fn p3_invalid_condition_logic_byte_fails_borsh_decode() {
         5_000_000,
         1,
         proof,
+        None,
     );
     // The condition_logic byte sits at offset 67 inside ix.data
     // (1 enum tag + 66 bytes of fixed P2 fields). Pinned by the
@@ -2758,6 +2948,7 @@ async fn p3_p2_revoked_authorization_still_fails_before_condition_verification()
         5_000_000,
         1,
         proof,
+        None,
     );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -2784,4 +2975,878 @@ async fn p3_p2_revoked_authorization_still_fails_before_condition_verification()
     assert!(!record.completed);
     assert_eq!(record.execution_nonce, 0);
     assert_eq!(record.last_execution_slot, 0);
+}
+
+// ── Stage 2 P4: Solend delegated withdraw boundary tests ─────────────────────
+//
+// These tests exercise the on-chain Solend boundary gate. Each negative
+// test reloads the AuthorizationRecord after the failed tx and asserts
+// no execution-tracking field was mutated.
+//
+// Tests opt in by:
+//   1. using `setup_execute_authz_solend` (Solend action_type) and
+//   2. calling `raw_execute_action_instruction` directly with an
+//      explicit `Some(boundary_proof)`.
+// The wrapper `execute_action_instruction` always passes `None`, so
+// using the wrapper would fail with `SolendBoundaryProofMissing`
+// before reaching any boundary semantics — this is by design.
+
+const RULE_ID_P4_HAPPY: [u8; 16] = [0x55; 16];
+const RULE_ID_P4_PROOF_MISSING: [u8; 16] = [0x56; 16];
+const RULE_ID_P4_MAIN_WALLET: [u8; 16] = [0x57; 16];
+const RULE_ID_P4_WRONG_PROGRAM: [u8; 16] = [0x58; 16];
+const RULE_ID_P4_WRONG_RESERVE: [u8; 16] = [0x59; 16];
+const RULE_ID_P4_WRONG_LM: [u8; 16] = [0x5A; 16];
+const RULE_ID_P4_WRONG_DEST: [u8; 16] = [0x5B; 16];
+const RULE_ID_P4_MISSING_REFRESH: [u8; 16] = [0x5C; 16];
+const RULE_ID_P4_MISSING_WITHDRAW: [u8; 16] = [0x5D; 16];
+const RULE_ID_P4_BAD_ORDER: [u8; 16] = [0x5E; 16];
+const RULE_ID_P4_DUP_WITHDRAW: [u8; 16] = [0x5F; 16];
+const RULE_ID_P4_CONFLICT_OTHER: [u8; 16] = [0x60; 16];
+const RULE_ID_P4_P3_FALSE_VS_GATE: [u8; 16] = [0x61; 16];
+const RULE_ID_P4_P3_OK_BOUNDARY_BAD: [u8; 16] = [0x62; 16];
+const RULE_ID_P4_REVOKE_GREEN: [u8; 16] = [0x63; 16];
+const RULE_ID_P4_REPLAY_GREEN: [u8; 16] = [0x64; 16];
+const RULE_ID_P4_OBLIG_OWNER_BAD: [u8; 16] = [0x65; 16];
+
+/// Reload the PDA after a failed tx and assert no execution-tracking
+/// field was mutated. Required by the P4 prompt for every failure
+/// path.
+async fn assert_no_mutation_after_failure(
+    ctx: &mut ProgramTestContext,
+    pda: Pubkey,
+) {
+    let account = ctx
+        .banks_client
+        .get_account(pda)
+        .await
+        .expect("get_account")
+        .expect("PDA must still exist (failed tx must NOT close the PDA)");
+    let record = AuthorizationRecord::try_from_slice(&account.data)
+        .expect("decode AuthorizationRecord");
+    assert_eq!(
+        record.used_amount_raw, 0,
+        "used_amount_raw must NOT advance on a failed Solend boundary"
+    );
+    assert!(
+        !record.completed,
+        "completed must NOT flip on a failed Solend boundary"
+    );
+    assert_eq!(
+        record.execution_nonce, 0,
+        "execution_nonce must NOT advance on a failed Solend boundary"
+    );
+    assert_eq!(
+        record.last_execution_slot, 0,
+        "last_execution_slot must NOT advance on a failed Solend boundary"
+    );
+}
+
+/// Submit a Solend `ExecuteAction` with the supplied (potentially
+/// poisoned) boundary proof, expect failure with the given error,
+/// and assert no PDA mutation. Used by every P4 negative test.
+#[allow(clippy::too_many_arguments)]
+async fn execute_solend_expect_failure(
+    ctx: &mut ProgramTestContext,
+    program_id: &Pubkey,
+    fx: &ExecuteFixture,
+    rule_id: [u8; 16],
+    proof: SolendBoundaryProof,
+    expected: AuthorityError,
+    description: &'static str,
+) {
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        rule_id,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        default_solend_proof(),
+        Some(proof),
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err(description);
+    assert_custom_err(err, expected);
+    assert_no_mutation_after_failure(ctx, fx.pda).await;
+}
+
+#[tokio::test]
+async fn p4_valid_solend_boundary_succeeds_and_mutates_state() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_HAPPY,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let proof = default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_HAPPY);
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P4_HAPPY,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        default_solend_proof(),
+        Some(proof),
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("Solend happy path with valid boundary must succeed");
+
+    let acc = ctx.banks_client.get_account(fx.pda).await.unwrap().unwrap();
+    let record = AuthorizationRecord::try_from_slice(&acc.data).unwrap();
+    assert_eq!(record.used_amount_raw, 5_000_000);
+    assert!(record.completed);
+    assert_eq!(record.execution_nonce, 1);
+    assert!(record.last_execution_slot > 0);
+}
+
+#[tokio::test]
+async fn p4_solend_action_without_boundary_proof_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_PROOF_MISSING,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P4_PROOF_MISSING,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        default_solend_proof(),
+        None, // Solend action without boundary proof
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("Solend action without boundary proof must fail");
+    assert_custom_err(err, AuthorityError::SolendBoundaryProofMissing);
+    assert_no_mutation_after_failure(&mut ctx, fx.pda).await;
+}
+
+/// REQUIRED POISON TEST (P4 prompt): obligation fixture whose
+/// authority == user main wallet. This must fail with the SPECIFIC
+/// `SolendMainWalletObligationRejected` error before any mutation.
+#[tokio::test]
+async fn p4_main_wallet_obligation_rejected_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_MAIN_WALLET,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof = default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_MAIN_WALLET);
+    // Poison: the obligation fixture claims the user's MAIN wallet
+    // (`ctx.payer`) is the obligation authority. Stage 2 hard-rejects
+    // this with a dedicated error code separate from the generic
+    // mismatch path.
+    proof.obligation.obligation_authority = ctx.payer.pubkey();
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_MAIN_WALLET,
+        proof,
+        AuthorityError::SolendMainWalletObligationRejected,
+        "main-wallet obligation must be rejected with the dedicated error",
+    )
+    .await;
+}
+
+/// Sibling test for the poison test above — random non-delegated,
+/// non-user wallet authority surfaces the *generic*
+/// `SolendObligationAuthorityMismatch`. Together these prove the
+/// main-wallet path has its own dedicated discriminant (P4 prompt:
+/// "Do not satisfy this requirement with a random wrong-wallet test
+/// only").
+#[tokio::test]
+async fn p4_random_wrong_wallet_obligation_authority_rejected() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_OBLIG_OWNER_BAD,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof = default_solend_boundary_proof(
+        &fx.delegated_wallet,
+        &RULE_ID_P4_OBLIG_OWNER_BAD,
+    );
+    // Some unrelated third-party pubkey — not the user, not the
+    // delegated wallet. Surfaces the GENERIC mismatch error.
+    proof.obligation.obligation_authority = Pubkey::new_unique();
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_OBLIG_OWNER_BAD,
+        proof,
+        AuthorityError::SolendObligationAuthorityMismatch,
+        "third-party-wallet obligation authority must surface generic mismatch",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn p4_wrong_solend_program_id_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_WRONG_PROGRAM,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof =
+        default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_WRONG_PROGRAM);
+    proof.solend_program_id = Pubkey::new_unique(); // not Solend
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_WRONG_PROGRAM,
+        proof,
+        AuthorityError::SolendProgramMismatch,
+        "wrong solend_program_id must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn p4_wrong_reserve_in_withdraw_sibling_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_WRONG_RESERVE,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof =
+        default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_WRONG_RESERVE);
+    // The withdraw sibling targets our obligation but a DIFFERENT
+    // reserve — exactly the audit case "withdraw with right
+    // obligation but wrong reserve".
+    proof.sibling_instructions[1].target_reserve = Some(Pubkey::new_unique());
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_WRONG_RESERVE,
+        proof,
+        AuthorityError::SolendReserveMismatch,
+        "withdraw with right obligation but wrong reserve must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn p4_wrong_lending_market_in_withdraw_sibling_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_WRONG_LM,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof =
+        default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_WRONG_LM);
+    proof.sibling_instructions[1].target_lending_market = Some(Pubkey::new_unique());
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_WRONG_LM,
+        proof,
+        AuthorityError::SolendLendingMarketMismatch,
+        "withdraw with wrong lending_market must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn p4_wrong_destination_against_authz_record_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_WRONG_DEST,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof =
+        default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_WRONG_DEST);
+    proof.destination_pubkey = Pubkey::new_unique(); // not record.destination
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_WRONG_DEST,
+        proof,
+        AuthorityError::SolendDestinationMismatch,
+        "destination not matching record.destination must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn p4_missing_refresh_reserve_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_MISSING_REFRESH,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof =
+        default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_MISSING_REFRESH);
+    proof.sibling_instructions.remove(0); // drop the refresh
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_MISSING_REFRESH,
+        proof,
+        AuthorityError::SolendRefreshMissing,
+        "missing RefreshReserve must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn p4_missing_withdraw_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_MISSING_WITHDRAW,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof =
+        default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_MISSING_WITHDRAW);
+    proof.sibling_instructions.pop(); // drop the withdraw
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_MISSING_WITHDRAW,
+        proof,
+        AuthorityError::SolendWithdrawMissing,
+        "missing Withdraw must fail",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn p4_wrong_instruction_order_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_BAD_ORDER,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof =
+        default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_BAD_ORDER);
+    proof.sibling_instructions.swap(0, 1); // Withdraw before Refresh
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_BAD_ORDER,
+        proof,
+        AuthorityError::SolendInstructionOrderInvalid,
+        "withdraw before refresh must fail",
+    )
+    .await;
+}
+
+/// "valid refresh + malicious withdraw + valid withdraw" — required
+/// sibling-spoof scenario from the P4 prompt. The duplicate withdraw
+/// targeting our obligation is detected as a conflict.
+#[tokio::test]
+async fn p4_duplicate_withdraw_for_same_obligation_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_DUP_WITHDRAW,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof =
+        default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_DUP_WITHDRAW);
+    let valid_withdraw = proof.sibling_instructions[1].clone();
+    // valid refresh (idx 0) + duplicate withdraw (inserted at idx 1) +
+    // valid withdraw (now at idx 2). All target our obligation.
+    proof
+        .sibling_instructions
+        .insert(1, valid_withdraw);
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_DUP_WITHDRAW,
+        proof,
+        AuthorityError::SolendDuplicateOrConflictingInstruction,
+        "duplicate withdraw for same obligation must fail",
+    )
+    .await;
+}
+
+/// "extra conflicting Solend instruction for the same target" —
+/// required scenario from the P4 prompt. Defends against e.g. an
+/// inserted `BorrowObligationLiquidity` siphoning collateral.
+#[tokio::test]
+async fn p4_other_solend_ix_touching_same_obligation_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_CONFLICT_OTHER,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof =
+        default_solend_boundary_proof(&fx.delegated_wallet, &RULE_ID_P4_CONFLICT_OTHER);
+    proof.sibling_instructions.push(SiblingIxDescriptor {
+        program_id: SOLEND_PROGRAM_ID_MAINNET,
+        // BorrowObligationLiquidity = variant 10. Targeting our
+        // obligation means an attacker is trying to sneak in a borrow
+        // through the same delegated obligation in the same tx.
+        variant_byte: 10,
+        target_reserve: None,
+        target_obligation: Some(proof.obligation_pubkey),
+        target_lending_market: None,
+        target_destination: None,
+    });
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_CONFLICT_OTHER,
+        proof,
+        AuthorityError::SolendDuplicateOrConflictingInstruction,
+        "other Solend ix touching our obligation must fail",
+    )
+    .await;
+}
+
+/// P3 condition false must fail BEFORE the P4 boundary check (the
+/// gate ordering is condition → boundary → mutation). The boundary
+/// proof here is structurally valid; the failure is a P3 condition
+/// mismatch and that's the error we expect.
+#[tokio::test]
+async fn p4_p3_condition_false_fails_before_p4_boundary() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_P3_FALSE_VS_GATE,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    // Build a P3 condition payload with a Lt-1bps threshold — under
+    // ~100 bps APR fixture this fold returns false.
+    let condition_proof = ConditionProofPayload {
+        condition_logic: ConditionLogic::All,
+        conditions: vec![ProofCondition::Solend {
+            condition: SolendSupplyAprCondition {
+                comparison: Comparison::Lt,
+                threshold_bps: 1,
+                rate_kind: RateKind::Apr,
+                formula_version: SUPPORTED_SOLEND_FORMULA_VERSION,
+                max_reserve_staleness_slots: 1_000_000,
+            },
+            snapshot: SolendReserveSnapshot {
+                available_amount: 5_000_000_000_000,
+                borrowed_amount_wads: 5_000_000_000_000u128 * SOLEND_WAD,
+                min_borrow_rate_pct: 0,
+                optimal_borrow_rate_pct: 4,
+                max_borrow_rate_pct: 30,
+                super_max_borrow_rate_pct: 300,
+                optimal_utilization_rate_pct: 80,
+                max_utilization_rate_pct: 95,
+                protocol_take_rate_pct: 20,
+                last_update_slot: 0,
+                stale_flag: false,
+            },
+        }],
+    };
+    let boundary_proof = default_solend_boundary_proof(
+        &fx.delegated_wallet,
+        &RULE_ID_P4_P3_FALSE_VS_GATE,
+    );
+
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P4_P3_FALSE_VS_GATE,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        condition_proof,
+        Some(boundary_proof),
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("P3 false condition must fail before P4 boundary");
+    // Critically: ConditionNotMet (P3) — NOT any P4 boundary error.
+    assert_custom_err(err, AuthorityError::ConditionNotMet);
+    assert_no_mutation_after_failure(&mut ctx, fx.pda).await;
+}
+
+/// P3 condition true but P4 boundary false must fail with a P4
+/// boundary error (the gate ordering ensures the boundary is reached
+/// only when conditions pass).
+#[tokio::test]
+async fn p4_p3_true_but_boundary_bad_fails_with_boundary_error() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_P3_OK_BOUNDARY_BAD,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    // P3: passing condition (default Solend Lt 1000bps with low-util
+    // fixture). P4: boundary poisoned with main-wallet authority.
+    let mut boundary_proof = default_solend_boundary_proof(
+        &fx.delegated_wallet,
+        &RULE_ID_P4_P3_OK_BOUNDARY_BAD,
+    );
+    boundary_proof.obligation.obligation_authority = ctx.payer.pubkey();
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_P3_OK_BOUNDARY_BAD,
+        boundary_proof,
+        AuthorityError::SolendMainWalletObligationRejected,
+        "P3 ok + P4 main-wallet poison must surface the P4 main-wallet error",
+    )
+    .await;
+}
+
+/// Revoke remains green for Solend authz: revoke flips the flag,
+/// subsequent execute fails with `AuthorizationRevoked` BEFORE
+/// reaching the P4 boundary.
+#[tokio::test]
+async fn p4_revoke_still_green_for_solend_authz() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_REVOKE_GREEN,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    // Revoke first.
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let revoke_ix = revoke_authorization_instruction(
+        &program_id,
+        &ctx.payer.pubkey(),
+        SCHEMA_VERSION,
+        RULE_ID_P4_REVOKE_GREEN,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[revoke_ix],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Now try execute with a perfectly-valid Solend boundary proof —
+    // AuthorizationRevoked must fire BEFORE the P4 boundary check.
+    let proof = default_solend_boundary_proof(
+        &fx.delegated_wallet,
+        &RULE_ID_P4_REVOKE_GREEN,
+    );
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        RULE_ID_P4_REVOKE_GREEN,
+        proof,
+        AuthorityError::AuthorizationRevoked,
+        "revoked Solend authz must reject before P4 boundary",
+    )
+    .await;
+}
+
+/// Replay/completed remains green for Solend: a successful first
+/// execute flips `completed=true`, and a second execute (even with a
+/// perfectly-valid boundary proof) fails with
+/// `AuthorizationCompleted` BEFORE reaching the P4 boundary.
+#[tokio::test]
+async fn p4_replay_after_completed_still_green_for_solend() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &RULE_ID_P4_REPLAY_GREEN,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let proof = default_solend_boundary_proof(
+        &fx.delegated_wallet,
+        &RULE_ID_P4_REPLAY_GREEN,
+    );
+
+    // First execute — happy path, mutates state.
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix1 = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P4_REPLAY_GREEN,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        5_000_000,
+        1,
+        default_solend_proof(),
+        Some(proof.clone()),
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix1],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Warp + refresh blockhash so the second tx has a different sig
+    // and isn't blocked by SameSlotReplay.
+    ctx.warp_to_slot(50).expect("warp_to_slot");
+    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix2 = raw_execute_action_instruction(
+        &program_id,
+        &fx.executor.pubkey(),
+        &ctx.payer.pubkey(),
+        &fx.delegated_wallet,
+        SCHEMA_VERSION,
+        RULE_ID_P4_REPLAY_GREEN,
+        fx.canonical_rule_hash,
+        fx.action_type,
+        1, // tiny non-zero amount
+        2,
+        default_solend_proof(),
+        Some(proof),
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[ix2],
+        Some(&fx.executor.pubkey()),
+        &[&fx.executor],
+        ctx.last_blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("second execute on completed authz must fail");
+    assert_custom_err(err, AuthorityError::AuthorizationCompleted);
+
+    // Reload and assert the FIRST execute's mutations stuck and the
+    // SECOND execute did NOT advance the nonce/slot.
+    let acc = ctx.banks_client.get_account(fx.pda).await.unwrap().unwrap();
+    let record = AuthorizationRecord::try_from_slice(&acc.data).unwrap();
+    assert_eq!(record.used_amount_raw, 5_000_000, "first execute mutation persists");
+    assert!(record.completed);
+    assert_eq!(record.execution_nonce, 1, "second execute did NOT advance nonce");
+}
+
+/// Ensure the `MAX_SIBLING_INSTRUCTIONS` cap is enforced on-chain
+/// too — the unit tests cover the boundary verifier directly; this
+/// test confirms the cap holds across the full process_execute_action
+/// path with no mutation.
+#[tokio::test]
+async fn p4_oversized_sibling_list_fails_before_mutation() {
+    let program_id = Pubkey::new_unique();
+    let mut ctx = build_program_test(program_id).start_with_context().await;
+    let rule_id: [u8; 16] = [0x66; 16];
+    let fx = setup_execute_authz_solend(
+        &mut ctx,
+        program_id,
+        &rule_id,
+        5_000_000,
+        1_000_000,
+    )
+    .await;
+    fund_keypair(&mut ctx, &fx.executor.pubkey(), 1_000_000_000).await;
+
+    let mut proof = default_solend_boundary_proof(&fx.delegated_wallet, &rule_id);
+    let unrelated = SiblingIxDescriptor {
+        program_id: Pubkey::new_unique(),
+        variant_byte: 0,
+        target_reserve: None,
+        target_obligation: None,
+        target_lending_market: None,
+        target_destination: None,
+    };
+    for _ in 0..MAX_SIBLING_INSTRUCTIONS {
+        proof.sibling_instructions.push(unrelated.clone());
+    }
+    assert!(proof.sibling_instructions.len() > MAX_SIBLING_INSTRUCTIONS);
+
+    execute_solend_expect_failure(
+        &mut ctx,
+        &program_id,
+        &fx,
+        rule_id,
+        proof,
+        AuthorityError::SolendBoundaryVerificationFailed,
+        "oversized sibling list must fail",
+    )
+    .await;
 }

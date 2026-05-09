@@ -24,6 +24,7 @@ use crate::condition_verifier::{
     SolendSupplyAprCondition,
 };
 use crate::derive_authorization_pda;
+use crate::solend_boundary::SolendBoundaryProof;
 
 /// Maximum number of proof-conditions per `ExecuteAction`. Bounded so a
 /// hostile or buggy executor cannot inflate compute / wire size, and so
@@ -139,10 +140,23 @@ pub enum AuthorityInstruction {
     /// constructed on-chain from `Clock::get()` so a hostile executor
     /// cannot bypass freshness gates by padding the proof.
     ///
-    /// **Wire-shape note (P3).** This variant grows by one trailing
-    /// field (`condition_proof`); the Borsh enum tag stays at `3`. A
-    /// pinned-length test in `lib.rs::tests` is updated alongside this
-    /// change so any future field addition fails loudly.
+    /// **Wire-shape note (P3 + P4).** Each slice grows the variant by
+    /// trailing fields, append-only:
+    ///
+    /// - P3 appended `condition_proof: ConditionProofPayload`.
+    /// - P4 appended `solend_boundary_proof: Option<SolendBoundaryProof>`
+    ///   (Borsh: 1 byte `Option` tag, then body if `Some`).
+    ///
+    /// The Borsh enum tag stays at `3`. A pinned-length test in
+    /// `lib.rs::tests` (`execute_action_borsh_field_order_is_pinned_through_p4`)
+    /// is updated alongside each change so any future field addition
+    /// fails loudly.
+    ///
+    /// `solend_boundary_proof` is `Some(_)` when `action_type ==
+    /// Stage2ActionType::SolendWithdrawAllDelegated` and `None`
+    /// otherwise. The on-chain `process_execute_action` enforces this
+    /// pairing — supplying `None` for a Solend action fails closed
+    /// with `SolendBoundaryProofMissing`.
     ///
     /// Variant order MUST stay append-only: this is the 4th variant
     /// (Borsh `u8` ordinal `3`) and a future-added variant goes after,
@@ -152,7 +166,7 @@ pub enum AuthorityInstruction {
     ///   0. `[signer]`           executor          — must equal authz.executor
     ///   1. `[writable]`         authz_pda         — existing PDA
     ///   2. `[]`                 user              — must equal authz.user (readonly)
-    ///   3. `[]`                 delegated_wallet  — readonly placeholder (P4+ wires CPI)
+    ///   3. `[]`                 delegated_wallet  — readonly placeholder (P5+ wires CPI)
     ExecuteAction {
         schema_version: u8,
         rule_id: [u8; 16],
@@ -161,6 +175,7 @@ pub enum AuthorityInstruction {
         input_amount_raw: u64,
         execution_nonce: u64,
         condition_proof: ConditionProofPayload,
+        solend_boundary_proof: Option<SolendBoundaryProof>,
     },
 }
 
@@ -253,11 +268,17 @@ pub fn close_authorization_instruction(
 
 /// Build an `ExecuteAction` instruction for off-chain tx builders and
 /// tests. The account list is pinned to the same order the on-chain
-/// processor reads (executor, authz_pda, user, delegated_wallet); P4+
+/// processor reads (executor, authz_pda, user, delegated_wallet); P5+
 /// will append Solend / Jupiter accounts after `delegated_wallet`.
 ///
-/// `condition_proof` is the deterministic per-condition payload the
-/// program evaluates before mutating state — see [`ConditionProofPayload`].
+/// - `condition_proof` is the deterministic per-condition payload the
+///   program evaluates before mutating state — see
+///   [`ConditionProofPayload`].
+/// - `solend_boundary_proof` MUST be `Some(_)` when `action_type ==
+///   Stage2ActionType::SolendWithdrawAllDelegated`, and `None`
+///   otherwise. The on-chain processor enforces this — see
+///   [`SolendBoundaryProof`] and the boundary verifier in
+///   `solend_boundary.rs`.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_action_instruction(
     program_id: &Pubkey,
@@ -271,6 +292,7 @@ pub fn execute_action_instruction(
     input_amount_raw: u64,
     execution_nonce: u64,
     condition_proof: ConditionProofPayload,
+    solend_boundary_proof: Option<SolendBoundaryProof>,
 ) -> Instruction {
     let (authz_pda, _bump) =
         derive_authorization_pda(program_id, schema_version, user, &rule_id);
@@ -282,6 +304,7 @@ pub fn execute_action_instruction(
         input_amount_raw,
         execution_nonce,
         condition_proof,
+        solend_boundary_proof,
     })
     .expect("borsh serialization of AuthorityInstruction is infallible");
 

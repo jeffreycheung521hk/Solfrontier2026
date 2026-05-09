@@ -86,6 +86,7 @@ use solana_program::{
 pub mod condition_verifier;
 pub mod error;
 pub mod instruction;
+pub mod solend_boundary;
 pub mod state;
 
 use crate::condition_verifier::{
@@ -96,6 +97,7 @@ use crate::error::AuthorityError;
 use crate::instruction::{
     AuthorityInstruction, ConditionProofPayload, ProofCondition, MAX_PROOF_CONDITIONS,
 };
+use crate::solend_boundary::{verify_solend_delegated_boundary, SolendBoundaryProof};
 use crate::state::{
     AuthorizationRecord, Stage2ActionType, STAGE2_AUTHORITY_SCHEMA_VERSION,
 };
@@ -154,6 +156,7 @@ pub fn process_instruction(
             input_amount_raw,
             execution_nonce,
             condition_proof,
+            solend_boundary_proof,
         } => process_execute_action(
             program_id,
             accounts,
@@ -164,6 +167,7 @@ pub fn process_instruction(
             input_amount_raw,
             execution_nonce,
             condition_proof,
+            solend_boundary_proof,
         ),
     }
 }
@@ -468,15 +472,17 @@ fn process_close_authorization(
 }
 
 /// Execute the action authorised by an existing authorization PDA
-/// (Stage 2 P2 boundary + P3 condition gate).
+/// (Stage 2 P2 boundary + P3 condition gate + P4 Solend delegated
+/// withdraw boundary).
 ///
 /// All `AuthorizationRecord` checks the spec demands run here. The
-/// processor performs **no** Solend / Jupiter CPI — variant-15 and
-/// sibling-ix verification are deferred to P4+ (see TODOs). P3 adds
-/// the deterministic condition gate: every supplied
-/// `ProofCondition` is verified through `condition_verifier`, the
-/// per-condition booleans are folded with the supplied
-/// `condition_logic`, and state mutation is gated on a `true` fold.
+/// processor performs **no** Solend / Jupiter CPI — Solend variant-15
+/// CPI and Jupiter sibling-ix sysvar verification are deferred to P5+
+/// (see TODOs). P4 adds the deterministic Solend boundary gate: when
+/// `record.allowed_action_type == SolendWithdrawAllDelegated`, the
+/// supplied `SolendBoundaryProof` is verified before any state
+/// mutation. For other action types (Jupiter), the Solend boundary
+/// gate is skipped and the supplied proof MUST be `None`.
 ///
 /// Boundary ordering (cheap → expensive, fail closed at the first
 /// mismatch):
@@ -486,14 +492,20 @@ fn process_close_authorization(
 ///   3. Lifecycle checks (expiry, revoked, completed)
 ///   4. Cap / nonce / replay checks (input_amount, monotone nonce,
 ///      same-slot replay)
-///   5. **Condition verification (P3 — this slice)**
-///   6. State mutation (one-shot v1)
+///   5. Condition verification (P3)
+///   6. **Solend delegated boundary (P4 — this slice; runs only for
+///       `Stage2ActionType::SolendWithdrawAllDelegated`)**
+///   7. State mutation (one-shot v1)
+///
+/// Checks → Checks → Effects: every gate above must pass before
+/// `used_amount_raw`, `completed`, `execution_nonce`, and
+/// `last_execution_slot` are written.
 ///
 /// Accounts (in order):
 ///   0. `[signer]`   executor          — must equal record.executor
 ///   1. `[writable]` authorization_pda — owned by this program
 ///   2. `[]`         user              — must equal record.user
-///   3. `[]`         delegated_wallet  — readonly placeholder for P4+
+///   3. `[]`         delegated_wallet  — readonly placeholder for P5+
 #[allow(clippy::too_many_arguments)]
 fn process_execute_action(
     program_id: &Pubkey,
@@ -505,6 +517,7 @@ fn process_execute_action(
     input_amount_raw: u64,
     execution_nonce: u64,
     condition_proof: ConditionProofPayload,
+    solend_boundary_proof: Option<SolendBoundaryProof>,
 ) -> ProgramResult {
     let account_iter = &mut accounts.iter();
     let executor_account = next_account_info(account_iter)?;
@@ -705,6 +718,30 @@ fn process_execute_action(
     if !combined {
         return Err(AuthorityError::ConditionNotMet.into());
     }
+
+    // ── Solend delegated boundary gate (P4) ─────────────────────────────
+    //
+    // Active only for SolendWithdrawAllDelegated. For Jupiter actions
+    // (or any future non-Solend action), the boundary proof MUST be
+    // `None` — if a hostile executor attaches a Solend proof to a
+    // Jupiter execute, we ignore it (rather than treat it as a
+    // tampered Jupiter call), because P4 is scoped strictly to
+    // Solend. P5+ will land the Jupiter pre/post bracket gate here.
+    //
+    // For Solend, the proof MUST be `Some(_)`; missing fails closed
+    // with `SolendBoundaryProofMissing`.
+    if record.allowed_action_type
+        == crate::state::Stage2ActionType::SolendWithdrawAllDelegated.to_u8()
+    {
+        let proof = solend_boundary_proof
+            .as_ref()
+            .ok_or(AuthorityError::SolendBoundaryProofMissing)?;
+        verify_solend_delegated_boundary(&record, proof)?;
+    }
+    // For non-Solend actions in this slice, `solend_boundary_proof`
+    // is intentionally not consumed. (Jupiter pre/post bracket lives
+    // in a separate P5+ slice.)
+    let _ = &solend_boundary_proof;
 
     // ── State mutations (one-shot v1) ───────────────────────────────────
     record.used_amount_raw = new_used;
@@ -1121,6 +1158,8 @@ mod tests {
             input_amount_raw: 5_000_000,
             execution_nonce: 1,
             condition_proof: dummy_solend_proof(),
+            // Jupiter action: solend_boundary_proof MUST be None.
+            solend_boundary_proof: None,
         };
         let bytes = borsh::to_vec(&original).unwrap();
         let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
@@ -1141,6 +1180,40 @@ mod tests {
             input_amount_raw: 1,
             execution_nonce: 1,
             condition_proof: dummy_pyth_proof(),
+            solend_boundary_proof: None,
+        };
+        let bytes = borsh::to_vec(&original).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn execute_action_borsh_roundtrip_with_solend_boundary_proof() {
+        // P4 wire shape: append-only `Option<SolendBoundaryProof>`
+        // after `condition_proof`. Roundtrip with a representative
+        // proof.
+        let proof = crate::solend_boundary::SolendBoundaryProof {
+            solend_program_id: crate::solend_boundary::SOLEND_PROGRAM_ID_MAINNET,
+            obligation_pubkey: Pubkey::new_from_array([0x11; 32]),
+            obligation: crate::solend_boundary::ObligationFixture {
+                account_owner_program: crate::solend_boundary::SOLEND_PROGRAM_ID_MAINNET,
+                obligation_authority: Pubkey::new_from_array([0xBB; 32]),
+                lending_market: Pubkey::new_from_array([0x01; 32]),
+            },
+            reserve_pubkey: Pubkey::new_from_array([0x10; 32]),
+            lending_market_pubkey: Pubkey::new_from_array([0x01; 32]),
+            destination_pubkey: Pubkey::new_from_array([0xCC; 32]),
+            sibling_instructions: vec![],
+        };
+        let original = AuthorityInstruction::ExecuteAction {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0xAB; 16],
+            canonical_rule_hash: [0xCD; 32],
+            action_type: Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
+            input_amount_raw: 5_000_000,
+            execution_nonce: 1,
+            condition_proof: dummy_solend_proof(),
+            solend_boundary_proof: Some(proof),
         };
         let bytes = borsh::to_vec(&original).unwrap();
         let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
@@ -1199,14 +1272,15 @@ mod tests {
     }
 
     #[test]
-    fn execute_action_borsh_field_order_is_pinned_through_p3() {
+    fn execute_action_borsh_field_order_is_pinned_through_p4() {
         // Borsh: enum tag is `u8` ordinal in declaration order, then
         // variant body in declared field order, integers little-endian,
         // fixed `[u8; N]` arrays raw. ExecuteAction is the 4th variant
         // (CreateAuthorization=0, Revoke=1, CloseAuthorization=2,
         // ExecuteAction=3). The first 67 bytes — through `execution_nonce`
-        // — are pinned for forward compatibility with P2; the trailing
-        // bytes are P3's appended `condition_proof: ConditionProofPayload`.
+        // — are the pinned P2 prefix; bytes 67..72 are P3's empty
+        // `condition_proof`; byte 72 is P4's `Option` tag (None) for
+        // `solend_boundary_proof`.
         let proof = ConditionProofPayload {
             condition_logic: ConditionLogic::All,
             conditions: vec![],
@@ -1220,6 +1294,7 @@ mod tests {
             input_amount_raw: 0x0102_0304_0506_0708,
             execution_nonce: 0x1112_1314_1516_1718,
             condition_proof: proof,
+            solend_boundary_proof: None,
         };
         let bytes = borsh::to_vec(&ix).unwrap();
         // Pinned P2 prefix (unchanged) — 67 bytes through execution_nonce.
@@ -1244,14 +1319,21 @@ mod tests {
         );
         // P3 trailing bytes — the borsh-encoded ConditionProofPayload
         // appended after `execution_nonce`.
+        let p3_end = 67 + proof_bytes.len();
         assert_eq!(
-            &bytes[67..],
+            &bytes[67..p3_end],
             &proof_bytes[..],
-            "bytes 67.. = condition_proof (Borsh-encoded ConditionProofPayload)",
+            "bytes 67..p3_end = condition_proof (Borsh-encoded ConditionProofPayload)",
         );
-        // Total length pin: 67 + ConditionLogic (1) + Vec<u32 len> (4)
-        // for the empty conditions vec.
-        assert_eq!(bytes.len(), 67 + 1 + 4);
+        // P4 trailing byte — the borsh `Option` tag (0 = None) for
+        // solend_boundary_proof. Future fields append after this.
+        assert_eq!(
+            bytes[p3_end], 0,
+            "byte p3_end = solend_boundary_proof Option tag (0 = None)"
+        );
+        // Total length pin: 67 (P2 prefix) + 1 + 4 (P3 empty proof:
+        // ConditionLogic byte + Vec<u32 len>) + 1 (P4 Option None tag).
+        assert_eq!(bytes.len(), 67 + 1 + 4 + 1);
     }
 
     #[test]
@@ -1289,6 +1371,7 @@ mod tests {
                 condition_logic: ConditionLogic::All,
                 conditions: vec![],
             },
+            solend_boundary_proof: None,
         })
         .unwrap();
         assert_eq!(execute[0], 3, "ExecuteAction tag = 3");
@@ -1333,6 +1416,21 @@ mod tests {
         assert_eq!(AuthorityError::PythConfidenceTooWide as u32, 29);
         assert_eq!(AuthorityError::SolendFormulaVersionUnsupported as u32, 30);
         assert_eq!(AuthorityError::SolendReserveStale as u32, 31);
+        // P4 Solend boundary (append-only).
+        assert_eq!(AuthorityError::SolendBoundaryProofMissing as u32, 32);
+        assert_eq!(AuthorityError::UnsupportedSolendAction as u32, 33);
+        assert_eq!(AuthorityError::SolendProgramMismatch as u32, 34);
+        assert_eq!(AuthorityError::SolendObligationOwnerMismatch as u32, 35);
+        assert_eq!(AuthorityError::SolendObligationAuthorityMismatch as u32, 36);
+        assert_eq!(AuthorityError::SolendMainWalletObligationRejected as u32, 37);
+        assert_eq!(AuthorityError::SolendReserveMismatch as u32, 38);
+        assert_eq!(AuthorityError::SolendLendingMarketMismatch as u32, 39);
+        assert_eq!(AuthorityError::SolendDestinationMismatch as u32, 40);
+        assert_eq!(AuthorityError::SolendRefreshMissing as u32, 41);
+        assert_eq!(AuthorityError::SolendWithdrawMissing as u32, 42);
+        assert_eq!(AuthorityError::SolendInstructionOrderInvalid as u32, 43);
+        assert_eq!(AuthorityError::SolendDuplicateOrConflictingInstruction as u32, 44);
+        assert_eq!(AuthorityError::SolendBoundaryVerificationFailed as u32, 45);
     }
 
     #[test]
