@@ -155,7 +155,7 @@ export interface CanonicalIntent {
 // schema requires. A new dependency would be overkill for this surface
 // area; the canonical-intent.rs schema is intentionally closed.
 
-class BorshWriter {
+export class BorshWriter {
   private chunks: number[] = [];
 
   private push(byte: number): void {
@@ -170,6 +170,11 @@ class BorshWriter {
     this.push(n);
   }
 
+  /** Borsh `bool` — 1 raw byte (`0x00` for false, `0x01` for true). */
+  writeBool(b: boolean): void {
+    this.push(b ? 1 : 0);
+  }
+
   /** u16 — 2 bytes, little-endian. */
   writeU16(n: number): void {
     if (!Number.isInteger(n) || n < 0 || n > 0xffff) {
@@ -177,6 +182,30 @@ class BorshWriter {
     }
     this.push(n & 0xff);
     this.push((n >> 8) & 0xff);
+  }
+
+  /** u32 — 4 bytes, little-endian. */
+  writeU32(n: number): void {
+    if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) {
+      throw new Error(`writeU32: out-of-range value ${n}`);
+    }
+    this.push(n & 0xff);
+    this.push((n >>> 8) & 0xff);
+    this.push((n >>> 16) & 0xff);
+    this.push((n >>> 24) & 0xff);
+  }
+
+  /** i32 — 4 bytes, little-endian, two's complement. */
+  writeI32(n: number): void {
+    if (!Number.isInteger(n) || n < -0x80000000 || n > 0x7fffffff) {
+      throw new Error(`writeI32: out-of-range value ${n}`);
+    }
+    // Two's complement = unsigned wraparound for the same bit pattern.
+    const u = n < 0 ? n + 0x100000000 : n;
+    this.push(u & 0xff);
+    this.push((u >>> 8) & 0xff);
+    this.push((u >>> 16) & 0xff);
+    this.push((u >>> 24) & 0xff);
   }
 
   /** u64 — 8 bytes, little-endian. Accepts bigint OR safe-integer Number. */
@@ -193,6 +222,26 @@ class BorshWriter {
     const MAX_U64 = BigInt("18446744073709551615"); // 2^64 - 1
     if (v < BigInt(0) || v > MAX_U64) {
       throw new Error(`writeU64: out-of-range value ${v}`);
+    }
+    const MASK = BigInt(0xff);
+    for (let i = 0; i < 8; i++) {
+      this.push(Number(v & MASK));
+      v >>= BigInt(8);
+    }
+  }
+
+  /** i64 — 8 bytes, little-endian, two's complement. Accepts bigint
+   *  OR safe-integer Number. */
+  writeI64(n: bigint | number): void {
+    let v: bigint = typeof n === "number" ? BigInt(n) : n;
+    const MIN_I64 = BigInt("-9223372036854775808");
+    const MAX_I64 = BigInt("9223372036854775807");
+    if (v < MIN_I64 || v > MAX_I64) {
+      throw new Error(`writeI64: out-of-range value ${v}`);
+    }
+    // Two's complement: negative numbers wrap to (2^64 + v).
+    if (v < BigInt(0)) {
+      v = BigInt("18446744073709551616") + v;
     }
     const MASK = BigInt(0xff);
     for (let i = 0; i < 8; i++) {
