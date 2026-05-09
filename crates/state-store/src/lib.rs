@@ -29,6 +29,7 @@ pub mod pending_state;
 pub mod session_policy;
 pub mod sessions;
 pub mod spend;
+pub mod stage2_watch_rules;
 pub mod tool_traces;
 pub mod tracking;
 pub mod transactions;
@@ -45,6 +46,9 @@ pub use pending_state::PendingStateRepository;
 pub use session_policy::SessionPolicyRepository;
 pub use sessions::SessionRepository;
 pub use spend::SpendRepository;
+pub use stage2_watch_rules::{
+    Stage2WatchRuleRepository, StoredWatchRule, WatchRuleStatus,
+};
 pub use tool_traces::ToolTraceRepository;
 pub use transactions::TransactionRepository;
 pub use tracking::TransactionTrackingRepository;
