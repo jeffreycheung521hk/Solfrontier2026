@@ -101,7 +101,14 @@ use crate::instruction::{
     AuthorityInstruction, ConditionProofPayload, ProofCondition, MAX_PROOF_CONDITIONS,
 };
 use crate::jupiter_boundary::{verify_jupiter_boundary_skeleton, JupiterBoundaryProof};
+use crate::solend_account_decode::{
+    decode_spl_token_account_lite, SPL_TOKEN_PROGRAM_ID,
+};
 use crate::solend_boundary::{verify_solend_delegated_boundary, SolendBoundaryProof};
+use crate::solend_cpi_builder::{
+    try_solend_cpi_skeleton, SolendCpiSubstrate, SolendWithdrawAccounts,
+    SolendWithdrawShadowExpectations, WITHDRAW_BASE_ACCOUNTS_LEN,
+};
 use crate::state::{
     AuthorizationRecord, Stage2ActionType, STAGE2_AUTHORITY_SCHEMA_VERSION,
 };
@@ -543,9 +550,16 @@ fn process_execute_action(
     let executor_account = next_account_info(account_iter)?;
     let authz_pda_account = next_account_info(account_iter)?;
     let user_account = next_account_info(account_iter)?;
-    let _delegated_wallet_account = next_account_info(account_iter)?;
-    // TODO(Stage 2 P3): Solend same-tx refresh + variant 15
-    // TODO(Stage 2 P4): Jupiter sibling-ix verification via instructions sysvar
+    let delegated_wallet_account = next_account_info(account_iter)?;
+    // P5b-2: Solend CPI substrate accounts at slots 4..=N follow the
+    // P4-pinned base layout (executor / authz_pda / user / delegated).
+    // The slice from `accounts[4..]` is consumed by the Solend CPI
+    // skeleton orchestrator below WHEN the action is
+    // `SolendWithdrawAllDelegated` AND the optional CPI account
+    // substrate is supplied (length-gated). Existing P1/P2/P3/P4
+    // tests that pass only the 4 base accounts continue to work — the
+    // orchestrator is skipped for them.
+    // TODO(Stage 2 P5+): Jupiter sibling-ix verification via instructions sysvar
     // TODO(Stage 2): token balance pre/post bracket assertion
 
     // ── Boundary checks (fail-closed, in spec order) ────────────────────
@@ -793,6 +807,173 @@ fn process_execute_action(
     // For non-Jupiter actions, `jupiter_boundary_proof` is
     // intentionally not consumed.
     let _ = &jupiter_boundary_proof;
+
+    // ── P5b-2 Solend CPI skeleton orchestrator (length-gated) ──────────
+    //
+    // Active only when:
+    //   1. action == SolendWithdrawAllDelegated, AND
+    //   2. the caller passed enough additional accounts to fill the
+    //      variant-15 12 base accounts + 4 substrate accounts
+    //      (solend_program, pyth_oracle, switchboard_oracle,
+    //      clock_sysvar) at fixed absolute offsets after the existing
+    //      P1/P2/P3/P4 4 base accounts.
+    //
+    // Absolute account layout when the orchestrator engages:
+    //   0  executor                 (existing)
+    //   1  authz_pda                 (existing)
+    //   2  user                      (existing)
+    //   3  delegated_wallet          (existing — must be signer in P5b-2)
+    //   4  source_collateral         (variant-15 slot 0)
+    //   5  delegated_ctoken          (variant-15 slot 1)
+    //   6  reserve                   (variant-15 slot 2)
+    //   7  obligation                (variant-15 slot 3)
+    //   8  lending_market            (variant-15 slot 4)
+    //   9  lending_market_authority  (variant-15 slot 5)
+    //  10  destination               (variant-15 slot 6)
+    //  11  reserve_collateral_mint   (variant-15 slot 7)
+    //  12  reserve_liquidity_supply  (variant-15 slot 8)
+    //  13  obligation_owner          (variant-15 slot 9 — signer)
+    //  14  user_transfer_authority   (variant-15 slot 10 — signer)
+    //  15  token_program             (variant-15 slot 11)
+    //  16  solend_program            (substrate)
+    //  17  pyth_oracle               (substrate)
+    //  18  switchboard_oracle        (substrate)
+    //  19  clock_sysvar              (substrate)
+    //  20+ deposit_reserves          (variable — at least 1 element
+    //                                  required by the orchestrator)
+    //
+    // If `accounts.len() < 21` (the absolute minimum for this layout
+    // with one deposit reserve), the orchestrator is skipped silently
+    // so existing P1/P2/P3/P4 tests that pass only the 4 base accounts
+    // continue to pass unchanged.
+    //
+    // Under Mode B (the P5b-2 production default), the orchestrator
+    // fails closed at the oracle gate after running Phase 1 validation
+    // end-to-end (signer guard, sysvar guard, shadow mapping, cToken
+    // amount read). This means callers see the most-specific error
+    // first when they violate an earlier invariant; only after every
+    // earlier check passes does the oracle fail-closed sentinel fire
+    // (`SolendCpiSuccessPathBlockedByOracleValidation`). When the
+    // orchestrator returns Err, we propagate immediately and refuse to
+    // mutate `AuthorizationRecord` — same contract as the boundary
+    // gates above.
+    const P5B2_MIN_ACCOUNTS: usize = 4 + WITHDRAW_BASE_ACCOUNTS_LEN + 4 + 1;
+    if record.allowed_action_type
+        == crate::state::Stage2ActionType::SolendWithdrawAllDelegated.to_u8()
+        && accounts.len() >= P5B2_MIN_ACCOUNTS
+    {
+        // Borrow hygiene: this whole block opens narrow, scoped borrows
+        // inside `try_solend_cpi_skeleton` and its Phase 1 validators;
+        // every borrow guard is dropped before we reach the (currently
+        // unreachable under Mode B) `invoke()` call sites in the CPI
+        // helpers. The `record` value is owned (decoded into a local
+        // above), and the only `authz_pda_account.data` borrow that
+        // happens after this block is the `borrow_mut()` for the final
+        // serialize — no overlap.
+        let withdraw_slice = &accounts[4..4 + WITHDRAW_BASE_ACCOUNTS_LEN];
+        let withdraw_accounts = SolendWithdrawAccounts::parse(withdraw_slice)?;
+        let solend_program_account = &accounts[4 + WITHDRAW_BASE_ACCOUNTS_LEN];
+        let pyth_oracle_account = &accounts[4 + WITHDRAW_BASE_ACCOUNTS_LEN + 1];
+        let switchboard_oracle_account = &accounts[4 + WITHDRAW_BASE_ACCOUNTS_LEN + 2];
+        let clock_sysvar_account = &accounts[4 + WITHDRAW_BASE_ACCOUNTS_LEN + 3];
+        let substrate = SolendCpiSubstrate {
+            solend_program: solend_program_account,
+            pyth_oracle: pyth_oracle_account,
+            switchboard_oracle: switchboard_oracle_account,
+            clock_sysvar: clock_sysvar_account,
+            extra_oracle: None,
+        };
+
+        // Deposit-reserves tail. Per Solend's
+        // `update_borrow_attribution_values(&accounts[12..])`, the
+        // remaining accounts after the substrate slots are forwarded
+        // positionally as deposit reserves. For the simple Stage 2
+        // single-deposit case this is one element equal to the
+        // withdraw reserve.
+        let deposit_reserves_start = 4 + WITHDRAW_BASE_ACCOUNTS_LEN + 4;
+        let mut deposit_reserves: Vec<&AccountInfo> =
+            Vec::with_capacity(accounts.len().saturating_sub(deposit_reserves_start));
+        for acc in accounts[deposit_reserves_start..].iter() {
+            deposit_reserves.push(acc);
+        }
+
+        // Derive expectations for the shadow-mapping validator.
+        //
+        // - `expected_obligation` / `expected_reserve` /
+        //   `expected_lending_market` / `expected_destination`
+        //   come from the Solend boundary proof (already verified
+        //   against the AuthorizationRecord in the P4 gate above).
+        //   Re-using them here makes the shadow mapping a defence-in-
+        //   depth structural check on the variant-15 AccountInfo list.
+        //
+        // - `expected_ctoken_mint` is set to `accounts[11].key` — the
+        //   variant-15 reserve_collateral_mint slot. The user's signed
+        //   WatchRule commits (via canonical_rule_hash) to this mint
+        //   being the cToken mint for the rule's reserve; the validator
+        //   then enforces that the cToken account at variant-15 slot 1
+        //   has the SAME mint in its data, which is a meaningful
+        //   structural invariant (Solend mints unique cTokens per
+        //   reserve and the user authorised redemption of *this*
+        //   reserve's cTokens).
+        //
+        // - `expected_liquidity_mint` is read from the destination
+        //   AccountInfo's data (slot 10). This is a Mode B limitation:
+        //   the boundary proof does NOT carry the liquidity mint as a
+        //   committed expectation, and the user's WatchRule's mint
+        //   commitment is not surfaced into the on-chain record. So we
+        //   peek the destination's mint here, then re-validate it
+        //   inside the shadow mapping (which is structurally identical
+        //   under Mode B but reachable code under future modes when the
+        //   commitment lands). The peek opens a narrow borrow on the
+        //   destination's data and drops it before calling the
+        //   orchestrator — no borrow guard crosses the orchestrator
+        //   call. Under Mode B the success path fails closed at the
+        //   oracle gate inside the orchestrator anyway, so this
+        //   peek-then-validate is acceptable.
+        let solend_proof = solend_boundary_proof
+            .as_ref()
+            .ok_or(AuthorityError::SolendBoundaryProofMissing)?;
+
+        let expected_ctoken_mint = *withdraw_accounts.reserve_collateral_mint.key;
+        let expected_liquidity_mint = {
+            // The destination account-level owner check the validator
+            // performs is structural; here we only need the inner mint
+            // field to thread back through the validator. Reject any
+            // non-SPL-Token destination here so the borrow path stays
+            // tight.
+            if withdraw_accounts.destination.owner != &SPL_TOKEN_PROGRAM_ID {
+                return Err(AuthorityError::SolendTokenAccountOwnerMismatch.into());
+            }
+            let dest_data = withdraw_accounts
+                .destination
+                .try_borrow_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            let decoded = decode_spl_token_account_lite(&dest_data)?;
+            // Borrow guard `dest_data` drops at end of this block —
+            // no `dest_data` reference survives past here, satisfying
+            // the borrow-not-across-CPI invariant.
+            drop(dest_data);
+            Pubkey::new_from_array(decoded.mint.to_bytes())
+        };
+
+        let expectations = SolendWithdrawShadowExpectations {
+            solend_program_id: &solend_proof.solend_program_id,
+            expected_obligation: &solend_proof.obligation_pubkey,
+            expected_reserve: &solend_proof.reserve_pubkey,
+            expected_lending_market: &solend_proof.lending_market_pubkey,
+            expected_ctoken_mint: &expected_ctoken_mint,
+            expected_liquidity_mint: &expected_liquidity_mint,
+        };
+
+        try_solend_cpi_skeleton(
+            &record,
+            delegated_wallet_account,
+            &substrate,
+            &withdraw_accounts,
+            &deposit_reserves,
+            &expectations,
+        )?;
+    }
 
     // ── State mutations (one-shot v1) ───────────────────────────────────
     record.used_amount_raw = new_used;
@@ -1570,6 +1751,37 @@ mod tests {
         assert_eq!(AuthorityError::JupiterSiblingListTooLarge as u32, 57);
         assert_eq!(AuthorityError::JupiterBracketCheckpointMissing as u32, 58);
         assert_eq!(AuthorityError::JupiterBracketCheckpointConsumed as u32, 59);
+        // P5a Solend account decode + boundary hardening (append-only).
+        assert_eq!(AuthorityError::SolendAccountDataTooShort as u32, 60);
+        assert_eq!(AuthorityError::SolendAccountOwnerMismatch as u32, 61);
+        assert_eq!(AuthorityError::SolendObligationDecodeFailed as u32, 62);
+        assert_eq!(AuthorityError::SolendReserveDecodeFailed as u32, 63);
+        assert_eq!(AuthorityError::SolendUnsupportedObligationVersion as u32, 64);
+        assert_eq!(AuthorityError::SolendUnsupportedReserveVersion as u32, 65);
+        assert_eq!(AuthorityError::SolendObligationLendingMarketMismatch as u32, 66);
+        assert_eq!(AuthorityError::SolendReserveLendingMarketMismatch as u32, 67);
+        assert_eq!(AuthorityError::SolendLastUpdateSlotMismatch as u32, 68);
+        assert_eq!(AuthorityError::SolendTokenAccountOwnerMismatch as u32, 69);
+        assert_eq!(AuthorityError::SolendTokenAccountMintMismatch as u32, 70);
+        assert_eq!(AuthorityError::SolendTokenAccountAuthorityMismatch as u32, 71);
+        assert_eq!(AuthorityError::SolendTokenAccountInvalidLength as u32, 72);
+        // P5b-1 Solend CPI builder shadow-mapping (append-only).
+        assert_eq!(AuthorityError::SolendCpiAccountOrderInvalid as u32, 73);
+        assert_eq!(AuthorityError::SolendCpiSysvarMismatch as u32, 74);
+        assert_eq!(AuthorityError::SolendCpiTokenProgramMismatch as u32, 75);
+        assert_eq!(AuthorityError::SolendCpiZeroCollateralAmount as u32, 76);
+        assert_eq!(AuthorityError::SolendCpiOracleUnverified as u32, 77);
+        assert_eq!(AuthorityError::SolendCpiBuilderInvariantFailed as u32, 78);
+        // P5b-2 Solend CPI skeleton (append-only).
+        assert_eq!(AuthorityError::SolendCpiDelegatedWalletMissing as u32, 79);
+        assert_eq!(AuthorityError::SolendCpiDelegatedWalletNotSigner as u32, 80);
+        assert_eq!(AuthorityError::SolendCpiDelegatedWalletMismatch as u32, 81);
+        assert_eq!(AuthorityError::SolendCpiRefreshReserveFailed as u32, 82);
+        assert_eq!(AuthorityError::SolendCpiRefreshObligationFailed as u32, 83);
+        assert_eq!(AuthorityError::SolendCpiWithdrawFailed as u32, 84);
+        assert_eq!(AuthorityError::SolendCpiSuccessPathBlockedByOracleValidation as u32, 85);
+        assert_eq!(AuthorityError::SolendCpiInsufficientAccounts as u32, 86);
+        assert_eq!(AuthorityError::SolendCpiBorrowAcrossInvokeRisk as u32, 87);
     }
 
     #[test]

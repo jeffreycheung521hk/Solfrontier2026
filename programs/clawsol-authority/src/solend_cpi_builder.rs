@@ -126,7 +126,8 @@
 
 use solana_program::{
     account_info::AccountInfo,
-    instruction::AccountMeta,
+    instruction::{AccountMeta, Instruction},
+    program::invoke,
     program_error::ProgramError,
     pubkey::Pubkey,
     sysvar,
@@ -872,6 +873,409 @@ pub fn verify_oracles_or_fail_closed_p5b1(
     _expected_reserve: &Pubkey,
 ) -> Result<(), ProgramError> {
     Err(AuthorityError::SolendCpiOracleUnverified.into())
+}
+
+// ── P5b-2: CPI helpers (uses `invoke`, NEVER `invoke_signed`) ───────────────
+//
+// These helpers wire the three Solend instructions a same-tx delegated
+// withdraw needs into actual CPI calls via `invoke()`. They follow the
+// **external delegated-wallet signer model**: the delegated_wallet is a
+// transaction-level signer (not a PDA), so the program calls `invoke`
+// — never `invoke_signed`. The PDA-signed path (Option A in the
+// `solend_cpi_builder.rs` Signer/bump policy section) remains
+// **deferred** until `AuthorizationRecord` carries a
+// `delegated_wallet_bump` (see project memory entry
+// `project_p5b2_bump_blocker.md`).
+//
+// **Borrow safety.** Each helper takes `&AccountInfo` references plus
+// instruction-data + AccountMeta lists already prepared by Phase 1. No
+// `try_borrow_data` or `try_borrow_mut_data` is called inside these
+// helpers. Phase 1 (validation + value collection) MUST drop every
+// `Ref<&[u8]>` guard before invoking any of these helpers — otherwise
+// the BPF runtime will panic on cross-CPI borrow conflict. See
+// `try_solend_cpi_skeleton` for the Phase 1 / Phase 2 split.
+//
+// **No `find_program_address`.** Callers pass the
+// `lending_market_authority` pubkey in (resolved off-chain or via a
+// committed pubkey in the AuthorizationRecord); we never derive PDAs
+// in the hot path.
+
+/// Phase-2 CPI: invoke Solend `RefreshReserve` (variant 3).
+///
+/// Borrow-safe contract:
+/// - The caller MUST have already dropped every account-data borrow
+///   guard before calling this function.
+/// - This helper takes only `&AccountInfo` references; it does NOT call
+///   `try_borrow_data` or `try_borrow_mut_data`.
+/// - On Solend CPI failure the result is mapped to
+///   [`AuthorityError::SolendCpiRefreshReserveFailed`].
+///
+/// `extra_oracle` is included only when `Some`. The wire shape and
+/// `AccountMeta` order mirror [`build_refresh_reserve_metas`].
+pub fn cpi_refresh_reserve<'a, 'info>(
+    solend_program: &'a AccountInfo<'info>,
+    reserve: &'a AccountInfo<'info>,
+    pyth_oracle: &'a AccountInfo<'info>,
+    switchboard_oracle: &'a AccountInfo<'info>,
+    clock_sysvar: &'a AccountInfo<'info>,
+    extra_oracle: Option<&'a AccountInfo<'info>>,
+) -> Result<(), ProgramError> {
+    if solend_program.key != &SOLEND_PROGRAM_ID_MAINNET {
+        return Err(AuthorityError::SolendProgramMismatch.into());
+    }
+    let metas = build_refresh_reserve_metas(
+        *reserve.key,
+        *pyth_oracle.key,
+        *switchboard_oracle.key,
+        *clock_sysvar.key,
+        extra_oracle.map(|a| *a.key),
+    );
+    let ix = Instruction {
+        program_id: *solend_program.key,
+        accounts: metas,
+        data: build_refresh_reserve_data(),
+    };
+    let mut account_infos: Vec<AccountInfo<'info>> = Vec::with_capacity(if extra_oracle.is_some() { 5 } else { 4 });
+    account_infos.push(reserve.clone());
+    account_infos.push(pyth_oracle.clone());
+    account_infos.push(switchboard_oracle.clone());
+    account_infos.push(clock_sysvar.clone());
+    if let Some(extra) = extra_oracle {
+        account_infos.push(extra.clone());
+    }
+    invoke(&ix, &account_infos)
+        .map_err(|_| AuthorityError::SolendCpiRefreshReserveFailed.into())
+}
+
+/// Phase-2 CPI: invoke Solend `RefreshObligation` (variant 7).
+///
+/// Borrow-safe contract: same as [`cpi_refresh_reserve`].
+///
+/// `deposit_reserves` is the obligation's deposit-reserve list (each
+/// writable, not signer); for the simple Stage 2 single-deposit case
+/// this is typically one element equal to the withdraw reserve. The
+/// caller MUST pass them in obligation-deposit order — Solend's
+/// `update_borrow_attribution_values` consumes them positionally.
+pub fn cpi_refresh_obligation<'a, 'info>(
+    solend_program: &'a AccountInfo<'info>,
+    obligation: &'a AccountInfo<'info>,
+    deposit_reserves: &[&'a AccountInfo<'info>],
+) -> Result<(), ProgramError> {
+    if solend_program.key != &SOLEND_PROGRAM_ID_MAINNET {
+        return Err(AuthorityError::SolendProgramMismatch.into());
+    }
+    let mut reserve_pubkeys: Vec<Pubkey> = Vec::with_capacity(deposit_reserves.len());
+    for r in deposit_reserves {
+        reserve_pubkeys.push(*r.key);
+    }
+    let metas = build_refresh_obligation_metas(*obligation.key, &reserve_pubkeys);
+    let ix = Instruction {
+        program_id: *solend_program.key,
+        accounts: metas,
+        data: build_refresh_obligation_data(),
+    };
+    let mut account_infos: Vec<AccountInfo<'info>> = Vec::with_capacity(1 + deposit_reserves.len());
+    account_infos.push(obligation.clone());
+    for r in deposit_reserves {
+        account_infos.push((*r).clone());
+    }
+    invoke(&ix, &account_infos)
+        .map_err(|_| AuthorityError::SolendCpiRefreshObligationFailed.into())
+}
+
+/// Phase-2 CPI: invoke Solend
+/// `WithdrawObligationCollateralAndRedeemReserveCollateral` (variant 15).
+///
+/// Borrow-safe contract: same as [`cpi_refresh_reserve`].
+///
+/// Signer model: `obligation_owner` and `user_transfer_authority` MUST
+/// both equal `AuthorizationRecord.delegated_wallet` AND have
+/// `is_signer == true` at the transaction level. This function does not
+/// re-check those invariants — the orchestrator
+/// [`try_solend_cpi_skeleton`] runs them in Phase 1.
+///
+/// `deposit_reserves` is appended after slot 11. Each entry is
+/// writable, not signer.
+#[allow(clippy::too_many_arguments)]
+pub fn cpi_withdraw_obligation_collateral_and_redeem_reserve_collateral<'a, 'info>(
+    solend_program: &'a AccountInfo<'info>,
+    accounts: &SolendWithdrawAccounts<'a, 'info>,
+    deposit_reserves: &[&'a AccountInfo<'info>],
+    amount: u64,
+) -> Result<(), ProgramError> {
+    if solend_program.key != &SOLEND_PROGRAM_ID_MAINNET {
+        return Err(AuthorityError::SolendProgramMismatch.into());
+    }
+    let mut deposit_reserve_pubkeys: Vec<Pubkey> = Vec::with_capacity(deposit_reserves.len());
+    for r in deposit_reserves {
+        deposit_reserve_pubkeys.push(*r.key);
+    }
+    let metas = build_withdraw_obligation_collateral_and_redeem_reserve_collateral_metas(
+        *accounts.source_collateral.key,
+        *accounts.delegated_ctoken.key,
+        *accounts.reserve.key,
+        *accounts.obligation.key,
+        *accounts.lending_market.key,
+        *accounts.lending_market_authority.key,
+        *accounts.destination.key,
+        *accounts.reserve_collateral_mint.key,
+        *accounts.reserve_liquidity_supply.key,
+        *accounts.obligation_owner.key,
+        *accounts.user_transfer_authority.key,
+        *accounts.token_program.key,
+        &deposit_reserve_pubkeys,
+    );
+    let ix = Instruction {
+        program_id: *solend_program.key,
+        accounts: metas,
+        data: build_withdraw_obligation_collateral_and_redeem_reserve_collateral_data(amount),
+    };
+    let mut account_infos: Vec<AccountInfo<'info>> =
+        Vec::with_capacity(WITHDRAW_BASE_ACCOUNTS_LEN + deposit_reserves.len());
+    account_infos.push(accounts.source_collateral.clone());
+    account_infos.push(accounts.delegated_ctoken.clone());
+    account_infos.push(accounts.reserve.clone());
+    account_infos.push(accounts.obligation.clone());
+    account_infos.push(accounts.lending_market.clone());
+    account_infos.push(accounts.lending_market_authority.clone());
+    account_infos.push(accounts.destination.clone());
+    account_infos.push(accounts.reserve_collateral_mint.clone());
+    account_infos.push(accounts.reserve_liquidity_supply.clone());
+    account_infos.push(accounts.obligation_owner.clone());
+    account_infos.push(accounts.user_transfer_authority.clone());
+    account_infos.push(accounts.token_program.clone());
+    for r in deposit_reserves {
+        account_infos.push((*r).clone());
+    }
+    invoke(&ix, &account_infos)
+        .map_err(|_| AuthorityError::SolendCpiWithdrawFailed.into())
+}
+
+// ── P5b-2: External delegated-wallet signer guard ───────────────────────────
+
+/// Verify that the supplied `delegated_wallet` AccountInfo:
+/// 1. equals `AuthorizationRecord.delegated_wallet`,
+/// 2. is NOT equal to `AuthorizationRecord.user` (defence-in-depth),
+/// 3. has `is_signer == true` at the transaction level.
+///
+/// This is the only sanctioned signer model in P5b-2. The PDA-signed
+/// path is **deferred** until `AuthorizationRecord` carries a
+/// `delegated_wallet_bump` (see `solend_cpi_builder.rs` Signer/bump
+/// policy section).
+pub fn require_external_delegated_wallet_signer(
+    delegated_wallet_account: &AccountInfo,
+    record: &AuthorizationRecord,
+) -> Result<(), ProgramError> {
+    if delegated_wallet_account.key == &record.user {
+        return Err(AuthorityError::SolendMainWalletObligationRejected.into());
+    }
+    if delegated_wallet_account.key != &record.delegated_wallet {
+        return Err(AuthorityError::SolendCpiDelegatedWalletMismatch.into());
+    }
+    if !delegated_wallet_account.is_signer {
+        return Err(AuthorityError::SolendCpiDelegatedWalletNotSigner.into());
+    }
+    Ok(())
+}
+
+// ── P5b-2: Oracle validation status (Mode A / B / C) ────────────────────────
+
+/// Oracle validation mode for the P5b-2 ExecuteAction Solend CPI path.
+///
+/// - **Mode A** — Official Reserve Oracle Decode. Extends the P5a
+///   reserve decoder with the official Solend reserve oracle fields,
+///   pinned by tests against the mainnet `Pack` source. Supplied oracle
+///   accounts must match the decoded reserve oracle config. P5b-2 does
+///   NOT pick A because the reserve oracle offsets have not been
+///   re-verified end-to-end against mainnet `Pack` (see
+///   `solend_account_decode.rs` "What this module is NOT" section, and
+///   `STAGE2_SOLEND_APY_RESEARCH.md` § 8 B-O1).
+/// - **Mode B** — Fail Closed. The CPI helper substrate is wired and
+///   exists, but the program success path returns
+///   [`SolendCpiSuccessPathBlockedByOracleValidation`] until oracle
+///   shadow mapping is resolved. **This is the P5b-2 default.**
+/// - **Mode C** — Demo Pinned Oracle Allowlist. A narrow demo-only
+///   static allowlist for the exact reserve/mint pair used in the demo,
+///   citing official source / repo / config proof for pinned oracle
+///   pubkeys. Fails closed for any reserve/mint not in the allowlist.
+///   P5b-2 does NOT pick C — the demo pinned oracle pubkeys for the
+///   mainnet USDC reserve have not been independently re-verified
+///   against an authoritative Solend config source for this slice.
+///
+/// **OracleResolved status: false. Mode: B.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolendOracleMode {
+    /// Mode A — official reserve oracle decode (NOT picked).
+    OfficialReserveDecode,
+    /// Mode B — fail closed until oracle validation lands.
+    FailClosed,
+    /// Mode C — demo pinned oracle allowlist (NOT picked).
+    DemoPinnedAllowlist,
+}
+
+/// Returns the oracle mode this build of `clawsol-authority` operates
+/// under. P5b-2 hardcodes [`SolendOracleMode::FailClosed`].
+pub const fn p5b2_oracle_mode() -> SolendOracleMode {
+    SolendOracleMode::FailClosed
+}
+
+// ── P5b-2: Two-phase Solend CPI orchestration ──────────────────────────────
+
+/// Bundle of the live AccountInfo references the orchestrator needs
+/// in addition to the [`SolendWithdrawAccounts`] base 12 slots.
+///
+/// `solend_program`, `pyth_oracle`, `switchboard_oracle`,
+/// `clock_sysvar`, and the optional `extra_oracle` are the additional
+/// accounts the RefreshReserve CPI needs that aren't in the variant-15
+/// base 12.
+#[derive(Debug, Clone, Copy)]
+pub struct SolendCpiSubstrate<'a, 'info> {
+    pub solend_program: &'a AccountInfo<'info>,
+    pub pyth_oracle: &'a AccountInfo<'info>,
+    pub switchboard_oracle: &'a AccountInfo<'info>,
+    pub clock_sysvar: &'a AccountInfo<'info>,
+    pub extra_oracle: Option<&'a AccountInfo<'info>>,
+}
+
+/// Two-phase Solend CPI orchestrator.
+///
+/// **Phase 1** (this function body before the `// Phase 2` marker):
+/// - Verify the delegated_wallet AccountInfo: signer + key match +
+///   not-the-user-main-wallet.
+/// - Verify the Solend program AccountInfo key + token-program slot.
+/// - Run [`validate_solend_withdraw_shadow_mapping`] (cross-checks every
+///   AccountInfo against `AuthorizationRecord` + boundary expectations).
+///   This narrowly opens `try_borrow_data()` guards on the obligation,
+///   reserve, delegated cToken, and destination accounts; the validator
+///   drops every guard before returning.
+/// - Read the live cToken `amount` via
+///   [`read_live_ctoken_amount_or_fail_closed`] (also drops its borrow).
+/// - Verify `clock_sysvar` is the canonical
+///   `solana_program::sysvar::clock::id()`.
+/// - Apply the oracle validation gate
+///   ([`verify_oracles_or_fail_closed_p5b1`]) — this currently always
+///   errors with [`SolendCpiOracleUnverified`], which we surface as
+///   [`SolendCpiSuccessPathBlockedByOracleValidation`] in Mode B.
+///
+/// **Phase 2** (only reached when Phase 1 returns `Ok` AND the oracle
+/// mode is something other than `FailClosed`):
+/// - Call [`cpi_refresh_reserve`].
+/// - On success, call [`cpi_refresh_obligation`].
+/// - On success, call [`cpi_withdraw_obligation_collateral_and_redeem_reserve_collateral`].
+/// - The orchestrator does NOT mutate `AuthorizationRecord` — that is
+///   the caller's responsibility, and it MUST happen only after this
+///   function returns `Ok`.
+///
+/// **Borrow hygiene.** No `try_borrow_data` / `try_borrow_mut_data`
+/// calls live across `invoke`. The Phase 1 validators each take a
+/// narrow borrow and drop it before returning. The CPI helpers
+/// themselves take only `&AccountInfo` references and never borrow the
+/// underlying RefCell.
+#[allow(clippy::too_many_arguments)]
+pub fn try_solend_cpi_skeleton<'a, 'info>(
+    record: &AuthorizationRecord,
+    delegated_wallet_account: &'a AccountInfo<'info>,
+    substrate: &SolendCpiSubstrate<'a, 'info>,
+    accounts: &SolendWithdrawAccounts<'a, 'info>,
+    deposit_reserves: &[&'a AccountInfo<'info>],
+    expectations: &SolendWithdrawShadowExpectations<'_>,
+) -> Result<(), ProgramError> {
+    // ── Phase 1 — Read and validate. Borrow guards open and close
+    //    inside individual validators; none cross the CPI boundary.
+
+    // Solend program-id self-check.
+    if substrate.solend_program.key != &SOLEND_PROGRAM_ID_MAINNET {
+        return Err(AuthorityError::SolendProgramMismatch.into());
+    }
+
+    // External delegated-wallet signer guard.
+    require_external_delegated_wallet_signer(delegated_wallet_account, record)?;
+
+    // Canonical clock sysvar guard (RefreshReserve consumes it; the
+    // other two CPIs read Clock::get() via syscall and don't take it
+    // as an account).
+    require_canonical_clock_sysvar(substrate.clock_sysvar)?;
+
+    // Token program canonical id guard.
+    require_canonical_token_program(accounts.token_program)?;
+
+    // Cross-check every AccountInfo in the variant-15 list. This
+    // briefly opens borrows on obligation / reserve / cToken /
+    // destination data and drops them before returning.
+    let _shadow_decoded =
+        validate_solend_withdraw_shadow_mapping(accounts, record, expectations)?;
+
+    // Read the live cToken `amount` from the delegated cToken account.
+    // This also briefly opens and drops a borrow.
+    let amount = read_live_ctoken_amount_or_fail_closed(
+        accounts.delegated_ctoken,
+        record,
+        expectations.expected_ctoken_mint,
+    )?;
+
+    // Oracle validation gate. Under Mode B (the P5b-2 default), the
+    // success path is fail-closed: any caller reaching this point is
+    // surfaced with `SolendCpiSuccessPathBlockedByOracleValidation`.
+    // The substrate oracle accounts ARE structurally validated to be
+    // present; we just refuse to proceed because we cannot prove they
+    // match the reserve's committed oracle config.
+    match p5b2_oracle_mode() {
+        SolendOracleMode::FailClosed => {
+            // Touch the oracle accounts so an unused-variable lint
+            // doesn't prevent the substrate from being structurally
+            // present — the caller still must supply real-shaped
+            // oracle accounts (RefreshReserve will fail at the runtime
+            // layer if they're missing). The fail-closed gate fires
+            // here BEFORE any CPI is invoked.
+            let _ = (
+                substrate.pyth_oracle,
+                substrate.switchboard_oracle,
+                substrate.extra_oracle,
+            );
+            return Err(AuthorityError::SolendCpiSuccessPathBlockedByOracleValidation.into());
+        }
+        SolendOracleMode::OfficialReserveDecode | SolendOracleMode::DemoPinnedAllowlist => {
+            // P5b-2 does NOT pick A or C. These arms are never taken
+            // by the production build; the constant `p5b2_oracle_mode`
+            // returns `FailClosed`. We keep them as a structural
+            // placeholder so a future slice that resolves oracle
+            // shadow mapping has a clean swap-in point.
+            verify_oracles_or_fail_closed_p5b1(
+                substrate.pyth_oracle,
+                substrate.switchboard_oracle,
+                substrate.extra_oracle,
+                expectations.expected_reserve,
+            )?;
+        }
+    }
+
+    // ── Phase 2 — CPI execution. Only reached when oracle validation
+    //    returns Ok. Under Mode B this is unreachable. Code structure
+    //    is intentionally preserved so a future slice swapping in real
+    //    oracle validation drops in here without re-architecting.
+
+    // 1. RefreshReserve
+    cpi_refresh_reserve(
+        substrate.solend_program,
+        accounts.reserve,
+        substrate.pyth_oracle,
+        substrate.switchboard_oracle,
+        substrate.clock_sysvar,
+        substrate.extra_oracle,
+    )?;
+
+    // 2. RefreshObligation
+    cpi_refresh_obligation(substrate.solend_program, accounts.obligation, deposit_reserves)?;
+
+    // 3. WithdrawObligationCollateralAndRedeemReserveCollateral
+    cpi_withdraw_obligation_collateral_and_redeem_reserve_collateral(
+        substrate.solend_program,
+        accounts,
+        deposit_reserves,
+        amount,
+    )?;
+
+    Ok(())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -1988,29 +2392,28 @@ mod tests {
     }
 
     #[test]
-    fn no_invoke_or_invoke_signed_in_p5b1_code() {
+    fn no_invoke_signed_in_p5b2_code() {
         // Source-grep test: production EXECUTABLE code MUST NOT contain
-        // `invoke(` or `invoke_signed(`. P5b-2 will add these; P5b-1
-        // strictly forbids them in production code. Doc comments may
-        // legitimately reference these entrypoints when explaining the
-        // P5b-1-vs-P5b-2 split, so we strip comment lines via
+        // `invoke_signed(`. P5b-2 introduces `invoke(` for the
+        // external-delegated-wallet CPI helpers, but `invoke_signed(`
+        // is strictly forbidden because the PDA-signed path is
+        // BLOCKED until `AuthorizationRecord` carries a
+        // `delegated_wallet_bump` (see project memory entry
+        // `project_p5b2_bump_blocker.md`).
+        //
+        // Doc comments may legitimately reference `invoke_signed` when
+        // explaining the P5b-2 deferral, so we strip comment lines via
         // `production_executable_source()`.
         //
         // Patterns are built via char-concat so the test source itself
         // does not contain a self-triggering literal.
         let prod = production_executable_source();
-        let pat_invoke =
-            ['i', 'n', 'v', 'o', 'k', 'e', '('].iter().collect::<String>();
         let pat_invoke_signed = ['i', 'n', 'v', 'o', 'k', 'e', '_', 's', 'i', 'g', 'n', 'e', 'd', '(']
             .iter()
             .collect::<String>();
         assert!(
-            !prod.contains(&pat_invoke),
-            "P5b-1 production executable code must not call the invoke entrypoint",
-        );
-        assert!(
             !prod.contains(&pat_invoke_signed),
-            "P5b-1 production executable code must not call the invoke_signed entrypoint",
+            "P5b-2 production executable code must not call the invoke_signed entrypoint",
         );
         // Additionally: no transaction-broadcast / RPC client surface in
         // production. Patterns are also char-concatenated to avoid
@@ -2034,6 +2437,51 @@ mod tests {
         assert!(!prod.contains(&pat_send_tx));
         assert!(!prod.contains(&pat_send_raw));
         assert!(!prod.contains(&pat_broadcast));
+    }
+
+    /// Verify that any `invoke(` calls in the production source live
+    /// only inside the dedicated P5b-2 CPI helpers
+    /// (`cpi_refresh_reserve`, `cpi_refresh_obligation`,
+    /// `cpi_withdraw_obligation_collateral_and_redeem_reserve_collateral`).
+    /// We don't enumerate them; instead we walk the production source
+    /// and assert that every `invoke(` token sits inside a function
+    /// whose declared name matches the allowlist.
+    ///
+    /// The check is structural: we compute the set of fn names that
+    /// surround each `invoke(` token by scanning forward from the
+    /// previous `pub fn` / `fn ` declaration above the token.
+    #[test]
+    fn invoke_calls_only_appear_in_dedicated_cpi_helpers() {
+        let prod = production_executable_source();
+        let pat_invoke = ['i', 'n', 'v', 'o', 'k', 'e', '('].iter().collect::<String>();
+
+        let allowlist: &[&str] = &[
+            "cpi_refresh_reserve",
+            "cpi_refresh_obligation",
+            "cpi_withdraw_obligation_collateral_and_redeem_reserve_collateral",
+        ];
+
+        // Walk every occurrence of "invoke(" in production source.
+        let mut idx = 0usize;
+        while let Some(found) = prod[idx..].find(&pat_invoke) {
+            let abs = idx + found;
+            // Find the most recent "fn " declaration before this token.
+            let prefix = &prod[..abs];
+            let last_fn_start = prefix.rfind("fn ").expect(
+                "every invoke() call site must live inside a fn declaration",
+            );
+            // Extract the function name token immediately after "fn ".
+            let after_fn = &prefix[last_fn_start + 3..];
+            let fn_name: String = after_fn
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                allowlist.iter().any(|allowed| allowed == &fn_name.as_str()),
+                "invoke( call site at offset {abs} lives in fn `{fn_name}` which is NOT in the P5b-2 CPI helper allowlist {allowlist:?}",
+            );
+            idx = abs + pat_invoke.len();
+        }
     }
 
     // ── Oracle gap fail-closed gate ───────────────────────────────────────

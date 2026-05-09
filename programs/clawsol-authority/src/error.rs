@@ -326,6 +326,44 @@ pub enum AuthorityError {
 
     #[error("Solend CPI builder invariant failed (catch-all for malformed account-info shape, missing signer flag, etc.)")]
     SolendCpiBuilderInvariantFailed = 78,
+
+    // ── Stage 2 P5b-2 Solend CPI Skeleton (append-only at codes 79+) ────
+    //
+    // Discriminants 79..=87 are appended for the Solend CPI skeleton
+    // wired into ExecuteAction's SolendWithdrawAllDelegated path in
+    // P5b-2. Numeric values are part of the on-chain wire shape (encoded
+    // into `ProgramError::Custom`) and MUST stay append-only — never
+    // reorder or renumber. P5b-2 introduces `invoke` (NOT `invoke_signed`)
+    // CPI helpers gated by an oracle-validation status check; the
+    // production success path remains fail-closed under Oracle Mode B
+    // until oracle validation lands.
+
+    #[error("Solend CPI requires the delegated_wallet AccountInfo at the canonical slot to be present and parseable")]
+    SolendCpiDelegatedWalletMissing = 79,
+
+    #[error("Solend CPI requires AuthorizationRecord.delegated_wallet to be a transaction-level signer")]
+    SolendCpiDelegatedWalletNotSigner = 80,
+
+    #[error("Solend CPI delegated_wallet AccountInfo key does not equal AuthorizationRecord.delegated_wallet")]
+    SolendCpiDelegatedWalletMismatch = 81,
+
+    #[error("Solend CPI RefreshReserve invocation failed (CPI returned an error)")]
+    SolendCpiRefreshReserveFailed = 82,
+
+    #[error("Solend CPI RefreshObligation invocation failed (CPI returned an error)")]
+    SolendCpiRefreshObligationFailed = 83,
+
+    #[error("Solend CPI WithdrawObligationCollateralAndRedeemReserveCollateral invocation failed (CPI returned an error)")]
+    SolendCpiWithdrawFailed = 84,
+
+    #[error("Solend CPI ExecuteAction success path is blocked: oracle shadow mapping is unresolved (Oracle Mode B fail-closed)")]
+    SolendCpiSuccessPathBlockedByOracleValidation = 85,
+
+    #[error("Solend CPI account list is missing required slots (delegated_wallet at 4, base 12 variant-15 accounts at 5..=16, oracle slots at 17..=18, clock sysvar at 19)")]
+    SolendCpiInsufficientAccounts = 86,
+
+    #[error("Solend CPI borrow-across-invoke risk detected (defensive sentinel — borrows must be dropped before invoke)")]
+    SolendCpiBorrowAcrossInvokeRisk = 87,
 }
 
 impl From<AuthorityError> for ProgramError {
