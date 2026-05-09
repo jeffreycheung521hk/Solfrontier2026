@@ -26,6 +26,7 @@ pub mod operator;
 pub mod policy;
 pub mod session;
 pub mod solana;
+pub mod stage2_watch_rule;
 pub mod swap;
 pub mod tool;
 pub mod transaction;
@@ -46,6 +47,13 @@ pub use events::GatewayEvent;
 pub use messages::{InboundMessage, MessageContent, OutboundContent, OutboundMessage};
 pub use policy::{PolicyRule, PolicyVerdict};
 pub use session::{SessionId, SessionState, SessionSummary};
+pub use stage2_watch_rule::{
+    canonical_rule_bytes, canonical_rule_hash, validate_conditions_bounded,
+    validate_used_amount, ActionSpec, BoundMode, Comparison, Condition, ConditionKind,
+    ConditionLogic, JupiterApiVersion, RateKind, VerificationLevel, WatchRule,
+    WatchRuleActionType, WatchRuleMetadata, WatchRuleValidationError, WithdrawMode,
+    MAX_CONDITIONS, MIN_CONDITIONS, STAGE2_WATCH_RULE_SCHEMA_VERSION,
+};
 pub use swap::{SwapIntent, SwapPolicyConfig, SwapPreview};
 pub use solana::{CommitmentLevel, SolanaEvent, SolanaNetwork};
 pub use tool::{ToolInput, ToolOutput, ToolSpec, ToolTrace};
