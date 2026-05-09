@@ -83,6 +83,7 @@ use solana_program::{
     sysvar::Sysvar,
 };
 
+pub mod condition_verifier;
 pub mod error;
 pub mod instruction;
 pub mod state;
