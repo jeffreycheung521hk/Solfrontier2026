@@ -31,6 +31,11 @@ pub mod policy_alerting;
 pub mod record_intent_demo;
 pub mod runtime;
 pub mod session_mgr;
+// Stage 2 W2 — watcher scheduler substrate over the W1 watch-rule
+// DB. Lifecycle + tick + force-tick + health surface ONLY. No live
+// RPC, no signing, no broadcast, no Solend/Jupiter tx construction.
+// Real evaluator + simulator implementations land in W3+.
+pub mod stage2_watcher;
 pub mod session_policy;
 pub mod supervisor;
 pub mod tools;

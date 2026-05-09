@@ -127,6 +127,15 @@ impl Stage2WatchRuleRepository {
         Self { pool }
     }
 
+    /// Read-only access to the underlying pool. Used by integration
+    /// tests that need to assert backdoor side-effects (e.g.
+    /// rewriting `created_at_ms` to fake a stale row), and by other
+    /// crates whose adjacency to this repo predates the public
+    /// helper surface.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// Insert a new rule row in the [`status::ACTIVE`] state.
     ///
     /// The `rule.created_at_slot` is recorded verbatim; `created_at_ms`
@@ -220,6 +229,87 @@ impl Stage2WatchRuleRepository {
         rows.into_iter().map(row_to_stored).collect()
     }
 
+    /// Bounded variant of [`Self::list_active`]. Returns at most
+    /// `limit` non-terminal rows, oldest-first. Designed for the W2
+    /// watcher's batch-tick path so a single tick cannot
+    /// unbounded-load the entire active set.
+    ///
+    /// `limit == 0` returns an empty Vec (cheap caller-side
+    /// bounded-tick assertion).
+    pub async fn list_active_limit(
+        &self,
+        current_slot: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredWatchRule>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, RowRaw>(
+            "SELECT rule_id, user_pubkey, executor_pubkey, delegated_wallet_pubkey,
+                    canonical_rule_hash, canonical_rule_bytes_hex, rule_json,
+                    action_type, condition_logic, status,
+                    max_input_amount_raw, used_amount_raw, destination_pubkey,
+                    expires_at_slot, created_at_slot,
+                    last_checked_slot, last_successful_tick_at_ms, last_error,
+                    execution_nonce, completed, revoked,
+                    created_at_ms, updated_at_ms
+             FROM stage2_watch_rules
+             WHERE expires_at_slot > ?
+               AND completed = 0
+               AND revoked = 0
+               AND status NOT IN ('completed', 'expired', 'revoked', 'failed')
+             ORDER BY created_at_ms ASC
+             LIMIT ?",
+        )
+        .bind(current_slot as i64)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_stored).collect()
+    }
+
+    /// Bounded "lifecycle scan" — returns rules in non-terminal
+    /// status (`active`, `condition_met`, `executing`) **regardless
+    /// of `expires_at_slot`**, oldest-first, capped by `limit`.
+    ///
+    /// This is the W2 watcher's tick query: it deliberately
+    /// includes rows whose slot-expiry has elapsed, because the
+    /// watcher's first job each tick is to flip those rows to
+    /// `expired` via [`Self::mark_expired_if_not_terminal`]. If we
+    /// used the slot-filtered [`Self::list_active`] /
+    /// [`Self::list_active_limit`], expired-by-slot rows would
+    /// silently linger in `active` status forever.
+    ///
+    /// `limit == 0` returns an empty Vec.
+    pub async fn list_pending_lifecycle_limit(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<StoredWatchRule>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, RowRaw>(
+            "SELECT rule_id, user_pubkey, executor_pubkey, delegated_wallet_pubkey,
+                    canonical_rule_hash, canonical_rule_bytes_hex, rule_json,
+                    action_type, condition_logic, status,
+                    max_input_amount_raw, used_amount_raw, destination_pubkey,
+                    expires_at_slot, created_at_slot,
+                    last_checked_slot, last_successful_tick_at_ms, last_error,
+                    execution_nonce, completed, revoked,
+                    created_at_ms, updated_at_ms
+             FROM stage2_watch_rules
+             WHERE completed = 0
+               AND revoked = 0
+               AND status NOT IN ('completed', 'expired', 'revoked', 'failed')
+             ORDER BY created_at_ms ASC
+             LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_stored).collect()
+    }
+
     /// List all rules belonging to a given user pubkey, oldest first.
     /// Includes terminal states (callers who only want non-terminal
     /// should use [`Self::list_active`]).
@@ -275,6 +365,34 @@ impl Stage2WatchRuleRepository {
         rule_id: &[u8; 16],
     ) -> Result<u64, StoreError> {
         self.set_status(rule_id, status::CONDITION_MET).await
+    }
+
+    /// TOCTOU-safe variant: only flip `status = active` →
+    /// `status = condition_met`. If the row is already in any other
+    /// state (e.g. revoked, expired, completed, failed,
+    /// condition_met) the UPDATE WHERE-clause matches zero rows and
+    /// the call returns `Ok(0)`.
+    ///
+    /// Watcher contract (W2): caller treats `Ok(0)` as "another
+    /// actor advanced the lifecycle between our load and our
+    /// transition; do nothing further this tick."
+    pub async fn mark_condition_met_if_active(
+        &self,
+        rule_id: &[u8; 16],
+    ) -> Result<u64, StoreError> {
+        let now_ms = Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            "UPDATE stage2_watch_rules
+             SET status = ?, updated_at_ms = ?
+             WHERE rule_id = ? AND status = ?",
+        )
+        .bind(status::CONDITION_MET)
+        .bind(now_ms)
+        .bind(rule_id_hex(rule_id))
+        .bind(status::ACTIVE)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Transition to `executing` and stamp the on-chain replay-protection
@@ -347,9 +465,85 @@ impl Stage2WatchRuleRepository {
         Ok(result.rows_affected())
     }
 
+    /// TOCTOU-safe variant: only flip to `failed` if the row is
+    /// currently in a non-terminal status (`active` or
+    /// `condition_met`). Already-`revoked`, `completed`, `expired`,
+    /// or already-`failed` rows are not overwritten.
+    pub async fn mark_failed_if_not_terminal(
+        &self,
+        rule_id: &[u8; 16],
+        error: &str,
+    ) -> Result<u64, StoreError> {
+        let now_ms = Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            "UPDATE stage2_watch_rules
+             SET status = ?, last_error = ?, updated_at_ms = ?
+             WHERE rule_id = ?
+               AND status IN (?, ?)",
+        )
+        .bind(status::FAILED)
+        .bind(error)
+        .bind(now_ms)
+        .bind(rule_id_hex(rule_id))
+        .bind(status::ACTIVE)
+        .bind(status::CONDITION_MET)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Record `last_error` on the rule WITHOUT changing its status.
+    /// Used by the W2 watcher when an evaluator or simulator returns
+    /// a transient error: the rule remains active for retry next
+    /// tick, but the error is preserved for health surfaces.
+    pub async fn record_last_error(
+        &self,
+        rule_id: &[u8; 16],
+        error: &str,
+    ) -> Result<u64, StoreError> {
+        let now_ms = Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            "UPDATE stage2_watch_rules
+             SET last_error = ?, updated_at_ms = ?
+             WHERE rule_id = ?",
+        )
+        .bind(error)
+        .bind(now_ms)
+        .bind(rule_id_hex(rule_id))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Terminal: set `status = expired`. `expires_at_slot` is unchanged.
     pub async fn mark_expired(&self, rule_id: &[u8; 16]) -> Result<u64, StoreError> {
         self.set_status(rule_id, status::EXPIRED).await
+    }
+
+    /// TOCTOU-safe variant: only flip to `expired` if the row is
+    /// currently in a non-terminal status (`active` or
+    /// `condition_met`). Avoids overwriting a row that became
+    /// revoked / completed / failed between the watcher's load and
+    /// its expiry transition.
+    pub async fn mark_expired_if_not_terminal(
+        &self,
+        rule_id: &[u8; 16],
+    ) -> Result<u64, StoreError> {
+        let now_ms = Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            "UPDATE stage2_watch_rules
+             SET status = ?, updated_at_ms = ?
+             WHERE rule_id = ?
+               AND status IN (?, ?)",
+        )
+        .bind(status::EXPIRED)
+        .bind(now_ms)
+        .bind(rule_id_hex(rule_id))
+        .bind(status::ACTIVE)
+        .bind(status::CONDITION_MET)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Terminal: set `status = revoked` and `revoked = 1`.
@@ -1083,5 +1277,259 @@ mod tests {
             matches!(err, StoreError::IntegrityCheckFailed(ref s) if s.contains("canonical hash mismatch")),
             "got {err:?}",
         );
+    }
+
+    // ── W2 status-guarded helpers ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_condition_met_if_active_succeeds_on_active() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+
+        let n = repo.mark_condition_met_if_active(&rule.rule_id).await.unwrap();
+        assert_eq!(n, 1, "active row should flip to condition_met");
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::ConditionMet);
+    }
+
+    #[tokio::test]
+    async fn mark_condition_met_if_active_no_op_on_revoked() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+        repo.mark_revoked(&rule.rule_id).await.unwrap();
+
+        let n = repo.mark_condition_met_if_active(&rule.rule_id).await.unwrap();
+        assert_eq!(n, 0, "revoked row must not be overwritten");
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::Revoked);
+    }
+
+    #[tokio::test]
+    async fn mark_condition_met_if_active_idempotent_on_condition_met() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+
+        repo.mark_condition_met(&rule.rule_id).await.unwrap();
+
+        let n = repo.mark_condition_met_if_active(&rule.rule_id).await.unwrap();
+        assert_eq!(n, 0, "second flip from condition_met must no-op");
+    }
+
+    #[tokio::test]
+    async fn mark_failed_if_not_terminal_does_not_overwrite_revoked() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+        repo.mark_revoked(&rule.rule_id).await.unwrap();
+
+        let n = repo
+            .mark_failed_if_not_terminal(&rule.rule_id, "evaluator timeout")
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "revoked row must not be flipped to failed");
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::Revoked);
+        assert!(
+            loaded.last_error.is_none(),
+            "no last_error should be written when guard rejects"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_failed_if_not_terminal_writes_error_on_active() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+
+        let n = repo
+            .mark_failed_if_not_terminal(&rule.rule_id, "evaluator unsupported action")
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::Failed);
+        assert_eq!(
+            loaded.last_error.as_deref(),
+            Some("evaluator unsupported action")
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_failed_if_not_terminal_does_not_overwrite_completed() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+        repo.mark_completed(&rule.rule_id, 5_000_000, FIXTURE_CREATED_AT + 5)
+            .await
+            .unwrap();
+
+        let n = repo
+            .mark_failed_if_not_terminal(&rule.rule_id, "x")
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::Completed);
+        assert!(loaded.completed);
+    }
+
+    #[tokio::test]
+    async fn record_last_error_does_not_change_status() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+
+        let n = repo
+            .record_last_error(&rule.rule_id, "RPC timeout, will retry")
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::Active);
+        assert_eq!(
+            loaded.last_error.as_deref(),
+            Some("RPC timeout, will retry")
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_expired_if_not_terminal_does_not_overwrite_revoked() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+        repo.mark_revoked(&rule.rule_id).await.unwrap();
+
+        let n = repo.mark_expired_if_not_terminal(&rule.rule_id).await.unwrap();
+        assert_eq!(n, 0);
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::Revoked);
+    }
+
+    #[tokio::test]
+    async fn mark_expired_if_not_terminal_flips_active() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+
+        let n = repo.mark_expired_if_not_terminal(&rule.rule_id).await.unwrap();
+        assert_eq!(n, 1);
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn list_active_limit_caps_results() {
+        let (_db, repo) = test_repo().await;
+
+        // Insert 5 distinct active rules.
+        for i in 0..5_u8 {
+            let mut r = fixture_a_solend_apr_below_10();
+            r.rule_id = [0xC0 + i; 16];
+            repo.insert(&r).await.unwrap();
+        }
+
+        let two = repo
+            .list_active_limit(FIXTURE_CREATED_AT + 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(two.len(), 2);
+
+        let all_with_huge_limit = repo
+            .list_active_limit(FIXTURE_CREATED_AT + 1, 999)
+            .await
+            .unwrap();
+        assert_eq!(all_with_huge_limit.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn list_active_limit_zero_returns_empty() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+
+        let none = repo
+            .list_active_limit(FIXTURE_CREATED_AT + 1, 0)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_pending_lifecycle_includes_expired_by_slot_active_status() {
+        let (_db, repo) = test_repo().await;
+
+        // Tight-expiry rule whose slot has already passed but
+        // status is still `active` — the W2 watcher's
+        // garbage-collect-first branch needs to see this.
+        let mut tight = fixture_a_solend_apr_below_10();
+        tight.rule_id = [0xE0; 16];
+        tight.expires_at_slot = FIXTURE_CREATED_AT + 100;
+        repo.insert(&tight).await.unwrap();
+
+        // list_active_limit at a higher slot would NOT see this
+        // row (slot filter excludes it).
+        let active_at_higher_slot = repo
+            .list_active_limit(FIXTURE_CREATED_AT + 200, 100)
+            .await
+            .unwrap();
+        assert!(active_at_higher_slot.is_empty());
+
+        // list_pending_lifecycle_limit DOES see it — that's the
+        // whole point.
+        let pending = repo.list_pending_lifecycle_limit(100).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].rule.rule_id, tight.rule_id);
+        assert_eq!(pending[0].status, WatchRuleStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn list_pending_lifecycle_excludes_terminal() {
+        let (_db, repo) = test_repo().await;
+        let active = fixture_a_solend_apr_below_10();
+        let mut revoked = fixture_a_solend_apr_below_10();
+        revoked.rule_id = [0xE1; 16];
+        let mut completed = fixture_a_solend_apr_below_10();
+        completed.rule_id = [0xE2; 16];
+        let mut expired_by_status = fixture_a_solend_apr_below_10();
+        expired_by_status.rule_id = [0xE3; 16];
+
+        for r in [&active, &revoked, &completed, &expired_by_status] {
+            repo.insert(r).await.unwrap();
+        }
+        repo.mark_revoked(&revoked.rule_id).await.unwrap();
+        repo.mark_completed(&completed.rule_id, 5_000_000, 0)
+            .await
+            .unwrap();
+        repo.mark_expired(&expired_by_status.rule_id).await.unwrap();
+
+        let pending = repo.list_pending_lifecycle_limit(100).await.unwrap();
+        let ids: Vec<[u8; 16]> = pending.iter().map(|r| r.rule.rule_id).collect();
+        assert_eq!(ids, vec![active.rule_id]);
+    }
+
+    #[tokio::test]
+    async fn list_pending_lifecycle_caps_at_limit() {
+        let (_db, repo) = test_repo().await;
+        for i in 0..4_u8 {
+            let mut r = fixture_a_solend_apr_below_10();
+            r.rule_id = [0xF0 + i; 16];
+            repo.insert(&r).await.unwrap();
+        }
+        let two = repo.list_pending_lifecycle_limit(2).await.unwrap();
+        assert_eq!(two.len(), 2);
+
+        let zero = repo.list_pending_lifecycle_limit(0).await.unwrap();
+        assert!(zero.is_empty());
     }
 }
