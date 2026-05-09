@@ -1199,6 +1199,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "clawsol-authority"
+version = "0.1.0"
+dependencies = [
+ "borsh 1.6.0",
+ "claw-types",
+ "solana-program",
+ "solana-program-test",
+ "solana-sdk",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "clawsol-intent"
 version = "0.1.0"
 dependencies = [

@@ -17,6 +17,7 @@ members = [
     "bins/keygen",
     "bins/sign-pending",
     "programs/clawsol-intent",
+    "programs/clawsol-authority",
 ]
 
 [workspace.package]
@@ -101,6 +102,7 @@ claw-channels     = { path = "crates/channels" }
 claw-api          = { path = "crates/api" }
 claw-gateway      = { path = "crates/gateway" }
 clawsol-intent    = { path = "programs/clawsol-intent" }
+clawsol-authority = { path = "programs/clawsol-authority" }
 
 [profile.release]
 opt-level     = 3

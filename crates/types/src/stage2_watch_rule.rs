@@ -319,6 +319,38 @@ impl WatchRuleActionType {
             Self::JupiterBuySolWithUsdc => "jupiter_buy_sol_with_usdc",
         }
     }
+
+    /// Stable on-chain discriminator value, used by the Stage 2
+    /// Authorization PDA's `allowed_action_type: u8` field.
+    ///
+    /// Values start at `1` so that the all-zero byte (a default-zeroed
+    /// PDA buffer) never aliases to a valid action type. The values
+    /// here are part of the on-chain wire shape and MUST NOT change
+    /// without a Stage 2 schema-version bump in
+    /// [`STAGE2_WATCH_RULE_SCHEMA_VERSION`].
+    ///
+    /// This helper is independent of Borsh — the canonical rule hash
+    /// is computed over the [`ActionSpec`] variant inside a
+    /// [`WatchRule`], not over this discriminator, so adding this
+    /// method does not affect any pinned canonical-hash fixture.
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::SolendWithdrawAllDelegated => 1,
+            Self::JupiterBuySolWithUsdc => 2,
+        }
+    }
+
+    /// Inverse of [`Self::to_u8`]. Returns `None` for any byte not in
+    /// `{1, 2}` so that the on-chain comparator can fail-closed on an
+    /// uninterpretable discriminator (zero-default, or a byte from a
+    /// future schema this build doesn't know about).
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::SolendWithdrawAllDelegated),
+            2 => Some(Self::JupiterBuySolWithUsdc),
+            _ => None,
+        }
+    }
 }
 
 // ── WatchRule top-level ─────────────────────────────────────────────────────
@@ -1171,6 +1203,28 @@ mod tests {
             WatchRuleActionType::JupiterBuySolWithUsdc.label(),
             "jupiter_buy_sol_with_usdc"
         );
+    }
+
+    #[test]
+    fn action_type_u8_round_trip() {
+        for v in [
+            WatchRuleActionType::SolendWithdrawAllDelegated,
+            WatchRuleActionType::JupiterBuySolWithUsdc,
+        ] {
+            assert_eq!(WatchRuleActionType::from_u8(v.to_u8()), Some(v));
+        }
+        // Stage 1's ActionType discriminators (1 = SolendDeposit,
+        // 2 = SolendWithdrawAll, 3 = JupiterSwap) are intentionally
+        // a different namespace; bytes outside the Stage 2 set must
+        // come back as None and never alias to a valid Stage 2 type.
+        assert_eq!(WatchRuleActionType::from_u8(0), None);
+        assert_eq!(WatchRuleActionType::from_u8(3), None);
+        assert_eq!(WatchRuleActionType::from_u8(255), None);
+
+        // Pin the on-chain wire values explicitly so any reorder /
+        // renumber is loud.
+        assert_eq!(WatchRuleActionType::SolendWithdrawAllDelegated.to_u8(), 1);
+        assert_eq!(WatchRuleActionType::JupiterBuySolWithUsdc.to_u8(), 2);
     }
 
     #[test]
