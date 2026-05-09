@@ -328,3 +328,49 @@ The harness does **not** write a JSON fixture when the env gate is unset
    from § 5.3 / § 5.4.
 4. **ClawSol-owned ALT deployment** if the byte mitigation in J-prep
    § 10.2 item 3 turns out to be necessary after live measurement.
+
+---
+
+## 12. 2026-05-09 Measurement Result
+
+First live `api.jup.ag/swap/v2/build` run committed as
+[`stage2_jupiter_sizing_fixtures.json`](./stage2_jupiter_sizing_fixtures.json).
+
+**Scenario.** USDC → wSOL, 5 USDC (`amount_raw = 5_000_000`),
+`slippageBps = 50`, `restrictIntermediateTokens = true`.
+
+**maxAccounts matrix.**
+
+| `maxAccounts` | Wrapped v0 tx bytes | Classification | Note |
+|---:|---:|---|---|
+| 64 | 1648 | Red | over the 1232-byte cap |
+| 58 | 1776 | Red | over the cap |
+| 55 | 1083 | Green | fits with headroom |
+| 52 | 1083 | Green | fits with headroom |
+| 50 | 1083 | Green | fits with headroom |
+| 48 | — | Inconclusive | HTTP 429 from `api.jup.ag` (rate-limited) |
+
+**Key conclusion.** Stage 2 Jupiter is **not preview-only by default**:
+the matrix shows measured green rows at `maxAccounts ∈ {55, 52, 50}`
+under the synthetic two-ix bracket model. Implementation **remains
+gated** by (a) the exact on-chain bracket wire shape (placeholder ix
+data sizes used for the measurement), (b) ALT field-semantics
+clarification (see caveat below), and (c) the J-prep § 13.1 blockers
+(Jupiter v6 program-id pin, Jito tip allowlist, ClawSol-owned ALT
+deployment).
+
+**Caveat — ALT field semantics.** Jupiter returned populated
+`addressesByLookupTableAddress` data but an **empty**
+`addressLookupTableAddresses` array. The fixture must therefore be read
+**conservatively as inline-resolved / no-ALT** until Jupiter's field
+semantics are pinned in writing — i.e. the 1083-byte rows assume zero
+ALT loading at compile time. If a future `/build` response includes
+non-empty `addressLookupTableAddresses` and forces compile-time ALT
+resolution, the green-row byte counts may shift; rerun the matrix
+before claiming the green classification holds end-to-end.
+
+**Safety.** This measurement was strictly **live API fetch/build only**:
+no signing, no broadcast, no `simulateTransaction`, no transaction
+submission. The JSON fixture's `safety_markers` array re-asserts
+`["NO_SIGNING", "NO_BROADCAST", "NO_TRANSACTION_SUBMISSION",
+"FETCH_BUILD_ONLY"]`.
