@@ -36,6 +36,13 @@ pub mod session_mgr;
 // RPC, no signing, no broadcast, no Solend/Jupiter tx construction.
 // Real evaluator + simulator implementations land in W3+.
 pub mod stage2_watcher;
+// Stage 2 W3 — watcher condition evaluator substrate. Snapshot
+// provider + rule evaluator + batched Stage2ConditionEvaluator
+// adapter with per-tick dedupe cache. Evaluation only — no signing,
+// no broadcast, no transaction construction, no Solend/Jupiter CPI.
+// Live providers must be added behind explicit constructors and must
+// not auto-enable from ambient environment variables.
+pub mod stage2_evaluator;
 pub mod session_policy;
 pub mod supervisor;
 pub mod tools;
