@@ -91,9 +91,18 @@
 //!   dependency into the BPF build.
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use solana_program::{msg, program_error::ProgramError, pubkey::Pubkey};
+use solana_program::{
+    account_info::AccountInfo, msg, program_error::ProgramError, pubkey::Pubkey,
+};
 
 use crate::error::AuthorityError;
+use crate::solend_account_decode::{
+    decode_obligation, decode_reserve, decode_spl_token_account_lite,
+    require_obligation_lending_market, require_obligation_owned_by_delegated_wallet,
+    require_reserve_lending_market, require_reserve_not_stale, require_spl_token_authority,
+    require_spl_token_mint, DecodedSolendObligation, DecodedSolendReserve,
+    DecodedSplTokenAccountLite, SPL_TOKEN_PROGRAM_ID,
+};
 use crate::state::AuthorizationRecord;
 
 /// Solend mainnet program id, base58
@@ -366,6 +375,98 @@ fn verify_same_tx_refresh_and_withdraw(
         return Err(AuthorityError::SolendInstructionOrderInvalid.into());
     }
     Ok(())
+}
+
+// ── Stage 2 P5a: AccountInfo wrappers for live account decode ───────────────
+//
+// Thin wrappers that read `AccountInfo.data` via `try_borrow_data()` and
+// dispatch to the pure decoders in `solend_account_decode`. Borrow
+// failures map to `ProgramError::AccountBorrowFailed` per the standard
+// Solana convention. RefCell guards are not held across calls — each
+// helper drops its borrow before returning the decoded value.
+//
+// These wrappers are substrate for the future P5b same-tx Refresh +
+// Withdraw flow. They DO NOT issue any CPI in this slice.
+
+/// Verify that a Solana `AccountInfo` is a Solend-program-owned
+/// obligation, decode the prefix fields, and run the boundary checks
+/// (delegated-wallet inner owner, lending market) against an
+/// `AuthorizationRecord`.
+///
+/// **Account-level vs inner owner.** Two distinct checks happen here:
+///
+/// 1. `account.owner == SOLEND_PROGRAM_ID_MAINNET` — the Solana
+///    account-level program owner. The user main wallet does NOT own
+///    Solend obligation accounts (Solend does); this gate exists to
+///    reject any non-Solend account masquerading as a Solend
+///    obligation.
+/// 2. `decoded.owner == record.delegated_wallet` (and NOT
+///    `record.user`) — the **inner** Solend `Obligation.owner` field
+///    at byte offset 42, which is the wallet authority.
+pub fn verify_obligation_account_info(
+    account: &AccountInfo,
+    record: &AuthorizationRecord,
+    expected_lending_market: &Pubkey,
+) -> Result<DecodedSolendObligation, ProgramError> {
+    if account.owner != &SOLEND_PROGRAM_ID_MAINNET {
+        return Err(AuthorityError::SolendAccountOwnerMismatch.into());
+    }
+    let data = account
+        .try_borrow_data()
+        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+    let decoded = decode_obligation(&data)?;
+    drop(data); // release the borrow before any further calls
+    require_obligation_owned_by_delegated_wallet(&decoded, record)?;
+    require_obligation_lending_market(&decoded, expected_lending_market)?;
+    Ok(decoded)
+}
+
+/// Verify that a Solana `AccountInfo` is a Solend-program-owned
+/// reserve, decode the prefix fields, run the lending-market check,
+/// and apply the standard staleness gate
+/// ([`require_reserve_not_stale`]).
+///
+/// `current_slot` is the on-chain `Clock::get()?.slot` — the caller
+/// MUST source it from the runtime, never from an executor-supplied
+/// value.
+pub fn verify_reserve_account_info(
+    account: &AccountInfo,
+    expected_lending_market: &Pubkey,
+    current_slot: u64,
+) -> Result<DecodedSolendReserve, ProgramError> {
+    if account.owner != &SOLEND_PROGRAM_ID_MAINNET {
+        return Err(AuthorityError::SolendAccountOwnerMismatch.into());
+    }
+    let data = account
+        .try_borrow_data()
+        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+    let decoded = decode_reserve(&data)?;
+    drop(data);
+    require_reserve_lending_market(&decoded, expected_lending_market)?;
+    require_reserve_not_stale(&decoded, current_slot)?;
+    Ok(decoded)
+}
+
+/// Verify that a Solana `AccountInfo` is a native SPL Token Account
+/// (program owner = `SPL_TOKEN_PROGRAM_ID`, length = 165), decode the
+/// minimal `(mint, owner, amount)` projection, and check that mint
+/// and authority match the expected values.
+pub fn verify_spl_token_account_info(
+    account: &AccountInfo,
+    expected_mint: &Pubkey,
+    expected_authority: &Pubkey,
+) -> Result<DecodedSplTokenAccountLite, ProgramError> {
+    if account.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(AuthorityError::SolendTokenAccountOwnerMismatch.into());
+    }
+    let data = account
+        .try_borrow_data()
+        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+    let decoded = decode_spl_token_account_lite(&data)?;
+    drop(data);
+    require_spl_token_mint(&decoded, expected_mint)?;
+    require_spl_token_authority(&decoded, expected_authority)?;
+    Ok(decoded)
 }
 
 #[cfg(test)]
@@ -799,5 +900,356 @@ mod tests {
         let bytes = borsh::to_vec(&original).unwrap();
         let decoded = SiblingIxDescriptor::try_from_slice(&bytes).unwrap();
         assert_eq!(decoded, original);
+    }
+}
+
+// ── Stage 2 P5a AccountInfo wrapper tests ───────────────────────────────────
+//
+// Unit-level tests for the `verify_*_account_info` helpers. We
+// construct synthetic `AccountInfo` values directly via
+// `AccountInfo::new(...)` so the tests stay in this crate's standard
+// `cargo test --lib` path (no banks-client harness required for these
+// pure decoder + AccountInfo borrow checks).
+
+#[cfg(test)]
+mod accountinfo_wrapper_tests {
+    use super::*;
+    use crate::solend_account_decode::{
+        OBLIGATION_OFFSET_LAST_UPDATE_SLOT, OBLIGATION_OFFSET_LAST_UPDATE_STALE,
+        OBLIGATION_OFFSET_LENDING_MARKET, OBLIGATION_OFFSET_OWNER,
+        OBLIGATION_OFFSET_VERSION, RESERVE_OFFSET_LAST_UPDATE_SLOT,
+        RESERVE_OFFSET_LAST_UPDATE_STALE, RESERVE_OFFSET_LENDING_MARKET,
+        RESERVE_OFFSET_VERSION, SOLEND_OBLIGATION_LEN, SOLEND_RESERVE_LEN,
+        SOLEND_SUPPORTED_VERSION, SPL_TOKEN_ACCOUNT_LEN, SPL_TOKEN_OFFSET_AMOUNT,
+        SPL_TOKEN_OFFSET_MINT, SPL_TOKEN_OFFSET_OWNER,
+    };
+    use crate::state::{Stage2ActionType, STAGE2_AUTHORITY_SCHEMA_VERSION};
+
+    fn pk(b: u8) -> Pubkey {
+        Pubkey::new_from_array([b; 32])
+    }
+
+    fn record() -> AuthorizationRecord {
+        AuthorizationRecord {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0xD0; 16],
+            user: pk(0xAA),
+            executor: pk(0xEE),
+            delegated_wallet: pk(0xBB),
+            canonical_rule_hash: [0; 32],
+            allowed_action_type: Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
+            max_input_amount_raw: 5_000_000,
+            used_amount_raw: 0,
+            destination: pk(0xCC),
+            expires_at_slot: 1_000_000,
+            revoked: false,
+            completed: false,
+            execution_nonce: 0,
+            last_execution_slot: 0,
+            bump: 255,
+        }
+    }
+
+    fn populate_obligation_prefix(
+        data: &mut [u8],
+        slot: u64,
+        stale: bool,
+        lending_market: [u8; 32],
+        inner_owner: [u8; 32],
+    ) {
+        data[OBLIGATION_OFFSET_VERSION] = SOLEND_SUPPORTED_VERSION;
+        data[OBLIGATION_OFFSET_LAST_UPDATE_SLOT..OBLIGATION_OFFSET_LAST_UPDATE_SLOT + 8]
+            .copy_from_slice(&slot.to_le_bytes());
+        data[OBLIGATION_OFFSET_LAST_UPDATE_STALE] = if stale { 1 } else { 0 };
+        data[OBLIGATION_OFFSET_LENDING_MARKET..OBLIGATION_OFFSET_LENDING_MARKET + 32]
+            .copy_from_slice(&lending_market);
+        data[OBLIGATION_OFFSET_OWNER..OBLIGATION_OFFSET_OWNER + 32]
+            .copy_from_slice(&inner_owner);
+    }
+
+    fn populate_reserve_prefix(
+        data: &mut [u8],
+        slot: u64,
+        stale: bool,
+        lending_market: [u8; 32],
+    ) {
+        data[RESERVE_OFFSET_VERSION] = SOLEND_SUPPORTED_VERSION;
+        data[RESERVE_OFFSET_LAST_UPDATE_SLOT..RESERVE_OFFSET_LAST_UPDATE_SLOT + 8]
+            .copy_from_slice(&slot.to_le_bytes());
+        data[RESERVE_OFFSET_LAST_UPDATE_STALE] = if stale { 1 } else { 0 };
+        data[RESERVE_OFFSET_LENDING_MARKET..RESERVE_OFFSET_LENDING_MARKET + 32]
+            .copy_from_slice(&lending_market);
+    }
+
+    fn populate_spl_token(data: &mut [u8], mint: [u8; 32], owner: [u8; 32], amount: u64) {
+        data[SPL_TOKEN_OFFSET_MINT..SPL_TOKEN_OFFSET_MINT + 32].copy_from_slice(&mint);
+        data[SPL_TOKEN_OFFSET_OWNER..SPL_TOKEN_OFFSET_OWNER + 32].copy_from_slice(&owner);
+        data[SPL_TOKEN_OFFSET_AMOUNT..SPL_TOKEN_OFFSET_AMOUNT + 8]
+            .copy_from_slice(&amount.to_le_bytes());
+    }
+
+    fn assert_err(actual: ProgramError, expected: AuthorityError) {
+        assert_eq!(
+            actual,
+            ProgramError::Custom(expected as u32),
+            "expected {expected:?} (code {})",
+            expected as u32,
+        );
+    }
+
+    /// REQUIRED P0 test: AccountInfo.owner must equal the Solend
+    /// program id, regardless of whether the bytes inside happen to
+    /// look like a valid obligation.
+    #[test]
+    fn obligation_accountinfo_owner_must_be_solend_program() {
+        let record = record();
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; SOLEND_OBLIGATION_LEN];
+        // Stage a *valid-looking* obligation prefix so the only thing
+        // that fails is the AccountInfo.owner gate.
+        populate_obligation_prefix(
+            &mut data,
+            100,
+            false,
+            [0x42; 32],
+            record.delegated_wallet.to_bytes(),
+        );
+        let wrong_owner = Pubkey::new_unique(); // NOT Solend
+        let account = AccountInfo::new(
+            &key,
+            false,
+            false,
+            &mut lamports,
+            &mut data,
+            &wrong_owner,
+            false,
+            0,
+        );
+        let lm = Pubkey::new_from_array([0x42; 32]);
+        let err = verify_obligation_account_info(&account, &record, &lm).unwrap_err();
+        assert_err(err, AuthorityError::SolendAccountOwnerMismatch);
+    }
+
+    #[test]
+    fn obligation_accountinfo_with_solend_owner_decodes_and_validates() {
+        let record = record();
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; SOLEND_OBLIGATION_LEN];
+        let lm: [u8; 32] = [0x42; 32];
+        populate_obligation_prefix(
+            &mut data,
+            100,
+            false,
+            lm,
+            record.delegated_wallet.to_bytes(),
+        );
+        let owner = SOLEND_PROGRAM_ID_MAINNET;
+        let account = AccountInfo::new(
+            &key, false, false, &mut lamports, &mut data, &owner, false, 0,
+        );
+        let decoded =
+            verify_obligation_account_info(&account, &record, &Pubkey::new_from_array(lm))
+                .unwrap();
+        assert_eq!(decoded.lending_market.to_bytes(), lm);
+        assert_eq!(decoded.owner, record.delegated_wallet);
+    }
+
+    /// AccountInfo path also enforces the main-wallet poison gate
+    /// (via the inner owner check after decode).
+    #[test]
+    fn obligation_accountinfo_main_wallet_inner_owner_rejected_with_dedicated_error() {
+        let record = record();
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; SOLEND_OBLIGATION_LEN];
+        populate_obligation_prefix(
+            &mut data,
+            100,
+            false,
+            [0x42; 32],
+            record.user.to_bytes(), // poison: user main wallet as inner owner
+        );
+        let owner = SOLEND_PROGRAM_ID_MAINNET;
+        let account = AccountInfo::new(
+            &key, false, false, &mut lamports, &mut data, &owner, false, 0,
+        );
+        let lm = Pubkey::new_from_array([0x42; 32]);
+        let err = verify_obligation_account_info(&account, &record, &lm).unwrap_err();
+        assert_err(err, AuthorityError::SolendMainWalletObligationRejected);
+    }
+
+    #[test]
+    fn obligation_accountinfo_short_data_rejected() {
+        let record = record();
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        // Smaller than SOLEND_OBLIGATION_LEN — the AccountInfo.owner
+        // gate passes; the decoder fails on length.
+        let mut data = vec![0u8; SOLEND_OBLIGATION_LEN - 1];
+        let owner = SOLEND_PROGRAM_ID_MAINNET;
+        let account = AccountInfo::new(
+            &key, false, false, &mut lamports, &mut data, &owner, false, 0,
+        );
+        let lm = pk(0x42);
+        let err = verify_obligation_account_info(&account, &record, &lm).unwrap_err();
+        assert_err(err, AuthorityError::SolendAccountDataTooShort);
+    }
+
+    #[test]
+    fn reserve_accountinfo_owner_must_be_solend_program() {
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; SOLEND_RESERVE_LEN];
+        populate_reserve_prefix(&mut data, 100, false, [0x33; 32]);
+        let wrong_owner = Pubkey::new_unique();
+        let account = AccountInfo::new(
+            &key,
+            false,
+            false,
+            &mut lamports,
+            &mut data,
+            &wrong_owner,
+            false,
+            0,
+        );
+        let lm = Pubkey::new_from_array([0x33; 32]);
+        let err = verify_reserve_account_info(&account, &lm, 100).unwrap_err();
+        assert_err(err, AuthorityError::SolendAccountOwnerMismatch);
+    }
+
+    #[test]
+    fn reserve_accountinfo_stale_flag_rejected() {
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; SOLEND_RESERVE_LEN];
+        populate_reserve_prefix(&mut data, 100, true, [0x33; 32]); // stale
+        let owner = SOLEND_PROGRAM_ID_MAINNET;
+        let account = AccountInfo::new(
+            &key, false, false, &mut lamports, &mut data, &owner, false, 0,
+        );
+        let lm = Pubkey::new_from_array([0x33; 32]);
+        let err = verify_reserve_account_info(&account, &lm, 100).unwrap_err();
+        assert_err(err, AuthorityError::SolendReserveStale);
+    }
+
+    #[test]
+    fn reserve_accountinfo_lending_market_mismatch_rejected() {
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; SOLEND_RESERVE_LEN];
+        populate_reserve_prefix(&mut data, 100, false, [0x33; 32]);
+        let owner = SOLEND_PROGRAM_ID_MAINNET;
+        let account = AccountInfo::new(
+            &key, false, false, &mut lamports, &mut data, &owner, false, 0,
+        );
+        let err =
+            verify_reserve_account_info(&account, &pk(0x77), 100).unwrap_err();
+        assert_err(err, AuthorityError::SolendReserveLendingMarketMismatch);
+    }
+
+    #[test]
+    fn reserve_accountinfo_happy_path() {
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; SOLEND_RESERVE_LEN];
+        let lm: [u8; 32] = [0x33; 32];
+        populate_reserve_prefix(&mut data, 100, false, lm);
+        let owner = SOLEND_PROGRAM_ID_MAINNET;
+        let account = AccountInfo::new(
+            &key, false, false, &mut lamports, &mut data, &owner, false, 0,
+        );
+        let decoded =
+            verify_reserve_account_info(&account, &Pubkey::new_from_array(lm), 100).unwrap();
+        assert_eq!(decoded.lending_market.to_bytes(), lm);
+        assert_eq!(decoded.last_update_slot, 100);
+        assert!(!decoded.last_update_stale);
+    }
+
+    #[test]
+    fn spl_token_accountinfo_owner_must_be_token_program() {
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; SPL_TOKEN_ACCOUNT_LEN];
+        populate_spl_token(&mut data, [0xAB; 32], [0xCD; 32], 100);
+        let wrong_owner = Pubkey::new_unique();
+        let account = AccountInfo::new(
+            &key,
+            false,
+            false,
+            &mut lamports,
+            &mut data,
+            &wrong_owner,
+            false,
+            0,
+        );
+        let err =
+            verify_spl_token_account_info(&account, &pk(0xAB), &pk(0xCD)).unwrap_err();
+        assert_err(err, AuthorityError::SolendTokenAccountOwnerMismatch);
+    }
+
+    #[test]
+    fn spl_token_accountinfo_happy_path() {
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; SPL_TOKEN_ACCOUNT_LEN];
+        let mint = [0xAB; 32];
+        let owner_bytes = [0xCD; 32];
+        populate_spl_token(&mut data, mint, owner_bytes, 1_234);
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+        let account = AccountInfo::new(
+            &key,
+            false,
+            false,
+            &mut lamports,
+            &mut data,
+            &token_program,
+            false,
+            0,
+        );
+        let decoded = verify_spl_token_account_info(
+            &account,
+            &Pubkey::new_from_array(mint),
+            &Pubkey::new_from_array(owner_bytes),
+        )
+        .unwrap();
+        assert_eq!(decoded.amount, 1_234);
+    }
+
+    /// REQUIRED P1 test: AccountInfo borrow failure surfaces as
+    /// `ProgramError::AccountBorrowFailed` (the standard Solana
+    /// runtime mapping) rather than panicking or silently succeeding.
+    #[test]
+    fn accountinfo_data_borrow_failure_maps_to_fail_closed_error() {
+        let record = record();
+        let key = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; SOLEND_OBLIGATION_LEN];
+        populate_obligation_prefix(
+            &mut data,
+            100,
+            false,
+            [0x42; 32],
+            record.delegated_wallet.to_bytes(),
+        );
+        let owner = SOLEND_PROGRAM_ID_MAINNET;
+        let account = AccountInfo::new(
+            &key, false, false, &mut lamports, &mut data, &owner, false, 0,
+        );
+
+        // Take a mutable borrow of the data RefCell BEFORE the
+        // verifier runs. The verifier's `try_borrow_data()` must now
+        // return Err(BorrowMutError) which we map to
+        // ProgramError::AccountBorrowFailed.
+        let _guard = account
+            .data
+            .try_borrow_mut()
+            .expect("test setup must take the mut borrow");
+        let lm = Pubkey::new_from_array([0x42; 32]);
+        let err =
+            verify_obligation_account_info(&account, &record, &lm).unwrap_err();
+        assert_eq!(err, ProgramError::AccountBorrowFailed);
+        // _guard is dropped at end of scope.
     }
 }

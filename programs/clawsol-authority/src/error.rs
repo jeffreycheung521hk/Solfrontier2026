@@ -248,6 +248,55 @@ pub enum AuthorityError {
     /// wire a balance bracket; this discriminant is pre-allocated.
     #[error("Jupiter bracket checkpoint already consumed — reserved for future trustless balance bracket")]
     JupiterBracketCheckpointConsumed = 59,
+
+    // ── Stage 2 P5a Solend Account Decode + Boundary Hardening ──────────
+    //
+    // Discriminants 60..=72 are appended for the Solend live-account
+    // decode substrate introduced in P5a (`solend_account_decode.rs`).
+    // Numeric values are part of the on-chain wire shape (encoded into
+    // `ProgramError::Custom`) and MUST stay append-only — never reorder
+    // or renumber. P5a is decoder + boundary-helper substrate only —
+    // no CPI, no invoke, no transaction construction. P5b will land
+    // same-tx Refresh + Withdraw CPI and re-use these errors.
+
+    #[error("Solend account data is shorter than the required Pack length (Obligation 1300, Reserve 619, or fixed prefix)")]
+    SolendAccountDataTooShort = 60,
+
+    #[error("Solana account-level owner program does not match the expected Solend program id (catch-all for non-program-specific account-info owner mismatches)")]
+    SolendAccountOwnerMismatch = 61,
+
+    #[error("Solend obligation decode failed (catch-all for malformed Pack tail / unrecoverable read)")]
+    SolendObligationDecodeFailed = 62,
+
+    #[error("Solend reserve decode failed (catch-all for malformed Pack tail / unrecoverable read)")]
+    SolendReserveDecodeFailed = 63,
+
+    #[error("Solend obligation version is not supported by this build (current SOLEND_SUPPORTED_VERSION = 1)")]
+    SolendUnsupportedObligationVersion = 64,
+
+    #[error("Solend reserve version is not supported by this build (current SOLEND_SUPPORTED_VERSION = 1)")]
+    SolendUnsupportedReserveVersion = 65,
+
+    #[error("decoded Obligation.lending_market does not match expected lending_market")]
+    SolendObligationLendingMarketMismatch = 66,
+
+    #[error("decoded Reserve.lending_market does not match expected lending_market")]
+    SolendReserveLendingMarketMismatch = 67,
+
+    #[error("Solend reserve last_update.slot does not equal current slot (strict same-slot helper for the future P5b Refresh + Withdraw flow)")]
+    SolendLastUpdateSlotMismatch = 68,
+
+    #[error("SPL token account-level owner program is not the native SPL Token program id")]
+    SolendTokenAccountOwnerMismatch = 69,
+
+    #[error("decoded SPL token account mint does not match the expected mint")]
+    SolendTokenAccountMintMismatch = 70,
+
+    #[error("decoded SPL token account authority/owner does not match the expected wallet")]
+    SolendTokenAccountAuthorityMismatch = 71,
+
+    #[error("SPL token account data length is not the native 165-byte SPL Token Account size (Token-2022 not supported by this slice)")]
+    SolendTokenAccountInvalidLength = 72,
 }
 
 impl From<AuthorityError> for ProgramError {

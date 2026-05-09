@@ -87,6 +87,7 @@ pub mod condition_verifier;
 pub mod error;
 pub mod instruction;
 pub mod jupiter_boundary;
+pub mod solend_account_decode;
 pub mod solend_boundary;
 pub mod state;
 

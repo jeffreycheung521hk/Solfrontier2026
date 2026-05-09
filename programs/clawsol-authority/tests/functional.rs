@@ -4697,3 +4697,64 @@ async fn j4_completed_replay_still_fails_before_jupiter_boundary() {
     assert!(record.completed);
     assert_eq!(record.execution_nonce, 1);
 }
+
+// ── Stage 2 P5a: safety grep ────────────────────────────────────────────────
+//
+// Compile-time scan of the P5a-touched source files for forbidden CPI /
+// transaction / signing / broadcast symbols. The Solend live-account
+// decode substrate (`solend_account_decode.rs`) MUST NOT contain any
+// executable CPI path. Solend boundary additions (`solend_boundary.rs`
+// AccountInfo wrappers) MUST NOT add `invoke` / `invoke_signed` calls.
+//
+// Comments may reference future P5b CPI by name (e.g. "P5b will land
+// same-tx Refresh + Withdraw"); the grep targets *call patterns*
+// (function name immediately followed by `(`) so plain prose mentions
+// don't trip it.
+
+#[test]
+fn safety_grep_no_cpi_symbols_in_p5a_decode_module() {
+    let source = include_str!("../src/solend_account_decode.rs");
+    for forbidden in &[
+        "invoke(",
+        "invoke_signed(",
+        "send_transaction(",
+        "sendRawTransaction(",
+        "signTransaction(",
+        "broadcast(",
+        "RpcClient::",
+        "reqwest::",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "P5a decode module must not contain CPI / RPC / signing symbol `{forbidden}`",
+        );
+    }
+}
+
+#[test]
+fn safety_grep_no_new_cpi_symbols_in_solend_boundary() {
+    // The Solend boundary file has existed since P4. P5a only ADDS
+    // AccountInfo wrappers (no CPI). The forbidden-call-pattern grep
+    // here scans the entire current file because P5a's change set
+    // adds no new executable CPI paths anywhere in it.
+    //
+    // Pre-existing P1 `invoke_signed(` exists ONLY in lib.rs (the
+    // CreateAuthorization processor); this test deliberately does not
+    // scan lib.rs.
+    let source = include_str!("../src/solend_boundary.rs");
+    for forbidden in &[
+        "invoke(",
+        "invoke_signed(",
+        "send_transaction(",
+        "sendRawTransaction(",
+        "signTransaction(",
+        "broadcast(",
+        "RpcClient::",
+        "reqwest::",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "Solend boundary must not contain CPI / RPC / signing symbol `{forbidden}`",
+        );
+    }
+}
