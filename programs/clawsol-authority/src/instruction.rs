@@ -58,6 +58,43 @@ pub enum AuthorityInstruction {
     ///                                       (writable = rent destination)
     ///   1. `[writable]`         authz_pda — existing PDA
     CloseAuthorization,
+
+    /// Execute the action authorised by an existing authorization PDA.
+    ///
+    /// P2 lands the boundary skeleton only — the processor performs every
+    /// `AuthorizationRecord` check the spec requires (signer, owner, PDA
+    /// derivation, schema_version, rule_id, user, executor, rule hash,
+    /// action_type, expiry, revoked, completed, input cap, monotone
+    /// nonce, same-slot replay) and applies the one-shot state mutation
+    /// (`used_amount_raw += input_amount_raw`, `completed = true`,
+    /// `execution_nonce = arg.execution_nonce`,
+    /// `last_execution_slot = current_slot`). It does **not** yet:
+    ///
+    /// - inspect or evaluate the rule's conditions[..] (Stage 2 O3),
+    /// - verify a sibling Solend `RefreshReserve` ix (Stage 2 P3),
+    /// - verify Jupiter `swap` sibling ix via the instructions sysvar
+    ///   (Stage 2 P4),
+    /// - take a token-balance pre/post bracket,
+    /// - sweep funds (Stage 2 spec § 8.1 steps 2–3 — handled by Revoke
+    ///   in a future slice).
+    ///
+    /// Variant order MUST stay append-only: this is the 4th variant
+    /// (Borsh `u8` ordinal `3`) and a future-added variant goes after,
+    /// never inserted before.
+    ///
+    /// Account layout:
+    ///   0. `[signer]`           executor          — must equal authz.executor
+    ///   1. `[writable]`         authz_pda         — existing PDA
+    ///   2. `[]`                 user              — must equal authz.user (readonly)
+    ///   3. `[]`                 delegated_wallet  — readonly placeholder (P3+ wires CPI)
+    ExecuteAction {
+        schema_version: u8,
+        rule_id: [u8; 16],
+        canonical_rule_hash: [u8; 32],
+        action_type: u8,
+        input_amount_raw: u64,
+        execution_nonce: u64,
+    },
 }
 
 /// Build a `CreateAuthorization` instruction for off-chain tx builders
@@ -142,6 +179,47 @@ pub fn close_authorization_instruction(
         accounts: vec![
             AccountMeta::new(*user, true),
             AccountMeta::new(authz_pda, false),
+        ],
+        data,
+    }
+}
+
+/// Build an `ExecuteAction` instruction for off-chain tx builders and
+/// tests. The account list is pinned to the same order the on-chain
+/// processor reads (executor, authz_pda, user, delegated_wallet); P3+
+/// will append Solend / Jupiter accounts after `delegated_wallet`.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_action_instruction(
+    program_id: &Pubkey,
+    executor: &Pubkey,
+    user: &Pubkey,
+    delegated_wallet: &Pubkey,
+    schema_version: u8,
+    rule_id: [u8; 16],
+    canonical_rule_hash: [u8; 32],
+    action_type: u8,
+    input_amount_raw: u64,
+    execution_nonce: u64,
+) -> Instruction {
+    let (authz_pda, _bump) =
+        derive_authorization_pda(program_id, schema_version, user, &rule_id);
+    let data = borsh::to_vec(&AuthorityInstruction::ExecuteAction {
+        schema_version,
+        rule_id,
+        canonical_rule_hash,
+        action_type,
+        input_amount_raw,
+        execution_nonce,
+    })
+    .expect("borsh serialization of AuthorityInstruction is infallible");
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*executor, true),
+            AccountMeta::new(authz_pda, false),
+            AccountMeta::new_readonly(*user, false),
+            AccountMeta::new_readonly(*delegated_wallet, false),
         ],
         data,
     }

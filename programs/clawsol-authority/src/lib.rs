@@ -139,6 +139,23 @@ pub fn process_instruction(
         AuthorityInstruction::CloseAuthorization => {
             process_close_authorization(program_id, accounts)
         }
+        AuthorityInstruction::ExecuteAction {
+            schema_version,
+            rule_id,
+            canonical_rule_hash,
+            action_type,
+            input_amount_raw,
+            execution_nonce,
+        } => process_execute_action(
+            program_id,
+            accounts,
+            schema_version,
+            rule_id,
+            canonical_rule_hash,
+            action_type,
+            input_amount_raw,
+            execution_nonce,
+        ),
     }
 }
 
@@ -441,6 +458,213 @@ fn process_close_authorization(
     Ok(())
 }
 
+/// Execute the action authorised by an existing authorization PDA
+/// (Stage 2 P2 boundary skeleton).
+///
+/// All `AuthorizationRecord` checks the spec demands run here. The
+/// processor performs **no** CPI — Solend variant-15 and Jupiter
+/// sibling-ix verification are deferred to P3 / P4 (see TODOs). The
+/// happy-path mutation is the one-shot v1 set: `used_amount_raw +=
+/// input_amount_raw`, `completed = true`, `execution_nonce` advances
+/// by one, `last_execution_slot = clock.slot`.
+///
+/// Accounts (in order):
+///   0. `[signer]`   executor          — must equal record.executor
+///   1. `[writable]` authorization_pda — owned by this program
+///   2. `[]`         user              — must equal record.user
+///   3. `[]`         delegated_wallet  — readonly placeholder for P3+
+#[allow(clippy::too_many_arguments)]
+fn process_execute_action(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    schema_version: u8,
+    rule_id: [u8; 16],
+    canonical_rule_hash: [u8; 32],
+    action_type: u8,
+    input_amount_raw: u64,
+    execution_nonce: u64,
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    let executor_account = next_account_info(account_iter)?;
+    let authz_pda_account = next_account_info(account_iter)?;
+    let user_account = next_account_info(account_iter)?;
+    let _delegated_wallet_account = next_account_info(account_iter)?;
+    // TODO(Stage 2 P3): Solend same-tx refresh + variant 15
+    // TODO(Stage 2 P4): Jupiter sibling-ix verification via instructions sysvar
+    // TODO(Stage 2): token balance pre/post bracket assertion
+
+    // ── Boundary checks (fail-closed, in spec order) ────────────────────
+
+    // 1. Executor must sign.
+    if !executor_account.is_signer {
+        return Err(AuthorityError::MissingExecutorSignature.into());
+    }
+
+    // 2. PDA must be owned by this program. We check this BEFORE
+    //    deserializing record bytes so a foreign-owned account with
+    //    look-alike data can never advance.
+    if authz_pda_account.owner != program_id {
+        return Err(AuthorityError::AuthorizationOwnerMismatch.into());
+    }
+
+    // 3. PDA derivation: address must match seeds.
+    //    Seeds: [b"authz", [schema_version], user.as_ref(), rule_id]
+    //    — identical to create / revoke / close, keyed off the *arg*
+    //    schema_version + rule_id and the *passed* user account so the
+    //    record body checks below catch any shuffling of which user
+    //    account was supplied.
+    let schema_version_bytes = [schema_version];
+    let seeds: &[&[u8]] = &[
+        AUTHZ_SEED_PREFIX,
+        &schema_version_bytes,
+        user_account.key.as_ref(),
+        rule_id.as_ref(),
+    ];
+    let (expected_pda, _bump) = Pubkey::find_program_address(seeds, program_id);
+    if expected_pda != *authz_pda_account.key {
+        return Err(AuthorityError::InvalidAuthorizationPda.into());
+    }
+
+    // Decode the record. From here on, every check compares the on-chain
+    // record (the user's signed contract) against the caller's args.
+    let mut record = {
+        let data = authz_pda_account.data.borrow();
+        AuthorizationRecord::try_from_slice(&data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+    };
+
+    // 4. Schema version: arg vs record. (The PDA derivation above also
+    //    keys on schema_version, so a mismatch here would also fail (3),
+    //    but the explicit check produces a precise error code.)
+    if record.schema_version != schema_version {
+        return Err(AuthorityError::UnsupportedSchemaVersion.into());
+    }
+
+    // 5. Rule id: arg vs record. Same belt-and-braces argument as (4).
+    if record.rule_id != rule_id {
+        return Err(AuthorityError::InvalidAuthorizationPda.into());
+    }
+
+    // 6. User account: must match record.user.
+    if record.user != *user_account.key {
+        return Err(AuthorityError::AuthorizationUserMismatch.into());
+    }
+
+    // 7. Executor signer: must match record.executor.
+    if record.executor != *executor_account.key {
+        return Err(AuthorityError::ExecutorMismatch.into());
+    }
+
+    // 8. Canonical rule hash: arg must equal what the user signed.
+    //    This is the commitment to the off-chain WatchRule body.
+    if record.canonical_rule_hash != canonical_rule_hash {
+        return Err(AuthorityError::RuleHashMismatch.into());
+    }
+
+    // 9. Action type: arg must match the discriminator the user
+    //    authorised. Stops a daemon from re-routing a Solend-authorised
+    //    rule into a Jupiter execution.
+    if record.allowed_action_type != action_type {
+        return Err(AuthorityError::ActionTypeMismatch.into());
+    }
+
+    // 10. Expiry. Strict: `current_slot < expires_at_slot`. Mirrors the
+    //     create-time check (process_create_authorization above) so the
+    //     boundary `current_slot == expires_at_slot` is treated as
+    //     expired everywhere. Reuses the existing P1 error variant.
+    let clock = Clock::get()?;
+    if clock.slot >= record.expires_at_slot {
+        return Err(AuthorityError::AuthorizationExpired.into());
+    }
+
+    // 11. Revoked.
+    if record.revoked {
+        return Err(AuthorityError::AuthorizationRevoked.into());
+    }
+
+    // 12. Already completed (one-shot v1 — second execution rejected).
+    if record.completed {
+        return Err(AuthorityError::AuthorizationCompleted.into());
+    }
+
+    // 13. Input amount must be non-zero. Zero would advance the nonce
+    //     without consuming any cap, which is uninteresting but worse —
+    //     it would let an executor spin completed=true on a record
+    //     without using any of the user's authorised budget.
+    if input_amount_raw == 0 {
+        return Err(AuthorityError::InputAmountZero.into());
+    }
+
+    // 14. Cap: used_amount_raw + input_amount_raw must not exceed
+    //     max_input_amount_raw, with checked_add to refuse overflow.
+    let new_used = record
+        .used_amount_raw
+        .checked_add(input_amount_raw)
+        .ok_or(AuthorityError::InputAmountExceeded)?;
+    if new_used > record.max_input_amount_raw {
+        return Err(AuthorityError::InputAmountExceeded.into());
+    }
+
+    // 15. Monotone nonce: arg must be exactly record.execution_nonce + 1.
+    //     P1 zero-initialises execution_nonce, so the first valid execute
+    //     supplies arg.execution_nonce = 1. checked_add guards the
+    //     u64::MAX edge.
+    let expected_next_nonce = record
+        .execution_nonce
+        .checked_add(1)
+        .ok_or(AuthorityError::ExecutionNonceMismatch)?;
+    if execution_nonce != expected_next_nonce {
+        return Err(AuthorityError::ExecutionNonceMismatch.into());
+    }
+
+    // 16. Same-slot replay guard. P1 zero-initialises last_execution_slot,
+    //     so the sentinel `record.last_execution_slot == 0` permits the
+    //     very first execute regardless of clock.slot. Subsequent
+    //     executions (only relevant in a future multi-use slice) would
+    //     compare against the prior slot — for one-shot v1 this is dead
+    //     code on the happy path because (12) already blocks a second
+    //     execute on the same record, but we keep it for forward-compat
+    //     and to fail loudly if either invariant changes.
+    if record.last_execution_slot != 0 && clock.slot == record.last_execution_slot {
+        return Err(AuthorityError::SameSlotReplay.into());
+    }
+
+    // ── State mutations (one-shot v1) ───────────────────────────────────
+    record.used_amount_raw = new_used;
+    record.completed = true;
+    record.execution_nonce = execution_nonce;
+    record.last_execution_slot = clock.slot;
+
+    record
+        .serialize(&mut &mut authz_pda_account.data.borrow_mut()[..])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    // TODO(Stage 2 O3): verify watch-rule conditions before accepting execution
+    // TODO(Stage 2): revoke-and-sweep handler
+
+    solana_program::log::sol_log_data(&[
+        b"authz_executed_v1",
+        &rule_id,
+        record.user.as_ref(),
+        record.executor.as_ref(),
+        core::slice::from_ref(&record.allowed_action_type),
+        &input_amount_raw.to_le_bytes(),
+        &record.used_amount_raw.to_le_bytes(),
+        &execution_nonce.to_le_bytes(),
+        &clock.slot.to_le_bytes(),
+    ]);
+    msg!(
+        "execute_action ok action_type={} input_amount_raw={} used_amount_raw={} nonce={} executed_at_slot={}",
+        record.allowed_action_type,
+        input_amount_raw,
+        record.used_amount_raw,
+        execution_nonce,
+        clock.slot
+    );
+
+    Ok(())
+}
+
 /// Pure, deterministic PDA derivation for off-chain tx builders and
 /// tests. Seeds: `["authz", [schema_version], user.as_ref(), rule_id]`.
 pub fn derive_authorization_pda(
@@ -711,5 +935,149 @@ mod tests {
         let bytes = borsh::to_vec(&close).unwrap();
         let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
         assert_eq!(close, decoded);
+    }
+
+    #[test]
+    fn execute_action_borsh_roundtrip() {
+        let original = AuthorityInstruction::ExecuteAction {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0xAB; 16],
+            canonical_rule_hash: [0xCD; 32],
+            action_type: Stage2ActionType::JupiterBuySolWithUsdc.to_u8(),
+            input_amount_raw: 5_000_000,
+            execution_nonce: 1,
+        };
+        let bytes = borsh::to_vec(&original).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn execute_action_borsh_field_order_is_pinned() {
+        // Borsh: enum tag is `u8` ordinal in declaration order, then
+        // variant body in declared field order, integers little-endian,
+        // fixed `[u8; N]` arrays raw. ExecuteAction is the 4th variant
+        // (CreateAuthorization=0, Revoke=1, CloseAuthorization=2,
+        // ExecuteAction=3). Anchor every byte so a future reorder is
+        // loud.
+        let ix = AuthorityInstruction::ExecuteAction {
+            schema_version: 0x01,
+            rule_id: [0x22; 16],
+            canonical_rule_hash: [0x66; 32],
+            action_type: 0x02,
+            input_amount_raw: 0x0102_0304_0506_0708,
+            execution_nonce: 0x1112_1314_1516_1718,
+        };
+        let bytes = borsh::to_vec(&ix).unwrap();
+        // Total: 1 (tag) + 1 + 16 + 32 + 1 + 8 + 8 = 67 bytes
+        assert_eq!(bytes.len(), 67);
+        assert_eq!(bytes[0], 0x03, "byte 0 = enum tag (ExecuteAction = 3)");
+        assert_eq!(bytes[1], 0x01, "byte 1 = schema_version");
+        assert_eq!(&bytes[2..18], &[0x22u8; 16][..], "bytes 2..18 = rule_id");
+        assert_eq!(
+            &bytes[18..50],
+            &[0x66u8; 32][..],
+            "bytes 18..50 = canonical_rule_hash"
+        );
+        assert_eq!(bytes[50], 0x02, "byte 50 = action_type");
+        assert_eq!(
+            &bytes[51..59],
+            &0x0102_0304_0506_0708u64.to_le_bytes()[..],
+            "bytes 51..59 = input_amount_raw (LE u64)"
+        );
+        assert_eq!(
+            &bytes[59..67],
+            &0x1112_1314_1516_1718u64.to_le_bytes()[..],
+            "bytes 59..67 = execution_nonce (LE u64)"
+        );
+    }
+
+    #[test]
+    fn authority_instruction_variant_tags_are_stable() {
+        // Pin the Borsh enum tag for every variant. Adding a future
+        // variant must extend this list; reordering MUST fail this test.
+        let create = borsh::to_vec(&AuthorityInstruction::CreateAuthorization {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0; 16],
+            executor: Pubkey::new_from_array([0; 32]),
+            delegated_wallet: Pubkey::new_from_array([0; 32]),
+            canonical_rule_hash: [0; 32],
+            allowed_action_type: Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
+            max_input_amount_raw: 1,
+            destination: Pubkey::new_from_array([0; 32]),
+            expires_at_slot: 1,
+        })
+        .unwrap();
+        assert_eq!(create[0], 0, "CreateAuthorization tag = 0");
+
+        let revoke = borsh::to_vec(&AuthorityInstruction::Revoke).unwrap();
+        assert_eq!(revoke, vec![1], "Revoke tag = 1, no body");
+
+        let close = borsh::to_vec(&AuthorityInstruction::CloseAuthorization).unwrap();
+        assert_eq!(close, vec![2], "CloseAuthorization tag = 2, no body");
+
+        let execute = borsh::to_vec(&AuthorityInstruction::ExecuteAction {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0; 16],
+            canonical_rule_hash: [0; 32],
+            action_type: Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
+            input_amount_raw: 1,
+            execution_nonce: 1,
+        })
+        .unwrap();
+        assert_eq!(execute[0], 3, "ExecuteAction tag = 3");
+    }
+
+    #[test]
+    fn authority_error_discriminants_are_pinned() {
+        // Numeric values are encoded into ProgramError::Custom(u32) and
+        // are part of the on-chain wire shape. Renumbering, reordering,
+        // or removing any value is a hard wire break.
+        assert_eq!(AuthorityError::UserMustSign as u32, 0);
+        assert_eq!(AuthorityError::InvalidPda as u32, 1);
+        assert_eq!(AuthorityError::AuthorizationExpired as u32, 2);
+        assert_eq!(AuthorityError::InvalidZeroMaxAmount as u32, 3);
+        assert_eq!(AuthorityError::UnsupportedSchemaVersion as u32, 4);
+        assert_eq!(AuthorityError::InvalidActionType as u32, 5);
+        assert_eq!(AuthorityError::RevokeWrongUser as u32, 6);
+        assert_eq!(AuthorityError::CloseWrongUser as u32, 7);
+        assert_eq!(AuthorityError::NotCloseable as u32, 8);
+        // P2 ExecuteAction additions (append-only).
+        assert_eq!(AuthorityError::MissingExecutorSignature as u32, 9);
+        assert_eq!(AuthorityError::InvalidAuthorizationPda as u32, 10);
+        assert_eq!(AuthorityError::AuthorizationOwnerMismatch as u32, 11);
+        assert_eq!(AuthorityError::AuthorizationUserMismatch as u32, 12);
+        assert_eq!(AuthorityError::ExecutorMismatch as u32, 13);
+        assert_eq!(AuthorityError::RuleHashMismatch as u32, 14);
+        assert_eq!(AuthorityError::ActionTypeMismatch as u32, 15);
+        assert_eq!(AuthorityError::AuthorizationRevoked as u32, 16);
+        assert_eq!(AuthorityError::AuthorizationCompleted as u32, 17);
+        assert_eq!(AuthorityError::InputAmountZero as u32, 18);
+        assert_eq!(AuthorityError::InputAmountExceeded as u32, 19);
+        assert_eq!(AuthorityError::ExecutionNonceMismatch as u32, 20);
+        assert_eq!(AuthorityError::SameSlotReplay as u32, 21);
+    }
+
+    #[test]
+    fn pda_seeds_unchanged_from_p1() {
+        // Belt-and-braces guard that P2's processor still uses the same
+        // four-component seed list as P1. If the seed scheme changes,
+        // any deployed PDA becomes unreachable — fail loudly here long
+        // before that happens on chain.
+        let program_id = Pubkey::new_from_array([7u8; 32]);
+        let user = Pubkey::new_from_array([0x11; 32]);
+        let rule_id = [0x22u8; 16];
+        let (pda, _bump) = derive_authorization_pda(&program_id, 1, &user, &rule_id);
+
+        let schema_version_bytes = [1u8];
+        let manual_seeds: &[&[u8]] = &[
+            b"authz",
+            &schema_version_bytes,
+            user.as_ref(),
+            rule_id.as_ref(),
+        ];
+        let (manual_pda, _) = Pubkey::find_program_address(manual_seeds, &program_id);
+        assert_eq!(pda, manual_pda);
+        assert_eq!(AUTHZ_SEED_PREFIX, b"authz");
     }
 }

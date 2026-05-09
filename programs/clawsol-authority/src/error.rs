@@ -34,6 +34,52 @@ pub enum AuthorityError {
 
     #[error("authorization is not yet eligible to be closed (must be revoked, completed, or expired)")]
     NotCloseable = 8,
+
+    // ── Stage 2 P2 ExecuteAction boundary ───────────────────────────────
+    //
+    // Discriminants 9..=20 are appended for the ExecuteAction processor.
+    // Numeric values are part of the on-chain wire shape (encoded into
+    // `ProgramError::Custom`) and MUST stay append-only — never reorder
+    // or renumber.
+
+    #[error("execute_action requires the executor account to sign the transaction")]
+    MissingExecutorSignature = 9,
+
+    #[error("authorization PDA derived from the provided seeds does not match the supplied account key")]
+    InvalidAuthorizationPda = 10,
+
+    #[error("authorization PDA owner is not this program")]
+    AuthorizationOwnerMismatch = 11,
+
+    #[error("authorization PDA's recorded user does not match the user account passed to execute_action")]
+    AuthorizationUserMismatch = 12,
+
+    #[error("execute_action signer does not match the executor recorded in the authorization PDA")]
+    ExecutorMismatch = 13,
+
+    #[error("canonical_rule_hash arg does not match the hash recorded in the authorization PDA")]
+    RuleHashMismatch = 14,
+
+    #[error("action_type arg does not match the allowed_action_type recorded in the authorization PDA")]
+    ActionTypeMismatch = 15,
+
+    #[error("authorization has already been revoked")]
+    AuthorizationRevoked = 16,
+
+    #[error("authorization has already been completed (one-shot v1 — second execution rejected)")]
+    AuthorizationCompleted = 17,
+
+    #[error("input_amount_raw must be > 0")]
+    InputAmountZero = 18,
+
+    #[error("input_amount_raw + used_amount_raw exceeds max_input_amount_raw")]
+    InputAmountExceeded = 19,
+
+    #[error("execution_nonce must equal record.execution_nonce + 1")]
+    ExecutionNonceMismatch = 20,
+
+    #[error("execute_action rejected: same-slot replay (current_slot == record.last_execution_slot)")]
+    SameSlotReplay = 21,
 }
 
 impl From<AuthorityError> for ProgramError {
