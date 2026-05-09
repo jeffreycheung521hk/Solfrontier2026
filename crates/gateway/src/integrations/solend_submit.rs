@@ -1470,7 +1470,7 @@ mod tests {
         let bh = StubBlockhash::new(0xAB, 10_000_000);
         let store = SolendSigningStore::new();
         let summary =
-            create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &NullSolendAuditSink, 600)
+            create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &NullSolendAuditSink, 600, None)
                 .await
                 .expect("handoff");
         // Peek inside via summary; the parked tx_bytes are only reachable

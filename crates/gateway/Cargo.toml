@@ -40,6 +40,12 @@ solana-sdk    = { workspace = true }
 solana-client = { workspace = true }
 solana-account-decoder = { workspace = true }
 solana-transaction-status = { workspace = true }
+# Stage 1 Tail Agent I — record_intent ix builder + PDA derivation.
+# `no-entrypoint` keeps the on-chain BPF entrypoint out of the gateway
+# binary (we only consume the off-chain instruction module). Demo-mode
+# only — production path stays disabled by default; see
+# `crate::record_intent_demo`.
+clawsol-intent = { workspace = true, features = ["no-entrypoint"] }
 spl-associated-token-account = { workspace = true }
 async-trait = { workspace = true }
 base64      = { workspace = true }
@@ -56,3 +62,7 @@ rand            = { workspace = true }
 # delay between attempts is skipped under `start_paused`. The feature is
 # additive — production builds (which only use [dependencies]) are unaffected.
 tokio           = { workspace = true, features = ["test-util"] }
+# Stage 1 Tail Agent I: tests decode the prepended record_intent ix
+# data via the program's `BorshDeserialize`. Dev-only; production
+# already gets borsh transitively via clawsol-intent.
+borsh           = { version = "1", features = ["derive"] }

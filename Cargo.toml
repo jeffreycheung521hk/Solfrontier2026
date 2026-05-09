@@ -100,6 +100,7 @@ claw-agent-runtime = { path = "crates/agent-runtime" }
 claw-channels     = { path = "crates/channels" }
 claw-api          = { path = "crates/api" }
 claw-gateway      = { path = "crates/gateway" }
+clawsol-intent    = { path = "programs/clawsol-intent" }
 
 [profile.release]
 opt-level     = 3

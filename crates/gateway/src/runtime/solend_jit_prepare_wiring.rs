@@ -66,6 +66,10 @@ fn signing_handoff_error_label(e: &SigningHandoffError) -> &'static str {
         SigningHandoffError::BlockhashFetchFailed(_) => "BlockhashFetchFailed",
         SigningHandoffError::SerializationFailed(_) => "SerializationFailed",
         SigningHandoffError::PartialSignFailed(_) => "PartialSignFailed",
+        SigningHandoffError::IntentExpired { .. } => "intent_expired",
+        SigningHandoffError::TxTooLargeWithRecordIntent { .. } => {
+            "tx_too_large_with_record_intent"
+        }
     }
 }
 
@@ -250,6 +254,14 @@ impl GatewaySolendJitPrepareHandler {
         //    intentional and produce distinct signing_request_ids;
         //    the JIT-ready entry is NOT consumed by a successful
         //    prepare so a later call (after expiry) still works.
+        // Stage 1 Tail Agent I: future slice will populate the
+        // `RecordIntentHandoffOptions` from `entry.canonical_metadata`
+        // + `entry.canonical_intent_bytes` + a daemon-passed
+        // `RecordIntentDemoConfig` when demo mode is enabled. Today
+        // the JIT-ready entry never carries canonical bits (the
+        // proposal-side wiring has not been migrated), so we pass
+        // `None` and the handoff behaves byte-for-byte identical to
+        // pre-Agent-I.
         let summary = match create_signing_handoff(
             &entry.plan,
             &entry.preflight,
@@ -257,6 +269,7 @@ impl GatewaySolendJitPrepareHandler {
             self.blockhash_provider.as_ref(),
             self.audit.as_ref(),
             self.signing_lease_seconds,
+            None,
         )
         .await
         {

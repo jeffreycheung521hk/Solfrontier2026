@@ -615,6 +615,14 @@ fn signing_handoff_error_label(e: &SigningHandoffError) -> &'static str {
         SigningHandoffError::BlockhashFetchFailed(_) => "BlockhashFetchFailed",
         SigningHandoffError::SerializationFailed(_) => "SerializationFailed",
         SigningHandoffError::PartialSignFailed(_) => "PartialSignFailed",
+        // Stage 1 Tail Agent I — withdraw path does not enable demo
+        // record_intent yet, so these arms cannot fire here. They are
+        // exhaustively listed to keep the match total in case a future
+        // slice routes the demo through the withdraw JIT prepare too.
+        SigningHandoffError::IntentExpired { .. } => "intent_expired",
+        SigningHandoffError::TxTooLargeWithRecordIntent { .. } => {
+            "tx_too_large_with_record_intent"
+        }
     }
 }
 

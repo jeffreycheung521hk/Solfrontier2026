@@ -23,6 +23,12 @@ pub mod lifecycle_persister;
 pub mod orchestrator;
 pub mod pending_signing;
 pub mod policy_alerting;
+// Stage 1 Tail Agent I — env-driven demo-mode gate that controls
+// whether the Solend deposit JIT handoff prepends a `record_intent`
+// instruction. Default off; production behaviour is unchanged unless
+// `CLAW_RECORD_INTENT_DEMO_ENABLED=1` AND
+// `CLAW_RECORD_INTENT_PROGRAM_ID=<base58 pubkey>` are both set.
+pub mod record_intent_demo;
 pub mod runtime;
 pub mod session_mgr;
 pub mod session_policy;

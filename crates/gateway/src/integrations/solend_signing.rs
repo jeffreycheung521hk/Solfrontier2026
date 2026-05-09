@@ -151,6 +151,34 @@ pub enum SigningHandoffError {
     SerializationFailed(String),
     #[error("partial sign failed: {0}")]
     PartialSignFailed(String),
+    /// Stage 1 Tail Agent I — canonical-intent expiry gate fired BEFORE
+    /// any blockhash fetch / signing / tx assembly. Surfaces with the
+    /// stable `error_type = "intent_expired"` label per the slice spec.
+    /// Carries the intent_id (hex), the slot used for the comparison,
+    /// and the expires_at_slot from the metadata.
+    #[error(
+        "intent_expired: current_slot {current_slot} >= expires_at_slot {expires_at_slot} \
+         (intent_id={intent_id_hex})"
+    )]
+    IntentExpired {
+        current_slot: u64,
+        expires_at_slot: u64,
+        intent_id_hex: String,
+    },
+    /// Stage 1 Tail Agent I — composed transaction (record_intent prefix
+    /// + setup + refresh + deposit ixs) exceeded Solana's
+    /// `PACKET_DATA_SIZE = 1232` byte limit. Surfaces with the stable
+    /// `error_type = "tx_too_large_with_record_intent"` label so demo
+    /// operators can spot it in audit. We never silently drop the
+    /// record_intent prefix — the user explicitly asked for tamper-
+    /// evidence and the slice spec forbids dropping it.
+    #[error(
+        "tx_too_large_with_record_intent: serialized {serialized_len} bytes > {limit} byte cap"
+    )]
+    TxTooLargeWithRecordIntent {
+        serialized_len: usize,
+        limit: usize,
+    },
 }
 
 // ── Parked artifact + store ─────────────────────────────────────────────────
@@ -496,6 +524,62 @@ impl Default for SolendSigningStore {
 
 // ── Async entry point ───────────────────────────────────────────────────────
 
+/// Stage 1 Tail Agent I — optional record_intent prefix + canonical
+/// expiry-gate parameters for [`create_signing_handoff`].
+///
+/// **Backward compatibility:** the handoff function takes
+/// `Option<&RecordIntentHandoffOptions>`. `None` preserves the
+/// pre-Agent-I behaviour byte-for-byte: no expiry-gate, no
+/// `record_intent` ix prepended. All existing call sites that pass
+/// `None` see identical transactions to before this slice.
+///
+/// **When `Some(opts)`:**
+///
+///   1. The expiry gate runs at the latest safe pre-signing boundary
+///      (BEFORE any blockhash fetch / signing / tx assembly). If
+///      `current_slot_for_gate >= canonical_metadata.expires_at_slot`,
+///      the function returns
+///      [`SigningHandoffError::IntentExpired`] without touching the
+///      signing store, the audit sink, or the network.
+///   2. A `record_intent` instruction is prepended so `tx.ix[0]` is
+///      the canonical-intent record and `tx.ix[1..]` is the existing
+///      Solend deposit instruction list, byte-for-byte unchanged
+///      except for the index shift.
+///   3. After tx assembly + partial sign, the serialized transaction
+///      length is checked against Solana's `PACKET_DATA_SIZE = 1232`
+///      byte limit. Over-limit returns
+///      [`SigningHandoffError::TxTooLargeWithRecordIntent`] — the
+///      record_intent prefix is NEVER silently dropped.
+///
+/// The `demo_program_id` is the deployed `clawsol-intent` program
+/// pubkey. It is configured at daemon startup from
+/// [`crate::record_intent_demo::ENV_RECORD_INTENT_PROGRAM_ID`] and is
+/// only present when demo mode is explicitly enabled via
+/// [`crate::record_intent_demo::ENV_RECORD_INTENT_DEMO_ENABLED`].
+#[derive(Debug, Clone)]
+pub struct RecordIntentHandoffOptions {
+    /// Pubkey of the deployed `clawsol-intent` program. Used both as
+    /// the `record_intent` ix's `program_id` and as the seed input to
+    /// [`clawsol_intent::derive_intent_pda`].
+    pub demo_program_id: solana_sdk::pubkey::Pubkey,
+    /// Backend canonical-intent metadata snapshot. The expiry gate
+    /// reads `expires_at_slot` from here; the recorded
+    /// `canonical_intent_hash` and `intent_id` are stamped into the
+    /// `record_intent` ix data.
+    pub canonical_metadata: claw_types::CanonicalIntentMetadata,
+    /// Borsh-canonical bytes of the full `CanonicalIntent`. Carried in
+    /// the `record_intent` ix data so the on-chain program can store
+    /// them in the PDA. Computed once at proposal time via
+    /// [`claw_types::canonical_bytes`].
+    pub canonical_intent_bytes: Vec<u8>,
+    /// Slot used for the `current_slot >= expires_at_slot` comparison.
+    /// Production wires this from the verified-slot snapshot captured
+    /// at re-evaluation time (a conservative lower-bound on the
+    /// current slot — staler than chain-current but never ahead of
+    /// it).
+    pub current_slot_for_gate: u64,
+}
+
 /// Build + park a signing handoff for a preflight-passing Solend deposit
 /// plan. See module-level docs for the strict partial-signing SOP.
 ///
@@ -508,6 +592,10 @@ impl Default for SolendSigningStore {
 /// `signing_lease_seconds` governs the TTL on the parked entry. Matches
 /// the approval-lease pattern; production wires it from
 /// `config.policy.approval_lease_seconds`.
+///
+/// `record_intent_options`: see [`RecordIntentHandoffOptions`]. `None`
+/// preserves the pre-Stage-1-Tail-Agent-I behaviour byte-for-byte.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_signing_handoff(
     plan: &SolendDepositTxPlan,
     preflight: &SolendPreflightOutcome,
@@ -515,7 +603,36 @@ pub async fn create_signing_handoff(
     blockhash_provider: &dyn RecentBlockhashProvider,
     audit: &dyn SolendAuditSink,
     signing_lease_seconds: u64,
+    record_intent_options: Option<&RecordIntentHandoffOptions>,
 ) -> Result<SigningHandoffSummary, SigningHandoffError> {
+    // ── Stage 1 Tail Agent I — expiry gate at the latest safe boundary ──
+    //
+    // Runs BEFORE any blockhash fetch / signing / tx assembly. If
+    // canonical metadata is supplied AND the expires_at_slot has
+    // passed, fail closed with the stable `intent_expired` label and
+    // touch nothing else (no audit emission, no signing-store park,
+    // no network call). This satisfies the slice spec's
+    // "fail closed before signing/submission" requirement.
+    if let Some(opts) = record_intent_options {
+        match crate::canonical_intent_gate::check_intent_expiry(
+            Some(&opts.canonical_metadata),
+            opts.current_slot_for_gate,
+        ) {
+            Ok(_) => {}
+            Err(crate::canonical_intent_gate::GateError::IntentExpired {
+                current_slot,
+                expires_at_slot,
+                intent_id_hex,
+            }) => {
+                return Err(SigningHandoffError::IntentExpired {
+                    current_slot,
+                    expires_at_slot,
+                    intent_id_hex: intent_id_hex.as_str().to_string(),
+                });
+            }
+        }
+    }
+
     // ── 0. Config sanity (same shape as 4C-3 ConfigError guards) ───────────
     match (plan.obligation_signer_required, plan.transient_obligation_pubkey) {
         (true, None) => return Err(SigningHandoffError::MissingTransientObligation),
@@ -580,9 +697,40 @@ pub async fn create_signing_handoff(
         })?;
 
     // ── 4. Concatenate and compile Message (session_wallet strictly payer) ──
+    //
+    // Stage 1 Tail Agent I: when demo mode is on, prepend a
+    // `record_intent` ix so `ix[0]` is the canonical-intent record and
+    // `ix[1..]` is the existing Solend deposit ix list (setup +
+    // refresh + deposit) byte-for-byte unchanged except for the
+    // index shift. The recorded action_type is hard-mapped to
+    // `ActionType::SolendDeposit` per the program's discriminator
+    // table at `programs/clawsol-intent/src/state.rs:45`.
+    let record_intent_prefix_len: usize = match record_intent_options {
+        Some(_) => 1,
+        None => 0,
+    };
     let mut all_ixs = Vec::with_capacity(
-        setup_ixs.len() + refresh_ixs.len() + deposit_ixs.len(),
+        record_intent_prefix_len + setup_ixs.len() + refresh_ixs.len() + deposit_ixs.len(),
     );
+    if let Some(opts) = record_intent_options {
+        // SolendDeposit discriminator from the on-chain program. Hard-
+        // coded to 1 here to match `ActionType::SolendDeposit = 1` in
+        // `programs/clawsol-intent/src/state.rs`. A future slice that
+        // demos withdraw_all or jupiter_swap will route the matching
+        // discriminator from the action_type field.
+        const ACTION_TYPE_SOLEND_DEPOSIT: u8 = 1;
+        let record_ix = clawsol_intent::instruction::record_intent_instruction(
+            &opts.demo_program_id,
+            &plan.session_wallet,
+            opts.canonical_metadata.schema_version,
+            opts.canonical_metadata.intent_id,
+            opts.canonical_metadata.canonical_intent_hash,
+            ACTION_TYPE_SOLEND_DEPOSIT,
+            opts.canonical_metadata.expires_at_slot,
+            opts.canonical_intent_bytes.clone(),
+        );
+        all_ixs.push(record_ix);
+    }
     all_ixs.extend(setup_ixs.iter().cloned());
     all_ixs.extend(refresh_ixs.iter().cloned());
     all_ixs.extend(deposit_ixs.iter().cloned());
@@ -642,6 +790,26 @@ pub async fn create_signing_handoff(
     let tx_bytes = bincode::serialize(&transaction).map_err(|e| {
         SigningHandoffError::SerializationFailed(format!("bincode serialize: {e}"))
     })?;
+
+    // ── Stage 1 Tail Agent I — tx-size check after record_intent prefix ──
+    //
+    // Solana's transport layer caps a transaction at
+    // `solana_sdk::packet::PACKET_DATA_SIZE = 1232` bytes.
+    // (Source: docs.rs/solana-sdk/2.1.21/solana_sdk/packet/constant.PACKET_DATA_SIZE.html)
+    // When demo mode prepended a `record_intent` ix and the result
+    // pushed us over the limit, fail closed with the stable
+    // `tx_too_large_with_record_intent` label. Per the slice spec we
+    // NEVER silently drop the record_intent prefix to keep within
+    // budget — tamper-evidence is the whole point.
+    if record_intent_options.is_some() {
+        const PACKET_DATA_SIZE: usize = 1232;
+        if tx_bytes.len() > PACKET_DATA_SIZE {
+            return Err(SigningHandoffError::TxTooLargeWithRecordIntent {
+                serialized_len: tx_bytes.len(),
+                limit: PACKET_DATA_SIZE,
+            });
+        }
+    }
 
     let signing_request_id = Uuid::new_v4();
     let now = Utc::now();
@@ -1056,7 +1224,7 @@ mod tests {
         let store = SolendSigningStore::new();
         let preflight = passed_preflight();
 
-        let summary = create_signing_handoff(&plan, &preflight, &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let summary = create_signing_handoff(&plan, &preflight, &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .expect("handoff created");
 
@@ -1141,7 +1309,7 @@ mod tests {
         let bh = StubBlockhash::ok(0x33, 100);
         let store = SolendSigningStore::new();
 
-        let summary = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let summary = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap();
         assert!(!summary.obligation_signer_backend_partial);
@@ -1168,7 +1336,7 @@ mod tests {
         plan.transient_obligation_pubkey = None;
         let bh = StubBlockhash::ok(0x01, 1);
         let store = SolendSigningStore::new();
-        let err = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let err = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap_err();
         assert!(matches!(err, SigningHandoffError::MissingTransientObligation));
@@ -1182,7 +1350,7 @@ mod tests {
         plan.transient_obligation_pubkey = Some(Pubkey::new_unique());
         let bh = StubBlockhash::ok(0x01, 1);
         let store = SolendSigningStore::new();
-        let err = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let err = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap_err();
         assert!(matches!(err, SigningHandoffError::UnexpectedTransientObligation));
@@ -1196,7 +1364,7 @@ mod tests {
         let plan = fresh_plan(false);
         let bh = StubBlockhash::erroring();
         let store = SolendSigningStore::new();
-        let err = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let err = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap_err();
         assert!(matches!(err, SigningHandoffError::BlockhashFetchFailed(_)));
@@ -1210,7 +1378,7 @@ mod tests {
         let plan = fresh_plan(false);
         let bh = StubBlockhash::ok(0x77, 100);
         let store = SolendSigningStore::new();
-        let summary = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let summary = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap();
 
@@ -1226,7 +1394,7 @@ mod tests {
         assert_eq!(store.parked_count(), 0, "no residual Keypair lingering");
 
         // Re-park and validate consume() on an expired entry drops it too.
-        let summary2 = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let summary2 = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap();
         {
@@ -1246,24 +1414,24 @@ mod tests {
         let store = SolendSigningStore::new();
 
         // Case 1: consume
-        let s1 = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let s1 = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap();
         let _ = store.consume(s1.signing_request_id).expect("present");
         assert!(!store.contains(&s1.signing_request_id));
 
         // Case 2: explicit remove
-        let s2 = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let s2 = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap();
         store.remove(&s2.signing_request_id);
         assert!(!store.contains(&s2.signing_request_id));
 
         // Case 3: cleanup_expired sweeps only expired
-        let s3 = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let s3 = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap();
-        let s4 = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let s4 = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap();
         {
@@ -1283,7 +1451,7 @@ mod tests {
         let plan = fresh_plan(false);
         let bh = StubBlockhash::ok(0x99, 100);
         let store = SolendSigningStore::new();
-        let summary = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120)
+        let summary = create_signing_handoff(&plan, &passed_preflight(), &store, &bh, &crate::integrations::solend_submit::NullSolendAuditSink, 120, None)
             .await
             .unwrap();
 
@@ -1312,6 +1480,7 @@ mod tests {
             &bh,
             &crate::integrations::solend_submit::NullSolendAuditSink,
             120,
+            None,
         )
         .await
         .unwrap();
@@ -1340,6 +1509,7 @@ mod tests {
             &bh,
             &crate::integrations::solend_submit::NullSolendAuditSink,
             120,
+            None,
         )
         .await
         .unwrap();
@@ -1370,6 +1540,7 @@ mod tests {
             &bh,
             &crate::integrations::solend_submit::NullSolendAuditSink,
             120,
+            None,
         )
         .await
         .unwrap();
@@ -1398,6 +1569,7 @@ mod tests {
             &bh,
             &crate::integrations::solend_submit::NullSolendAuditSink,
             120,
+            None,
         )
         .await
         .unwrap();
@@ -1416,6 +1588,471 @@ mod tests {
         let _tx: Transaction = bincode::deserialize(&bytes).unwrap();
         // Retrieval is NOT consumptive.
         assert!(store.contains(&summary.signing_request_id));
+    }
+
+    // ── Stage 1 Tail Agent I — record_intent prefix + expiry-gate tests ────
+    //
+    // All tests in this block exercise the `Some(opts)` path of
+    // `create_signing_handoff`. The `None` path is covered by every
+    // pre-existing test above (which all pass `, None` after the
+    // Agent-I refactor) — backward compatibility proof.
+
+    use claw_types::{
+        canonical_bytes, canonical_hash, CanonicalIntent, CanonicalIntentActionType,
+        CanonicalIntentMetadata, IntentAction, PubkeyBytes,
+        STAGE1_TAIL_SCHEMA_VERSION,
+    };
+
+    fn fixture_canonical_intent_solend_deposit() -> CanonicalIntent {
+        CanonicalIntent {
+            schema_version: STAGE1_TAIL_SCHEMA_VERSION,
+            intent_id: [
+                0x57, 0x41, 0x4C, 0x4C, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+            ],
+            user: PubkeyBytes::new([0xAA; 32]),
+            action: IntentAction::SolendDeposit {
+                wallet_pubkey: PubkeyBytes::new([0xAA; 32]),
+                input_mint: PubkeyBytes::new([0x11; 32]),
+                reserve_pubkey: PubkeyBytes::new([0x22; 32]),
+                lending_market: PubkeyBytes::new([0x33; 32]),
+                amount_raw: 5_000_000,
+                amount_decimals: 6,
+            },
+            expires_at_slot: 1_000_000_000,
+        }
+    }
+
+    fn fixture_record_intent_options(
+        program_id: solana_sdk::pubkey::Pubkey,
+        current_slot_for_gate: u64,
+        intent_override: Option<CanonicalIntent>,
+    ) -> RecordIntentHandoffOptions {
+        let intent = intent_override.unwrap_or_else(fixture_canonical_intent_solend_deposit);
+        let bytes = canonical_bytes(&intent);
+        let hash = canonical_hash(&intent);
+        let metadata = CanonicalIntentMetadata {
+            schema_version: intent.schema_version,
+            intent_id: intent.intent_id,
+            canonical_intent_hash: hash,
+            expires_at_slot: intent.expires_at_slot,
+            action_type: CanonicalIntentActionType::SolendDeposit,
+        };
+        RecordIntentHandoffOptions {
+            demo_program_id: program_id,
+            canonical_metadata: metadata,
+            canonical_intent_bytes: bytes,
+            current_slot_for_gate,
+        }
+    }
+
+    /// Test 1 — backward compatibility. The `None` path produces the
+    /// SAME instruction list it did before Agent I (covered by every
+    /// pre-Agent-I test above). This test additionally pins that the
+    /// instruction count equals setup + refresh + deposit (no extra
+    /// prefix instruction smuggled in).
+    #[tokio::test]
+    async fn record_intent_disabled_default_does_not_prepend_ix() {
+        let plan = fresh_plan(false);
+        let bh = StubBlockhash::ok(0xC0, 200);
+        let store = SolendSigningStore::new();
+        let summary = create_signing_handoff(
+            &plan,
+            &passed_preflight(),
+            &store,
+            &bh,
+            &crate::integrations::solend_submit::NullSolendAuditSink,
+            120,
+            None, // demo OFF — pre-Agent-I behaviour
+        )
+        .await
+        .unwrap();
+        let parked = store.consume(summary.signing_request_id).unwrap();
+        let tx: Transaction = bincode::deserialize(&parked.tx_bytes).unwrap();
+        let expected_ix_count =
+            plan.setup_instructions.len()
+                + plan.refresh_instructions.len()
+                + plan.deposit_instructions.len();
+        assert_eq!(
+            tx.message.instructions.len(),
+            expected_ix_count,
+            "with record_intent OFF, ix list length must match setup+refresh+deposit"
+        );
+    }
+
+    /// Test 2 — record_intent enabled, valid metadata, current_slot
+    /// well below expires_at_slot. The first instruction in the
+    /// resulting tx MUST be the clawsol-intent program; the
+    /// remaining instructions must be byte-identical to the
+    /// pre-Agent-I list (just shifted by one).
+    #[tokio::test]
+    async fn record_intent_enabled_prepends_clawsol_intent_program_id_at_ix0() {
+        let program_id = Pubkey::new_unique();
+        // existing-obligation path keeps tx size under the 1232-byte
+        // cap once the record_intent prefix is added; first-deposit
+        // path is exercised separately by
+        // `record_intent_first_deposit_exceeds_tx_size_cap` below.
+        let plan = fresh_plan(true);
+        let bh = StubBlockhash::ok(0xC1, 200);
+        let store = SolendSigningStore::new();
+        let opts = fixture_record_intent_options(program_id, /*current_slot=*/ 100, None);
+        let summary = create_signing_handoff(
+            &plan,
+            &passed_preflight(),
+            &store,
+            &bh,
+            &crate::integrations::solend_submit::NullSolendAuditSink,
+            120,
+            Some(&opts),
+        )
+        .await
+        .unwrap();
+        let parked = store.consume(summary.signing_request_id).unwrap();
+        let tx: Transaction = bincode::deserialize(&parked.tx_bytes).unwrap();
+        let expected_total =
+            1 + plan.setup_instructions.len()
+                + plan.refresh_instructions.len()
+                + plan.deposit_instructions.len();
+        assert_eq!(tx.message.instructions.len(), expected_total);
+        let ix0 = &tx.message.instructions[0];
+        let ix0_program_id = tx.message.account_keys[ix0.program_id_index as usize];
+        assert_eq!(
+            ix0_program_id, program_id,
+            "ix[0] program_id must be the configured clawsol-intent program"
+        );
+    }
+
+    /// Test 3 — the canonical_intent_hash carried in the record_intent
+    /// ix data equals `canonical_hash(intent)` from claw-types. This
+    /// is the cross-surface tamper-evidence anchor.
+    #[tokio::test]
+    async fn record_intent_canonical_hash_matches_metadata() {
+        let program_id = Pubkey::new_unique();
+        let plan = fresh_plan(true); // existing-obligation; see Test 2 note
+        let bh = StubBlockhash::ok(0xC2, 200);
+        let store = SolendSigningStore::new();
+        let intent = fixture_canonical_intent_solend_deposit();
+        let expected_hash = canonical_hash(&intent);
+        let opts = fixture_record_intent_options(program_id, 100, Some(intent));
+        let summary = create_signing_handoff(
+            &plan,
+            &passed_preflight(),
+            &store,
+            &bh,
+            &crate::integrations::solend_submit::NullSolendAuditSink,
+            120,
+            Some(&opts),
+        )
+        .await
+        .unwrap();
+        let parked = store.consume(summary.signing_request_id).unwrap();
+        let tx: Transaction = bincode::deserialize(&parked.tx_bytes).unwrap();
+        // Decode the ix[0] data via the program's borsh schema.
+        let decoded: clawsol_intent::instruction::IntentInstruction =
+            borsh::from_slice(&tx.message.instructions[0].data).unwrap();
+        match decoded {
+            clawsol_intent::instruction::IntentInstruction::RecordIntent {
+                canonical_intent_hash,
+                action_type,
+                schema_version,
+                expires_at_slot,
+                ..
+            } => {
+                assert_eq!(canonical_intent_hash, expected_hash);
+                assert_eq!(action_type, 1, "SolendDeposit discriminator = 1");
+                assert_eq!(schema_version, STAGE1_TAIL_SCHEMA_VERSION);
+                assert_eq!(expires_at_slot, 1_000_000_000);
+            }
+        }
+    }
+
+    /// Test 4 — the intent PDA recorded in ix[0].accounts[1] equals
+    /// what `clawsol_intent::derive_intent_pda(...)` produces from
+    /// the same (program_id, schema_version, user, intent_id) tuple.
+    /// This is the contract: off-chain builder and on-chain program
+    /// MUST agree on the PDA.
+    #[tokio::test]
+    async fn record_intent_pda_derivation_matches_program_helper() {
+        let program_id = Pubkey::new_unique();
+        let plan = fresh_plan(true); // existing-obligation; see Test 2 note
+        let bh = StubBlockhash::ok(0xC3, 200);
+        let store = SolendSigningStore::new();
+        let opts = fixture_record_intent_options(program_id, 100, None);
+        let session_wallet = plan.session_wallet;
+        let summary = create_signing_handoff(
+            &plan,
+            &passed_preflight(),
+            &store,
+            &bh,
+            &crate::integrations::solend_submit::NullSolendAuditSink,
+            120,
+            Some(&opts),
+        )
+        .await
+        .unwrap();
+        let parked = store.consume(summary.signing_request_id).unwrap();
+        let tx: Transaction = bincode::deserialize(&parked.tx_bytes).unwrap();
+        let ix0 = &tx.message.instructions[0];
+        let pda_in_ix = tx.message.account_keys[ix0.accounts[1] as usize];
+        let (expected_pda, _bump) = clawsol_intent::derive_intent_pda(
+            &program_id,
+            opts.canonical_metadata.schema_version,
+            &session_wallet,
+            &opts.canonical_metadata.intent_id,
+        );
+        assert_eq!(pda_in_ix, expected_pda);
+    }
+
+    /// Test 5 — current_slot strictly above expires_at_slot fails
+    /// closed with the stable `intent_expired` label. The store and
+    /// audit sink are NOT touched on this path.
+    #[tokio::test]
+    async fn record_intent_expired_metadata_blocks_handoff() {
+        let program_id = Pubkey::new_unique();
+        let plan = fresh_plan(false);
+        let bh = StubBlockhash::ok(0xC4, 200);
+        let store = SolendSigningStore::new();
+        let opts = fixture_record_intent_options(
+            program_id,
+            /*current_slot=*/ 1_000_000_001, // > expires_at_slot (1_000_000_000)
+            None,
+        );
+        let err = create_signing_handoff(
+            &plan,
+            &passed_preflight(),
+            &store,
+            &bh,
+            &crate::integrations::solend_submit::NullSolendAuditSink,
+            120,
+            Some(&opts),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            SigningHandoffError::IntentExpired {
+                current_slot,
+                expires_at_slot,
+                ..
+            } => {
+                assert_eq!(current_slot, 1_000_000_001);
+                assert_eq!(expires_at_slot, 1_000_000_000);
+            }
+            other => panic!("expected IntentExpired, got {other:?}"),
+        }
+        // No park happened — store stays empty.
+        assert_eq!(store.parked_count(), 0);
+    }
+
+    /// Test 6 — current_slot exactly EQUAL to expires_at_slot also
+    /// fails closed (the gate uses `>=`). Boundary explicit.
+    #[tokio::test]
+    async fn record_intent_boundary_equality_blocks() {
+        let program_id = Pubkey::new_unique();
+        let plan = fresh_plan(false);
+        let bh = StubBlockhash::ok(0xC5, 200);
+        let store = SolendSigningStore::new();
+        let opts = fixture_record_intent_options(
+            program_id,
+            /*current_slot=*/ 1_000_000_000, // == expires_at_slot
+            None,
+        );
+        let err = create_signing_handoff(
+            &plan,
+            &passed_preflight(),
+            &store,
+            &bh,
+            &crate::integrations::solend_submit::NullSolendAuditSink,
+            120,
+            Some(&opts),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SigningHandoffError::IntentExpired { .. }));
+    }
+
+    /// Test 7 — current_slot strictly below expires_at_slot continues
+    /// to a successful handoff. Verifies the gate is "fail-on-or-after"
+    /// and not "fail-always-when-Some".
+    #[tokio::test]
+    async fn record_intent_not_expired_continues_to_handoff() {
+        let program_id = Pubkey::new_unique();
+        let plan = fresh_plan(true); // existing-obligation; see Test 2 note
+        let bh = StubBlockhash::ok(0xC6, 200);
+        let store = SolendSigningStore::new();
+        let opts = fixture_record_intent_options(
+            program_id,
+            /*current_slot=*/ 999_999_999, // < expires_at_slot
+            None,
+        );
+        let summary = create_signing_handoff(
+            &plan,
+            &passed_preflight(),
+            &store,
+            &bh,
+            &crate::integrations::solend_submit::NullSolendAuditSink,
+            120,
+            Some(&opts),
+        )
+        .await
+        .unwrap();
+        // Park happened.
+        assert!(store.contains(&summary.signing_request_id));
+    }
+
+    /// Test 8 — byte-for-byte ordering proof.
+    ///
+    /// Run the SAME plan + SAME blockhash through `create_signing_handoff`
+    /// twice — once with `None`, once with `Some(opts)` — and assert
+    /// that the enabled tx's `ix[1..]` is byte-equal to the disabled
+    /// tx's `ix[0..]` after each `CompiledInstruction` is resolved
+    /// through its `account_keys` lookup. This proves the existing
+    /// Solend setup + refresh + deposit ix list is preserved exactly,
+    /// only shifted by one index — the slice spec's "byte-for-byte
+    /// and order-preserving after index shift" requirement.
+    ///
+    /// Uses `fresh_plan(true)` (existing obligation, no fresh Keypair
+    /// generated inside the handoff) so the only nondeterminism
+    /// between the two calls is the `signing_request_id` UUID, which
+    /// does not appear in the compiled tx.
+    #[tokio::test]
+    async fn record_intent_enabled_preserves_solend_ix_bytes_after_prefix() {
+        let plan = fresh_plan(true);
+        assert!(
+            !plan.obligation_signer_required,
+            "fresh_plan(true) must avoid the runtime Keypair branch"
+        );
+        let bh = StubBlockhash::ok(0xC7, 200);
+
+        // Disabled (pre-Agent-I) call.
+        let store_a = SolendSigningStore::new();
+        let s_disabled = create_signing_handoff(
+            &plan,
+            &passed_preflight(),
+            &store_a,
+            &bh,
+            &crate::integrations::solend_submit::NullSolendAuditSink,
+            120,
+            None,
+        )
+        .await
+        .unwrap();
+        let parked_disabled = store_a.consume(s_disabled.signing_request_id).unwrap();
+        let tx_disabled: Transaction = bincode::deserialize(&parked_disabled.tx_bytes).unwrap();
+
+        // Enabled (Agent-I demo) call.
+        let store_b = SolendSigningStore::new();
+        let program_id = Pubkey::new_unique();
+        let opts = fixture_record_intent_options(program_id, /*current_slot=*/ 100, None);
+        let s_enabled = create_signing_handoff(
+            &plan,
+            &passed_preflight(),
+            &store_b,
+            &bh,
+            &crate::integrations::solend_submit::NullSolendAuditSink,
+            120,
+            Some(&opts),
+        )
+        .await
+        .unwrap();
+        let parked_enabled = store_b.consume(s_enabled.signing_request_id).unwrap();
+        let tx_enabled: Transaction = bincode::deserialize(&parked_enabled.tx_bytes).unwrap();
+
+        // Resolve every CompiledInstruction back through account_keys
+        // to a (program_id, account-pubkey-list, data-bytes) tuple so
+        // the comparison is independent of how the Message compiler
+        // happened to order account_keys in each transaction.
+        fn resolve(tx: &Transaction) -> Vec<(Pubkey, Vec<Pubkey>, Vec<u8>)> {
+            tx.message
+                .instructions
+                .iter()
+                .map(|ix| {
+                    let program = tx.message.account_keys[ix.program_id_index as usize];
+                    let accs: Vec<Pubkey> = ix
+                        .accounts
+                        .iter()
+                        .map(|i| tx.message.account_keys[*i as usize])
+                        .collect();
+                    (program, accs, ix.data.clone())
+                })
+                .collect()
+        }
+        let disabled_resolved = resolve(&tx_disabled);
+        let enabled_resolved = resolve(&tx_enabled);
+
+        assert_eq!(
+            enabled_resolved.len(),
+            disabled_resolved.len() + 1,
+            "enabled adds exactly one prefix instruction"
+        );
+        assert_eq!(
+            &enabled_resolved[1..],
+            &disabled_resolved[..],
+            "Solend ix list must be byte-for-byte and order-preserving \
+             after the index shift introduced by the record_intent prefix"
+        );
+        assert_eq!(
+            enabled_resolved[0].0, program_id,
+            "the prefix ix is the configured clawsol-intent program"
+        );
+    }
+
+    /// Test 9 — error label string is the stable `intent_expired`
+    /// per the slice spec. Pinned via the Display impl content.
+    #[test]
+    fn intent_expired_error_display_contains_stable_label() {
+        let err = SigningHandoffError::IntentExpired {
+            current_slot: 100,
+            expires_at_slot: 50,
+            intent_id_hex: "deadbeef".to_string(),
+        };
+        let s = format!("{err}");
+        assert!(s.contains("intent_expired"));
+        assert!(s.contains("100"));
+        assert!(s.contains("50"));
+        assert!(s.contains("deadbeef"));
+    }
+
+    /// Test 10 — first-deposit + record_intent prefix exceeds the
+    /// `PACKET_DATA_SIZE = 1232` byte tx cap and fails closed with
+    /// `TxTooLargeWithRecordIntent`. Per the slice spec we NEVER
+    /// silently drop the prefix to fit. Operators see this in audit
+    /// and must either (a) wait for the obligation to exist
+    /// (subsequent deposits fit) or (b) defer to a Stage 2
+    /// action-binding flow that doesn't carry full canonical bytes
+    /// in the prefix.
+    #[tokio::test]
+    async fn record_intent_first_deposit_exceeds_tx_size_cap() {
+        let program_id = Pubkey::new_unique();
+        // first-deposit path: includes CreateAccount + InitObligation +
+        // ATA creates → setup ix list is at the upper bound and the
+        // record_intent prefix pushes total bytes past 1232.
+        let plan = fresh_plan(false);
+        let bh = StubBlockhash::ok(0xC8, 200);
+        let store = SolendSigningStore::new();
+        let opts = fixture_record_intent_options(program_id, /*current_slot=*/ 100, None);
+        let err = create_signing_handoff(
+            &plan,
+            &passed_preflight(),
+            &store,
+            &bh,
+            &crate::integrations::solend_submit::NullSolendAuditSink,
+            120,
+            Some(&opts),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            SigningHandoffError::TxTooLargeWithRecordIntent {
+                serialized_len,
+                limit,
+            } => {
+                assert_eq!(limit, 1232, "Solana PACKET_DATA_SIZE = 1232 bytes");
+                assert!(
+                    serialized_len > limit,
+                    "serialized_len ({serialized_len}) must exceed the 1232 byte cap"
+                );
+            }
+            other => panic!("expected TxTooLargeWithRecordIntent, got {other:?}"),
+        }
     }
 
     // ── Forbidden-term structural scan on this module's source ─────────────
