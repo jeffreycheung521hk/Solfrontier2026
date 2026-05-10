@@ -87,6 +87,7 @@ pub mod condition_verifier;
 pub mod error;
 pub mod instruction;
 pub mod jupiter_boundary;
+pub mod jupiter_bracket;
 pub mod solend_account_decode;
 pub mod solend_boundary;
 pub mod solend_cpi_builder;
@@ -101,6 +102,9 @@ use crate::instruction::{
     AuthorityInstruction, ConditionProofPayload, ProofCondition, MAX_PROOF_CONDITIONS,
 };
 use crate::jupiter_boundary::{verify_jupiter_boundary_skeleton, JupiterBoundaryProof};
+use crate::jupiter_bracket::{
+    process_post_jupiter_bracket_check, process_pre_jupiter_bracket_check,
+};
 use crate::solend_account_decode::{
     decode_spl_token_account_lite, SPL_TOKEN_PROGRAM_ID,
 };
@@ -182,6 +186,14 @@ pub fn process_instruction(
             solend_boundary_proof,
             jupiter_boundary_proof,
         ),
+        // J5 BONUS PROTOTYPE — trustless dual-bracket pre-check.
+        AuthorityInstruction::PreJupiterBracketCheck { proof } => {
+            process_pre_jupiter_bracket_check(program_id, accounts, proof)
+        }
+        // J5 BONUS PROTOTYPE — trustless dual-bracket post-check.
+        AuthorityInstruction::PostJupiterBracketCheck { proof } => {
+            process_post_jupiter_bracket_check(program_id, accounts, proof)
+        }
     }
 }
 
@@ -1679,6 +1691,76 @@ mod tests {
         })
         .unwrap();
         assert_eq!(execute[0], 3, "ExecuteAction tag = 3");
+
+        // J5 BONUS — append-only tags 4 and 5.
+        let pre = borsh::to_vec(&AuthorityInstruction::PreJupiterBracketCheck {
+            proof: crate::jupiter_bracket::JupiterPreBracketProof {
+                execution_nonce: 1,
+                destination_token_account: Pubkey::new_from_array([0; 32]),
+                expected_destination_mint: Pubkey::new_from_array([0; 32]),
+                min_output_amount_raw: 1,
+            },
+        })
+        .unwrap();
+        assert_eq!(pre[0], 4, "PreJupiterBracketCheck tag = 4 (J5)");
+
+        let post = borsh::to_vec(&AuthorityInstruction::PostJupiterBracketCheck {
+            proof: crate::jupiter_bracket::JupiterPostBracketProof {
+                execution_nonce: 1,
+                destination_token_account: Pubkey::new_from_array([0; 32]),
+            },
+        })
+        .unwrap();
+        assert_eq!(post[0], 5, "PostJupiterBracketCheck tag = 5 (J5)");
+    }
+
+    /// J5 BONUS — pin the J5 instruction Borsh discriminator positions
+    /// at the same level as the rest of the AuthorityInstruction
+    /// variants. If anyone reorders or inserts before tags 4 / 5 this
+    /// fires loudly.
+    #[test]
+    fn j5_instruction_variants_are_append_only() {
+        // Pre-bracket: tag 4, then nonce(8) + dest(32) + mint(32) + min_out(8) = 80 body bytes.
+        let pre = borsh::to_vec(&AuthorityInstruction::PreJupiterBracketCheck {
+            proof: crate::jupiter_bracket::JupiterPreBracketProof {
+                execution_nonce: 0x0102_0304_0506_0708,
+                destination_token_account: Pubkey::new_from_array([0xCC; 32]),
+                expected_destination_mint: Pubkey::new_from_array([0x12; 32]),
+                min_output_amount_raw: 0x1112_1314_1516_1718,
+            },
+        })
+        .unwrap();
+        assert_eq!(pre[0], 4);
+        assert_eq!(
+            &pre[1..9],
+            &0x0102_0304_0506_0708u64.to_le_bytes()[..],
+            "bytes 1..9 = execution_nonce (LE u64)"
+        );
+        assert_eq!(&pre[9..41], &[0xCCu8; 32][..], "bytes 9..41 = destination_token_account");
+        assert_eq!(&pre[41..73], &[0x12u8; 32][..], "bytes 41..73 = expected_destination_mint");
+        assert_eq!(
+            &pre[73..81],
+            &0x1112_1314_1516_1718u64.to_le_bytes()[..],
+            "bytes 73..81 = min_output_amount_raw (LE u64)"
+        );
+        assert_eq!(pre.len(), 81, "tag(1) + body(80)");
+
+        // Post-bracket: tag 5, then nonce(8) + dest(32) = 40 body bytes.
+        let post = borsh::to_vec(&AuthorityInstruction::PostJupiterBracketCheck {
+            proof: crate::jupiter_bracket::JupiterPostBracketProof {
+                execution_nonce: 0x0102_0304_0506_0708,
+                destination_token_account: Pubkey::new_from_array([0xCC; 32]),
+            },
+        })
+        .unwrap();
+        assert_eq!(post[0], 5);
+        assert_eq!(
+            &post[1..9],
+            &0x0102_0304_0506_0708u64.to_le_bytes()[..],
+            "bytes 1..9 = execution_nonce (LE u64)"
+        );
+        assert_eq!(&post[9..41], &[0xCCu8; 32][..], "bytes 9..41 = destination_token_account");
+        assert_eq!(post.len(), 41, "tag(1) + body(40)");
     }
 
     #[test]

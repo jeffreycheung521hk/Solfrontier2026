@@ -25,6 +25,9 @@ use crate::condition_verifier::{
 };
 use crate::derive_authorization_pda;
 use crate::jupiter_boundary::JupiterBoundaryProof;
+use crate::jupiter_bracket::{
+    derive_jupiter_bracket_checkpoint_pda, JupiterPostBracketProof, JupiterPreBracketProof,
+};
 use crate::solend_boundary::SolendBoundaryProof;
 
 /// Maximum number of proof-conditions per `ExecuteAction`. Bounded so a
@@ -184,6 +187,49 @@ pub enum AuthorityInstruction {
         solend_boundary_proof: Option<SolendBoundaryProof>,
         jupiter_boundary_proof: Option<JupiterBoundaryProof>,
     },
+
+    /// **J5 BONUS PROTOTYPE — trustless dual-bracket pre-check.**
+    ///
+    /// Stage 2 J4 deferred the trustless balance bracket; J5 lands the
+    /// dual-instruction model: this is the pre-bracket leg.
+    ///
+    /// Borsh enum tag: `4` (5th variant — append-only).
+    ///
+    /// Account layout:
+    ///   0. `[signer, writable]` executor                  — pays for checkpoint rent
+    ///   1. `[]`                 authorization_pda         — owned by this program
+    ///   2. `[]`                 destination_token_account — live SPL Token account
+    ///   3. `[writable]`         checkpoint_pda            — created here
+    ///   4. `[]`                 system_program            — for create_account CPI
+    ///
+    /// See `jupiter_bracket::process_pre_jupiter_bracket_check` for
+    /// gate semantics.
+    ///
+    /// **NOT a Jupiter API caller. NOT a Jupiter CPI. NOT live-proven.**
+    PreJupiterBracketCheck { proof: JupiterPreBracketProof },
+
+    /// **J5 BONUS PROTOTYPE — trustless dual-bracket post-check.**
+    ///
+    /// Loads the checkpoint PDA created by `PreJupiterBracketCheck`,
+    /// re-unpacks the destination's live SPL Token data, computes the
+    /// trustless balance delta, and gates it against the recorded
+    /// `min_output_amount_raw`. Marks the checkpoint consumed; replay
+    /// fails closed with
+    /// [`crate::error::AuthorityError::JupiterBracketCheckpointConsumed`].
+    ///
+    /// Borsh enum tag: `5` (6th variant — append-only).
+    ///
+    /// Account layout:
+    ///   0. `[signer]`           executor                  — must equal authz.executor
+    ///   1. `[]`                 authorization_pda         — owned by this program
+    ///   2. `[]`                 destination_token_account — live SPL Token account
+    ///   3. `[writable]`         checkpoint_pda            — flipped to consumed
+    ///
+    /// See `jupiter_bracket::process_post_jupiter_bracket_check` for
+    /// gate semantics.
+    ///
+    /// **NOT a Jupiter API caller. NOT a Jupiter CPI. NOT live-proven.**
+    PostJupiterBracketCheck { proof: JupiterPostBracketProof },
 }
 
 /// Build a `CreateAuthorization` instruction for off-chain tx builders
@@ -331,6 +377,71 @@ pub fn execute_action_instruction(
             AccountMeta::new(authz_pda, false),
             AccountMeta::new_readonly(*user, false),
             AccountMeta::new_readonly(*delegated_wallet, false),
+        ],
+        data,
+    }
+}
+
+/// Build a `PreJupiterBracketCheck` instruction (J5 bonus prototype).
+///
+/// The checkpoint PDA address is derived from the proof's
+/// `execution_nonce` and `destination_token_account` — callers do NOT
+/// supply it as an argument; the builder computes it.
+pub fn pre_jupiter_bracket_check_instruction(
+    program_id: &Pubkey,
+    executor: &Pubkey,
+    authorization_pda: &Pubkey,
+    proof: JupiterPreBracketProof,
+) -> Instruction {
+    let (checkpoint_pda, _bump) = derive_jupiter_bracket_checkpoint_pda(
+        program_id,
+        authorization_pda,
+        proof.execution_nonce,
+        &proof.destination_token_account,
+    );
+    let destination = proof.destination_token_account;
+    let data = borsh::to_vec(&AuthorityInstruction::PreJupiterBracketCheck { proof })
+        .expect("borsh serialization of AuthorityInstruction is infallible");
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*executor, true),
+            AccountMeta::new_readonly(*authorization_pda, false),
+            AccountMeta::new_readonly(destination, false),
+            AccountMeta::new(checkpoint_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data,
+    }
+}
+
+/// Build a `PostJupiterBracketCheck` instruction (J5 bonus prototype).
+///
+/// Same checkpoint-PDA derivation rule as the pre-check builder — the
+/// caller supplies `proof.execution_nonce` and
+/// `proof.destination_token_account`, the builder computes the PDA.
+pub fn post_jupiter_bracket_check_instruction(
+    program_id: &Pubkey,
+    executor: &Pubkey,
+    authorization_pda: &Pubkey,
+    proof: JupiterPostBracketProof,
+) -> Instruction {
+    let (checkpoint_pda, _bump) = derive_jupiter_bracket_checkpoint_pda(
+        program_id,
+        authorization_pda,
+        proof.execution_nonce,
+        &proof.destination_token_account,
+    );
+    let destination = proof.destination_token_account;
+    let data = borsh::to_vec(&AuthorityInstruction::PostJupiterBracketCheck { proof })
+        .expect("borsh serialization of AuthorityInstruction is infallible");
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*executor, true),
+            AccountMeta::new_readonly(*authorization_pda, false),
+            AccountMeta::new_readonly(destination, false),
+            AccountMeta::new(checkpoint_pda, false),
         ],
         data,
     }
