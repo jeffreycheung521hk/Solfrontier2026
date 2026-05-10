@@ -43,6 +43,14 @@ pub mod stage2_watcher;
 // Live providers must be added behind explicit constructors and must
 // not auto-enable from ambient environment variables.
 pub mod stage2_evaluator;
+// Stage 2 W4 — Solend demo executor glue. Selects condition_met rules,
+// leases via the state-store CAS guard + same-process in-flight set,
+// builds a strongly typed Stage2ExecuteActionRequest from the rule and
+// the bound DemoSolendExecutionFixture (MAINNET_BETA_DEMO_USDC_TUPLE),
+// dispatches through an injected Stage2ExecutionClient, writes back
+// completed / failed. W4-lite default: MockExecutionClient only — no
+// live RPC, no signing, no broadcast, no transaction construction.
+pub mod stage2_executor;
 pub mod session_policy;
 pub mod supervisor;
 pub mod tools;

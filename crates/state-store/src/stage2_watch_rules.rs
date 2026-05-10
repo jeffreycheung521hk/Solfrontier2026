@@ -417,6 +417,38 @@ impl Stage2WatchRuleRepository {
         Ok(result.rows_affected())
     }
 
+    /// TOCTOU-safe variant: only flip `status = condition_met` →
+    /// `status = executing` and stamp the supplied `nonce`. If the row
+    /// is in any other state (`active`, `executing`, `completed`,
+    /// `failed`, `revoked`, `expired`) the UPDATE's WHERE-clause
+    /// matches zero rows and the call returns `Ok(0)`.
+    ///
+    /// Executor contract (W4): caller treats `Ok(0)` as "another actor
+    /// already leased this rule; back off, do not retry". This is the
+    /// cross-process leasing primitive that prevents two daemons
+    /// (or a daemon + a crashed restart) from each issuing a Solend
+    /// withdraw against the same rule.
+    pub async fn mark_executing_if_condition_met(
+        &self,
+        rule_id: &[u8; 16],
+        nonce: u64,
+    ) -> Result<u64, StoreError> {
+        let now_ms = Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            "UPDATE stage2_watch_rules
+             SET status = ?, execution_nonce = ?, updated_at_ms = ?
+             WHERE rule_id = ? AND status = ?",
+        )
+        .bind(status::EXECUTING)
+        .bind(nonce as i64)
+        .bind(now_ms)
+        .bind(rule_id_hex(rule_id))
+        .bind(status::CONDITION_MET)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Terminal-success transition: set `status = completed`, set
     /// `completed = 1`, record the consumed amount, and stamp the
     /// completion slot in `last_checked_slot`.
@@ -1077,6 +1109,86 @@ mod tests {
         let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
         assert_eq!(loaded.status, WatchRuleStatus::Executing);
         assert_eq!(loaded.execution_nonce, nonce);
+    }
+
+    #[tokio::test]
+    async fn mark_executing_if_condition_met_leases_from_condition_met() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+        repo.mark_condition_met(&rule.rule_id).await.unwrap();
+
+        let nonce = 17_u64;
+        let n = repo
+            .mark_executing_if_condition_met(&rule.rule_id, nonce)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::Executing);
+        assert_eq!(loaded.execution_nonce, nonce);
+    }
+
+    #[tokio::test]
+    async fn mark_executing_if_condition_met_refuses_active_row() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+        // Row stays in `active`; CAS guard must NOT transition it.
+
+        let n = repo
+            .mark_executing_if_condition_met(&rule.rule_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "CAS guard must refuse non-condition_met rows");
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::Active);
+        assert_eq!(loaded.execution_nonce, 0);
+    }
+
+    #[tokio::test]
+    async fn mark_executing_if_condition_met_refuses_terminal_row() {
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+        repo.mark_failed(&rule.rule_id, "earlier failure").await.unwrap();
+
+        let n = repo
+            .mark_executing_if_condition_met(&rule.rule_id, 9)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "CAS guard must not resurrect a failed row");
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, WatchRuleStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn mark_executing_if_condition_met_is_single_lease() {
+        // Cross-process double-lease guard: once one caller wins the
+        // CAS, a second concurrent caller observes Ok(0) and must
+        // back off.
+        let (_db, repo) = test_repo().await;
+        let rule = fixture_a_solend_apr_below_10();
+        repo.insert(&rule).await.unwrap();
+        repo.mark_condition_met(&rule.rule_id).await.unwrap();
+
+        let first = repo
+            .mark_executing_if_condition_met(&rule.rule_id, 1)
+            .await
+            .unwrap();
+        let second = repo
+            .mark_executing_if_condition_met(&rule.rule_id, 2)
+            .await
+            .unwrap();
+        assert_eq!(first, 1, "first lease wins");
+        assert_eq!(second, 0, "second lease must observe Ok(0)");
+
+        let loaded = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        // Nonce reflects the FIRST lease, not the second.
+        assert_eq!(loaded.execution_nonce, 1);
     }
 
     #[tokio::test]
