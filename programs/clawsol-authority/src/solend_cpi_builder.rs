@@ -127,6 +127,7 @@
 use solana_program::{
     account_info::AccountInfo,
     instruction::{AccountMeta, Instruction},
+    msg,
     program::invoke,
     program_error::ProgramError,
     pubkey::Pubkey,
@@ -1114,9 +1115,209 @@ pub enum SolendOracleMode {
 }
 
 /// Returns the oracle mode this build of `clawsol-authority` operates
-/// under. P5b-2 hardcodes [`SolendOracleMode::FailClosed`].
+/// under by default. P5b-2 hardcodes [`SolendOracleMode::FailClosed`].
+///
+/// Note: P5c introduces a runtime tuple-comparison gate
+/// ([`select_oracle_mode_for_runtime_tuple`]) which can return Mode C
+/// for the single demo-pinned mainnet-beta USDC tuple
+/// ([`MAINNET_BETA_DEMO_USDC_TUPLE`]). The default this const-fn
+/// returns is unchanged — it represents the global posture, not the
+/// per-call dispatch.
 pub const fn p5b2_oracle_mode() -> SolendOracleMode {
     SolendOracleMode::FailClosed
+}
+
+// ── P5c: Demo Pinned Oracle Allowlist (Mode C) ─────────────────────────────
+//
+// WARNING: STAGE 2 DEMO ONLY — PINNED ORACLE ALLOWLIST.
+// Not a production oracle resolver. Not a dynamic reserve parser.
+// One mainnet-beta tuple. Everything else stays Mode B fail-closed.
+//
+// P5c lifts the P5b-2 oracle gap (Mode B fail-closed) for exactly one
+// reserve/mint/oracle tuple: the canonical Solend Save Main Pool USDC
+// reserve `BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw`. The runtime
+// tuple is compared field-by-field against [`MAINNET_BETA_DEMO_USDC_TUPLE`]
+// by [`verify_demo_pinned_oracle_tuple`]. On exact match, the orchestrator
+// dispatches to Mode C and falls through to the existing Phase 2 CPI
+// helpers. On any mismatch, it stays in Mode B and returns
+// `SolendCpiSuccessPathBlockedByOracleValidation` (error 85). On a
+// reserve match with any other field mismatch, it returns the more
+// specific [`AuthorityError::SolendDemoOracleTupleMismatch`] (error 89).
+
+/// One pinned oracle tuple for Stage-2 demo use.
+///
+/// **WARNING: STAGE 2 DEMO ONLY — PINNED ORACLE ALLOWLIST.**
+/// Not a production oracle resolver. Not a dynamic reserve parser.
+/// Exactly one tuple is allowlisted by [`MAINNET_BETA_DEMO_USDC_TUPLE`]
+/// for the mainnet-beta canonical Solend USDC reserve. Every other
+/// tuple stays Mode B fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DemoOracleTuple {
+    pub reserve: Pubkey,
+    pub lending_market: Pubkey,
+    pub liquidity_mint: Pubkey,
+    pub ctoken_mint: Pubkey,
+    pub pyth_oracle: Pubkey,
+    pub switchboard_oracle: Pubkey,
+    /// Coercion convention: when the runtime tuple's `extra_oracle` is
+    /// `Option::None`, callers compare it as if it were
+    /// `Pubkey::default()` (all-zeros). The canonical USDC reserve has
+    /// no extra oracle slot, so this field is `Pubkey::default()` for
+    /// the mainnet-beta demo tuple. The verifier does NOT run owner /
+    /// data validation on a `Pubkey::default()` extra_oracle.
+    pub extra_oracle: Pubkey,
+}
+
+/// The single mainnet-beta demo tuple authorized for Mode C dispatch.
+///
+/// Sources of truth (in-repo):
+/// - `reserve` / `lending_market` / `liquidity_mint`: pinned by
+///   `crates/gateway/src/integrations/solend/assembler.rs` and the
+///   live mainnet proof docs at `docs/proofs/SOLEND_USDC_DEPOSIT_*` and
+///   `docs/proofs/LLM_SOLEND_MAINNET_E2E_PHASE5G.md`.
+/// - `pyth_oracle`: pinned by
+///   `crates/gateway/src/integrations/solend/deposit.rs` and
+///   `docs/proofs/SOLEND_USDC_DEPOSIT_SLICE3G.md`.
+/// - `switchboard_oracle`: the Solend null sentinel
+///   (`SOLEND_NULL_ORACLE_SENTINEL_BS58` in
+///   `crates/gateway/src/integrations/solend/raw.rs`). The canonical
+///   USDC reserve has NO Switchboard oracle, so the RefreshReserve
+///   account at slot 2 carries the `nu11…` sentinel — NOT
+///   `Pubkey::default()`. Pinning the wrong sentinel would let a
+///   hostile executor masquerade an unrelated default-keyed account
+///   into that slot.
+/// - `extra_oracle`: `Pubkey::default()` (all zeros) — the canonical
+///   USDC reserve has no extra oracle. The verifier coerces
+///   `Option::None` → `Pubkey::default()` for the equality check.
+/// - `ctoken_mint`: cToken mint at byte offset 227 of the canonical
+///   Solend reserve `BgxfHJ…`. Authorized by Jeff 2026-05-10; not
+///   previously pinned in-repo because the gateway decodes it
+///   dynamically from the live reserve account
+///   (`crates/gateway/src/integrations/solend/raw.rs`,
+///   `RES_COLL_MINT_OFF: usize = 227`).
+pub const MAINNET_BETA_DEMO_USDC_TUPLE: DemoOracleTuple = DemoOracleTuple {
+    reserve:            solana_program::pubkey!("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"),
+    lending_market:     solana_program::pubkey!("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY"),
+    liquidity_mint:     solana_program::pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+    // cToken mint at reserve offset 227. Authorized by Jeff 2026-05-10;
+    // not previously pinned in-repo because gateway decodes it dynamically.
+    ctoken_mint:        solana_program::pubkey!("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E"),
+    pyth_oracle:        solana_program::pubkey!("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX"),
+    switchboard_oracle: solana_program::pubkey!("nu11111111111111111111111111111111111111111"),
+    // None coerced to default. The canonical USDC reserve has no extra
+    // oracle slot; the verifier maps Option::None ↔ Pubkey::default()
+    // for the equality check and skips owner/data validation on it.
+    extra_oracle:       Pubkey::new_from_array([0u8; 32]),
+};
+
+/// Tuple-comparison verifier for the P5c demo pinned oracle allowlist.
+///
+/// Logic:
+/// 1. If `runtime_reserve` does not equal `DEMO.reserve`, log
+///    `Demo Allowlist: unknown reserve` and return
+///    [`AuthorityError::SolendDemoOracleUnknownReserve`].
+/// 2. Else, compare each remaining field one-by-one against
+///    [`MAINNET_BETA_DEMO_USDC_TUPLE`]. On the first mismatch, log the
+///    specific field name and return
+///    [`AuthorityError::SolendDemoOracleTupleMismatch`].
+///    Order: `lending_market` → `liquidity_mint` → `ctoken_mint`
+///    → `pyth_oracle` → `switchboard_oracle` → `extra_oracle`.
+/// 3. The runtime `extra_oracle: Option<&Pubkey>` is coerced to
+///    `Pubkey::default()` when `None`. No owner or data validation
+///    runs on a `Pubkey::default()` extra_oracle (the demo tuple's
+///    extra_oracle is itself `Pubkey::default()`, so the comparison
+///    is equality of two zero-filled keys; nothing is dereferenced).
+/// 4. On full match, return `Ok(())`. The orchestrator falls through
+///    to the existing `cpi_*` Phase-2 helpers.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_demo_pinned_oracle_tuple(
+    runtime_reserve: &Pubkey,
+    runtime_lending_market: &Pubkey,
+    runtime_liquidity_mint: &Pubkey,
+    runtime_ctoken_mint: &Pubkey,
+    runtime_pyth_oracle: &Pubkey,
+    runtime_switchboard: &Pubkey,
+    runtime_extra_oracle: Option<&Pubkey>,
+) -> Result<(), ProgramError> {
+    let demo = &MAINNET_BETA_DEMO_USDC_TUPLE;
+
+    if runtime_reserve != &demo.reserve {
+        msg!("Demo Allowlist: unknown reserve");
+        return Err(AuthorityError::SolendDemoOracleUnknownReserve.into());
+    }
+
+    if runtime_lending_market != &demo.lending_market {
+        msg!("Demo Allowlist: lending_market mismatch");
+        return Err(AuthorityError::SolendDemoOracleTupleMismatch.into());
+    }
+
+    if runtime_liquidity_mint != &demo.liquidity_mint {
+        msg!("Demo Allowlist: liquidity_mint mismatch");
+        return Err(AuthorityError::SolendDemoOracleTupleMismatch.into());
+    }
+
+    if runtime_ctoken_mint != &demo.ctoken_mint {
+        msg!("Demo Allowlist: ctoken_mint mismatch");
+        return Err(AuthorityError::SolendDemoOracleTupleMismatch.into());
+    }
+
+    if runtime_pyth_oracle != &demo.pyth_oracle {
+        msg!("Demo Allowlist: pyth_oracle mismatch");
+        return Err(AuthorityError::SolendDemoOracleTupleMismatch.into());
+    }
+
+    if runtime_switchboard != &demo.switchboard_oracle {
+        msg!("Demo Allowlist: switchboard_oracle mismatch");
+        return Err(AuthorityError::SolendDemoOracleTupleMismatch.into());
+    }
+
+    // Coerce Option::None ↔ Pubkey::default() for the equality check.
+    // The demo tuple's extra_oracle is itself Pubkey::default(); we do
+    // NOT run owner/data validation on a default extra_oracle.
+    let runtime_extra = runtime_extra_oracle.copied().unwrap_or_default();
+    if runtime_extra != demo.extra_oracle {
+        msg!("Demo Allowlist: extra_oracle mismatch");
+        return Err(AuthorityError::SolendDemoOracleTupleMismatch.into());
+    }
+
+    Ok(())
+}
+
+/// Mode-selector for the P5c demo pinned oracle allowlist.
+///
+/// Returns [`SolendOracleMode::DemoPinnedAllowlist`] iff every field of
+/// the runtime tuple equals the corresponding field of
+/// [`MAINNET_BETA_DEMO_USDC_TUPLE`]. Otherwise returns
+/// [`SolendOracleMode::FailClosed`].
+///
+/// This is the dispatcher consulted by [`try_solend_cpi_skeleton`] AFTER
+/// Phase 1 validation succeeds. Mismatches at this stage do NOT surface
+/// the more specific demo-allowlist error variants (88 / 89); the
+/// orchestrator preserves the P5b-2 fail-closed sentinel
+/// (error 85) for any non-demo tuple. The specific 88/89 errors fire
+/// only when [`verify_demo_pinned_oracle_tuple`] is called directly
+/// (e.g. by the unit tests in `tests/p5c_demo_pinned_oracle.rs`).
+pub fn select_oracle_mode_for_runtime_tuple(
+    runtime_reserve: &Pubkey,
+    runtime_lending_market: &Pubkey,
+    runtime_liquidity_mint: &Pubkey,
+    runtime_ctoken_mint: &Pubkey,
+    runtime_pyth_oracle: &Pubkey,
+    runtime_switchboard: &Pubkey,
+    runtime_extra_oracle: Option<&Pubkey>,
+) -> SolendOracleMode {
+    match verify_demo_pinned_oracle_tuple(
+        runtime_reserve,
+        runtime_lending_market,
+        runtime_liquidity_mint,
+        runtime_ctoken_mint,
+        runtime_pyth_oracle,
+        runtime_switchboard,
+        runtime_extra_oracle,
+    ) {
+        Ok(()) => SolendOracleMode::DemoPinnedAllowlist,
+        Err(_) => SolendOracleMode::FailClosed,
+    }
 }
 
 // ── P5b-2: Two-phase Solend CPI orchestration ──────────────────────────────
@@ -1213,13 +1414,29 @@ pub fn try_solend_cpi_skeleton<'a, 'info>(
         expectations.expected_ctoken_mint,
     )?;
 
-    // Oracle validation gate. Under Mode B (the P5b-2 default), the
-    // success path is fail-closed: any caller reaching this point is
-    // surfaced with `SolendCpiSuccessPathBlockedByOracleValidation`.
-    // The substrate oracle accounts ARE structurally validated to be
-    // present; we just refuse to proceed because we cannot prove they
-    // match the reserve's committed oracle config.
-    match p5b2_oracle_mode() {
+    // Oracle validation gate.
+    //
+    // P5b-2 baseline: Mode B (FailClosed) — return error 85 unconditionally.
+    // P5c extension:  Mode C (DemoPinnedAllowlist) — when the runtime
+    //   tuple matches the single mainnet-beta demo USDC tuple
+    //   ([`MAINNET_BETA_DEMO_USDC_TUPLE`]), fall through to Phase 2
+    //   without invoking [`verify_oracles_or_fail_closed_p5b1`] (that
+    //   helper always errors and is reserved for the future Mode A
+    //   official decode path). Any non-demo tuple stays Mode B.
+    //
+    // Note: this dispatch never re-borrows AccountInfo data — it
+    // compares the AccountInfo `key` references already in scope.
+    let runtime_extra_oracle_key = substrate.extra_oracle.map(|a| a.key);
+    let mode = select_oracle_mode_for_runtime_tuple(
+        expectations.expected_reserve,
+        expectations.expected_lending_market,
+        expectations.expected_liquidity_mint,
+        expectations.expected_ctoken_mint,
+        substrate.pyth_oracle.key,
+        substrate.switchboard_oracle.key,
+        runtime_extra_oracle_key,
+    );
+    match mode {
         SolendOracleMode::FailClosed => {
             // Touch the oracle accounts so an unused-variable lint
             // doesn't prevent the substrate from being structurally
@@ -1234,12 +1451,20 @@ pub fn try_solend_cpi_skeleton<'a, 'info>(
             );
             return Err(AuthorityError::SolendCpiSuccessPathBlockedByOracleValidation.into());
         }
-        SolendOracleMode::OfficialReserveDecode | SolendOracleMode::DemoPinnedAllowlist => {
-            // P5b-2 does NOT pick A or C. These arms are never taken
-            // by the production build; the constant `p5b2_oracle_mode`
-            // returns `FailClosed`. We keep them as a structural
-            // placeholder so a future slice that resolves oracle
-            // shadow mapping has a clean swap-in point.
+        SolendOracleMode::DemoPinnedAllowlist => {
+            // Mode C — runtime tuple equals MAINNET_BETA_DEMO_USDC_TUPLE.
+            // Fall through to Phase 2 (the existing cpi_* helpers
+            // below). No further oracle validation runs here: the
+            // tuple match IS the validation, scoped narrowly to the
+            // single demo allowlist.
+            msg!("Demo Allowlist: oracle tuple matched, dispatching Mode C");
+        }
+        SolendOracleMode::OfficialReserveDecode => {
+            // P5b-2 does NOT pick A. This arm is never taken by the
+            // production build; `select_oracle_mode_for_runtime_tuple`
+            // only returns FailClosed or DemoPinnedAllowlist. We keep
+            // it as a structural placeholder so a future slice that
+            // resolves oracle shadow mapping has a clean swap-in point.
             verify_oracles_or_fail_closed_p5b1(
                 substrate.pyth_oracle,
                 substrate.switchboard_oracle,

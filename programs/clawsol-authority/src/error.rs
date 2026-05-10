@@ -364,6 +364,23 @@ pub enum AuthorityError {
 
     #[error("Solend CPI borrow-across-invoke risk detected (defensive sentinel — borrows must be dropped before invoke)")]
     SolendCpiBorrowAcrossInvokeRisk = 87,
+
+    // ── Stage 2 P5c Demo Pinned Oracle Allowlist (append-only at codes 88+) ──
+    //
+    // Discriminants 88..=89 are appended for the P5c demo pinned oracle
+    // allowlist (Mode C) introduced in `solend_cpi_builder.rs`. STAGE 2
+    // DEMO ONLY — not a production oracle resolver. The allowlist
+    // covers exactly one mainnet-beta tuple (the canonical Solend USDC
+    // reserve `BgxfHJ…`); every other tuple stays Mode B fail-closed
+    // (error 85). Numeric values are part of the on-chain wire shape
+    // (encoded into `ProgramError::Custom`) and MUST stay append-only —
+    // never reorder or renumber.
+
+    #[error("Solend CPI demo pinned oracle allowlist: runtime reserve is not the demo-allowlisted reserve")]
+    SolendDemoOracleUnknownReserve = 88,
+
+    #[error("Solend CPI demo pinned oracle allowlist: runtime tuple field disagrees with MAINNET_BETA_DEMO_USDC_TUPLE")]
+    SolendDemoOracleTupleMismatch = 89,
 }
 
 impl From<AuthorityError> for ProgramError {
