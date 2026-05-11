@@ -345,6 +345,131 @@ export interface W5dConditionalDepositResult {
   native_onchain_apr_source: string;
 }
 
+/// Wire DTO for the W5g chat-first execution result.
+///
+/// Field names + status values mirror Agent D's
+/// `claw_api::state::ChatExecuteResultDto` (Rust) — the canonical
+/// backend contract. The user's second chat message
+///
+/// > "Execute W5g conditional deposit <rule_id_hex> <canonical_rule_hash_hex>
+/// >  with approval phrase W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED"
+///
+/// is parsed by the chat-route, which dispatches to Agent D's
+/// `Stage2ChatExecuteHandler` (also reachable directly via
+/// `POST /sessions/:id/stage2/w5g/execute`). Whatever transport the
+/// chat-route uses, the *result body* the frontend renders is this
+/// DTO — wrapped in a `ChatResponse` variant with status tag
+/// `"w5g_conditional_execution"`.
+///
+/// ── INTEGER SAFETY ────────────────────────────────────────────────
+///
+/// Solana raw amounts (USDC u64, slot u64, cToken u64/u128) can exceed
+/// `Number.MAX_SAFE_INTEGER` (2^53 − 1). Agent D serialises these as
+/// JSON strings via `crate::serde_str::opt_u64_string` /
+/// `opt_i64_string`. The frontend MUST treat them as strings and
+/// render them as-is. If a UI conversion to "X.YYYYYY USDC" is needed
+/// for display, the consumer should check
+/// `Number.isSafeInteger(Number(raw))` before any arithmetic and
+/// gracefully degrade to the raw string when not safe.
+///
+/// ── FIELDS NOT IN AGENT D'S DTO ───────────────────────────────────
+///
+/// `amount_raw`, `controlled_wallet`, `source_usdc_ata`,
+/// `reserve_pubkey`, `obligation_pubkey`, `decision_source` are NOT in
+/// Agent D's strict `ChatExecuteResultDto` — Agent D went with
+/// "rule_id-only" as the user explicitly preferred. They remain here
+/// as **optional** so that:
+///   - the showcase fixture can populate them for a richer demo card,
+///   - if Agent D (or the chat-route wire seam) chooses to enrich the
+///     wire shape during integration, the frontend already supports
+///     it without a re-type,
+///   - and the card degrades gracefully (omits the row) when absent.
+export interface W5gConditionalExecutionResult {
+  /// Discrete lifecycle status returned by Agent D's
+  /// `ChatExecuteResultDto.status`. The frontend renders one card
+  /// variant per status. `prechecks_failed` covers all pre-execution
+  /// rejections (rule lookup, approval phrase, condition re-check,
+  /// budget re-check); `execution_failed` covers post-build /
+  /// broadcast / verification failures.
+  status:
+    | "completed"
+    | "broadcasted_timeout"
+    | "prechecks_failed"
+    | "execution_failed";
+
+  /// 16-byte hex of the deterministic rule id (same as the W5e/W5f
+  /// `rule_id_hex`). Anchors this execution to the persisted rule.
+  rule_id_hex: string;
+  /// 32-byte hex of the canonical Borsh-encoded rule hash. Agent D's
+  /// DTO declares this REQUIRED — the integrity anchor that prevents
+  /// re-applying an execution against a replaced rule.
+  canonical_rule_hash_hex: string;
+
+  /// Base58 of the broadcast signature, when one exists. Present on
+  /// `completed` / `broadcasted_timeout`; usually null on
+  /// `prechecks_failed`; may be present on `execution_failed`
+  /// (broadcast accepted but verification then failed).
+  tx_signature?: string | null;
+  /// Pre-built Solscan URL. If the backend doesn't include it, the
+  /// frontend constructs `https://solscan.io/tx/<sig>` from
+  /// `tx_signature` directly.
+  solscan_url?: string | null;
+  /// Slot at which the tx confirmed. u64 → string.
+  confirmation_slot?: string | null;
+
+  /// Save UI display APY at re-check time, in basis points. Echo of
+  /// the W5f primary decision metric — Agent D names this with the
+  /// `used_` prefix to make "value the executor saw" unambiguous.
+  used_save_display_apy_bps?: number | null;
+  /// Native on-chain supply APR at re-check time, in basis points.
+  /// Audit-only, mirrors the W5f secondary metric.
+  used_native_onchain_apr_bps?: number | null;
+  /// Threshold extracted from the persisted rule, in basis points.
+  used_threshold_bps?: number | null;
+
+  // ── Token balance deltas — Agent D serialises u64/i64 as strings ─
+  before_usdc_raw?: string | null;
+  after_usdc_raw?: string | null;
+  /// May carry a leading `-` if the controlled wallet's USDC went
+  /// down (the expected deposit case).
+  usdc_delta_raw?: string | null;
+  before_ctoken_amount?: string | null;
+  after_ctoken_amount?: string | null;
+  ctoken_delta_raw?: string | null;
+
+  // ── TX audit ─────────────────────────────────────────────────────
+  /// Serialized v0 message length in bytes. u64 → string.
+  serialized_tx_bytes?: string | null;
+  /// Number of instructions in the assembled tx. u64 → string.
+  instruction_count?: string | null;
+  /// `true` iff a CreateIdempotent for the cToken ATA was prepended.
+  ctoken_ata_create_included?: boolean | null;
+
+  /// Snake-case error variant from
+  /// `claw_gateway::stage2_chat_execute::ChatExecuteErrorCode`, or
+  /// `null` on the happy path.
+  error_code?: string | null;
+  /// Human-readable failure reason. Sent through verbatim — never
+  /// inspected for structural meaning on the frontend.
+  error_reason?: string | null;
+
+  // ── Optional enrichment fields (NOT in Agent D's strict DTO) ─────
+  /// USDC raw amount the rule reserved. u64 → string. May be enriched
+  /// by the chat-route wire seam from the persisted rule.
+  amount_raw?: string | null;
+  /// Base58 of the controlled (bounded-executor) wallet.
+  controlled_wallet?: string | null;
+  /// Source USDC ATA on the controlled wallet, base58.
+  source_usdc_ata?: string | null;
+  /// Solend Main Pool USDC reserve, base58.
+  reserve_pubkey?: string | null;
+  /// Obligation account pubkey for the deposit, base58.
+  obligation_pubkey?: string | null;
+  /// Which metric drove `condition_met` at execution. Always
+  /// `"save_display_apy"` on the W5f happy path.
+  decision_source?: string | null;
+}
+
 /// Discriminated union mirroring Rust's `ChatResponse` enum.
 /// `status` is the discriminant; the runtime guarantees no other shape.
 export type ChatResponse =
@@ -356,7 +481,15 @@ export type ChatResponse =
   | { status: "malformed_provider_output"; reason: string }
   | { status: "tool_error"; tool_name: string; message: string }
   | { status: "pending_action_exists"; reason: string }
-  | { status: "w5d_conditional_deposit"; result: W5dConditionalDepositResult };
+  | { status: "w5d_conditional_deposit"; result: W5dConditionalDepositResult }
+  /// W5g chat-first execution result. Tag string aligns with the Rust
+  /// enum's `#[serde(rename_all = "snake_case")]` projection of the
+  /// variant `W5gConditionalExecution { result }`. Agent D may rename
+  /// the Rust variant during integration — keep this in sync.
+  | {
+      status: "w5g_conditional_execution";
+      result: W5gConditionalExecutionResult;
+    };
 
 /// HTTP-status-aware envelope used by the chat client.
 /// The chat route maps domain outcomes to: 200 OK, 400 Bad Request,
@@ -371,10 +504,30 @@ export type ChatRouteResult =
   | { kind: "unexpected"; httpStatus: number; error: string };
 
 /// Local UI message — rendered in the chat history.
+///
+/// `local_w5g_safe_error` is emitted client-side when `postChat` itself
+/// throws (network drop, fetch abort, JSON parse failure) while the
+/// user's last typed message looked like a W5g execute command. The
+/// chat-route may legitimately take 20-30+ s during mainnet
+/// confirmation; if the HTTP request collapses we MUST NOT drop the
+/// user's intent — we render a safe, no-overclaim card so the operator
+/// knows to verify on Solscan / backend logs before retrying.
 export type ChatMessage =
   | { id: string; kind: "user"; text: string; sentAt: IsoDate }
   | { id: string; kind: "assistant"; result: ChatRouteResult; receivedAt: IsoDate }
-  | { id: string; kind: "system"; text: string; at: IsoDate };
+  | { id: string; kind: "system"; text: string; at: IsoDate }
+  | {
+      id: string;
+      kind: "local_w5g_safe_error";
+      /// The chat command the user sent (verbatim). Surfaced so the
+      /// operator can re-issue or re-verify without re-typing.
+      userText: string;
+      /// The thrown error's message string. Rendered in a small detail
+      /// region so the operator can see the underlying transport
+      /// failure — never used to decide whether the tx succeeded.
+      networkError: string;
+      at: IsoDate;
+    };
 
 // ── Approval decide route (Phase 6 Day 2) ────────────────────────────────────
 

@@ -292,6 +292,41 @@ export async function postChat(
 /// backend would take. No network call.
 function showcaseChatReply(message: string): ChatRouteResult {
   const lower = message.toLowerCase();
+
+  // ── W5d/W5e/W5f conditional-order fixture ───────────────────────
+  //
+  // Lets a showcase-mode operator see the W5f conditional-order card
+  // (including W5g's "Ready to execute" copy-command panel) without
+  // standing up the live backend. Match is intentionally narrow so it
+  // does not steal traffic from the legacy `usdc`/`solend` fallback.
+  const w5dOrder = parseShowcaseW5dConditional(message);
+  if (w5dOrder !== null) {
+    return { kind: "ok", response: w5dOrder };
+  }
+
+  // ── W5g chat-first execution fixture ────────────────────────────
+  //
+  // Matches the deterministic command grammar:
+  //   "Execute W5g conditional deposit <rule_id_hex> <canonical_hash>
+  //    with approval phrase W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED"
+  //
+  // Suffix selectors on the trailing rule_id let demo viewers preview
+  // each lifecycle state without changing code. Status enum mirrors
+  // Agent D's `ChatExecuteResultDto.status`:
+  //
+  //   …deadbeef / default       → completed
+  //   …timeout / …timeout01     → broadcasted_timeout
+  //   …prefail / …precheck01    → prechecks_failed
+  //   …execfail / …exec01       → execution_failed
+  //
+  // All amounts / slots are STRINGS — Solana u64 / u128 don't fit JS
+  // Number safely. The frontend's W5g card renders strings verbatim
+  // and only does decimal conversion under a safe-integer guard.
+  const w5gExec = parseShowcaseW5gExecute(message);
+  if (w5gExec !== null) {
+    return { kind: "ok", response: w5gExec };
+  }
+
   if (lower.includes("solend") || lower.includes("usdc")) {
     return {
       kind: "ok",
@@ -322,6 +357,198 @@ function showcaseChatReply(message: string): ChatRouteResult {
       assistant_text:
         "Showcase mode is rendering a fixture reply. " +
         "Ask me to deposit USDC into Solend to see the LLM tool-call shape.",
+    },
+  };
+}
+
+/// Parse the W5d/W5e/W5f conditional-order grammar and produce a
+/// `ready_to_execute` fixture. Strict prefix match so this fixture is
+/// only fired by the canonical demo command — random "solend" chatter
+/// continues to fall through to the legacy `tool_dispatched` fixture.
+function parseShowcaseW5dConditional(
+  message: string,
+): ChatResponse | null {
+  const trimmed = message.trim();
+  if (
+    !/^If Solend Main Pool USDC deposit APR is above\s+\d+(?:\.\d+)?%,\s+deposit 0\.25 USDC from my bounded executor wallet into Solend\.?\s*$/i.test(
+      trimmed,
+    )
+  ) {
+    return null;
+  }
+  // Echo the user's threshold so the card shows the right percent.
+  const pctMatch = trimmed.match(/above\s+(\d+(?:\.\d+)?)%/i);
+  const pctLabel = pctMatch ? pctMatch[1] : "1";
+  const thresholdBps = Math.round(parseFloat(pctLabel) * 100);
+  return {
+    status: "w5d_conditional_deposit",
+    result: {
+      input_text: trimmed,
+      source: "save_display_apy",
+      reserve_pubkey: "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw",
+      current_apr_bps: 312,
+      threshold_bps: thresholdBps,
+      threshold_pct_label: pctLabel,
+      condition_met: 312 > thresholdBps,
+      execution_attempted: false,
+      // Force the ready-to-execute path so the demo viewer sees the
+      // W5g copy-command panel inside the W5f card.
+      status: 312 > thresholdBps ? "ready_to_execute" : "watching",
+      tx_signature: null,
+      controlled_wallet: "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+      source_usdc_ata: "73CnYmQAUKgaiQ4mY3ub2j8wPqkfaUmEnu3GuVHzefVB",
+      required_budget_raw: 250_000,
+      current_budget_raw: 1_000_000,
+      budget_status: "reserved",
+      last_checked_slot: 415_571_900,
+      expires_at_slot: 415_621_900,
+      rule_id_hex: "deadbeefcafef00d0000000000000000",
+      canonical_rule_hash_hex:
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      rule_persisted: true,
+      decision_source: "save_display_apy",
+      save_display_apy_bps: 312,
+      native_onchain_apr_bps: 287,
+      native_onchain_apr_source: "b_o1_reserve_math",
+    },
+  };
+}
+
+/// Parse a W5g execute command and produce a deterministic fixture
+/// `ChatResponse`. Returns `null` if the message doesn't match the
+/// W5g grammar.
+function parseShowcaseW5gExecute(
+  message: string,
+): ChatResponse | null {
+  const m = message
+    .trim()
+    .match(
+      /^Execute W5g conditional deposit\s+([0-9a-fA-F]{1,64})\s+([0-9a-fA-F]{1,64})\s+with approval phrase\s+(.+)$/,
+    );
+  if (m === null) return null;
+  const ruleIdHex = m[1];
+  const canonicalHashHex = m[2];
+  const trailing = ruleIdHex.toLowerCase();
+
+  // Common fields shared across all lifecycle fixtures. Field names
+  // mirror Agent D's `ChatExecuteResultDto`; the optional enrichment
+  // fields (amount_raw, controlled_wallet, …) are populated here for
+  // a richer demo card and gracefully omitted by the renderer when
+  // absent on the live wire.
+  const baseFields = {
+    rule_id_hex: ruleIdHex,
+    canonical_rule_hash_hex: canonicalHashHex,
+    used_save_display_apy_bps: 312,
+    used_native_onchain_apr_bps: 287,
+    used_threshold_bps: 100,
+    decision_source: "save_display_apy",
+    amount_raw: "250000",
+    controlled_wallet: "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+    source_usdc_ata: "73CnYmQAUKgaiQ4mY3ub2j8wPqkfaUmEnu3GuVHzefVB",
+    reserve_pubkey: "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw",
+    obligation_pubkey: "BdFLjCcPdpe1xkhfH1jWaPKJEWE9rZ87dpW48VtUra1wN",
+  } as const;
+
+  if (trailing.endsWith("prefail") || trailing.endsWith("precheck01")) {
+    return {
+      status: "w5g_conditional_execution",
+      result: {
+        ...baseFields,
+        status: "prechecks_failed",
+        tx_signature: null,
+        solscan_url: null,
+        confirmation_slot: null,
+        serialized_tx_bytes: null,
+        instruction_count: null,
+        ctoken_ata_create_included: null,
+        before_usdc_raw: null,
+        after_usdc_raw: null,
+        usdc_delta_raw: null,
+        before_ctoken_amount: null,
+        after_ctoken_amount: null,
+        ctoken_delta_raw: null,
+        error_code: "approval_phrase_mismatch",
+        error_reason:
+          "Approval phrase did not match the canonical W5g phrase (showcase fixture).",
+      },
+    };
+  }
+
+  if (trailing.endsWith("execfail") || trailing.endsWith("exec01")) {
+    return {
+      status: "w5g_conditional_execution",
+      result: {
+        ...baseFields,
+        status: "execution_failed",
+        tx_signature: null,
+        solscan_url: null,
+        confirmation_slot: null,
+        serialized_tx_bytes: "1232",
+        instruction_count: "4",
+        ctoken_ata_create_included: false,
+        before_usdc_raw: "1000000",
+        after_usdc_raw: "1000000",
+        usdc_delta_raw: "0",
+        before_ctoken_amount: "0",
+        after_ctoken_amount: "0",
+        ctoken_delta_raw: "0",
+        error_code: "simulation_failed",
+        error_reason:
+          "Simulation reported insufficient funds (showcase fixture).",
+      },
+    };
+  }
+
+  if (trailing.endsWith("timeout") || trailing.endsWith("timeout01")) {
+    // Broadcasted but never observed finalized — has a signature, no
+    // deltas, no completed badge.
+    return {
+      status: "w5g_conditional_execution",
+      result: {
+        ...baseFields,
+        status: "broadcasted_timeout",
+        tx_signature:
+          "4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
+        solscan_url: null,
+        confirmation_slot: null,
+        serialized_tx_bytes: "1232",
+        instruction_count: "4",
+        ctoken_ata_create_included: true,
+        before_usdc_raw: "1000000",
+        after_usdc_raw: null,
+        usdc_delta_raw: null,
+        before_ctoken_amount: "0",
+        after_ctoken_amount: null,
+        ctoken_delta_raw: null,
+        error_code: "confirmation_timeout",
+        error_reason:
+          "Broadcasted at slot 415_571_900; finalization not observed within 120 s (showcase fixture).",
+      },
+    };
+  }
+
+  // Default: completed happy path.
+  return {
+    status: "w5g_conditional_execution",
+    result: {
+      ...baseFields,
+      status: "completed",
+      tx_signature:
+        "4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
+      solscan_url:
+        "https://solscan.io/tx/4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
+      confirmation_slot: "415571964",
+      serialized_tx_bytes: "1232",
+      instruction_count: "4",
+      ctoken_ata_create_included: true,
+      before_usdc_raw: "1000000",
+      after_usdc_raw: "750000",
+      usdc_delta_raw: "-250000",
+      before_ctoken_amount: "0",
+      after_ctoken_amount: "240156",
+      ctoken_delta_raw: "240156",
+      error_code: null,
+      error_reason: null,
     },
   };
 }
