@@ -939,10 +939,40 @@ impl GatewayDaemon {
         let w5e_repo = std::sync::Arc::new(Stage2WatchRuleRepository::new(
             db.pool().clone(),
         ));
+        // W5g — chat-card controlled-wallet Solend deposit execution.
+        //
+        // Default: `None` (chat-route W5g approval command surfaces a
+        // typed ToolError; dedicated route returns 503). Wired ONLY
+        // when every env gate is set AND the controlled-wallet keypair
+        // loads successfully AND the matching `LiveSaveDisplayApyFetcher`
+        // / `LiveW5dAprFetcher` / RPC URL are also available. The
+        // orchestrator itself also fails-closed on a per-request basis
+        // in case the daemon was misconfigured between startup and
+        // request time.
+        //
+        // Built BEFORE the chat handler so the SAME `Arc` is shared
+        // by both consumers (chat-route detection + dedicated route).
+        let w5g_executor: Option<
+            std::sync::Arc<crate::stage2_chat_execute::Stage2ChatExecutor>,
+        > = {
+            let cfg = crate::stage2_chat_execute::Stage2ChatExecuteConfig::from_std_env();
+            if !cfg.master_gate_on {
+                info!(
+                    "W5g chat-execute disabled (CLAW_STAGE2_LIVE_CHAT_EXECUTION != \"1\"); \
+                     chat-route W5g approval command will surface ToolError and \
+                     POST /sessions/:id/stage2/w5g/execute will return 503"
+                );
+                None
+            } else {
+                build_w5g_executor(cfg, w5e_repo.clone())
+            }
+        };
+
         let chat_handler_ref: Option<ChatHandlerRef> =
             match crate::runtime::chat_wiring::wire_chat_handler_from_std_env(
                 &registry,
                 Some(w5e_repo.clone()),
+                w5g_executor.clone(),
             ) {
                 Ok(opt) => {
                     if opt.is_some() {
@@ -962,27 +992,14 @@ impl GatewayDaemon {
                 }
             };
 
-        // W5g — chat-card controlled-wallet Solend deposit execution.
-        //
-        // Default: `None` (route returns 503). Wired ONLY when every
-        // env gate is set AND the controlled-wallet keypair loads
-        // successfully AND the matching `LiveSaveDisplayApyFetcher` /
-        // `LiveW5dAprFetcher` / RPC URL are also available. Any
-        // missing piece keeps the route fail-closed; the orchestrator
-        // itself also fails-closed on a per-request basis in case the
-        // daemon was misconfigured between startup and request time.
-        let chat_execute_ref: Option<claw_api::state::ChatExecuteHandlerRef> = {
-            let cfg = crate::stage2_chat_execute::Stage2ChatExecuteConfig::from_std_env();
-            if !cfg.master_gate_on {
-                info!(
-                    "W5g chat-execute disabled (CLAW_STAGE2_LIVE_CHAT_EXECUTION != \"1\"); \
-                     POST /sessions/:id/stage2/w5g/execute will return 503"
-                );
-                None
-            } else {
-                wire_w5g_executor(cfg, w5e_repo.clone())
-            }
-        };
+        // W5g dedicated-route adapter — wraps the same shared executor.
+        let chat_execute_ref: Option<claw_api::state::ChatExecuteHandlerRef> =
+            w5g_executor.as_ref().map(|exec| {
+                crate::runtime::stage2_chat_execute_wiring::GatewayChatExecuteAdapter::new(
+                    exec.clone(),
+                )
+                .into_handler_ref()
+            });
 
         // Phase 6B Window 2 — JIT prepare handler. Bridges the API
         // trait (`SolendJitPrepareHandler`) to the gateway-internal
@@ -2717,14 +2734,12 @@ impl WalletChallengeHandler for GatewayWalletChallengeHandler {
 /// ANY missing piece. The orchestrator itself fail-closes on a
 /// per-request basis too — this function only short-circuits the
 /// daemon-startup wiring when it would obviously be unusable.
-fn wire_w5g_executor(
+fn build_w5g_executor(
     cfg: crate::stage2_chat_execute::Stage2ChatExecuteConfig,
     w5e_repo: std::sync::Arc<
         claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository,
     >,
-) -> Option<claw_api::state::ChatExecuteHandlerRef> {
-    // Resolve RPC URL (env wins over file-config conventions used
-    // elsewhere; we reuse the W5d/W5f env var convention here).
+) -> Option<std::sync::Arc<crate::stage2_chat_execute::Stage2ChatExecutor>> {
     let rpc_url = std::env::var("HELIUS_RPC_URL")
         .or_else(|_| std::env::var("CLAW_RPC_URL"))
         .ok()
@@ -2734,7 +2749,7 @@ fn wire_w5g_executor(
         None => {
             info!(
                 "W5g chat-execute disabled (no HELIUS_RPC_URL / CLAW_RPC_URL); \
-                 POST /sessions/:id/stage2/w5g/execute will return 503"
+                 chat-route ToolError + 503 on /stage2/w5g/execute"
             );
             return None;
         }
@@ -2762,13 +2777,11 @@ fn wire_w5g_executor(
         Err(e) => {
             info!(
                 "W5g chat-execute disabled (live sender build failed): {e}; \
-                 POST /sessions/:id/stage2/w5g/execute will return 503"
+                 chat-route ToolError + 503 on /stage2/w5g/execute"
             );
             return None;
         }
     };
-    // Reuse the SAME fetcher impls the chat-route already builds —
-    // they hit the same Helius RPC and the same Solend REST API.
     let save_apy_fetcher: std::sync::Arc<
         dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher,
     > = std::sync::Arc::new(
@@ -2780,8 +2793,7 @@ fn wire_w5g_executor(
         Some(f) => std::sync::Arc::new(f),
         None => {
             info!(
-                "W5g chat-execute disabled (LiveW5dAprFetcher rejected RPC URL); \
-                 POST /sessions/:id/stage2/w5g/execute will return 503"
+                "W5g chat-execute disabled (LiveW5dAprFetcher rejected RPC URL)"
             );
             return None;
         }
@@ -2793,12 +2805,11 @@ fn wire_w5g_executor(
         w5e_repo,
         cfg,
     ));
-    let adapter =
-        crate::runtime::stage2_chat_execute_wiring::GatewayChatExecuteAdapter::new(executor);
     info!(
-        "W5g chat-execute ENABLED — POST /sessions/:id/stage2/w5g/execute will dispatch \
-         live mainnet broadcasts under env-gated approval. Every request still runs the \
-         full precheck chain (approval phrase + canonical hash + Save APY re-check + budget)."
+        "W5g chat-execute ENABLED — the chat-route W5g approval command and \
+         POST /sessions/:id/stage2/w5g/execute share the same orchestrator. \
+         Each request runs the full precheck chain (approval phrase + canonical \
+         hash + Save APY re-check + budget) before the sender is touched."
     );
-    Some(adapter.into_handler_ref())
+    Some(executor)
 }

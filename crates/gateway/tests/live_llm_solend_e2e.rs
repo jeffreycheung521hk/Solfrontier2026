@@ -768,7 +768,7 @@ async fn run_live_llm_solend_e2e() {
     );
 
     // ── Build the chat handler over the same registry ─────────────────────
-    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider, None) {
+    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider, None, None) {
         Ok(Some(c)) => c,
         Ok(None) => panic!(
             "chat provider env gate returned None despite {ENV_LLM_OPT_IN}=1; \
@@ -865,6 +865,11 @@ async fn run_live_llm_solend_e2e() {
         // Any other Conflict variant — exhaustive defense.
         ChatRouteOutcome::Conflict(other) => panic!(
             "Branch D: unexpected Conflict variant: {other:?}"
+        ),
+        ChatRouteOutcome::Ok(ChatResponse::W5gConditionalExecution { result }) => panic!(
+            "Branch D: Solend live LLM test must dispatch solend_deposit_usdc, \
+             but the W5g chat-route interceptor matched (status={}); result={result:?}",
+            result.status,
         ),
     };
     assert_eq!(

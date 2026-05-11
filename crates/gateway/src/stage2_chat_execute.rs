@@ -217,6 +217,134 @@ pub struct ChatExecuteRequest {
     pub approval_phrase: String,
 }
 
+// ── W5g chat-command parser ──────────────────────────────────────────────
+//
+// The user-typed shape (built on the frontend by
+// `buildW5gExecuteCommand`):
+//
+//   "Execute W5g conditional deposit <rule_id_hex> <canonical_rule_hash_hex>
+//    with approval phrase W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED"
+//
+// is detected at the chat-route boundary (case-insensitive prefilter),
+// parsed strictly into a [`ChatExecuteRequest`], and dispatched to
+// [`Stage2ChatExecutor::execute`]. The orchestrator's typed result
+// then flows back through the chat-route as a `W5gConditionalExecution`
+// ChatResponse variant — so the operator never needs an out-of-band
+// button.
+
+/// Typed parse-failure for the W5g chat command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum W5gChatCommandParseError {
+    MissingPrefix,
+    MissingRuleIdHex,
+    InvalidRuleIdHex { value: String },
+    MissingCanonicalHashHex,
+    InvalidCanonicalHashHex { value: String },
+    MissingApprovalPhraseMarker,
+    EmptyApprovalPhrase,
+}
+
+impl std::fmt::Display for W5gChatCommandParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            W5gChatCommandParseError::MissingPrefix => {
+                write!(f, "missing 'Execute W5g conditional deposit' prefix")
+            }
+            W5gChatCommandParseError::MissingRuleIdHex => {
+                write!(f, "missing 32-char rule_id hex after the prefix")
+            }
+            W5gChatCommandParseError::InvalidRuleIdHex { value } => write!(
+                f,
+                "rule_id hex must be 32 lowercase/uppercase hex chars; got {value:?}"
+            ),
+            W5gChatCommandParseError::MissingCanonicalHashHex => {
+                write!(f, "missing 64-char canonical_rule_hash hex after rule_id")
+            }
+            W5gChatCommandParseError::InvalidCanonicalHashHex { value } => write!(
+                f,
+                "canonical_rule_hash hex must be 64 hex chars; got {value:?}"
+            ),
+            W5gChatCommandParseError::MissingApprovalPhraseMarker => {
+                write!(f, "missing 'approval phrase' marker after canonical hash")
+            }
+            W5gChatCommandParseError::EmptyApprovalPhrase => {
+                write!(f, "approval phrase is empty")
+            }
+        }
+    }
+}
+
+/// Lightweight pre-filter the chat router uses to decide whether to
+/// invoke the strict W5g parser at all. A message that matches this
+/// filter is *worth* trying to parse; one that doesn't is left for
+/// the W5d/W5f bridge or the LLM path.
+pub fn looks_like_w5g_chat_command(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("execute w5g conditional deposit")
+        && lower.contains("approval phrase")
+}
+
+/// Strict parser for the W5g chat approval command. Accepts the
+/// exact grammar built on the frontend; whitespace-tolerant on the
+/// separators between the prefix / rule_id / hash / marker, but
+/// rejects any structural deviation (missing prefix, malformed hex,
+/// missing marker, empty phrase).
+pub fn parse_w5g_chat_command(
+    text: &str,
+) -> Result<ChatExecuteRequest, W5gChatCommandParseError> {
+    let lower = text.to_ascii_lowercase();
+    let prefix = "execute w5g conditional deposit";
+    let prefix_idx = lower
+        .find(prefix)
+        .ok_or(W5gChatCommandParseError::MissingPrefix)?;
+    // Slice the ORIGINAL `text` (preserving hex case) starting after
+    // the prefix. ASCII-only fragments above mean byte offsets are
+    // safe on the lowered string.
+    let after_prefix = &text[prefix_idx + prefix.len()..];
+
+    let mut iter = after_prefix.split_whitespace();
+    let rule_id_token = iter
+        .next()
+        .ok_or(W5gChatCommandParseError::MissingRuleIdHex)?;
+    if rule_id_token.len() != 32 || !rule_id_token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(W5gChatCommandParseError::InvalidRuleIdHex {
+            value: rule_id_token.to_string(),
+        });
+    }
+    let canonical_hash_token = iter
+        .next()
+        .ok_or(W5gChatCommandParseError::MissingCanonicalHashHex)?;
+    if canonical_hash_token.len() != 64
+        || !canonical_hash_token.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(W5gChatCommandParseError::InvalidCanonicalHashHex {
+            value: canonical_hash_token.to_string(),
+        });
+    }
+
+    // The remainder must contain the marker "approval phrase" (any
+    // case) followed by the literal phrase. Search the ORIGINAL text
+    // (case-insensitive) after the canonical hash token.
+    let tail_idx_in_lower = {
+        let tail_marker = "approval phrase";
+        let scan_from = prefix_idx + prefix.len();
+        lower[scan_from..]
+            .find(tail_marker)
+            .map(|i| scan_from + i + tail_marker.len())
+            .ok_or(W5gChatCommandParseError::MissingApprovalPhraseMarker)?
+    };
+    let approval_phrase = text[tail_idx_in_lower..].trim().to_string();
+    if approval_phrase.is_empty() {
+        return Err(W5gChatCommandParseError::EmptyApprovalPhrase);
+    }
+
+    Ok(ChatExecuteRequest {
+        rule_id_hex: rule_id_token.to_string(),
+        canonical_rule_hash_hex: canonical_hash_token.to_string(),
+        approval_phrase,
+    })
+}
+
 /// High-level result of an execution attempt. The orchestrator
 /// returns this; the API layer collapses it into a typed wire DTO
 /// (`ChatExecuteResultDto`).
@@ -2022,6 +2150,108 @@ mod tests {
         assert!(!rule_status_is_executable(WatchRuleStatus::Failed));
         assert!(!rule_status_is_executable(WatchRuleStatus::Expired));
         assert!(!rule_status_is_executable(WatchRuleStatus::Revoked));
+    }
+
+    // ── W5g chat-command parser ────────────────────────────────────────
+
+    /// Canonical happy-path: the exact string the frontend's
+    /// `buildW5gExecuteCommand` produces parses cleanly into a
+    /// `ChatExecuteRequest`.
+    #[test]
+    fn w5g_chat_parser_accepts_canonical_command() {
+        let cmd = "Execute W5g conditional deposit \
+                   f401000090d00300000000009a62dace \
+                   26068ac3efbf438407ed607901ea24cb28f67e6a6f6064fd48b879341576931d \
+                   with approval phrase W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED";
+        let r = parse_w5g_chat_command(cmd).unwrap();
+        assert_eq!(r.rule_id_hex, "f401000090d00300000000009a62dace");
+        assert_eq!(
+            r.canonical_rule_hash_hex,
+            "26068ac3efbf438407ed607901ea24cb28f67e6a6f6064fd48b879341576931d"
+        );
+        assert_eq!(r.approval_phrase, W5G_REQUIRED_APPROVAL_PHRASE);
+    }
+
+    /// Detector + parser are case-insensitive on the marker words
+    /// but preserve case on the hex tokens (rule_id_hex is stored
+    /// case-insensitively elsewhere via `decode_rule_id_hex`).
+    #[test]
+    fn w5g_chat_parser_case_insensitive_markers() {
+        let cmd = "EXECUTE W5G CONDITIONAL DEPOSIT \
+                   F401000090D00300000000009A62DACE \
+                   26068AC3EFBF438407ED607901EA24CB28F67E6A6F6064FD48B879341576931D \
+                   WITH APPROVAL PHRASE W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED";
+        let r = parse_w5g_chat_command(cmd).unwrap();
+        assert_eq!(r.rule_id_hex, "F401000090D00300000000009A62DACE");
+        assert!(looks_like_w5g_chat_command(cmd));
+    }
+
+    #[test]
+    fn w5g_detector_rejects_w5d_and_arbitrary_text() {
+        assert!(!looks_like_w5g_chat_command(
+            "If Solend Main Pool USDC deposit APR is above 1%, ..."
+        ));
+        assert!(!looks_like_w5g_chat_command("show my balances"));
+        // The "approval phrase" marker is required. A message that
+        // has the prefix but no marker stays in the LLM fall-through
+        // path (intentionally permissive — the parser then rejects).
+        assert!(!looks_like_w5g_chat_command(
+            "execute w5g conditional deposit and please send it"
+        ));
+        // Marker without the prefix also stays in fall-through.
+        assert!(!looks_like_w5g_chat_command(
+            "tell me the approval phrase for this rule"
+        ));
+    }
+
+    #[test]
+    fn w5g_chat_parser_rejects_short_rule_id_hex() {
+        let cmd = "Execute W5g conditional deposit \
+                   deadbeef \
+                   26068ac3efbf438407ed607901ea24cb28f67e6a6f6064fd48b879341576931d \
+                   with approval phrase W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED";
+        match parse_w5g_chat_command(cmd).unwrap_err() {
+            W5gChatCommandParseError::InvalidRuleIdHex { .. } => {}
+            other => panic!("expected InvalidRuleIdHex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn w5g_chat_parser_rejects_non_hex_canonical() {
+        let cmd = "Execute W5g conditional deposit \
+                   f401000090d00300000000009a62dace \
+                   this-is-not-hex-at-all-this-is-not-hex-at-all-this-is-not-hex-at \
+                   with approval phrase W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED";
+        match parse_w5g_chat_command(cmd).unwrap_err() {
+            W5gChatCommandParseError::InvalidCanonicalHashHex { .. } => {}
+            other => panic!("expected InvalidCanonicalHashHex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn w5g_chat_parser_rejects_missing_approval_marker() {
+        let cmd = "Execute W5g conditional deposit \
+                   f401000090d00300000000009a62dace \
+                   26068ac3efbf438407ed607901ea24cb28f67e6a6f6064fd48b879341576931d \
+                   and please send it";
+        match parse_w5g_chat_command(cmd).unwrap_err() {
+            W5gChatCommandParseError::MissingApprovalPhraseMarker => {}
+            other => panic!("expected MissingApprovalPhraseMarker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn w5g_chat_parser_passes_through_wrong_approval_phrase_to_orchestrator() {
+        // The PARSER does not check the phrase value; the
+        // orchestrator does (and surfaces RequestApprovalMismatch).
+        // This means a typo-ed phrase still parses but is rejected
+        // downstream — exactly the typed error the operator needs.
+        let cmd = "Execute W5g conditional deposit \
+                   f401000090d00300000000009a62dace \
+                   26068ac3efbf438407ed607901ea24cb28f67e6a6f6064fd48b879341576931d \
+                   with approval phrase YOLO";
+        let r = parse_w5g_chat_command(cmd).unwrap();
+        assert_eq!(r.approval_phrase, "YOLO");
     }
 
     // ── Orchestrator: gate refusals ────────────────────────────────────

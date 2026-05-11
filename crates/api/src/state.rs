@@ -1076,6 +1076,22 @@ pub enum ChatResponse {
     /// `tool_name == "w5d_conditional_deposit"` so the frontend reuses
     /// its current error-card path.
     W5dConditionalDeposit { result: W5dConditionalDepositResultDto },
+    /// W5g — chat-first controlled-wallet Solend deposit execution.
+    /// Emitted when the user's chat message matches the W5g approval
+    /// command shape (e.g. `"Execute W5g conditional deposit
+    /// <rule_id_hex> <canonical_rule_hash_hex> with approval phrase
+    /// W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED"`). The gateway's
+    /// chat handler routes the command to `Stage2ChatExecutor` and
+    /// maps the typed outcome into [`ChatExecuteResultDto`] — the
+    /// same DTO returned by the dedicated
+    /// `POST /sessions/:id/stage2/w5g/execute` route.
+    ///
+    /// Parse failures and orchestrator pre-check failures are
+    /// represented as a typed [`ChatExecuteResultDto`] with
+    /// `status="prechecks_failed"` + an `error_code`. Network /
+    /// protocol failures past send are `status="execution_failed"`
+    /// / `"broadcasted_timeout"`.
+    W5gConditionalExecution { result: ChatExecuteResultDto },
 }
 
 /// Wire DTO mirroring `claw_gateway::stage2_demo_apr_bridge::W5dEvaluationResult`.

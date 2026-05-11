@@ -266,7 +266,7 @@ async fn run_live_llm_jupiter_e2e() {
     let registry = ToolRegistry::new().with_tool(tool_arc);
 
     // ── Build the chat handler over the same registry ─────────────────────
-    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider, None) {
+    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider, None, None) {
         Ok(Some(c)) => c,
         Ok(None) => panic!(
             "chat provider env gate returned None despite {ENV_LLM_OPT_IN}=1; \
@@ -341,6 +341,11 @@ async fn run_live_llm_jupiter_e2e() {
         ChatRouteOutcome::BadRequest(msg) => panic!("chat route 400: {msg}"),
         ChatRouteOutcome::Disabled(msg) => panic!("chat route disabled: {msg}"),
         ChatRouteOutcome::Conflict(other) => panic!("unexpected Conflict variant: {other:?}"),
+        ChatRouteOutcome::Ok(ChatResponse::W5gConditionalExecution { result }) => panic!(
+            "Jupiter live LLM test must dispatch submit_jupiter_swap, \
+             but the W5g chat-route interceptor matched (status={}); result={result:?}",
+            result.status,
+        ),
     };
 
     // Assert: LLM picked submit_jupiter_swap.

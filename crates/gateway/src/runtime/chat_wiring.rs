@@ -413,6 +413,7 @@ pub fn wire_chat_handler_with_registry(
     registry: &ToolRegistry,
     env: &dyn EnvProvider,
     w5e_repo: Option<Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>>,
+    w5g_executor: Option<Arc<crate::stage2_chat_execute::Stage2ChatExecutor>>,
 ) -> Result<Option<ChatHandlerRef>, LlmProviderConfigError> {
     let llm = match build_chat_provider_from_env(env)? {
         Some(c) => c,
@@ -476,6 +477,12 @@ pub fn wire_chat_handler_with_registry(
             handler = handler.with_w5f_save_apy(Arc::new(save));
         }
     }
+    // W5g — attach the orchestrator if the daemon built one. The
+    // daemon is responsible for constructing the executor under the
+    // full env-gate chain; this wire layer just plumbs the Arc.
+    if let Some(executor) = w5g_executor {
+        handler = handler.with_w5g_executor(executor);
+    }
     Ok(Some(handler.into_handler_ref()))
 }
 
@@ -491,8 +498,9 @@ pub fn wire_chat_handler_with_registry(
 pub fn wire_chat_handler_from_std_env(
     registry: &ToolRegistry,
     w5e_repo: Option<Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>>,
+    w5g_executor: Option<Arc<crate::stage2_chat_execute::Stage2ChatExecutor>>,
 ) -> Result<Option<ChatHandlerRef>, LlmProviderConfigError> {
-    wire_chat_handler_with_registry(registry, &StdEnvProvider, w5e_repo)
+    wire_chat_handler_with_registry(registry, &StdEnvProvider, w5e_repo, w5g_executor)
 }
 
 /// Bridge from the API-layer `ChatHandler` trait to the runtime's
@@ -544,6 +552,16 @@ pub struct GatewayChatHandler {
     /// `ToolError` for any matched W5d command because W5f requires
     /// the Save metric to render the typed card.
     w5f_save_apy: Option<Arc<dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher>>,
+    /// W5g — chat-route controlled-wallet Solend deposit execution.
+    /// When present, the chat handler detects the W5g approval
+    /// command (`Execute W5g conditional deposit … with approval
+    /// phrase …`), dispatches to the orchestrator, and emits a
+    /// typed `W5gConditionalExecution` variant. When absent (every
+    /// env gate fail-closed at daemon startup), the chat route
+    /// returns a `ToolError` with `tool_name="w5g_conditional_execution"`
+    /// so the operator sees an explicit refusal instead of a silent
+    /// fall-through to the LLM.
+    w5g_executor: Option<Arc<crate::stage2_chat_execute::Stage2ChatExecutor>>,
 }
 
 impl GatewayChatHandler {
@@ -561,6 +579,7 @@ impl GatewayChatHandler {
             w5d_bridge: None,
             w5e_repo: None,
             w5f_save_apy: None,
+            w5g_executor: None,
         }
     }
 
@@ -607,6 +626,18 @@ impl GatewayChatHandler {
         self
     }
 
+    /// W5g — attach the chat-card live-execution orchestrator. When
+    /// present, the chat handler detects the W5g approval command
+    /// and dispatches; when absent, the chat handler returns a
+    /// typed `ToolError` so the operator gets a clear refusal.
+    pub fn with_w5g_executor(
+        mut self,
+        executor: Arc<crate::stage2_chat_execute::Stage2ChatExecutor>,
+    ) -> Self {
+        self.w5g_executor = Some(executor);
+        self
+    }
+
     /// Wraps `self` in an `Arc<dyn ChatHandler>` ready for `AppState`.
     pub fn into_handler_ref(self) -> ChatHandlerRef {
         ChatHandlerRef::new(Arc::new(self))
@@ -648,6 +679,20 @@ impl ChatHandler for GatewayChatHandler {
                     )
                     .await;
                 }
+            }
+
+            // ── W5g approval-command interceptor ──────────────────────
+            //
+            // If the message matches the W5g approval-command grammar,
+            // dispatch deterministically — BEFORE any LLM call. If the
+            // executor isn't wired (env gates fail-closed) the route
+            // returns a typed ToolError; if parsing fails, same shape.
+            if crate::stage2_chat_execute::looks_like_w5g_chat_command(&message) {
+                return handle_w5g_chat_command(
+                    self.w5g_executor.as_deref(),
+                    &message,
+                )
+                .await;
             }
 
             // Rebuild the strict one-turn handler per call so every
@@ -742,6 +787,66 @@ async fn handle_w5d_demo_command(
             })
         }
     }
+}
+
+/// W5g chat-route branch. Parses the user-typed approval command,
+/// dispatches to the orchestrator if it's wired, and emits a typed
+/// [`ChatResponse::W5gConditionalExecution`] carrying the full
+/// execution result. Parse failures and absent-executor cases
+/// surface as `ChatResponse::ToolError` with
+/// `tool_name == "w5g_conditional_execution"` so the frontend reuses
+/// its existing error-card surface for the structural-rejection
+/// path. (Orchestrator pre-check failures are NOT ToolErrors — they
+/// flow through the typed W5g card with `status="prechecks_failed"`.)
+///
+/// This is the single boundary where `ChatExecuteOutcome` (rich
+/// internal type) collapses into the lean wire DTO
+/// (`ChatExecuteResultDto`).
+async fn handle_w5g_chat_command(
+    executor: Option<&crate::stage2_chat_execute::Stage2ChatExecutor>,
+    message: &str,
+) -> ChatRouteOutcome {
+    const TOOL_NAME: &str = "w5g_conditional_execution";
+
+    // Parse the user-typed command. Parse failures are surfaced as
+    // ToolError because they're STRUCTURAL — the operator can fix
+    // them by re-copying the command from the W5f card.
+    let request = match crate::stage2_chat_execute::parse_w5g_chat_command(message) {
+        Ok(r) => r,
+        Err(e) => {
+            return ChatRouteOutcome::Ok(ChatResponse::ToolError {
+                tool_name: TOOL_NAME.to_string(),
+                message: format!("w5g parse: {e}"),
+            });
+        }
+    };
+
+    // Executor must be wired. If not, this is a daemon-startup
+    // misconfiguration; we surface a typed ToolError so the operator
+    // sees an explicit "not wired" message instead of a silent LLM
+    // fall-through that pretends to act.
+    let executor = match executor {
+        Some(e) => e,
+        None => {
+            return ChatRouteOutcome::Ok(ChatResponse::ToolError {
+                tool_name: TOOL_NAME.to_string(),
+                message:
+                    "W5g chat-execute is not wired in this daemon \
+                     (env gates fail-closed). The W5e/W5f read paths still work, \
+                     but no live deposit can be authorised from chat until \
+                     the daemon is started with CLAW_STAGE2_LIVE_CHAT_EXECUTION=1 \
+                     + matching approval phrase + delegated keypair + cluster + RPC."
+                        .to_string(),
+            });
+        }
+    };
+
+    // Dispatch to the orchestrator. Every result variant (Completed /
+    // BroadcastedTimeout / PrechecksFailed / ExecutionFailed) flows
+    // through the typed W5g card on the frontend.
+    let outcome = executor.execute(request).await;
+    let dto = crate::runtime::stage2_chat_execute_wiring::map_outcome_to_dto(outcome);
+    ChatRouteOutcome::Ok(ChatResponse::W5gConditionalExecution { result: dto })
 }
 
 /// Translate the runtime's typed [`ConversationOutcome`] into the
@@ -1758,7 +1863,7 @@ mod p5e_env_gate_tests {
     #[test]
     fn p5e_wire_with_registry_returns_none_when_env_disabled() {
         let env = MockEnv::empty();
-        let result = wire_chat_handler_with_registry(&stub_registry(), &env, None)
+        let result = wire_chat_handler_with_registry(&stub_registry(), &env, None, None)
             .expect("disabled env must be Ok(None)");
         assert!(result.is_none());
     }
@@ -1773,7 +1878,7 @@ mod p5e_env_gate_tests {
             ("OPENAI_API_KEY", "sk-test-fixture"),
         ]);
         let empty = ToolRegistry::new();
-        let result = wire_chat_handler_with_registry(&empty, &env, None);
+        let result = wire_chat_handler_with_registry(&empty, &env, None, None);
         match result {
             Err(LlmProviderConfigError::InvalidProviderConfig { .. }) => {}
             // Result's Ok arm contains `Option<ChatHandlerRef>` (no Debug);
