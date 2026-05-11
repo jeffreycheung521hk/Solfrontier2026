@@ -261,6 +261,38 @@ export interface ChatRequest {
   message: string;
 }
 
+/// Wire DTO mirroring Rust's `claw_api::state::W5dConditionalDepositResultDto`.
+///
+/// Produced by the chat handler's W5d demo-bridge interceptor when the
+/// user types the deterministic demo grammar. The chat route NEVER
+/// broadcasts a tx in this slice — `tx_signature` is always `null`
+/// and `status` is one of `"condition_not_met"` | `"ready_to_execute"`.
+export interface W5dConditionalDepositResult {
+  input_text: string;
+  /// Always `"onchain_reserve_b_o1"` from the chat route — the live
+  /// APR comes from decoding the Solend Main Pool USDC reserve via
+  /// the B-O1 byte decoder + the W3 evaluator wrappers. No external
+  /// Save/Solend public-API path.
+  source: string;
+  /// Solend Main Pool USDC reserve pubkey, base58.
+  reserve_pubkey: string;
+  /// Current Solend Main Pool USDC supply APR in basis points
+  /// (1 % = 100 bps).
+  current_apr_bps: number;
+  /// Threshold the user typed, in basis points.
+  threshold_bps: number;
+  /// Echo of the percent label the user typed (e.g. `"2.5"`).
+  threshold_pct_label: string;
+  /// Strict `current_apr_bps > threshold_bps`.
+  condition_met: boolean;
+  /// Always `false` from the chat route in the present slice.
+  execution_attempted: boolean;
+  /// `"condition_not_met"` | `"ready_to_execute"`.
+  status: string;
+  /// Reserved; always `null` in the present slice.
+  tx_signature: string | null;
+}
+
 /// Discriminated union mirroring Rust's `ChatResponse` enum.
 /// `status` is the discriminant; the runtime guarantees no other shape.
 export type ChatResponse =
@@ -271,7 +303,8 @@ export type ChatResponse =
   | { status: "malformed_tool_arguments"; tool_name: string; reason: string }
   | { status: "malformed_provider_output"; reason: string }
   | { status: "tool_error"; tool_name: string; message: string }
-  | { status: "pending_action_exists"; reason: string };
+  | { status: "pending_action_exists"; reason: string }
+  | { status: "w5d_conditional_deposit"; result: W5dConditionalDepositResult };
 
 /// HTTP-status-aware envelope used by the chat client.
 /// The chat route maps domain outcomes to: 200 OK, 400 Bad Request,

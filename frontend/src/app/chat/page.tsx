@@ -33,6 +33,7 @@ import type {
   ChatResponse,
   ChatRouteResult,
   SessionId,
+  W5dConditionalDepositResult,
 } from "@/lib/types";
 
 // Live-mode wallet bind state. The Phantom popup for signMessage is
@@ -586,6 +587,11 @@ function ChatResponseCard({ response }: { response: ChatResponse }) {
       // the same card if it ever shows up under 200.
       return <PendingActionCard reason={response.reason} />;
 
+    case "w5d_conditional_deposit":
+      // W5d demo-bridge: deterministic-parser + B-O1 on-chain APR.
+      // Render a typed card — never a raw JSON blob.
+      return <W5dConditionalDepositCard result={response.result} />;
+
     default: {
       // Exhaustiveness check — `never` assertion fails to compile if
       // the ChatResponse union grows a new variant without a case
@@ -594,6 +600,75 @@ function ChatResponseCard({ response }: { response: ChatResponse }) {
       return exhaustive;
     }
   }
+}
+
+/// Format a basis-point integer as a percent label (e.g. 163 → "1.63%").
+function bpsToPctLabel(bps: number): string {
+  const whole = Math.floor(bps / 100);
+  const frac = Math.abs(bps % 100);
+  return `${whole}.${frac.toString().padStart(2, "0")}%`;
+}
+
+function W5dConditionalDepositCard({
+  result,
+}: {
+  result: W5dConditionalDepositResult;
+}) {
+  const conditionLabel = result.condition_met ? "true" : "false";
+  const statusTone =
+    result.status === "ready_to_execute"
+      ? "bg-amber-50 text-amber-900 border-amber-200"
+      : "bg-emerald-50 text-emerald-900 border-emerald-200";
+  return (
+    <div className="flex justify-start">
+      <div
+        data-testid="w5d-conditional-deposit-card"
+        className="max-w-[85%] rounded-2xl rounded-bl-sm bg-card border px-4 py-3 text-sm space-y-1"
+      >
+        <div className="font-medium">W5d conditional deposit (demo bridge)</div>
+        <div className="text-xs text-muted-foreground italic break-words">
+          &ldquo;{result.input_text}&rdquo;
+        </div>
+        <div className={`mt-2 inline-block rounded border px-2 py-1 text-xs ${statusTone}`}>
+          {result.status === "ready_to_execute"
+            ? "Ready to execute — live send not authorised from chat"
+            : "Condition not met — no execution"}
+        </div>
+        <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
+          <dt className="text-muted-foreground">source</dt>
+          <dd className="font-mono break-all">{result.source}</dd>
+
+          <dt className="text-muted-foreground">reserve</dt>
+          <dd className="font-mono break-all">{result.reserve_pubkey}</dd>
+
+          <dt className="text-muted-foreground">current APR</dt>
+          <dd>
+            {result.current_apr_bps} bps ({bpsToPctLabel(result.current_apr_bps)})
+          </dd>
+
+          <dt className="text-muted-foreground">threshold</dt>
+          <dd>
+            {result.threshold_bps} bps ({bpsToPctLabel(result.threshold_bps)})
+          </dd>
+
+          <dt className="text-muted-foreground">condition_met</dt>
+          <dd className="font-mono">{conditionLabel}</dd>
+
+          <dt className="text-muted-foreground">execution_attempted</dt>
+          <dd className="font-mono">{result.execution_attempted ? "true" : "false"}</dd>
+
+          <dt className="text-muted-foreground">tx_signature</dt>
+          <dd className="font-mono break-all">{result.tx_signature ?? "N/A"}</dd>
+        </dl>
+        <div className="mt-2 text-[10px] text-muted-foreground leading-snug">
+          Demo bridge: deterministic parser → B-O1 on-chain APR → W5c
+          direct Solend conditional-deposit boundary. NOT clawsol-authority
+          ExecuteAction; NOT AuthorizationRecord PDA live execution; NOT
+          Jupiter; NOT a first-class production SolendDeposit ActionSpec.
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function PendingActionCard({ reason }: { reason: string }) {

@@ -51,6 +51,12 @@ pub mod stage2_evaluator;
 // completed / failed. W4-lite default: MockExecutionClient only — no
 // live RPC, no signing, no broadcast, no transaction construction.
 pub mod stage2_executor;
+// Stage 2 W5d — chat/demo APR conditional-deposit bridge. Deterministic
+// parser for one specific demo grammar + B-O1-on-chain-APR evaluator
+// + a `W5dAprFetcher` trait the chat handler depends on. No
+// `sendTransaction` site; no keypair; no LLM call. Live RPC is the
+// `LiveW5dAprFetcher` impl; tests use a mock.
+pub mod stage2_demo_apr_bridge;
 pub mod session_policy;
 pub mod supervisor;
 pub mod tools;

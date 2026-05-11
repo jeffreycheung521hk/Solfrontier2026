@@ -46,6 +46,7 @@ use claw_agent_runtime::{
 };
 use claw_api::state::{
     ChatHandler, ChatHandlerRef, ChatResponse, ChatRouteOutcome,
+    W5dConditionalDepositResultDto,
 };
 use claw_tool_system::{
     dispatch::ToolDispatcher,
@@ -427,12 +428,26 @@ pub fn wire_chat_handler_with_registry(
             })
         }
     };
-    let handler = GatewayChatHandler::new(
+    let mut handler = GatewayChatHandler::new(
         llm,
         narrowed,
         ALIGNMENT_SYSTEM_PROMPT.to_string(),
         chat_capabilities(),
     );
+    // W5d demo-bridge — opt-in via RPC URL. The presence of a working
+    // RPC URL is treated as "the demo bridge is configured"; absence
+    // means W5d grammar is NOT recognised by the chat handler and the
+    // message falls through to the LLM (i.e. legacy behaviour).
+    if let Some(rpc) = env
+        .get("HELIUS_RPC_URL")
+        .or_else(|| env.get("CLAW_RPC_URL"))
+    {
+        if let Some(fetcher) =
+            crate::stage2_demo_apr_bridge::LiveW5dAprFetcher::new(rpc)
+        {
+            handler = handler.with_w5d_bridge(Arc::new(fetcher));
+        }
+    }
     Ok(Some(handler.into_handler_ref()))
 }
 
@@ -473,6 +488,13 @@ pub struct GatewayChatHandler {
     /// route is the LLM-driven path, which never holds
     /// `SignTransaction` / `SendTransaction`).
     caps: CapabilitySet,
+    /// Optional W5d demo-bridge — when present, the chat handler tries
+    /// the deterministic W5d grammar BEFORE dispatching to the LLM.
+    /// A non-matching message falls through unchanged (LLM path
+    /// preserved). When `None`, the chat handler behaves exactly as
+    /// pre-W5d (LLM-only). The chat route never broadcasts a tx —
+    /// the live-send path is reserved for the env-gated W5c harness.
+    w5d_bridge: Option<Arc<dyn crate::stage2_demo_apr_bridge::W5dAprFetcher>>,
 }
 
 impl GatewayChatHandler {
@@ -487,7 +509,22 @@ impl GatewayChatHandler {
             registry,
             system_prompt,
             caps,
+            w5d_bridge: None,
         }
+    }
+
+    /// Variant constructor that attaches a W5d APR-bridge fetcher.
+    /// The chat handler will route any message that matches the W5d
+    /// deterministic grammar (per
+    /// [`crate::stage2_demo_apr_bridge::looks_like_w5d_command`]) to
+    /// the fetcher instead of the LLM. Non-matching messages continue
+    /// through the existing LLM path unchanged.
+    pub fn with_w5d_bridge(
+        mut self,
+        fetcher: Arc<dyn crate::stage2_demo_apr_bridge::W5dAprFetcher>,
+    ) -> Self {
+        self.w5d_bridge = Some(fetcher);
+        self
     }
 
     /// Wraps `self` in an `Arc<dyn ChatHandler>` ready for `AppState`.
@@ -508,6 +545,25 @@ impl ChatHandler for GatewayChatHandler {
     ) -> Pin<Box<dyn std::future::Future<Output = ChatRouteOutcome> + Send + '_>> {
         let session_id = session_id.clone();
         Box::pin(async move {
+            // ── W5d demo-bridge interceptor ──────────────────────────
+            //
+            // If the chat handler was built with a W5d fetcher (daemon
+            // config has the RPC URL) AND the message matches the
+            // deterministic W5d grammar, dispatch deterministically
+            // BEFORE invoking the LLM. Any non-matching message falls
+            // through to the LLM path unchanged.
+            //
+            // The chat route NEVER broadcasts a tx. The bridge's
+            // happy-path status is one of `"condition_not_met"` |
+            // `"ready_to_execute"`. Live-send authorisation is reserved
+            // for the env-gated W5c test harness.
+            if let Some(fetcher) = &self.w5d_bridge {
+                if crate::stage2_demo_apr_bridge::looks_like_w5d_command(&message)
+                {
+                    return handle_w5d_demo_command(fetcher.as_ref(), &message).await;
+                }
+            }
+
             // Rebuild the strict one-turn handler per call so every
             // invocation gets a fresh dispatcher and never inherits any
             // cross-turn mutable state. Phase 5C guarantees the handler
@@ -522,6 +578,52 @@ impl ChatHandler for GatewayChatHandler {
             let outcome = handler.handle_one_turn(session_id, message).await;
             map_outcome(outcome)
         })
+    }
+}
+
+/// W5d chat-route branch. Tries `parse_demo_command` strictly; if it
+/// rejects the grammar (the lightweight detector matched but the
+/// strict parser failed), surfaces a typed `ChatResponse::ToolError`
+/// with the parser's typed reason so the existing frontend error-card
+/// renders it. If parse succeeds and the fetcher returns a result,
+/// builds the typed W5d card variant; otherwise translates the typed
+/// `EvaluationError` to a `ToolError`.
+///
+/// This function is the single boundary where the rich gateway-side
+/// types (`W5dEvaluationResult`, `EvaluationError`, `ParseError`)
+/// collapse into the lean wire DTOs (`ChatResponse::*`,
+/// `W5dConditionalDepositResultDto`) the api crate exposes.
+async fn handle_w5d_demo_command(
+    fetcher: &(dyn crate::stage2_demo_apr_bridge::W5dAprFetcher + 'static),
+    message: &str,
+) -> ChatRouteOutcome {
+    const TOOL_NAME: &str = "w5d_conditional_deposit";
+    match crate::stage2_demo_apr_bridge::handle_demo_command(fetcher, message).await {
+        Ok(result) => {
+            let dto = W5dConditionalDepositResultDto {
+                input_text: result.input_text,
+                source: result.source,
+                reserve_pubkey: result.reserve_pubkey,
+                current_apr_bps: result.current_apr_bps,
+                threshold_bps: result.threshold_bps,
+                threshold_pct_label: result.threshold_pct_label,
+                condition_met: result.condition_met,
+                execution_attempted: result.execution_attempted,
+                status: result.status,
+                tx_signature: result.tx_signature,
+            };
+            ChatRouteOutcome::Ok(ChatResponse::W5dConditionalDeposit { result: dto })
+        }
+        Err(eval_err) => {
+            // Map any evaluator failure (parse, RPC, decode, APR) to a
+            // typed `ToolError` so the frontend reuses its existing
+            // error-card surface. The message is the typed display of
+            // the gateway-side `EvaluationError`.
+            ChatRouteOutcome::Ok(ChatResponse::ToolError {
+                tool_name: TOOL_NAME.to_string(),
+                message: eval_err.to_string(),
+            })
+        }
     }
 }
 
@@ -1562,5 +1664,174 @@ mod p5e_env_gate_tests {
             Err(e) => panic!("expected InvalidProviderConfig; got Err({e})"),
             Ok(_) => panic!("expected InvalidProviderConfig; got Ok(<chat handler>)"),
         }
+    }
+}
+
+// ── W5d chat-route interceptor tests ─────────────────────────────────────
+//
+// These tests exercise the `handle_w5d_demo_command` branch + the
+// `looks_like_w5d_command` detector / fall-through logic at the
+// GatewayChatHandler seam without making a single RPC call. The mock
+// fetcher is the same one defined in `stage2_demo_apr_bridge::tests`,
+// but since module-private items don't cross test-binary boundaries
+// we redefine a tiny one here.
+
+#[cfg(test)]
+mod w5d_chat_route_tests {
+    use super::*;
+    use crate::stage2_demo_apr_bridge::{
+        looks_like_w5d_command, DemoParsed, EvaluationError, W5dAprFetcher,
+        W5dEvaluationResult, W5D_RESERVE_BS58,
+    };
+    use async_trait::async_trait;
+    use claw_api::state::ChatResponse;
+    use std::sync::Arc;
+
+    #[derive(Debug, Clone)]
+    struct MockFetcher {
+        current_apr_bps: u32,
+    }
+    #[async_trait]
+    impl W5dAprFetcher for MockFetcher {
+        async fn evaluate(
+            &self,
+            input_text: &str,
+            parsed: &DemoParsed,
+        ) -> Result<W5dEvaluationResult, EvaluationError> {
+            let condition_met = self.current_apr_bps > parsed.threshold_bps;
+            let status = if condition_met {
+                "ready_to_execute".to_string()
+            } else {
+                "condition_not_met".to_string()
+            };
+            Ok(W5dEvaluationResult {
+                input_text: input_text.to_string(),
+                source: "onchain_reserve_b_o1".to_string(),
+                reserve_pubkey: W5D_RESERVE_BS58.to_string(),
+                current_apr_bps: self.current_apr_bps,
+                threshold_bps: parsed.threshold_bps,
+                threshold_pct_label: parsed.threshold_pct_label.clone(),
+                condition_met,
+                execution_attempted: false,
+                status,
+                tx_signature: None,
+            })
+        }
+    }
+
+    /// Detector: non-W5d messages must NOT match (chat route falls
+    /// through to the LLM path).
+    #[test]
+    fn non_w5d_message_does_not_match_detector() {
+        assert!(!looks_like_w5d_command("show my balances"));
+        assert!(!looks_like_w5d_command("what is the jupiter quote for SOL"));
+        assert!(!looks_like_w5d_command("deposit my USDC into Save"));
+    }
+
+    /// False branch — current+300 cannot exceed itself, so
+    /// `condition_met=false`, `status="condition_not_met"`, and the
+    /// chat handler must NOT have called any send path.
+    #[tokio::test]
+    async fn handle_w5d_false_command_returns_condition_not_met() {
+        let fetcher = MockFetcher {
+            current_apr_bps: 163,
+        };
+        let outcome = handle_w5d_demo_command(
+            &fetcher,
+            "If Solend Main Pool USDC deposit APR is above 4.63%, deposit 0.25 USDC from my bounded executor wallet into Solend.",
+        )
+        .await;
+        match outcome {
+            ChatRouteOutcome::Ok(ChatResponse::W5dConditionalDeposit { result }) => {
+                assert!(!result.condition_met);
+                assert_eq!(result.status, "condition_not_met");
+                assert!(!result.execution_attempted);
+                assert!(result.tx_signature.is_none());
+                assert_eq!(result.current_apr_bps, 163);
+                assert_eq!(result.threshold_bps, 463);
+                assert_eq!(result.source, "onchain_reserve_b_o1");
+            }
+            other => panic!("expected W5dConditionalDeposit, got {other:?}"),
+        }
+    }
+
+    /// True branch — current-1% always less than current, so
+    /// `condition_met=true`. The chat route NEVER broadcasts, so
+    /// `status` is `"ready_to_execute"` and `tx_signature` stays None.
+    #[tokio::test]
+    async fn handle_w5d_true_command_returns_ready_to_execute() {
+        let fetcher = MockFetcher {
+            current_apr_bps: 163,
+        };
+        let outcome = handle_w5d_demo_command(
+            &fetcher,
+            "If Solend Main Pool USDC deposit APR is above 0.63%, deposit 0.25 USDC from my bounded executor wallet into Solend.",
+        )
+        .await;
+        match outcome {
+            ChatRouteOutcome::Ok(ChatResponse::W5dConditionalDeposit { result }) => {
+                assert!(result.condition_met);
+                assert_eq!(result.status, "ready_to_execute");
+                assert!(!result.execution_attempted);
+                assert!(result.tx_signature.is_none());
+            }
+            other => panic!("expected W5dConditionalDeposit, got {other:?}"),
+        }
+    }
+
+    /// Parser failure (lightweight detector matched but strict parser
+    /// rejected) surfaces as `ChatResponse::ToolError` with
+    /// `tool_name == "w5d_conditional_deposit"`.
+    #[tokio::test]
+    async fn handle_w5d_parse_error_surfaces_as_tool_error() {
+        let fetcher = MockFetcher {
+            current_apr_bps: 163,
+        };
+        // The detector matches (pool name + "deposit apr" present),
+        // but the amount is unsupported (1.0 instead of 0.25).
+        let outcome = handle_w5d_demo_command(
+            &fetcher,
+            "If Solend Main Pool USDC deposit APR is above 10%, deposit 1.0 USDC from my bounded executor wallet into Solend.",
+        )
+        .await;
+        match outcome {
+            ChatRouteOutcome::Ok(ChatResponse::ToolError { tool_name, message }) => {
+                assert_eq!(tool_name, "w5d_conditional_deposit");
+                assert!(
+                    message.contains("unsupported amount")
+                        || message.contains("UnsupportedAmount")
+                        || message.contains("0.25 USDC"),
+                    "expected unsupported-amount in message, got {message}"
+                );
+            }
+            other => panic!("expected ToolError, got {other:?}"),
+        }
+    }
+
+    /// Builder-level: `with_w5d_bridge` attaches the fetcher; the
+    /// detector branch fires for matching messages. Non-matching
+    /// messages fall through to the LLM path unchanged (no fetcher
+    /// call), which we observe indirectly by confirming the detector
+    /// would NOT match the test phrase.
+    #[test]
+    fn with_w5d_bridge_attaches_fetcher_and_detector_is_consistent() {
+        let llm = claw_agent_runtime::disabled_provider();
+        let handler = GatewayChatHandler::new(
+            llm,
+            ToolRegistry::new(),
+            "alignment".to_string(),
+            CapabilitySet::empty(),
+        )
+        .with_w5d_bridge(Arc::new(MockFetcher { current_apr_bps: 1 }));
+        // Handler holds the fetcher; we don't have a getter (intentional
+        // — internal state). Verify via the detector helper that a
+        // non-W5d message does NOT match, so the handler would skip
+        // the bridge and fall through to the LLM path.
+        assert!(handler.w5d_bridge.is_some());
+        assert!(!looks_like_w5d_command("hello world"));
+        // And a W5d-shaped message would match.
+        assert!(looks_like_w5d_command(
+            "If Solend Main Pool USDC deposit APR is above 1%, ..."
+        ));
     }
 }
