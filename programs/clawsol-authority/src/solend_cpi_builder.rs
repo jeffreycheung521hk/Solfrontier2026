@@ -1199,9 +1199,11 @@ pub const MAINNET_BETA_DEMO_USDC_TUPLE: DemoOracleTuple = DemoOracleTuple {
     reserve:            solana_program::pubkey!("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"),
     lending_market:     solana_program::pubkey!("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY"),
     liquidity_mint:     solana_program::pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
-    // cToken mint at reserve offset 227. Authorized by Jeff 2026-05-10;
-    // not previously pinned in-repo because gateway decodes it dynamically.
-    ctoken_mint:        solana_program::pubkey!("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E"),
+    // cToken mint at reserve offset 227. Pinned against live mainnet by
+    // W5a-0 preflight on 2026-05-11: the on-chain Solend Main Pool USDC
+    // reserve publishes this value. The previous in-repo pin did not
+    // match — see git log for the rotation context.
+    ctoken_mint:        solana_program::pubkey!("993dVFL2uXWYeoXuEBFXR4BijeXdTv4s6BzsCjJZuwqk"),
     pyth_oracle:        solana_program::pubkey!("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX"),
     switchboard_oracle: solana_program::pubkey!("nu11111111111111111111111111111111111111111"),
     // None coerced to default. The canonical USDC reserve has no extra

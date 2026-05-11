@@ -327,7 +327,7 @@ fn localnet_clone_uses_source_network_pubkeys_not_random_localnet_keys() {
     let expected_reserve = bs58_to_pubkey("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw");
     let expected_lm = bs58_to_pubkey("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY");
     let expected_liq_mint = bs58_to_pubkey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-    let expected_ctoken = bs58_to_pubkey("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E");
+    let expected_ctoken = bs58_to_pubkey("993dVFL2uXWYeoXuEBFXR4BijeXdTv4s6BzsCjJZuwqk");
     let expected_pyth = bs58_to_pubkey("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX");
     let expected_sb = bs58_to_pubkey("nu11111111111111111111111111111111111111111");
     let expected_extra = Pubkey::new_from_array([0u8; 32]);

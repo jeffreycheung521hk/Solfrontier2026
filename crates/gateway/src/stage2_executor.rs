@@ -406,7 +406,10 @@ pub struct DemoSolendExecutionFixture {
 pub const DEMO_RESERVE_BS58: &str = "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw";
 pub const DEMO_LENDING_MARKET_BS58: &str = "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY";
 pub const DEMO_LIQUIDITY_MINT_BS58: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-pub const DEMO_CTOKEN_MINT_BS58: &str = "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E";
+// W5a-0 (2026-05-11): pinned against live mainnet reserve decode of the
+// Solend Main Pool USDC reserve at offset 227. The previous in-repo pin
+// did not match; see git log for the rotation context.
+pub const DEMO_CTOKEN_MINT_BS58: &str = "993dVFL2uXWYeoXuEBFXR4BijeXdTv4s6BzsCjJZuwqk";
 pub const DEMO_PYTH_ORACLE_BS58: &str = "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX";
 pub const DEMO_SWITCHBOARD_ORACLE_BS58: &str = "nu11111111111111111111111111111111111111111";
 

@@ -193,7 +193,7 @@ struct P5dFixture {
     /// Source collateral: any SPL Token account.
     source_collateral: Pubkey,
     /// reserve_collateral_mint slot 7 = demo cToken mint
-    /// (MAINNET_BETA_DEMO_USDC_TUPLE.ctoken_mint = 9n4nbM75…).
+    /// (MAINNET_BETA_DEMO_USDC_TUPLE.ctoken_mint = 993dVFL2…).
     reserve_collateral_mint: Pubkey,
     reserve_liquidity_supply: Pubkey,
     /// Demo Pyth oracle pubkey = MAINNET_BETA_DEMO_USDC_TUPLE.pyth_oracle.
