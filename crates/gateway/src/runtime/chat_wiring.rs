@@ -2087,3 +2087,185 @@ mod w5d_chat_route_tests {
         ));
     }
 }
+
+/// W5g chat-route seam tests. Proves that when a `Stage2ChatExecutor`
+/// is wired via `GatewayChatHandler::with_w5g_executor(...)`, a valid
+/// W5g approval-command message dispatches through to the orchestrator
+/// and the response is returned as the typed
+/// `ChatResponse::W5gConditionalExecution { result }` variant — NOT a
+/// `ToolError`. This is the wired-vs-not-wired discriminator.
+///
+/// The executor is constructed with `master_gate_on=false` so the
+/// orchestrator short-circuits at its first precheck (returning a
+/// `prechecks_failed` status with reason `master_gate_missing`) — the
+/// sender stub PANICS if reached, additionally proving no broadcast
+/// path is invoked.
+#[cfg(test)]
+mod w5g_chat_route_tests {
+    use super::*;
+    use crate::stage2_chat_execute::{
+        ChatExecuteSendOutcome, ChatExecuteSendRequest, Stage2ChatExecuteConfig,
+        Stage2ChatExecuteSender, Stage2ChatExecutor, W5G_REQUIRED_APPROVAL_PHRASE,
+    };
+    use crate::stage2_demo_apr_bridge::{
+        compose_w5e_result, controlled_wallet_addresses, DemoParsed, EvaluationError,
+        SaveDisplayApyFetcher, SaveDisplayApyReading, W5dAprFetcher, W5dEvaluationResult,
+    };
+    use async_trait::async_trait;
+    use claw_agent_runtime::disabled_provider;
+    use claw_api::state::ChatResponse;
+    use claw_state_store::{stage2_watch_rules::Stage2WatchRuleRepository, Database};
+    use claw_tool_system::permissions::CapabilitySet;
+    use claw_types::session::SessionId;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// Sender stub that panics if invoked. master_gate_on=false should
+    /// stop the executor before any sender path runs; if this stub ever
+    /// fires, the seam is leaking past its precheck gate.
+    #[derive(Debug)]
+    struct UncallableW5gSender;
+    #[async_trait]
+    impl Stage2ChatExecuteSender for UncallableW5gSender {
+        async fn build_sign_send_poll(
+            &self,
+            _request: ChatExecuteSendRequest,
+        ) -> ChatExecuteSendOutcome {
+            panic!(
+                "W5g sender must not be reached when master_gate_on=false; \
+                 the executor must short-circuit before any send path"
+            );
+        }
+    }
+
+    /// Stub Save display APY fetcher. Returns a deterministic 210-bps
+    /// reading anchored to the W5f Main Pool USDC identifiers; never
+    /// invoked under master_gate_off but required by the executor's type.
+    #[derive(Debug, Clone)]
+    struct StubW5gSaveFetcher;
+    #[async_trait]
+    impl SaveDisplayApyFetcher for StubW5gSaveFetcher {
+        async fn fetch_main_pool_usdc(
+            &self,
+        ) -> Result<SaveDisplayApyReading, EvaluationError> {
+            Ok(SaveDisplayApyReading {
+                save_display_apy_bps: 210,
+                raw_supply_interest_str: "2.10".to_string(),
+                reserve_pubkey: "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw".to_string(),
+                lending_market: "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY".to_string(),
+                liquidity_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                collateral_mint: "993dVFL2uXWYeoXuEBFXR4BijeXdTv4s6BzsCjJZuwqk".to_string(),
+                rewards_present: false,
+            })
+        }
+    }
+
+    /// Stub B-O1 native APR fetcher. Returns a deterministic 166-bps
+    /// reading; never invoked under master_gate_off but required by the
+    /// executor's type.
+    #[derive(Debug, Clone)]
+    struct StubW5gAprFetcher;
+    #[async_trait]
+    impl W5dAprFetcher for StubW5gAprFetcher {
+        async fn evaluate(
+            &self,
+            input_text: &str,
+            parsed: &DemoParsed,
+        ) -> Result<W5dEvaluationResult, EvaluationError> {
+            let (controlled_wallet, source_usdc_ata) = controlled_wallet_addresses();
+            Ok(compose_w5e_result(
+                input_text,
+                parsed,
+                166,
+                500_000,
+                42_424_242,
+                controlled_wallet,
+                source_usdc_ata,
+            ))
+        }
+    }
+
+    /// Pins the wired W5g chat-route seam. Constructs `GatewayChatHandler`
+    /// with `.with_w5g_executor(...)` (the executor's `master_gate_on` is
+    /// intentionally `false` so the orchestrator returns the
+    /// `prechecks_failed` outcome and no send path is reached), submits a
+    /// valid W5g approval command, and asserts the chat handler returns
+    /// the typed `ChatResponse::W5gConditionalExecution { result }`
+    /// variant — proving the seam dispatches through to the orchestrator
+    /// and DOES NOT fall back to the "not wired" `ToolError`.
+    #[tokio::test]
+    async fn wired_approval_path_returns_w5g_conditional_execution_variant() {
+        // In-memory state-store DB; the executor's repo is required by
+        // its constructor even though master_gate_off prevents lookup.
+        let db = Database::open_in_memory().await.expect("in-memory DB");
+        let repo = Arc::new(Stage2WatchRuleRepository::new(db.pool().clone()));
+
+        // Master gate OFF → executor short-circuits with
+        // PrechecksFailed/MasterGateMissing before the sender is reached.
+        let config = Stage2ChatExecuteConfig {
+            master_gate_on: false,
+            env_approval_phrase: None,
+            cluster: None,
+            rpc_url_present: false,
+            keypair_path_present: false,
+        };
+        let executor = Arc::new(Stage2ChatExecutor::new(
+            Arc::new(UncallableW5gSender),
+            Arc::new(StubW5gSaveFetcher),
+            Arc::new(StubW5gAprFetcher),
+            repo,
+            config,
+        ));
+
+        let llm = disabled_provider();
+        let handler = GatewayChatHandler::new(
+            llm,
+            ToolRegistry::new(),
+            "alignment".to_string(),
+            CapabilitySet::empty(),
+        )
+        .with_w5g_executor(executor);
+
+        // Build a syntactically valid W5g approval command — 32 hex
+        // chars rule_id, 64 hex chars canonical_rule_hash, exact phrase.
+        let rule_id_hex = "0102030405060708090a0b0c0d0e0f10";
+        let canonical_hash_hex =
+            "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30";
+        let message = format!(
+            "Execute W5g conditional deposit {rule_id_hex} {canonical_hash_hex} \
+             with approval phrase {W5G_REQUIRED_APPROVAL_PHRASE}"
+        );
+
+        let outcome = handler
+            .handle_chat(&SessionId::from(Uuid::new_v4()), message)
+            .await;
+
+        match outcome {
+            ChatRouteOutcome::Ok(ChatResponse::W5gConditionalExecution { result }) => {
+                // Mocked rejected status — master_gate_off ⇒ prechecks_failed.
+                assert_eq!(
+                    result.status, "prechecks_failed",
+                    "wired executor with master_gate_off must surface prechecks_failed"
+                );
+                // The parser round-tripped the user's rule_id_hex through
+                // to the DTO. This is the substantive seam evidence.
+                assert_eq!(result.rule_id_hex, rule_id_hex);
+                assert_eq!(result.canonical_rule_hash_hex, canonical_hash_hex);
+                // Sender stub panics if called; passing this assertion
+                // confirms no broadcast was attempted.
+                assert!(
+                    result.tx_signature.is_none(),
+                    "no broadcast under master_gate_off; tx_signature must be None"
+                );
+                assert!(
+                    result.confirmation_slot.is_none(),
+                    "no confirmation under master_gate_off; confirmation_slot must be None"
+                );
+            }
+            other => panic!(
+                "expected ChatResponse::W5gConditionalExecution (proves wired seam), \
+                 got {other:?}"
+            ),
+        }
+    }
+}
