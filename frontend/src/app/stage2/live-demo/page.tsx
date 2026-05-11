@@ -2,7 +2,7 @@
 
 // Stage 2 — `/stage2/live-demo` Phantom controlled-wallet funding UI.
 //
-// Lets the operator's connected Phantom wallet transfer EXACTLY 50
+// Lets the operator's connected Phantom wallet transfer EXACTLY 5
 // USDC into the controlled demo wallet
 // (`BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L`). This is the
 // reliable true-RPC demo moment for Stage 2 — the controlled wallet
@@ -41,6 +41,8 @@ import {
   CONTROLLED_WALLET_BASE58,
   FUNDING_AMOUNT_BASE_UNITS,
   FUNDING_AMOUNT_UI_LABEL,
+  LAST_SUCCESSFUL_FUNDING_SIGNATURE,
+  LAST_SUCCESSFUL_FUNDING_SLOT,
   MAX_POLL_ATTEMPTS_DEFAULT,
   POLL_INTERVAL_MS_DEFAULT,
   SignatureStatusNetworkError,
@@ -409,8 +411,11 @@ function LiveDemoBody() {
       } else {
         // timeout — the tx MAY still land; we just stopped polling.
         // Keep the signature visible so the operator can verify on
-        // Solscan. Distinct from a real on-chain failure; the UI
-        // renders this in amber, not red.
+        // Solscan. UI renders this red per the demo-polish spec
+        // ("true errors red only when status.err is non-null or
+        // polling times out"), but the body copy makes the
+        // "may still land" caveat explicit so the operator does not
+        // assume the funds were lost.
         setState({
           kind: "error",
           reason:
@@ -471,6 +476,8 @@ function LiveDemoBody() {
           approve in Phantom.
         </AlertDescription>
       </Alert>
+
+      <LastSuccessfulFundingPanel />
 
       <Card>
         <CardHeader className="pb-3">
@@ -694,6 +701,71 @@ function LiveDemoBody() {
 
 // ── Sub-components ───────────────────────────────────────────────────────
 
+/// Read-only "Last successful funding tx" card.
+///
+/// Shows the empirical mainnet proof that the page's exact instruction
+/// layout (TransferChecked tag 12 + optional CreateIdempotent ATA)
+/// finalizes cleanly. This is a STATIC display — no RPC call is made
+/// to verify it on render; the signature + slot + err shape are
+/// pinned at module level (`LAST_SUCCESSFUL_FUNDING_SIGNATURE`,
+/// `LAST_SUCCESSFUL_FUNDING_SLOT`). The operator/audience can click
+/// the Solscan link to verify out-of-band.
+function LastSuccessfulFundingPanel() {
+  const sig = LAST_SUCCESSFUL_FUNDING_SIGNATURE;
+  return (
+    <Card
+      className="border-green-500/40"
+      data-testid="last-funding-tx-panel"
+    >
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm font-medium flex items-center gap-2">
+          <span>Last successful funding tx</span>
+          <Badge
+            variant="outline"
+            className="border-green-500/60 bg-green-500/10 text-green-700 dark:text-green-400"
+            data-testid="last-funding-tx-finalized-badge"
+          >
+            Finalized
+          </Badge>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-1 text-xs">
+        <KeyValueRow
+          k="tx"
+          v={
+            <a
+              href={solscanTxUrl(sig)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-mono text-foreground underline hover:no-underline break-all"
+              data-testid="last-funding-tx-solscan-link"
+            >
+              {sig.slice(0, 12)}…{sig.slice(-8)}
+            </a>
+          }
+        />
+        <KeyValueRow
+          k="slot"
+          v={
+            <span className="font-mono text-muted-foreground">
+              {LAST_SUCCESSFUL_FUNDING_SLOT.toLocaleString()}
+            </span>
+          }
+        />
+        <KeyValueRow
+          k="on-chain err"
+          v={<span className="font-mono text-muted-foreground">None</span>}
+        />
+        <div className="pt-2 text-[11px] text-muted-foreground">
+          Empirical proof on mainnet that this page&apos;s instruction layout
+          (TransferChecked + idempotent CreateAta) finalizes cleanly. Read-only
+          display — no transaction is sent on render.
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 /// Threshold (in poll attempts) past which we promote the
 /// "submitted" headline to "Confirmation delayed". At
 /// POLL_INTERVAL_MS_DEFAULT = 2 000 ms this is ≈ 5 s after the
@@ -718,7 +790,9 @@ function SignaturePanel({
         state.kind === "error"
           ? meta.errorVariant === "on_chain"
             ? "-failed-on-chain"
-            : "-timeout"
+            : meta.errorVariant === "timeout"
+              ? "-timeout"
+              : "-network"
           : ""
       }`}
     >
@@ -753,7 +827,7 @@ interface PanelMeta {
   body: string | null;
   borderClass: string;
   /** Only set when `state.kind === "error"`; drives data-testid. */
-  errorVariant?: "on_chain" | "timeout";
+  errorVariant?: "on_chain" | "timeout" | "network";
 }
 
 function panelMeta(state: {
@@ -769,7 +843,7 @@ function panelMeta(state: {
         "Signed bytes are on the wire. The frontend is now polling " +
         "getSignatureStatuses with searchTransactionHistory enabled — " +
         "this will observe finalization even if the blockhash window expires.",
-      // Neutral / amber per spec — NOT red, NOT green.
+      // Neutral / amber — NOT red, NOT green. Not a failure.
       borderClass: "border-amber-500/40",
     };
   }
@@ -793,27 +867,43 @@ function panelMeta(state: {
       borderClass: "border-green-500/40",
     };
   }
-  // state.kind === "error" (signature defined → render via panel)
+  // state.kind === "error" (signature defined → render via panel).
+  //
+  // Per the prompt's UX rule: red is reserved for "true errors" —
+  // status.err non-null (on-chain failure) AND confirmation timeout.
+  // Transient RPC throws are amber because the tx may still land.
   const reason = state.reason ?? "Funding error.";
-  const isOnChainFailure = /^Transaction failed on chain/i.test(reason);
-  if (isOnChainFailure) {
+  if (/^Transaction failed on chain/i.test(reason)) {
     return {
       headline: "Transaction failed on chain",
       body: reason.replace(/^Transaction failed on chain:\s*/i, ""),
-      // Red border for an actual on-chain failure (status.err set).
       borderClass: "border-destructive/40",
       errorVariant: "on_chain",
     };
   }
-  // Confirmation timeout / network error during polling — the tx
-  // MAY still land. Amber, NOT red, per the prompt's UX rule.
+  if (/^Confirmation timeout/i.test(reason)) {
+    return {
+      headline: "Confirmation timeout",
+      body:
+        "Waited past the poll cap without seeing the tx confirm on chain. " +
+        "Verify on Solscan — if the tx finalized after the cap, the funds " +
+        "moved despite this banner.",
+      // Red — counted as a true error per the new UX rule. The
+      // Solscan link below the headline lets the operator verify
+      // out-of-band.
+      borderClass: "border-destructive/40",
+      errorVariant: "timeout",
+    };
+  }
+  // Fallback: network error during polling (> 3 consecutive RPC
+  // throws). The tx may still land — amber, not red.
   return {
-    headline: "Confirmation timeout",
+    headline: "Network error during confirmation",
     body:
-      "Waited past the poll cap without seeing the tx confirm. " +
-      "The tx may still land — verify on Solscan.",
+      "Could not reach the RPC endpoint while polling. " +
+      "The signed tx is on the wire — verify on Solscan.",
     borderClass: "border-amber-500/40",
-    errorVariant: "timeout",
+    errorVariant: "network",
   };
 }
 

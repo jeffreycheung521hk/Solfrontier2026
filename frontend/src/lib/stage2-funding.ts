@@ -51,16 +51,35 @@ export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
 
 /// Funding amount — exactly 5 USDC = 5 × 10^6 base units. u64.
 ///
-/// Pinned to 5 USDC on 2026-05-11. The demo's bounded-automation
+/// Pinned to the smallest demo-meaningful amount on 2026-05-11 so
+/// live-mainnet runs stay cheap. The demo's bounded-automation
 /// framing — the controlled wallet only receives an explicit
-/// one-shot transfer; the user main wallet retains self-custody
-/// and is never delegated — is independent of the amount. See git
-/// log for prior values.
+/// one-shot transfer; the user main wallet retains self-custody and
+/// is never delegated — is independent of the amount. The empirical
+/// reference tx `5RWXZh…r6Px9` (see `LAST_SUCCESSFUL_FUNDING_SIGNATURE`
+/// below) was a 5 USDC transfer with this exact instruction layout.
 export const FUNDING_AMOUNT_BASE_UNITS = BigInt(5_000_000);
 
 /// Funding amount UI label — produced by integer math, never by
 /// floating-point arithmetic.
 export const FUNDING_AMOUNT_UI_LABEL = "5.000000 USDC";
+
+/// Empirical proof of a successful Phantom controlled-wallet funding
+/// using THIS exact instruction layout (TransferChecked tag 12 +
+/// optional CreateIdempotent ATA). Finalized cleanly on mainnet at
+/// slot 418961171, err=None. Rendered read-only on the demo page so
+/// the operator/audience can verify the wire-shape works before
+/// signing a fresh tx in this session.
+///
+/// NOT a key — just a public tx signature. Anyone can resolve it
+/// through Solscan or the JSON-RPC `getTransaction` endpoint.
+export const LAST_SUCCESSFUL_FUNDING_SIGNATURE =
+  "5RWXZhGeFWohJAdSv2iUrM1qiBFSNnaxkqq8dEBErauoLi2y8rGvqavSDKv4WVhgomDkhH55r7yZ5UiTmvGr6Px9";
+
+/// Slot at which `LAST_SUCCESSFUL_FUNDING_SIGNATURE` finalized. Used
+/// for the read-only proof panel's secondary label. Operator can
+/// cross-check on Solscan / `solana confirm -v <sig>`.
+export const LAST_SUCCESSFUL_FUNDING_SLOT = 418961171;
 
 // ── ATA derivation (deterministic; no RPC) ────────────────────────────────
 
