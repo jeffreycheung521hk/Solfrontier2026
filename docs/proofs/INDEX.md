@@ -12,6 +12,7 @@ Most-recent first. Click any tx hash to verify on Solscan.
 
 | Artifact | What It Proves | Status | Date | Public Evidence | Proof Doc |
 |---|---|---|---|---|---|
+| **Phase 6I-K** — LLM-guided Solend withdraw mainnet | Withdraw-side counterpart to Phase 5G: NL → OpenAI → tool dispatch → human approval → JIT signing handoff → Phantom → daemon submit → mainnet `Finalized`; round-trip closed against the same wallet's May 7 deposit | Finalized | 2026-05-08 | [`3tMpTSEn…EZPJZ`](https://solscan.io/tx/3tMpTSEnmvszjSwgow43KMd4dLqnZwwSvnTbHkcPsCiyfizLf2h7kcMc1M7LwokHLC3SBPzpTfykjsc48z8EZPJZ) — slot 418,395,346 | [`LLM_SOLEND_WITHDRAW_MAINNET_E2E_PHASE6I.md`](LLM_SOLEND_WITHDRAW_MAINNET_E2E_PHASE6I.md) |
 | **Phase 5 Closeout** | Milestone seal — security model, fail-closed defense record, slice-by-slice components | (sealed) | 2026-04-26 | (doc) | [`PHASE5_CLOSEOUT.md`](PHASE5_CLOSEOUT.md) |
 | **Phase 5G** — LLM-guided Solend mainnet | NL → live OpenAI → strict 1-turn handler → Solend → mainnet `Finalized`, with LLM holding zero signing authority | Finalized | 2026-04-25 | [`4M4ezLgm…Py3y`](https://solscan.io/tx/4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y) — slot 415,571,964 | [`LLM_SOLEND_MAINNET_E2E_PHASE5G.md`](LLM_SOLEND_MAINNET_E2E_PHASE5G.md) |
 | **Phase 5F** — live LLM chat dry run | Real OpenAI gpt-4o-mini call through `POST /sessions/:id/chat`; one tool call only; strict schema enforced | Stopped at `awaiting_approval` (intentional) | 2026-04-25 | (no on-chain — proposal-only dry run) | [`LLM_SOLEND_CHAT_DRY_RUN_PHASE5E.md`](LLM_SOLEND_CHAT_DRY_RUN_PHASE5E.md) |
@@ -24,16 +25,17 @@ Most-recent first. Click any tx hash to verify on Solscan.
 
 For a reviewer with 5 minutes:
 1. **[Phase 5 Closeout](PHASE5_CLOSEOUT.md)** — milestone seal, security model, fail-closed record
-2. **[Phase 5G proof](LLM_SOLEND_MAINNET_E2E_PHASE5G.md)** — the LLM-guided mainnet artifact
+2. **[Phase 5G proof](LLM_SOLEND_MAINNET_E2E_PHASE5G.md)** — the LLM-guided deposit mainnet artifact
+3. **[Phase 6I-K proof](LLM_SOLEND_WITHDRAW_MAINNET_E2E_PHASE6I.md)** — the LLM-guided withdraw mainnet artifact (round-trip closed)
 
 For a reviewer with 30 minutes:
-3. **[Phase 4C proof](SOLEND_USDC_DEPOSIT_PHASE4C_E2E.md)** — non-LLM baseline (Solend rail correctness)
-4. **[Phase 5F proof](LLM_SOLEND_CHAT_DRY_RUN_PHASE5E.md)** — chat-route correctness without execution rail
-5. **[`ARCHITECTURE.md`](../../ARCHITECTURE.md)** — system invariants this proof rail depends on
+4. **[Phase 4C proof](SOLEND_USDC_DEPOSIT_PHASE4C_E2E.md)** — non-LLM baseline (Solend rail correctness)
+5. **[Phase 5F proof](LLM_SOLEND_CHAT_DRY_RUN_PHASE5E.md)** — chat-route correctness without execution rail
+6. **[`ARCHITECTURE.md`](../../ARCHITECTURE.md)** — system invariants this proof rail depends on
 
 For a reviewer who wants the historical depth:
-6. **[Slice 3G proof](SOLEND_USDC_DEPOSIT_SLICE3G.md)** — first mainnet Solend deposit (pre-LLM integration)
-7. **[Jupiter live mainnet proof](JUPITER_LIVE_MAINNET_PROOF.md)** — earlier swap integration with Phantom bridge
+7. **[Slice 3G proof](SOLEND_USDC_DEPOSIT_SLICE3G.md)** — first mainnet Solend deposit (pre-LLM integration)
+8. **[Jupiter live mainnet proof](JUPITER_LIVE_MAINNET_PROOF.md)** — earlier swap integration with Phantom bridge
 
 ## Other Artifacts in this Directory
 
