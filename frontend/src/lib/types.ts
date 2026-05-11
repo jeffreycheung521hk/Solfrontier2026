@@ -266,25 +266,24 @@ export interface ChatRequest {
 /// Produced by the chat handler's W5d demo-bridge interceptor when the
 /// user types the deterministic demo grammar. The chat route NEVER
 /// broadcasts a tx — `tx_signature` is always `null`. W5e extended the
-/// status enum to `"watching" | "ready_to_execute" | "needs_funding"`
-/// and added budget / liveness / rule-id fields.
+/// status enum to `"watching" | "ready_to_execute" | "needs_funding"`.
+/// W5f added the Save UI display APY as the primary decision metric
+/// (with native on-chain APR retained as a secondary audit field).
 export interface W5dConditionalDepositResult {
   input_text: string;
-  /// Always `"onchain_reserve_b_o1"` from the chat route — the live
-  /// APR comes from decoding the Solend Main Pool USDC reserve via
-  /// the B-O1 byte decoder + the W3 evaluator wrappers. No external
-  /// Save/Solend public-API path.
+  /// Legacy `source` field. After W5f equals `"save_display_apy"`;
+  /// new UI should read `decision_source` directly.
   source: string;
   /// Solend Main Pool USDC reserve pubkey, base58.
   reserve_pubkey: string;
-  /// Current Solend Main Pool USDC supply APR in basis points
-  /// (1 % = 100 bps).
+  /// W5f wire-compat alias for `save_display_apy_bps`. Older callers
+  /// reading this field see the same value that drives the decision.
   current_apr_bps: number;
   /// Threshold the user typed, in basis points.
   threshold_bps: number;
   /// Echo of the percent label the user typed (e.g. `"2.5"`).
   threshold_pct_label: string;
-  /// Strict `current_apr_bps > threshold_bps`.
+  /// Strict `save_display_apy_bps > threshold_bps` after W5f.
   condition_met: boolean;
   /// Always `false` from the chat route.
   execution_attempted: boolean;
@@ -326,6 +325,24 @@ export interface W5dConditionalDepositResult {
   /// True iff the gateway successfully persisted (or found existing)
   /// the rule via `Stage2WatchRuleRepository`. False ⇒ preview-only.
   rule_persisted: boolean;
+
+  // ── W5f decision metric + audit ──────────────────────────────────────
+
+  /// Which metric drove `condition_met`. Always `"save_display_apy"`
+  /// on the W5f happy path.
+  decision_source: string;
+  /// Save/Solend UI display APY in basis points, fetched live from
+  /// the official Solend REST API at
+  /// `https://api.solend.fi/v1/reserves?scope=solend&ids=<reserve>`
+  /// (`results[0].rates.supplyInterest`, percent string ⇒ bps). This
+  /// is the value the user sees on save.finance. Drives the decision.
+  save_display_apy_bps: number;
+  /// Native on-chain supply APR in basis points, decoded via B-O1
+  /// reserve math. Audit-only — does NOT drive the decision. Surfaced
+  /// so the user can see the gap between Save UI APY and native APR.
+  native_onchain_apr_bps: number;
+  /// Provenance for the native APR — always `"b_o1_reserve_math"`.
+  native_onchain_apr_source: string;
 }
 
 /// Discriminated union mirroring Rust's `ChatResponse` enum.

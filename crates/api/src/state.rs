@@ -1090,24 +1090,35 @@ pub enum ChatResponse {
 /// replacing W5d's `condition_not_met` (which incorrectly treated
 /// a conditional order as a terminal quote check).
 ///
+/// W5f — adds the Save/Solend UI display APY as the **primary
+/// decision metric** alongside the native on-chain APR as an audit
+/// field. `current_apr_bps` is kept as a wire-compat alias that
+/// equals `save_display_apy_bps` so older frontends keep working.
+///
 /// **No-overclaim:** this DTO proves a chat-side deterministic
-/// detection + on-chain APR evaluation + controlled-wallet budget
-/// read + (when wired) real `Stage2WatchRuleRepository` persistence,
-/// with a typed lifecycle status the frontend renders. It does NOT
-/// prove a `clawsol-authority` `ExecuteAction`, an
-/// `AuthorizationRecord` PDA live execution, a Jupiter conditional
-/// execution path, a first-class production
-/// `SolendDepositControlledWallet` `ActionSpec`, or a running
-/// watcher tick loop. `status="watching"` describes the rule's
-/// durable state in the state-store, not an active polling loop.
+/// detection + Save REST API APY fetch + on-chain APR evaluation +
+/// controlled-wallet budget read + (when wired) real
+/// `Stage2WatchRuleRepository` persistence, with a typed lifecycle
+/// status the frontend renders. It does NOT prove a
+/// `clawsol-authority` `ExecuteAction`, an `AuthorizationRecord`
+/// PDA live execution, a Jupiter conditional execution path, a
+/// first-class production `SolendDepositControlledWallet`
+/// `ActionSpec`, or a running watcher tick loop. `status="watching"`
+/// describes the rule's durable state in the state-store, not an
+/// active polling loop.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct W5dConditionalDepositResultDto {
     pub input_text: String,
+    /// Legacy label kept for wire compat. After W5f, equal to
+    /// `"save_display_apy"`. Prefer `decision_source` in new UI.
     pub source: String,
     pub reserve_pubkey: String,
+    /// W5f: alias = `save_display_apy_bps`. Kept for wire compat
+    /// with older frontends that read this field.
     pub current_apr_bps: u32,
     pub threshold_bps: u32,
     pub threshold_pct_label: String,
+    /// W5f: decided by `save_display_apy_bps > threshold_bps`.
     pub condition_met: bool,
     /// Always `false` from the chat route in the present slice.
     pub execution_attempted: bool,
@@ -1127,6 +1138,25 @@ pub struct W5dConditionalDepositResultDto {
     pub rule_id_hex: Option<String>,
     pub canonical_rule_hash_hex: Option<String>,
     pub rule_persisted: bool,
+
+    // ── W5f decision metric + audit ──────────────────────────────────────
+
+    /// W5f: which metric drove `condition_met`. Always
+    /// `"save_display_apy"` on the happy path.
+    pub decision_source: String,
+    /// W5f: Save/Solend UI display APY in basis points, fetched from
+    /// the official Solend REST API at
+    /// `https://api.solend.fi/v1/reserves?scope=solend&ids=<reserve>`
+    /// (field `results[0].rates.supplyInterest`, percentage string
+    /// converted to bps).
+    pub save_display_apy_bps: u32,
+    /// W5f: native on-chain supply APR in basis points, decoded via
+    /// B-O1 reserve math. Audit-only — does NOT drive the chat-time
+    /// decision.
+    pub native_onchain_apr_bps: u32,
+    /// W5f: provenance for the native APR. Always
+    /// `"b_o1_reserve_math"` in this slice.
+    pub native_onchain_apr_source: String,
 }
 
 /// Domain-level outcome returned by `ChatHandler::handle_chat`.

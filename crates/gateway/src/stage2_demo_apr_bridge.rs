@@ -1,10 +1,62 @@
-//! Stage 2 W5d/W5e — Chat-route conditional-order bridge (production-side).
+//! Stage 2 W5d/W5e/W5f — Chat-route conditional-order bridge.
 //!
-//! The deterministic-parser + B-O1-on-chain-APR evaluator surface that
-//! the user-facing `/chat` route uses to recognise the demo grammar
+//! The deterministic-parser + dual-APR evaluator surface that the
+//! user-facing `/chat` route uses to recognise the demo grammar
 //! *before* the LLM is asked anything.
 //!
-//! # W5e semantics (this slice)
+//! # W5f — Save display APY drives the chat-time decision
+//!
+//! The chat-time decision metric is **Save/Solend UI display APY**
+//! fetched from the official Solend REST API at
+//! `https://api.solend.fi/v1/reserves?scope=solend&ids=<reserve>` —
+//! specifically `results[0].rates.supplyInterest`, which is the same
+//! value the Save UI renders for the user. Native on-chain APR via
+//! the B-O1 reserve-math wrappers is retained as a **secondary audit
+//! field** (`native_onchain_apr_bps`); it is NOT used for the chat-time
+//! decision unless the UI explicitly labels the metric as a fallback.
+//!
+//! ## Source documentation (cited at use-sites below)
+//!
+//! - <https://dev.solend.fi/docs/api/> — Solend dev portal API page;
+//!   the OpenAPI spec is served at <https://api.solend.fi/> (Swagger UI).
+//! - <https://docs.save.finance/getting-started/supply-and-borrow-apy> —
+//!   Save docs: displayed supply APY is compounded over a year and
+//!   includes liquidity-mining rewards when present.
+//! - <https://dev.solend.fi/docs/ts-sdk/usage/> — TS SDK fallback path
+//!   reference (not used in this slice; we hit the REST API directly).
+//!
+//! ## Unit reasoning (proved against live response)
+//!
+//! Sample for the pinned Main Pool USDC reserve:
+//!
+//! ```json
+//! { "rates": { "supplyInterest": "2.10", "borrowInterest": "4.02" } }
+//! ```
+//!
+//! The `supplyInterest` field is a **percentage string** (e.g. `"2.10"`
+//! == 2.10 %), NOT a decimal fraction and NOT bps. Conversion to bps is
+//! `round(parse_f64(value) * 100)`. For Main Pool USDC at the time of
+//! W5f implementation, `rewards: []` so `supplyInterest` IS the full
+//! Save-UI value — there are no LM rewards to add. When reward APYs do
+//! appear, summing them would be required to match Save UI total (out
+//! of W5f scope; the audit field surfaces them via the daemon log).
+//!
+//! ## Pinned Main Pool USDC identifiers (Addendum 2)
+//!
+//! The REST response is rejected unless ALL FOUR of these match:
+//!
+//! | field                             | pinned value                                  |
+//! | --------------------------------- | --------------------------------------------- |
+//! | `reserve.pubkey`                  | `BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw` |
+//! | `reserve.lendingMarket`           | `4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY` |
+//! | `reserve.liquidity.mintPubkey`    | `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` |
+//! | `reserve.collateral.mintPubkey`   | `993dVFL2uXWYeoXuEBFXR4BijeXdTv4s6BzsCjJZuwqk` |
+//!
+//! Any mismatch fails closed with `EvaluationError::MainPoolMismatch`;
+//! the chat-route surfaces a `tool_error` card. No silent fallback to
+//! native APR — per the brief.
+//!
+//! # W5e semantics (preserved unchanged)
 //!
 //! A command like
 //!
@@ -121,6 +173,49 @@ const RPC_REQUEST_TIMEOUT_MS: u64 = 8_000;
 /// surface as a typed error so the chat layer can fall back to a clean
 /// "couldn't evaluate" card without claiming a live APR.
 const APR_BPS_SANITY_MAX: u32 = 10_000;
+
+// ── W5f Save REST API pins (Addendum 2: Main Pool filter MANDATORY) ───────
+
+/// Default base URL for the official Solend REST API. Overridable via
+/// the `SOLEND_API_BASE_URL` env var (the daemon may want to point at
+/// a fixture during integration tests). Docs:
+/// <https://dev.solend.fi/docs/api/>.
+pub const SOLEND_API_BASE_URL_DEFAULT: &str = "https://api.solend.fi";
+
+/// `scope` query parameter for the Solend REST API. `"solend"` is the
+/// production scope — confirmed via live probe against `/v1/markets` +
+/// `/v1/markets/configs`.
+pub const SOLEND_API_SCOPE: &str = "solend";
+
+/// Save REST API request timeout. The chat route is user-facing; a
+/// slow Save API shouldn't tie up an HTTP worker.
+const SAVE_API_REQUEST_TIMEOUT_MS: u64 = 8_000;
+
+/// Pinned Main Pool USDC reserve pubkey (Addendum 2). The Save REST
+/// response is rejected unless `reserve.pubkey` matches this exactly.
+pub const W5F_MAIN_POOL_RESERVE_BS58: &str =
+    "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw";
+
+/// Pinned Main Pool lending-market pubkey (Addendum 2). The Save REST
+/// response is rejected unless `reserve.lendingMarket` matches this
+/// exactly. (Mirrors `stage2_executor::DEMO_LENDING_MARKET_BS58`.)
+pub const W5F_MAIN_POOL_LENDING_MARKET_BS58: &str =
+    "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY";
+
+/// Pinned Main Pool liquidity-mint pubkey (Addendum 2). The Save REST
+/// response is rejected unless `reserve.liquidity.mintPubkey` matches.
+pub const W5F_MAIN_POOL_LIQUIDITY_MINT_BS58: &str =
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+/// Pinned Main Pool cToken-mint pubkey (Addendum 2). The Save REST
+/// response is rejected unless `reserve.collateral.mintPubkey` matches.
+pub const W5F_MAIN_POOL_COLLATERAL_MINT_BS58: &str =
+    "993dVFL2uXWYeoXuEBFXR4BijeXdTv4s6BzsCjJZuwqk";
+
+/// Plausible-range guard on the Save display APY parsed from the REST
+/// response. A reading outside this window indicates either a malformed
+/// API response or an unrelated upstream change; fail closed.
+const SAVE_DISPLAY_APY_PERCENT_SANITY_MAX: f64 = 1000.0;
 
 // ── Parser ────────────────────────────────────────────────────────────────
 
@@ -370,19 +465,25 @@ fn normalize_whitespace(s: &str) -> String {
 pub struct W5dEvaluationResult {
     /// Echoed verbatim from the chat input.
     pub input_text: String,
-    /// Stable string the frontend renders in the "source" row of the
-    /// W5d card. Always `"onchain_reserve_b_o1"` for this evaluator.
+    /// Legacy `source` string kept for wire compatibility with the
+    /// W5d-era card. After W5f, the more specific
+    /// `native_onchain_apr_source` describes the audit metric and
+    /// `decision_source` describes which metric drove the decision.
+    /// Always `"save_display_apy"` after W5f.
     pub source: String,
-    /// `BgxfHJDz…JMpmw` (Solend Main Pool USDC reserve, base58).
+    /// `BgxfHJDz…JMpmw` (Solend Main Pool USDC reserve, base58). After
+    /// W5f, this is cross-verified against the Save REST API response
+    /// before the decision metric is accepted.
     pub reserve_pubkey: String,
-    /// Current Solend Main Pool USDC supply APR in basis points,
-    /// derived from the on-chain reserve via the B-O1 wrappers.
+    /// W5f alias kept for wire compatibility: equal to
+    /// `save_display_apy_bps` so older frontends keep working. New
+    /// callers should read `save_display_apy_bps` directly.
     pub current_apr_bps: u32,
     /// Threshold parsed from the user's text, in basis points.
     pub threshold_bps: u32,
     /// Echo of the percent label the user typed (e.g. `"2.5"`).
     pub threshold_pct_label: String,
-    /// Strict-greater decision: `current_apr_bps > threshold_bps`.
+    /// Strict-greater decision: `save_display_apy_bps > threshold_bps`.
     pub condition_met: bool,
     /// True iff this evaluation triggered a downstream execution
     /// attempt. The chat-side default is always `false` (the live
@@ -438,6 +539,29 @@ pub struct W5dEvaluationResult {
     /// the chat handler is not wired with a repo OR insertion failed
     /// for any reason other than the idempotent-duplicate case.
     pub rule_persisted: bool,
+
+    // ── W5f decision metric + audit ──────────────────────────────────────
+
+    /// W5f — which metric drove `condition_met`. Always
+    /// `"save_display_apy"` in the happy path. (A hypothetical fallback
+    /// path would set this to `"native_onchain_apr_fallback"`; the
+    /// brief explicitly prefers fail-closed over fallback, so this
+    /// slice does not implement the fallback path.)
+    pub decision_source: String,
+    /// W5f — Save/Solend UI display APY for Main Pool USDC, in basis
+    /// points. Fetched live from the official Solend REST API at
+    /// `/v1/reserves?scope=solend&ids=<reserve>` (field
+    /// `results[0].rates.supplyInterest`, parsed as percent string and
+    /// converted to bps). This drives `condition_met`.
+    pub save_display_apy_bps: u32,
+    /// W5f — native on-chain supply APR in basis points, decoded from
+    /// the reserve account via the B-O1 wrappers. Audit-only — does
+    /// NOT drive the chat-time decision. Surfaced so the user sees
+    /// the gap between Save UI APY and native APR.
+    pub native_onchain_apr_bps: u32,
+    /// W5f — provenance label for the native APR. Always
+    /// `"b_o1_reserve_math"` in this slice.
+    pub native_onchain_apr_source: String,
 }
 
 /// Errors the chat layer surfaces to the user when evaluation cannot
@@ -473,6 +597,19 @@ pub enum EvaluationError {
     /// (`0 ≤ bps ≤ 10_000`). Treated as a sanity-failure so the UI
     /// doesn't render an APR that's clearly wrong.
     AprOutOfRange { current_apr_bps_raw: u64 },
+    /// W5f — Save REST API is unavailable, returned an error, or the
+    /// response could not be parsed into the expected shape. The chat
+    /// route fails closed (typed `ToolError`); it does NOT silently
+    /// fall back to native APR as the decision metric.
+    MarketDataUnavailable { reason: String },
+    /// W5f — the Save REST response did not match the pinned Main Pool
+    /// USDC identifiers (Addendum 2). Strictly refused — never decide
+    /// on a non-Main-Pool reserve.
+    MainPoolMismatch {
+        field: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl std::fmt::Display for EvaluationError {
@@ -495,6 +632,13 @@ impl std::fmt::Display for EvaluationError {
             EvaluationError::AprOutOfRange { current_apr_bps_raw } => write!(
                 f,
                 "APR out of plausible range: {current_apr_bps_raw} bps > {APR_BPS_SANITY_MAX}"
+            ),
+            EvaluationError::MarketDataUnavailable { reason } => {
+                write!(f, "save market data unavailable: {reason}")
+            }
+            EvaluationError::MainPoolMismatch { field, expected, actual } => write!(
+                f,
+                "main pool mismatch: {field} expected {expected} got {actual}"
             ),
         }
     }
@@ -716,6 +860,264 @@ impl W5dAprFetcher for LiveW5dAprFetcher {
     }
 }
 
+// ── W5f Save display APY fetcher ─────────────────────────────────────────
+//
+// Hits the official Solend REST API and returns the Main Pool USDC
+// display APY in bps, verified against the pinned identifiers.
+//
+// Source: <https://dev.solend.fi/docs/api/>. The Swagger UI served at
+// <https://api.solend.fi/> documents the endpoint shape; we sampled
+// the live response on 2026-05-11 to lock the JSON field name and
+// unit (percentage string, e.g. `"2.10"` ⇒ 2.10 %).
+
+/// The reading returned by [`SaveDisplayApyFetcher::fetch_main_pool_usdc`].
+/// Carries both the converted bps value and the raw percent string so
+/// the daemon log + audit trail can witness the API response verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveDisplayApyReading {
+    /// Save UI display APY in basis points (1 % = 100 bps). Derived as
+    /// `round(parse_f64(supplyInterest) * 100)`.
+    pub save_display_apy_bps: u32,
+    /// The verbatim percent-string returned by the API (e.g. `"2.10"`)
+    /// — useful for audit logs and for the no-overclaim banner.
+    pub raw_supply_interest_str: String,
+    /// `reserve.pubkey` from the API — always equals
+    /// `W5F_MAIN_POOL_RESERVE_BS58` (verified before returning).
+    pub reserve_pubkey: String,
+    /// `reserve.lendingMarket` from the API — always equals
+    /// `W5F_MAIN_POOL_LENDING_MARKET_BS58` (verified before returning).
+    pub lending_market: String,
+    /// `reserve.liquidity.mintPubkey` — verified.
+    pub liquidity_mint: String,
+    /// `reserve.collateral.mintPubkey` — verified.
+    pub collateral_mint: String,
+    /// Whether the API response carried any non-empty `rewards[]`. For
+    /// Main Pool USDC this is currently `false`; if it ever becomes
+    /// `true`, the chat card surfaces a note that the displayed APY
+    /// may not include LM rewards (W5f scope is the base supplyInterest
+    /// only; reward-sum is a future slice).
+    pub rewards_present: bool,
+}
+
+/// Trait the chat orchestrator depends on for Save display APY. Tests
+/// inject a deterministic mock; production uses
+/// [`LiveSaveDisplayApyFetcher`].
+#[async_trait]
+pub trait SaveDisplayApyFetcher: Send + Sync + std::fmt::Debug {
+    /// Fetch the Save display APY for the pinned Main Pool USDC
+    /// reserve. Must verify ALL FOUR pinned identifiers before
+    /// returning success; on any mismatch return
+    /// [`EvaluationError::MainPoolMismatch`].
+    async fn fetch_main_pool_usdc(&self) -> Result<SaveDisplayApyReading, EvaluationError>;
+}
+
+/// Live implementation hitting the official Solend REST API at
+/// `https://api.solend.fi`. Read-only; no broadcast; no keypair; no
+/// signing. Single HTTP GET per evaluation with a tight timeout.
+#[derive(Debug, Clone)]
+pub struct LiveSaveDisplayApyFetcher {
+    base_url: String,
+    http: reqwest::Client,
+}
+
+impl LiveSaveDisplayApyFetcher {
+    /// Build a fetcher with the given base URL. Returns `None` if the
+    /// URL is empty / whitespace-only OR the HTTP client cannot be
+    /// built (extremely unlikely; only on platform misconfiguration).
+    pub fn new(base_url: impl Into<String>) -> Option<Self> {
+        let base_url = base_url.into();
+        let trimmed_url = base_url.trim().trim_end_matches('/').to_string();
+        if trimmed_url.is_empty() {
+            return None;
+        }
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(SAVE_API_REQUEST_TIMEOUT_MS))
+            .build()
+            .ok()?;
+        Some(Self {
+            base_url: trimmed_url,
+            http,
+        })
+    }
+
+    /// Build a default fetcher pointing at the official Solend REST
+    /// API. Convenience for callers that don't need to override the
+    /// base URL (production daemon path).
+    pub fn with_default_base_url() -> Self {
+        Self::new(SOLEND_API_BASE_URL_DEFAULT).expect("default base URL is non-empty")
+    }
+}
+
+#[async_trait]
+impl SaveDisplayApyFetcher for LiveSaveDisplayApyFetcher {
+    async fn fetch_main_pool_usdc(&self) -> Result<SaveDisplayApyReading, EvaluationError> {
+        let url = format!(
+            "{base}/v1/reserves?scope={scope}&ids={ids}",
+            base = self.base_url,
+            scope = SOLEND_API_SCOPE,
+            ids = W5F_MAIN_POOL_RESERVE_BS58,
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| EvaluationError::MarketDataUnavailable {
+                reason: format!("transport: {e}"),
+            })?;
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            return Err(EvaluationError::MarketDataUnavailable {
+                reason: format!("http {status}"),
+            });
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| EvaluationError::MarketDataUnavailable {
+                reason: format!("body: {e}"),
+            })?;
+        parse_save_reserves_response(&body)
+    }
+}
+
+/// Pure parser for the `/v1/reserves` response body. Verifies the
+/// pinned Main Pool USDC identifiers and converts the percent-string
+/// `supplyInterest` to bps. Extracted so the unit tests can drive it
+/// with fixture JSON instead of hitting the network.
+pub fn parse_save_reserves_response(
+    body: &Value,
+) -> Result<SaveDisplayApyReading, EvaluationError> {
+    let results = body
+        .get("results")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| EvaluationError::MarketDataUnavailable {
+            reason: "missing or non-array `results`".to_string(),
+        })?;
+    if results.is_empty() {
+        return Err(EvaluationError::MarketDataUnavailable {
+            reason: "empty `results` array".to_string(),
+        });
+    }
+    let r = &results[0];
+
+    // ── Main Pool identifier verification (Addendum 2) ───────────────────
+    let reserve_pubkey = r["reserve"]["pubkey"]
+        .as_str()
+        .ok_or_else(|| EvaluationError::MarketDataUnavailable {
+            reason: "missing reserve.pubkey".to_string(),
+        })?
+        .to_string();
+    if reserve_pubkey != W5F_MAIN_POOL_RESERVE_BS58 {
+        return Err(EvaluationError::MainPoolMismatch {
+            field: "reserve.pubkey".to_string(),
+            expected: W5F_MAIN_POOL_RESERVE_BS58.to_string(),
+            actual: reserve_pubkey,
+        });
+    }
+    let lending_market = r["reserve"]["lendingMarket"]
+        .as_str()
+        .ok_or_else(|| EvaluationError::MarketDataUnavailable {
+            reason: "missing reserve.lendingMarket".to_string(),
+        })?
+        .to_string();
+    if lending_market != W5F_MAIN_POOL_LENDING_MARKET_BS58 {
+        return Err(EvaluationError::MainPoolMismatch {
+            field: "reserve.lendingMarket".to_string(),
+            expected: W5F_MAIN_POOL_LENDING_MARKET_BS58.to_string(),
+            actual: lending_market,
+        });
+    }
+    let liquidity_mint = r["reserve"]["liquidity"]["mintPubkey"]
+        .as_str()
+        .ok_or_else(|| EvaluationError::MarketDataUnavailable {
+            reason: "missing reserve.liquidity.mintPubkey".to_string(),
+        })?
+        .to_string();
+    if liquidity_mint != W5F_MAIN_POOL_LIQUIDITY_MINT_BS58 {
+        return Err(EvaluationError::MainPoolMismatch {
+            field: "reserve.liquidity.mintPubkey".to_string(),
+            expected: W5F_MAIN_POOL_LIQUIDITY_MINT_BS58.to_string(),
+            actual: liquidity_mint,
+        });
+    }
+    let collateral_mint = r["reserve"]["collateral"]["mintPubkey"]
+        .as_str()
+        .ok_or_else(|| EvaluationError::MarketDataUnavailable {
+            reason: "missing reserve.collateral.mintPubkey".to_string(),
+        })?
+        .to_string();
+    if collateral_mint != W5F_MAIN_POOL_COLLATERAL_MINT_BS58 {
+        return Err(EvaluationError::MainPoolMismatch {
+            field: "reserve.collateral.mintPubkey".to_string(),
+            expected: W5F_MAIN_POOL_COLLATERAL_MINT_BS58.to_string(),
+            actual: collateral_mint,
+        });
+    }
+
+    // ── supplyInterest as PERCENT STRING → bps (Addendum 2: prove unit) ──
+    //
+    // Sampled 2026-05-11 against the live API:
+    //   {"rates": {"supplyInterest": "2.10", ...}}
+    // i.e. a decimal string with two fractional digits representing
+    // PERCENT (not decimal fraction; not bps). Conversion:
+    //   bps = round(parse_f64(value) * 100)
+    let raw_supply_interest_str = r["rates"]["supplyInterest"]
+        .as_str()
+        .ok_or_else(|| EvaluationError::MarketDataUnavailable {
+            reason: "missing rates.supplyInterest (or non-string)".to_string(),
+        })?
+        .to_string();
+    let save_display_apy_bps = parse_percent_string_to_bps(&raw_supply_interest_str)?;
+
+    let rewards_present = r
+        .get("rewards")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
+    Ok(SaveDisplayApyReading {
+        save_display_apy_bps,
+        raw_supply_interest_str,
+        reserve_pubkey,
+        lending_market,
+        liquidity_mint,
+        collateral_mint,
+        rewards_present,
+    })
+}
+
+/// Convert a percent-string like `"2.10"` to integer basis points.
+/// Strict on shape: rejects non-finite, negative, or implausibly-large
+/// values. The conversion uses `round` so `"0.005"` → 0 bps (sub-bp
+/// noise) and `"0.01"` → 1 bp (a real bp).
+pub fn parse_percent_string_to_bps(s: &str) -> Result<u32, EvaluationError> {
+    let value: f64 = s.trim().parse().map_err(|e: std::num::ParseFloatError| {
+        EvaluationError::MarketDataUnavailable {
+            reason: format!("supplyInterest not a valid f64: {s:?} ({e})"),
+        }
+    })?;
+    if !value.is_finite() {
+        return Err(EvaluationError::MarketDataUnavailable {
+            reason: format!("supplyInterest non-finite: {s:?}"),
+        });
+    }
+    if value < 0.0 || value > SAVE_DISPLAY_APY_PERCENT_SANITY_MAX {
+        return Err(EvaluationError::MarketDataUnavailable {
+            reason: format!(
+                "supplyInterest out of plausible range [0, {SAVE_DISPLAY_APY_PERCENT_SANITY_MAX}]: {s:?}"
+            ),
+        });
+    }
+    let bps_f = (value * 100.0).round();
+    if bps_f < 0.0 || bps_f > u32::MAX as f64 {
+        return Err(EvaluationError::MarketDataUnavailable {
+            reason: format!("supplyInterest bps overflow after round: {bps_f}"),
+        });
+    }
+    Ok(bps_f as u32)
+}
+
 // ── Compose helper (shared by live + mock fetchers) ──────────────────────
 
 /// Compose the typed `W5dEvaluationResult` from the raw inputs the
@@ -740,8 +1142,16 @@ pub fn compose_w5e_result(
     };
     W5dEvaluationResult {
         input_text: input_text.to_string(),
-        source: "onchain_reserve_b_o1".to_string(),
+        // After W5f, `source` is the LEGACY label kept for wire
+        // compat. The orchestrator overwrites it to `"save_display_apy"`
+        // when the Save fetcher path runs; this default applies only to
+        // unit tests that call `compose_w5e_result` directly without
+        // a save fetcher.
+        source: "save_display_apy".to_string(),
         reserve_pubkey: W5D_RESERVE_BS58.to_string(),
+        // W5e compatibility: pre-W5f, `current_apr_bps` carried the
+        // native on-chain APR. After W5f the orchestrator overwrites
+        // this to mirror `save_display_apy_bps` for wire compat.
         current_apr_bps,
         threshold_bps: parsed.threshold_bps,
         threshold_pct_label: parsed.threshold_pct_label.clone(),
@@ -756,11 +1166,19 @@ pub fn compose_w5e_result(
         budget_status: budget_status.to_string(),
         last_checked_slot,
         // expires_at / rule_id / canonical_rule_hash filled in by
-        // `handle_demo_command_v2` after the WatchRule is constructed.
+        // `handle_demo_command_v3` after the WatchRule is constructed.
         expires_at_slot: None,
         rule_id_hex: None,
         canonical_rule_hash_hex: None,
         rule_persisted: false,
+        // W5f defaults (overridden by `handle_demo_command_v3` when a
+        // Save fetcher is wired). For the single-APR mock path this
+        // produces a degenerate-but-valid result where both metrics
+        // equal the one APR the mock provided.
+        decision_source: "save_display_apy".to_string(),
+        save_display_apy_bps: current_apr_bps,
+        native_onchain_apr_bps: current_apr_bps,
+        native_onchain_apr_source: "b_o1_reserve_math".to_string(),
     }
 }
 
@@ -906,13 +1324,95 @@ fn hex_id_32(id: &[u8; 32]) -> String {
 
 // ── High-level chat-handler entry point ──────────────────────────────────
 
-/// W5e — full chat-route entry point: detect → parse → fetch (APR +
-/// budget + slot) → compose result → construct WatchRule → persist
-/// (if repo is wired) → fill in `rule_id` / `canonical_rule_hash` /
-/// `expires_at_slot` / `rule_persisted`.
+/// W5f — full chat-route entry point. Composes the native-APR fetch
+/// (B-O1 + budget + slot) with the Save display APY fetch (REST API),
+/// then overrides the decision metric so `condition_met` is driven by
+/// **Save display APY**, not native APR.
 ///
-/// Callers that just want the W5d preview surface (no rule
-/// construction) can call `fetcher.evaluate(...)` directly.
+/// Flow:
+///
+///  1. `parse_demo_command(input)` → typed `DemoParsed`
+///  2. `apr_fetcher.evaluate(...)` → native APR + budget + slot
+///  3. `save_apy_fetcher.fetch_main_pool_usdc()` → Save display APY
+///     (verified against pinned Main Pool identifiers)
+///  4. Re-decide `condition_met` and `status` using Save APY
+///  5. Construct + persist the WatchRule (W5e semantics unchanged)
+///
+/// **Fail-closed contract**: if the Save REST fetch returns
+/// `MarketDataUnavailable` or `MainPoolMismatch`, this function
+/// propagates the typed error and the chat-route renders a
+/// `tool_error` card. It does NOT silently fall back to native APR —
+/// the brief is explicit that fallback would only be acceptable if the
+/// UI labels the metric as `"native_onchain_apr_fallback"` (out of
+/// W5f scope; this slice prefers fail-closed for demo clarity).
+pub async fn handle_demo_command_v3(
+    apr_fetcher: &(dyn W5dAprFetcher + 'static),
+    save_apy_fetcher: &(dyn SaveDisplayApyFetcher + 'static),
+    repo: Option<&Stage2WatchRuleRepository>,
+    input_text: &str,
+) -> Result<W5dEvaluationResult, EvaluationError> {
+    let parsed = parse_demo_command(input_text)
+        .map_err(|e| EvaluationError::Parse { parse_error: e })?;
+
+    // 1. Native APR + budget + slot.
+    let mut result = apr_fetcher.evaluate(input_text, &parsed).await?;
+    // After step 1, `result.current_apr_bps` carries NATIVE APR
+    // (per `compose_w5e_result`'s default field population). Capture
+    // it before we overwrite the decision-side fields.
+    let native_onchain_apr_bps = result.current_apr_bps;
+
+    // 2. Save display APY — fail closed on any unavailability.
+    let save = save_apy_fetcher.fetch_main_pool_usdc().await?;
+
+    // 3. Override the decision-side fields using Save APY.
+    result.save_display_apy_bps = save.save_display_apy_bps;
+    result.native_onchain_apr_bps = native_onchain_apr_bps;
+    result.native_onchain_apr_source = "b_o1_reserve_math".to_string();
+    result.decision_source = "save_display_apy".to_string();
+    result.source = "save_display_apy".to_string();
+    // Wire-compat alias: callers reading the old `current_apr_bps`
+    // field see the SAME value that drives the decision.
+    result.current_apr_bps = save.save_display_apy_bps;
+    result.condition_met = save.save_display_apy_bps > parsed.threshold_bps;
+
+    // 4. Re-derive status (and budget_status) under the new condition.
+    let budget_ok = result.current_budget_raw >= result.required_budget_raw;
+    let (status, budget_status) = match (budget_ok, result.condition_met) {
+        (false, _) => ("needs_funding", "needs_funding"),
+        (true, true) => ("ready_to_execute", "reserved"),
+        (true, false) => ("watching", "reserved"),
+    };
+    result.status = status.to_string();
+    result.budget_status = budget_status.to_string();
+
+    // 5. WatchRule construction + persistence — unchanged from W5e.
+    //
+    // NOTE on metric divergence: the rule's Condition is
+    // `SolendReserveSupplyRate` (native on-chain APR), while the chat
+    // card's `condition_met` follows Save display APY. The W2 watcher
+    // (when run) will evaluate the rule against native APR. The card
+    // surfaces both numbers so the gap is visible to the user.
+    let rule = build_w5e_watch_rule(&parsed, result.last_checked_slot);
+    let canonical = canonical_rule_hash(&rule);
+    result.rule_id_hex = Some(hex_id_16(&rule.rule_id));
+    result.canonical_rule_hash_hex = Some(hex_id_32(&canonical));
+    result.expires_at_slot = Some(rule.expires_at_slot);
+
+    if let Some(repo_ref) = repo {
+        result.rule_persisted = persist_rule_idempotent(repo_ref, &rule).await;
+    }
+    // else: rule_persisted stays false (preview-only). Caller MUST
+    // surface this in the no-overclaim banner.
+
+    Ok(result)
+}
+
+/// W5e wrapper kept for back-compat. Mirrors `handle_demo_command_v3`
+/// but uses an internal `DegenerateSaveFetcher` that returns the same
+/// APR for both metrics — preserving old single-APR test semantics.
+///
+/// Production callers MUST migrate to `handle_demo_command_v3`; the
+/// chat handler already does.
 pub async fn handle_demo_command_v2(
     fetcher: &(dyn W5dAprFetcher + 'static),
     repo: Option<&Stage2WatchRuleRepository>,
@@ -1414,5 +1914,312 @@ mod tests {
     #[test]
     fn live_fetcher_accepts_well_formed_url() {
         assert!(LiveW5dAprFetcher::new("https://example.invalid/").is_some());
+    }
+
+    // ── W5f Save display APY tests ────────────────────────────────────────
+
+    /// W5f: a controllable mock that returns programmable Save APY
+    /// readings (or a typed error). Used by the orchestrator tests so
+    /// we can drive the divergence between native APR and Save APY
+    /// without hitting the network.
+    #[derive(Debug, Clone)]
+    pub(crate) struct MockSaveDisplayApyFetcher {
+        pub outcome: Result<SaveDisplayApyReading, EvaluationError>,
+    }
+
+    impl MockSaveDisplayApyFetcher {
+        pub(crate) fn with_apy_bps(bps: u32) -> Self {
+            Self {
+                outcome: Ok(SaveDisplayApyReading {
+                    save_display_apy_bps: bps,
+                    raw_supply_interest_str: format!("{:.2}", (bps as f64) / 100.0),
+                    reserve_pubkey: W5F_MAIN_POOL_RESERVE_BS58.to_string(),
+                    lending_market: W5F_MAIN_POOL_LENDING_MARKET_BS58.to_string(),
+                    liquidity_mint: W5F_MAIN_POOL_LIQUIDITY_MINT_BS58.to_string(),
+                    collateral_mint: W5F_MAIN_POOL_COLLATERAL_MINT_BS58.to_string(),
+                    rewards_present: false,
+                }),
+            }
+        }
+
+        pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
+            Self {
+                outcome: Err(EvaluationError::MarketDataUnavailable {
+                    reason: reason.into(),
+                }),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SaveDisplayApyFetcher for MockSaveDisplayApyFetcher {
+        async fn fetch_main_pool_usdc(
+            &self,
+        ) -> Result<SaveDisplayApyReading, EvaluationError> {
+            self.outcome.clone()
+        }
+    }
+
+    /// Unit conversion smoke for the percent-string parser. Pinned
+    /// against the live response shape (`"2.10"` ⇒ 210 bps).
+    #[test]
+    fn w5f_percent_string_to_bps_table() {
+        assert_eq!(parse_percent_string_to_bps("0").unwrap(), 0);
+        assert_eq!(parse_percent_string_to_bps("0.00").unwrap(), 0);
+        assert_eq!(parse_percent_string_to_bps("0.01").unwrap(), 1);
+        assert_eq!(parse_percent_string_to_bps("1").unwrap(), 100);
+        assert_eq!(parse_percent_string_to_bps("2.10").unwrap(), 210);
+        assert_eq!(parse_percent_string_to_bps("4.02").unwrap(), 402);
+        assert_eq!(parse_percent_string_to_bps("100").unwrap(), 10_000);
+        // Sub-bp rounds to zero (and to one bp at midpoint).
+        assert_eq!(parse_percent_string_to_bps("0.004").unwrap(), 0);
+        assert_eq!(parse_percent_string_to_bps("0.005").unwrap(), 1);
+    }
+
+    #[test]
+    fn w5f_percent_string_rejects_non_numeric() {
+        assert!(parse_percent_string_to_bps("abc").is_err());
+        assert!(parse_percent_string_to_bps("").is_err());
+        assert!(parse_percent_string_to_bps("nan").is_err()); // string→f64 yields NaN
+    }
+
+    #[test]
+    fn w5f_percent_string_rejects_negative_and_implausible() {
+        match parse_percent_string_to_bps("-0.5").unwrap_err() {
+            EvaluationError::MarketDataUnavailable { reason } => {
+                assert!(reason.contains("out of plausible range"), "got: {reason}")
+            }
+            other => panic!("expected MarketDataUnavailable, got {other:?}"),
+        }
+        match parse_percent_string_to_bps("1001").unwrap_err() {
+            EvaluationError::MarketDataUnavailable { reason } => {
+                assert!(reason.contains("out of plausible range"), "got: {reason}")
+            }
+            other => panic!("expected MarketDataUnavailable, got {other:?}"),
+        }
+    }
+
+    /// W5f: pinned-Main-Pool fixture parses to the expected reading.
+    /// Mirrors the verbatim response we sampled from the live API on
+    /// 2026-05-11.
+    #[test]
+    fn w5f_parse_main_pool_fixture_succeeds() {
+        let fixture = json!({
+            "results": [{
+                "reserve": {
+                    "pubkey": W5F_MAIN_POOL_RESERVE_BS58,
+                    "lendingMarket": W5F_MAIN_POOL_LENDING_MARKET_BS58,
+                    "liquidity": {"mintPubkey": W5F_MAIN_POOL_LIQUIDITY_MINT_BS58},
+                    "collateral": {"mintPubkey": W5F_MAIN_POOL_COLLATERAL_MINT_BS58},
+                },
+                "rates": {"supplyInterest": "2.10", "borrowInterest": "4.02"},
+                "rewards": [],
+            }],
+            "next": null
+        });
+        let reading = parse_save_reserves_response(&fixture).unwrap();
+        assert_eq!(reading.save_display_apy_bps, 210);
+        assert_eq!(reading.raw_supply_interest_str, "2.10");
+        assert_eq!(reading.reserve_pubkey, W5F_MAIN_POOL_RESERVE_BS58);
+        assert_eq!(reading.lending_market, W5F_MAIN_POOL_LENDING_MARKET_BS58);
+        assert!(!reading.rewards_present);
+    }
+
+    /// W5f: pubkey mismatch is refused — Addendum 2 forbids deciding
+    /// on a non-Main-Pool reserve.
+    #[test]
+    fn w5f_parse_refuses_wrong_reserve_pubkey() {
+        let fixture = json!({
+            "results": [{
+                "reserve": {
+                    "pubkey": "1111111111111111111111111111111111111111111",
+                    "lendingMarket": W5F_MAIN_POOL_LENDING_MARKET_BS58,
+                    "liquidity": {"mintPubkey": W5F_MAIN_POOL_LIQUIDITY_MINT_BS58},
+                    "collateral": {"mintPubkey": W5F_MAIN_POOL_COLLATERAL_MINT_BS58},
+                },
+                "rates": {"supplyInterest": "2.10"},
+                "rewards": [],
+            }],
+        });
+        match parse_save_reserves_response(&fixture).unwrap_err() {
+            EvaluationError::MainPoolMismatch { field, expected, actual } => {
+                assert_eq!(field, "reserve.pubkey");
+                assert_eq!(expected, W5F_MAIN_POOL_RESERVE_BS58);
+                assert_eq!(actual, "1111111111111111111111111111111111111111111");
+            }
+            other => panic!("expected MainPoolMismatch, got {other:?}"),
+        }
+    }
+
+    /// W5f: lending-market mismatch is refused. Same Addendum 2 rule
+    /// applied to a different field — e.g. a different USDC reserve
+    /// under a non-main lending market would be rejected.
+    #[test]
+    fn w5f_parse_refuses_wrong_lending_market() {
+        let fixture = json!({
+            "results": [{
+                "reserve": {
+                    "pubkey": W5F_MAIN_POOL_RESERVE_BS58,
+                    "lendingMarket": "1111111111111111111111111111111111111111111",
+                    "liquidity": {"mintPubkey": W5F_MAIN_POOL_LIQUIDITY_MINT_BS58},
+                    "collateral": {"mintPubkey": W5F_MAIN_POOL_COLLATERAL_MINT_BS58},
+                },
+                "rates": {"supplyInterest": "2.10"},
+                "rewards": [],
+            }],
+        });
+        match parse_save_reserves_response(&fixture).unwrap_err() {
+            EvaluationError::MainPoolMismatch { field, .. } => {
+                assert_eq!(field, "reserve.lendingMarket");
+            }
+            other => panic!("expected MainPoolMismatch, got {other:?}"),
+        }
+    }
+
+    /// W5f: empty `results` array surfaces as MarketDataUnavailable
+    /// (not a panic, not a silent native-APR fallback).
+    #[test]
+    fn w5f_parse_refuses_empty_results() {
+        let fixture = json!({"results": [], "next": null});
+        match parse_save_reserves_response(&fixture).unwrap_err() {
+            EvaluationError::MarketDataUnavailable { reason } => {
+                assert!(reason.contains("empty"), "got: {reason}")
+            }
+            other => panic!("expected MarketDataUnavailable, got {other:?}"),
+        }
+    }
+
+    /// W5f: missing `supplyInterest` (or non-string shape) surfaces as
+    /// MarketDataUnavailable.
+    #[test]
+    fn w5f_parse_refuses_missing_supply_interest() {
+        let fixture = json!({
+            "results": [{
+                "reserve": {
+                    "pubkey": W5F_MAIN_POOL_RESERVE_BS58,
+                    "lendingMarket": W5F_MAIN_POOL_LENDING_MARKET_BS58,
+                    "liquidity": {"mintPubkey": W5F_MAIN_POOL_LIQUIDITY_MINT_BS58},
+                    "collateral": {"mintPubkey": W5F_MAIN_POOL_COLLATERAL_MINT_BS58},
+                },
+                "rates": {"borrowInterest": "4.02"},
+                "rewards": [],
+            }],
+        });
+        match parse_save_reserves_response(&fixture).unwrap_err() {
+            EvaluationError::MarketDataUnavailable { reason } => {
+                assert!(reason.contains("supplyInterest"), "got: {reason}")
+            }
+            other => panic!("expected MarketDataUnavailable, got {other:?}"),
+        }
+    }
+
+    /// W5f core invariant: the chat-time decision follows Save APY,
+    /// NOT native APR. Native=100 bps + Save=300 bps + threshold=200
+    /// → `condition_met=true` (decision uses Save). Without W5f the
+    /// answer would be `false`.
+    #[tokio::test]
+    async fn w5f_save_apy_drives_condition_not_native_apr() {
+        let apr_fetcher = MockW5dAprFetcher::with_apr(100); // native
+        let save_fetcher = MockSaveDisplayApyFetcher::with_apy_bps(300); // Save UI
+        let input = "If Solend Main Pool USDC deposit APR is above 2%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let r = handle_demo_command_v3(&apr_fetcher, &save_fetcher, None, input)
+            .await
+            .unwrap();
+        // Decision uses Save APY (300 > 200) → condition_met=true.
+        assert!(r.condition_met, "decision must use Save APY, not native");
+        assert_eq!(r.status, "ready_to_execute");
+        assert_eq!(r.decision_source, "save_display_apy");
+        assert_eq!(r.save_display_apy_bps, 300);
+        // Audit field carries native APR untouched.
+        assert_eq!(r.native_onchain_apr_bps, 100);
+        assert_eq!(r.native_onchain_apr_source, "b_o1_reserve_math");
+        // Wire-compat alias mirrors the decision metric.
+        assert_eq!(r.current_apr_bps, 300);
+    }
+
+    /// Inverse: native=300 + Save=100 + threshold=200 → false.
+    /// Proves the decision is NOT silently using native.
+    #[tokio::test]
+    async fn w5f_save_apy_below_threshold_yields_watching_even_if_native_above() {
+        let apr_fetcher = MockW5dAprFetcher::with_apr(300); // native says go
+        let save_fetcher = MockSaveDisplayApyFetcher::with_apy_bps(100); // Save says stop
+        let input = "If Solend Main Pool USDC deposit APR is above 2%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let r = handle_demo_command_v3(&apr_fetcher, &save_fetcher, None, input)
+            .await
+            .unwrap();
+        assert!(!r.condition_met);
+        assert_eq!(r.status, "watching");
+        assert_eq!(r.save_display_apy_bps, 100);
+        assert_eq!(r.native_onchain_apr_bps, 300);
+    }
+
+    /// Budget gate remains a hard precondition even after the W5f
+    /// decision metric switch.
+    #[tokio::test]
+    async fn w5f_needs_funding_overrides_save_apy_decision() {
+        let apr_fetcher = MockW5dAprFetcher {
+            current_apr_bps: 100,
+            current_budget_raw: 50_000, // < 250_000 required
+            last_checked_slot: 419_000_000,
+        };
+        let save_fetcher = MockSaveDisplayApyFetcher::with_apy_bps(500);
+        let input = "If Solend Main Pool USDC deposit APR is above 1%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let r = handle_demo_command_v3(&apr_fetcher, &save_fetcher, None, input)
+            .await
+            .unwrap();
+        // Save APY > threshold so condition is met, BUT budget short.
+        assert!(r.condition_met);
+        assert_eq!(r.status, "needs_funding");
+        assert_eq!(r.budget_status, "needs_funding");
+    }
+
+    /// W5f fail-closed: Save API unavailable propagates as the typed
+    /// MarketDataUnavailable error. The orchestrator does NOT silently
+    /// fall back to native APR.
+    #[tokio::test]
+    async fn w5f_save_api_unavailable_fails_closed() {
+        let apr_fetcher = MockW5dAprFetcher::with_apr(100);
+        let save_fetcher = MockSaveDisplayApyFetcher::unavailable("transport: oops");
+        let input = "If Solend Main Pool USDC deposit APR is above 2%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let err = handle_demo_command_v3(&apr_fetcher, &save_fetcher, None, input)
+            .await
+            .unwrap_err();
+        match err {
+            EvaluationError::MarketDataUnavailable { reason } => {
+                assert!(reason.contains("transport"));
+            }
+            other => panic!("expected MarketDataUnavailable, got {other:?}"),
+        }
+    }
+
+    /// W5f live fetcher accepts the official base URL + rejects empty.
+    #[test]
+    fn w5f_live_save_fetcher_url_validation() {
+        assert!(LiveSaveDisplayApyFetcher::new("").is_none());
+        assert!(LiveSaveDisplayApyFetcher::new("   ").is_none());
+        assert!(LiveSaveDisplayApyFetcher::new(SOLEND_API_BASE_URL_DEFAULT).is_some());
+        // Trailing slash is normalised so the URL builder doesn't
+        // produce `//v1/...` paths.
+        let f = LiveSaveDisplayApyFetcher::new("https://api.solend.fi/").unwrap();
+        assert_eq!(f.base_url, "https://api.solend.fi");
+    }
+
+    /// Sanity: the pinned Main Pool USDC identifiers match the
+    /// existing executor source-of-truth constants. If the executor
+    /// constants ever drift this test fires immediately.
+    #[test]
+    fn w5f_main_pool_pins_match_executor_constants() {
+        assert_eq!(
+            W5F_MAIN_POOL_RESERVE_BS58,
+            crate::stage2_executor::DEMO_RESERVE_BS58
+        );
+        assert_eq!(
+            W5F_MAIN_POOL_LENDING_MARKET_BS58,
+            crate::stage2_executor::DEMO_LENDING_MARKET_BS58
+        );
+        assert_eq!(
+            W5F_MAIN_POOL_LIQUIDITY_MINT_BS58,
+            crate::stage2_executor::DEMO_LIQUIDITY_MINT_BS58
+        );
     }
 }

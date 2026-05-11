@@ -668,13 +668,22 @@ function W5dConditionalDepositCard({
   // for USDC; rendered as a fixed-precision string.
   const requiredUsdc = (result.required_budget_raw / 1_000_000).toFixed(2);
   const currentUsdc = (result.current_budget_raw / 1_000_000).toFixed(6);
+
+  // W5f degraded-path detector: if the gateway didn't wire a Save
+  // fetcher, the orchestrator falls back to native APR for the
+  // decision and `save_display_apy_bps == native_onchain_apr_bps`.
+  const decisionMetricsEqual =
+    result.save_display_apy_bps === result.native_onchain_apr_bps;
+  const degradedW5fPath =
+    decisionMetricsEqual && result.decision_source === "save_display_apy";
+
   return (
     <div className="flex justify-start">
       <div
         data-testid="w5d-conditional-deposit-card"
-        className="max-w-[85%] rounded-2xl rounded-bl-sm bg-card border px-4 py-3 text-sm space-y-1"
+        className="max-w-[85%] rounded-2xl rounded-bl-sm bg-card border px-4 py-3 text-sm space-y-2"
       >
-        <div className="font-medium">W5e conditional order (demo bridge)</div>
+        <div className="font-medium">W5f conditional order (Save display APY)</div>
         <div className="text-xs text-muted-foreground italic break-words">
           &ldquo;{result.input_text}&rdquo;
         </div>
@@ -685,91 +694,174 @@ function W5dConditionalDepositCard({
         >
           {banner.text}
         </div>
-        <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
-          <dt className="text-muted-foreground">source</dt>
-          <dd className="font-mono break-all">{result.source}</dd>
 
-          <dt className="text-muted-foreground">reserve</dt>
-          <dd className="font-mono break-all">{result.reserve_pubkey}</dd>
+        {/* ── Primary: Save display APY drives the decision ─────── */}
+        <div className="mt-3">
+          <div className="text-xs font-medium text-foreground/80">
+            Primary — Save display APY
+          </div>
+          <dl
+            className="mt-1 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs"
+            data-testid="w5f-primary-block"
+          >
+            <dt className="text-muted-foreground">Save display APY</dt>
+            <dd data-testid="w5f-save-display-apy">
+              {result.save_display_apy_bps} bps (
+              {bpsToPctLabel(result.save_display_apy_bps)})
+            </dd>
 
-          <dt className="text-muted-foreground">current APR</dt>
-          <dd>
-            {result.current_apr_bps} bps ({bpsToPctLabel(result.current_apr_bps)})
-          </dd>
+            <dt className="text-muted-foreground">threshold</dt>
+            <dd>
+              {result.threshold_bps} bps ({bpsToPctLabel(result.threshold_bps)})
+            </dd>
 
-          <dt className="text-muted-foreground">threshold</dt>
-          <dd>
-            {result.threshold_bps} bps ({bpsToPctLabel(result.threshold_bps)})
-          </dd>
+            <dt className="text-muted-foreground">decision source</dt>
+            <dd className="font-mono" data-testid="w5f-decision-source">
+              {result.decision_source}
+            </dd>
 
-          <dt className="text-muted-foreground">condition_met</dt>
-          <dd className="font-mono">{conditionLabel}</dd>
+            <dt className="text-muted-foreground">condition_met</dt>
+            <dd className="font-mono">{conditionLabel}</dd>
+          </dl>
+        </div>
 
-          <dt className="text-muted-foreground">budget status</dt>
-          <dd className="font-mono">{result.budget_status}</dd>
+        {/* ── Audit: native B-O1 on-chain APR (secondary) ───────── */}
+        <div className="mt-3">
+          <div className="text-xs font-medium text-foreground/80">
+            Audit — Native on-chain APR
+          </div>
+          <dl
+            className="mt-1 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs"
+            data-testid="w5f-audit-block"
+          >
+            <dt className="text-muted-foreground">native APR</dt>
+            <dd data-testid="w5f-native-onchain-apr">
+              {result.native_onchain_apr_bps} bps (
+              {bpsToPctLabel(result.native_onchain_apr_bps)})
+            </dd>
 
-          <dt className="text-muted-foreground">required budget</dt>
-          <dd>
-            {result.required_budget_raw} raw ({requiredUsdc} USDC)
-          </dd>
+            <dt className="text-muted-foreground">native source</dt>
+            <dd className="font-mono" data-testid="w5f-native-source">
+              {result.native_onchain_apr_source}
+            </dd>
 
-          <dt className="text-muted-foreground">current budget</dt>
-          <dd>
-            {result.current_budget_raw} raw ({currentUsdc} USDC)
-          </dd>
+            <dt className="text-muted-foreground">reserve pubkey</dt>
+            <dd className="font-mono break-all">{result.reserve_pubkey}</dd>
+          </dl>
+        </div>
 
-          <dt className="text-muted-foreground">controlled wallet</dt>
-          <dd className="font-mono break-all flex items-start">
-            <span className="break-all" data-testid="w5e-controlled-wallet">
-              {result.controlled_wallet}
-            </span>
-            <CopyButton value={result.controlled_wallet} label="controlled wallet" />
-          </dd>
+        {/* ── Budget block ─────────────────────────────────────── */}
+        <div className="mt-3">
+          <div className="text-xs font-medium text-foreground/80">Budget</div>
+          <dl
+            className="mt-1 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs"
+            data-testid="w5f-budget-block"
+          >
+            <dt className="text-muted-foreground">budget status</dt>
+            <dd className="font-mono">{result.budget_status}</dd>
 
-          <dt className="text-muted-foreground">source USDC ATA</dt>
-          <dd className="font-mono break-all flex items-start">
-            <span className="break-all" data-testid="w5e-source-usdc-ata">
-              {result.source_usdc_ata}
-            </span>
-            <CopyButton value={result.source_usdc_ata} label="source USDC ATA" />
-          </dd>
+            <dt className="text-muted-foreground">required budget</dt>
+            <dd>
+              {result.required_budget_raw} raw ({requiredUsdc} USDC)
+            </dd>
 
-          <dt className="text-muted-foreground">last_checked_slot</dt>
-          <dd className="font-mono" data-testid="w5e-last-checked-slot">
-            {result.last_checked_slot}
-          </dd>
+            <dt className="text-muted-foreground">current budget</dt>
+            <dd>
+              {result.current_budget_raw} raw ({currentUsdc} USDC)
+            </dd>
 
-          <dt className="text-muted-foreground">expires_at_slot</dt>
-          <dd className="font-mono" data-testid="w5e-expires-at-slot">
-            {result.expires_at_slot ?? "N/A"}
-          </dd>
+            <dt className="text-muted-foreground">controlled wallet</dt>
+            <dd className="font-mono break-all flex items-start">
+              <span className="break-all" data-testid="w5e-controlled-wallet">
+                {result.controlled_wallet}
+              </span>
+              <CopyButton
+                value={result.controlled_wallet}
+                label="controlled wallet"
+              />
+            </dd>
 
-          <dt className="text-muted-foreground">rule_id</dt>
-          <dd className="font-mono break-all" data-testid="w5e-rule-id">
-            {result.rule_id_hex ?? "N/A"}
-          </dd>
+            <dt className="text-muted-foreground">source USDC ATA</dt>
+            <dd className="font-mono break-all flex items-start">
+              <span className="break-all" data-testid="w5e-source-usdc-ata">
+                {result.source_usdc_ata}
+              </span>
+              <CopyButton
+                value={result.source_usdc_ata}
+                label="source USDC ATA"
+              />
+            </dd>
+          </dl>
+        </div>
 
-          <dt className="text-muted-foreground">canonical_rule_hash</dt>
-          <dd className="font-mono break-all" data-testid="w5e-canonical-hash">
-            {result.canonical_rule_hash_hex ?? "N/A"}
-          </dd>
+        {/* ── Rule identity + liveness ─────────────────────────── */}
+        <div className="mt-3">
+          <div className="text-xs font-medium text-foreground/80">Rule</div>
+          <dl
+            className="mt-1 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs"
+            data-testid="w5f-rule-block"
+          >
+            <dt className="text-muted-foreground">last_checked_slot</dt>
+            <dd className="font-mono" data-testid="w5e-last-checked-slot">
+              {result.last_checked_slot}
+            </dd>
 
-          <dt className="text-muted-foreground">rule_persisted</dt>
-          <dd className="font-mono" data-testid="w5e-rule-persisted">
-            {result.rule_persisted ? "true" : "false (preview-only)"}
-          </dd>
+            <dt className="text-muted-foreground">expires_at_slot</dt>
+            <dd className="font-mono" data-testid="w5e-expires-at-slot">
+              {result.expires_at_slot ?? "N/A"}
+            </dd>
 
-          <dt className="text-muted-foreground">execution_attempted</dt>
-          <dd className="font-mono">{result.execution_attempted ? "true" : "false"}</dd>
+            <dt className="text-muted-foreground">rule_id</dt>
+            <dd className="font-mono break-all" data-testid="w5e-rule-id">
+              {result.rule_id_hex ?? "N/A"}
+            </dd>
 
-          <dt className="text-muted-foreground">tx_signature</dt>
-          <dd className="font-mono break-all">{result.tx_signature ?? "N/A"}</dd>
-        </dl>
-        <div className="mt-2 text-[10px] text-muted-foreground leading-snug">
-          Demo bridge: deterministic parser → B-O1 on-chain APR → Stage 2
-          WatchRule persistence. NOT a first-class production SolendDeposit
-          ActionSpec; the action carrier is `SolendWithdrawAllDelegated`
-          and live execution is gated outside this chat surface.
+            <dt className="text-muted-foreground">canonical_rule_hash</dt>
+            <dd className="font-mono break-all" data-testid="w5e-canonical-hash">
+              {result.canonical_rule_hash_hex ?? "N/A"}
+            </dd>
+
+            <dt className="text-muted-foreground">rule_persisted</dt>
+            <dd className="font-mono" data-testid="w5e-rule-persisted">
+              {result.rule_persisted ? "true" : "false (preview-only)"}
+            </dd>
+
+            <dt className="text-muted-foreground">execution_attempted</dt>
+            <dd className="font-mono">
+              {result.execution_attempted ? "true" : "false"}
+            </dd>
+
+            <dt className="text-muted-foreground">tx_signature</dt>
+            <dd className="font-mono break-all">{result.tx_signature ?? "N/A"}</dd>
+          </dl>
+        </div>
+
+        {/* ── No-overclaim footer ─────────────────────────────── */}
+        <div className="mt-2 text-[10px] text-muted-foreground leading-snug space-y-1">
+          <p>
+            This card follows <b>Save display APY</b> for the user-facing
+            condition. Native B-O1 APR is shown as an audit field. The
+            persisted WatchRule&apos;s on-chain condition still
+            evaluates against native APR when the W2 watcher ticks — the
+            two metrics may diverge.
+          </p>
+          {degradedW5fPath && (
+            <p
+              className="text-amber-700"
+              data-testid="w5f-degraded-banner"
+            >
+              Note: the gateway is running in W5e degraded mode (no Save
+              REST fetcher wired); the metrics shown are identical
+              because both come from the on-chain B-O1 evaluator.
+            </p>
+          )}
+          <p>
+            Demo bridge: deterministic parser → Save REST API APY +
+            B-O1 on-chain APR → Stage 2 WatchRule persistence. NOT a
+            first-class production SolendDeposit ActionSpec; the action
+            carrier is <code>SolendWithdrawAllDelegated</code> and live
+            execution is gated outside this chat surface.
+          </p>
         </div>
       </div>
     </div>

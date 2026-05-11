@@ -457,6 +457,25 @@ pub fn wire_chat_handler_with_registry(
     if let Some(repo) = w5e_repo {
         handler = handler.with_w5e_repo(repo);
     }
+    // W5f — attach the live Save display APY fetcher. The fetcher hits
+    // the official Solend REST API at
+    // <https://dev.solend.fi/docs/api/>. Base URL is overridable via
+    // `SOLEND_API_BASE_URL` so integration tests can point at a stub.
+    // Absent / blocked => the chat handler falls back to the W5e
+    // single-APR path (degraded mode); the UI can detect this because
+    // `save_display_apy_bps == native_onchain_apr_bps` in that case.
+    {
+        let base_url = env
+            .get("SOLEND_API_BASE_URL")
+            .unwrap_or_else(|| {
+                crate::stage2_demo_apr_bridge::SOLEND_API_BASE_URL_DEFAULT.to_string()
+            });
+        if let Some(save) =
+            crate::stage2_demo_apr_bridge::LiveSaveDisplayApyFetcher::new(base_url)
+        {
+            handler = handler.with_w5f_save_apy(Arc::new(save));
+        }
+    }
     Ok(Some(handler.into_handler_ref()))
 }
 
@@ -466,6 +485,9 @@ pub fn wire_chat_handler_with_registry(
 ///
 /// W5e — the daemon supplies the optional `Stage2WatchRuleRepository`
 /// it constructed from its `Database` handle; this entry forwards it.
+/// W5f — the live Save display APY fetcher is constructed internally
+/// from the `SOLEND_API_BASE_URL` env var (defaulting to the official
+/// Solend REST API).
 pub fn wire_chat_handler_from_std_env(
     registry: &ToolRegistry,
     w5e_repo: Option<Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>>,
@@ -510,12 +532,18 @@ pub struct GatewayChatHandler {
     w5d_bridge: Option<Arc<dyn crate::stage2_demo_apr_bridge::W5dAprFetcher>>,
     /// W5e — optional state-store repository for persisting demo
     /// watch rules. When present (daemon wires it from `Database`),
-    /// `handle_demo_command_v2` will insert the rule and set
+    /// `handle_demo_command_v3` will insert the rule and set
     /// `rule_persisted=true`. When absent, the bridge returns a
     /// preview-only result with `rule_persisted=false`.
     w5e_repo: Option<
         Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>,
     >,
+    /// W5f — Save display APY fetcher (REST API). When present, the
+    /// orchestrator uses Save UI APY (not native on-chain APR) as the
+    /// decision metric. When absent, the chat route surfaces a
+    /// `ToolError` for any matched W5d command because W5f requires
+    /// the Save metric to render the typed card.
+    w5f_save_apy: Option<Arc<dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher>>,
 }
 
 impl GatewayChatHandler {
@@ -532,6 +560,7 @@ impl GatewayChatHandler {
             caps,
             w5d_bridge: None,
             w5e_repo: None,
+            w5f_save_apy: None,
         }
     }
 
@@ -560,6 +589,21 @@ impl GatewayChatHandler {
         repo: Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>,
     ) -> Self {
         self.w5e_repo = Some(repo);
+        self
+    }
+
+    /// W5f — attach a `SaveDisplayApyFetcher`. When present, the
+    /// chat-route orchestrator uses Save UI display APY (not native
+    /// on-chain APR) as the decision metric for W5d-grammar commands.
+    /// When absent, the chat route falls back to the W5e single-APR
+    /// path (native APR drives the decision) — but this is NOT W5f
+    /// parity and the card will render with `decision_source` showing
+    /// the legacy `save_display_apy` placeholder against `current_apr_bps`.
+    pub fn with_w5f_save_apy(
+        mut self,
+        fetcher: Arc<dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher>,
+    ) -> Self {
+        self.w5f_save_apy = Some(fetcher);
         self
     }
 
@@ -598,6 +642,7 @@ impl ChatHandler for GatewayChatHandler {
                 {
                     return handle_w5d_demo_command(
                         fetcher.as_ref(),
+                        self.w5f_save_apy.as_deref(),
                         self.w5e_repo.as_deref(),
                         &message,
                     )
@@ -636,11 +681,26 @@ impl ChatHandler for GatewayChatHandler {
 /// `W5dConditionalDepositResultDto`) the api crate exposes.
 async fn handle_w5d_demo_command(
     fetcher: &(dyn crate::stage2_demo_apr_bridge::W5dAprFetcher + 'static),
+    save_apy: Option<&(dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher + 'static)>,
     repo: Option<&claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>,
     message: &str,
 ) -> ChatRouteOutcome {
     const TOOL_NAME: &str = "w5d_conditional_deposit";
-    match crate::stage2_demo_apr_bridge::handle_demo_command_v2(fetcher, repo, message).await
+    // W5f: prefer the v3 orchestrator (Save APY decision metric).
+    // When the daemon did NOT wire a Save fetcher, fall back to v2
+    // (native APR decision) so the route still works in degraded
+    // environments — but the resulting card will have
+    // `save_display_apy_bps == native_onchain_apr_bps` so the UI can
+    // detect the legacy path.
+    let result = match save_apy {
+        Some(s) => {
+            crate::stage2_demo_apr_bridge::handle_demo_command_v3(fetcher, s, repo, message)
+                .await
+        }
+        None => crate::stage2_demo_apr_bridge::handle_demo_command_v2(fetcher, repo, message)
+            .await,
+    };
+    match result
     {
         Ok(result) => {
             let dto = W5dConditionalDepositResultDto {
@@ -664,6 +724,10 @@ async fn handle_w5d_demo_command(
                 rule_id_hex: result.rule_id_hex,
                 canonical_rule_hash_hex: result.canonical_rule_hash_hex,
                 rule_persisted: result.rule_persisted,
+                decision_source: result.decision_source,
+                save_display_apy_bps: result.save_display_apy_bps,
+                native_onchain_apr_bps: result.native_onchain_apr_bps,
+                native_onchain_apr_source: result.native_onchain_apr_source,
             };
             ChatRouteOutcome::Ok(ChatResponse::W5dConditionalDeposit { result: dto })
         }
@@ -1790,6 +1854,7 @@ mod w5d_chat_route_tests {
         let outcome = handle_w5d_demo_command(
             &fetcher,
             None,
+            None,
             "If Solend Main Pool USDC deposit APR is above 4.63%, deposit 0.25 USDC from my bounded executor wallet into Solend.",
         )
         .await;
@@ -1802,13 +1867,22 @@ mod w5d_chat_route_tests {
                 assert!(result.tx_signature.is_none());
                 assert_eq!(result.current_apr_bps, 163);
                 assert_eq!(result.threshold_bps, 463);
-                assert_eq!(result.source, "onchain_reserve_b_o1");
+                // After W5f, `source` is the legacy field carrying the
+                // decision-source label. With no Save fetcher wired
+                // (this test exercises the W5e degraded path), the
+                // result still carries `"save_display_apy"` as the
+                // default label.
+                assert_eq!(result.source, "save_display_apy");
                 assert_eq!(result.last_checked_slot, 42_424_242);
                 assert!(result.expires_at_slot.is_some());
                 assert!(result.rule_id_hex.is_some());
                 assert!(result.canonical_rule_hash_hex.is_some());
                 // No repo wired → preview-only, must not claim persisted.
                 assert!(!result.rule_persisted);
+                // W5f degraded path: native and Save metrics both equal
+                // the one APR the mock fetcher produced.
+                assert_eq!(result.save_display_apy_bps, 163);
+                assert_eq!(result.native_onchain_apr_bps, 163);
             }
             other => panic!("expected W5dConditionalDeposit, got {other:?}"),
         }
@@ -1826,6 +1900,7 @@ mod w5d_chat_route_tests {
         };
         let outcome = handle_w5d_demo_command(
             &fetcher,
+            None,
             None,
             "If Solend Main Pool USDC deposit APR is above 0.63%, deposit 0.25 USDC from my bounded executor wallet into Solend.",
         )
@@ -1857,6 +1932,7 @@ mod w5d_chat_route_tests {
         // but the amount is unsupported (1.0 instead of 0.25).
         let outcome = handle_w5d_demo_command(
             &fetcher,
+            None,
             None,
             "If Solend Main Pool USDC deposit APR is above 10%, deposit 1.0 USDC from my bounded executor wallet into Solend.",
         )
