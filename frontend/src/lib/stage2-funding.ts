@@ -1,7 +1,7 @@
 // Stage 2 — Phantom controlled-wallet funding helpers.
 //
 // Pure-Solana primitives the demo page uses to build a single
-// "fund 50 USDC into the controlled wallet" transaction. NO RPC,
+// "fund 5 USDC into the controlled wallet" transaction. NO RPC,
 // NO signing, NO sending — those happen in the page (RPC) or in
 // the existing `@/lib/phantom` wrapper (signing).
 //
@@ -49,12 +49,18 @@ export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
   "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
 );
 
-/// Funding amount — exactly 50 USDC = 50 × 10^6 base units. u64.
-export const FUNDING_AMOUNT_BASE_UNITS = BigInt(50_000_000);
+/// Funding amount — exactly 5 USDC = 5 × 10^6 base units. u64.
+///
+/// Pinned to 5 USDC on 2026-05-11. The demo's bounded-automation
+/// framing — the controlled wallet only receives an explicit
+/// one-shot transfer; the user main wallet retains self-custody
+/// and is never delegated — is independent of the amount. See git
+/// log for prior values.
+export const FUNDING_AMOUNT_BASE_UNITS = BigInt(5_000_000);
 
 /// Funding amount UI label — produced by integer math, never by
 /// floating-point arithmetic.
-export const FUNDING_AMOUNT_UI_LABEL = "50.000000 USDC";
+export const FUNDING_AMOUNT_UI_LABEL = "5.000000 USDC";
 
 // ── ATA derivation (deterministic; no RPC) ────────────────────────────────
 
@@ -195,7 +201,7 @@ export interface BuildFundingTxArgs {
 ///
 /// Always:
 ///   1. (optional) `CreateIdempotent` ATA for the controlled wallet
-///   2. `TransferChecked` 50 USDC from `sourceAta` → `destinationAta`
+///   2. `TransferChecked` 5 USDC from `sourceAta` → `destinationAta`
 ///
 /// Returns the assembled `Transaction`; the caller signs via Phantom
 /// (`signTransaction`) and submits via the JSON-RPC connection.

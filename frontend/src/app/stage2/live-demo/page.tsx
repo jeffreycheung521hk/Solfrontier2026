@@ -16,11 +16,11 @@
 //     live ONLY on the operator's filesystem).
 //   - No Solend live execution. No Jupiter conditional execution.
 //   - No arbitrary amount input — the amount is pinned at exactly
-//     50 USDC = 50_000_000 base units.
+//     5 USDC = 5_000_000 base units.
 //   - The page is gated behind `NEXT_PUBLIC_STAGE2_LIVE_DEMO=1`.
 //     Without that env var set, the page renders a disabled
 //     explanation and never builds a transaction.
-//   - Disabled when not connected, or when balance < 50 USDC, or
+//   - Disabled when not connected, or when balance < 5 USDC, or
 //     when the connected wallet equals the controlled wallet (no
 //     self-funding loops without explicit user override).
 
@@ -410,7 +410,7 @@ function LiveDemoBody() {
         <div className="flex items-center gap-3 text-sm text-muted-foreground flex-wrap">
           <Badge variant="default">{CLUSTER_LABEL}</Badge>
           <span>·</span>
-          <Badge variant="outline">live mainnet · 50 USDC</Badge>
+          <Badge variant="outline">live mainnet · 5 USDC</Badge>
           <span className="ml-auto">
             <WalletConnect onChange={setWalletPubkey} />
           </span>
@@ -420,7 +420,7 @@ function LiveDemoBody() {
       <Alert className="border-amber-500/40">
         <AlertTitle className="text-sm">Read this before you sign</AlertTitle>
         <AlertDescription className="text-xs">
-          This transfers exactly <strong>50 USDC</strong> from your connected
+          This transfers exactly <strong>5 USDC</strong> from your connected
           wallet into a controlled demo wallet. Automation can only act on
           funds inside that controlled wallet — your main wallet is never
           delegated. No Solend / Jupiter execution is triggered from this
@@ -629,13 +629,13 @@ function LiveDemoBody() {
                   ? "Confirming…"
                   : state.kind === "finalized"
                     ? "Funded ✓"
-                    : "Fund Controlled Wallet (50 USDC)"}
+                    : "Fund Controlled Wallet (5 USDC)"}
         </Button>
       </div>
 
       <div className="text-[11px] text-muted-foreground italic">
         Phantom will show its standard approval popup. You sign one
-        transaction — a TransferChecked of 50 USDC. No Solend, Jupiter, or
+        transaction — a TransferChecked of 5 USDC. No Solend, Jupiter, or
         automation action is initiated from this page.
       </div>
     </div>
@@ -675,7 +675,7 @@ function SignaturePanel({
         </div>
         {finalized && (
           <div className="text-muted-foreground">
-            50 USDC now in the controlled wallet. Automation may act only
+            5 USDC now in the controlled wallet. Automation may act only
             on this wallet&apos;s funds; your main wallet is untouched.
           </div>
         )}
