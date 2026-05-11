@@ -1084,38 +1084,49 @@ pub enum ChatResponse {
 /// `W5dEvaluationResult` at the chat-route boundary so the api crate
 /// does not need a build-time dependency on the gateway crate.
 ///
+/// W5e — extended with budget visibility, liveness anchor
+/// (`last_checked_slot`), and persisted-rule identity. The status
+/// field is now `watching` | `ready_to_execute` | `needs_funding`,
+/// replacing W5d's `condition_not_met` (which incorrectly treated
+/// a conditional order as a terminal quote check).
+///
 /// **No-overclaim:** this DTO proves a chat-side deterministic
-/// detection + on-chain APR evaluation + W5d-bridge typed result. It
-/// does NOT prove a `clawsol-authority` `ExecuteAction`, an
+/// detection + on-chain APR evaluation + controlled-wallet budget
+/// read + (when wired) real `Stage2WatchRuleRepository` persistence,
+/// with a typed lifecycle status the frontend renders. It does NOT
+/// prove a `clawsol-authority` `ExecuteAction`, an
 /// `AuthorizationRecord` PDA live execution, a Jupiter conditional
-/// execution path, or a first-class production
-/// `SolendDepositControlledWallet` `ActionSpec`. The `tx_signature`
-/// field is reserved for a future slice that wires live send into
-/// the chat route; in the present slice it is always `None`.
+/// execution path, a first-class production
+/// `SolendDepositControlledWallet` `ActionSpec`, or a running
+/// watcher tick loop. `status="watching"` describes the rule's
+/// durable state in the state-store, not an active polling loop.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct W5dConditionalDepositResultDto {
-    /// Echoed verbatim from the user's chat message.
     pub input_text: String,
-    /// Stable string the frontend renders in the "source" row of the
-    /// W5d card. Always `"onchain_reserve_b_o1"`.
     pub source: String,
-    /// Solend Main Pool USDC reserve pubkey, base58.
     pub reserve_pubkey: String,
-    /// Current Solend Main Pool USDC supply APR in basis points, as
-    /// computed from the on-chain reserve via the B-O1 evaluator.
     pub current_apr_bps: u32,
-    /// Threshold the user typed, in basis points.
     pub threshold_bps: u32,
-    /// Echo of the percent label the user typed (e.g. `"2.5"`).
     pub threshold_pct_label: String,
-    /// Strict `>` decision.
     pub condition_met: bool,
     /// Always `false` from the chat route in the present slice.
     pub execution_attempted: bool,
-    /// `"condition_not_met"` | `"ready_to_execute"`.
+    /// W5e: `"watching"` | `"ready_to_execute"` | `"needs_funding"`.
     pub status: String,
     /// Reserved for future slices; always `None` here.
     pub tx_signature: Option<String>,
+    /// W5e fields.
+    pub controlled_wallet: String,
+    pub source_usdc_ata: String,
+    pub required_budget_raw: u64,
+    pub current_budget_raw: u64,
+    /// `"reserved"` | `"needs_funding"`.
+    pub budget_status: String,
+    pub last_checked_slot: u64,
+    pub expires_at_slot: Option<u64>,
+    pub rule_id_hex: Option<String>,
+    pub canonical_rule_hash_hex: Option<String>,
+    pub rule_persisted: bool,
 }
 
 /// Domain-level outcome returned by `ChatHandler::handle_chat`.

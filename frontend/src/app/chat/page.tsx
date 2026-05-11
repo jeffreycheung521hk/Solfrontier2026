@@ -609,30 +609,81 @@ function bpsToPctLabel(bps: number): string {
   return `${whole}.${frac.toString().padStart(2, "0")}%`;
 }
 
+function CopyButton({ value, label }: { value: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  const onClick = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // navigator.clipboard can throw in non-secure contexts; swallow
+      // silently — the value is still selectable in the DOM.
+    }
+  }, [value]);
+  return (
+    <button
+      type="button"
+      aria-label={`Copy ${label}`}
+      onClick={onClick}
+      className="ml-2 inline-flex shrink-0 items-center rounded border px-1.5 py-0.5 text-[10px] hover:bg-muted"
+    >
+      {copied ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
 function W5dConditionalDepositCard({
   result,
 }: {
   result: W5dConditionalDepositResult;
 }) {
   const conditionLabel = result.condition_met ? "true" : "false";
-  const statusTone =
-    result.status === "ready_to_execute"
-      ? "bg-amber-50 text-amber-900 border-amber-200"
-      : "bg-emerald-50 text-emerald-900 border-emerald-200";
+  // W5e status enum: watching | ready_to_execute | needs_funding.
+  // Each gets its own banner copy + tone exactly as specified by the
+  // W5e brief.
+  let banner: { tone: string; text: string };
+  switch (result.status) {
+    case "ready_to_execute":
+      banner = {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Ready to execute — live send is not authorised from chat.",
+      };
+      break;
+    case "needs_funding":
+      banner = {
+        tone: "bg-rose-50 text-rose-900 border-rose-200",
+        text: "Needs funding — send 0.25 USDC to the controlled wallet before this conditional order can execute.",
+      };
+      break;
+    case "watching":
+    default:
+      banner = {
+        tone: "bg-emerald-50 text-emerald-900 border-emerald-200",
+        text: "Watching — budget reserved until condition is met, expired, or cancelled.",
+      };
+      break;
+  }
+  // Required-budget label: raw 250_000 → "0.25 USDC". Always 6 decimals
+  // for USDC; rendered as a fixed-precision string.
+  const requiredUsdc = (result.required_budget_raw / 1_000_000).toFixed(2);
+  const currentUsdc = (result.current_budget_raw / 1_000_000).toFixed(6);
   return (
     <div className="flex justify-start">
       <div
         data-testid="w5d-conditional-deposit-card"
         className="max-w-[85%] rounded-2xl rounded-bl-sm bg-card border px-4 py-3 text-sm space-y-1"
       >
-        <div className="font-medium">W5d conditional deposit (demo bridge)</div>
+        <div className="font-medium">W5e conditional order (demo bridge)</div>
         <div className="text-xs text-muted-foreground italic break-words">
           &ldquo;{result.input_text}&rdquo;
         </div>
-        <div className={`mt-2 inline-block rounded border px-2 py-1 text-xs ${statusTone}`}>
-          {result.status === "ready_to_execute"
-            ? "Ready to execute — live send not authorised from chat"
-            : "Condition not met — no execution"}
+        <div
+          data-testid="w5e-status-banner"
+          data-status={result.status}
+          className={`mt-2 inline-block rounded border px-2 py-1 text-xs ${banner.tone}`}
+        >
+          {banner.text}
         </div>
         <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
           <dt className="text-muted-foreground">source</dt>
@@ -654,6 +705,60 @@ function W5dConditionalDepositCard({
           <dt className="text-muted-foreground">condition_met</dt>
           <dd className="font-mono">{conditionLabel}</dd>
 
+          <dt className="text-muted-foreground">budget status</dt>
+          <dd className="font-mono">{result.budget_status}</dd>
+
+          <dt className="text-muted-foreground">required budget</dt>
+          <dd>
+            {result.required_budget_raw} raw ({requiredUsdc} USDC)
+          </dd>
+
+          <dt className="text-muted-foreground">current budget</dt>
+          <dd>
+            {result.current_budget_raw} raw ({currentUsdc} USDC)
+          </dd>
+
+          <dt className="text-muted-foreground">controlled wallet</dt>
+          <dd className="font-mono break-all flex items-start">
+            <span className="break-all" data-testid="w5e-controlled-wallet">
+              {result.controlled_wallet}
+            </span>
+            <CopyButton value={result.controlled_wallet} label="controlled wallet" />
+          </dd>
+
+          <dt className="text-muted-foreground">source USDC ATA</dt>
+          <dd className="font-mono break-all flex items-start">
+            <span className="break-all" data-testid="w5e-source-usdc-ata">
+              {result.source_usdc_ata}
+            </span>
+            <CopyButton value={result.source_usdc_ata} label="source USDC ATA" />
+          </dd>
+
+          <dt className="text-muted-foreground">last_checked_slot</dt>
+          <dd className="font-mono" data-testid="w5e-last-checked-slot">
+            {result.last_checked_slot}
+          </dd>
+
+          <dt className="text-muted-foreground">expires_at_slot</dt>
+          <dd className="font-mono" data-testid="w5e-expires-at-slot">
+            {result.expires_at_slot ?? "N/A"}
+          </dd>
+
+          <dt className="text-muted-foreground">rule_id</dt>
+          <dd className="font-mono break-all" data-testid="w5e-rule-id">
+            {result.rule_id_hex ?? "N/A"}
+          </dd>
+
+          <dt className="text-muted-foreground">canonical_rule_hash</dt>
+          <dd className="font-mono break-all" data-testid="w5e-canonical-hash">
+            {result.canonical_rule_hash_hex ?? "N/A"}
+          </dd>
+
+          <dt className="text-muted-foreground">rule_persisted</dt>
+          <dd className="font-mono" data-testid="w5e-rule-persisted">
+            {result.rule_persisted ? "true" : "false (preview-only)"}
+          </dd>
+
           <dt className="text-muted-foreground">execution_attempted</dt>
           <dd className="font-mono">{result.execution_attempted ? "true" : "false"}</dd>
 
@@ -661,10 +766,10 @@ function W5dConditionalDepositCard({
           <dd className="font-mono break-all">{result.tx_signature ?? "N/A"}</dd>
         </dl>
         <div className="mt-2 text-[10px] text-muted-foreground leading-snug">
-          Demo bridge: deterministic parser → B-O1 on-chain APR → W5c
-          direct Solend conditional-deposit boundary. NOT clawsol-authority
-          ExecuteAction; NOT AuthorizationRecord PDA live execution; NOT
-          Jupiter; NOT a first-class production SolendDeposit ActionSpec.
+          Demo bridge: deterministic parser → B-O1 on-chain APR → Stage 2
+          WatchRule persistence. NOT a first-class production SolendDeposit
+          ActionSpec; the action carrier is `SolendWithdrawAllDelegated`
+          and live execution is gated outside this chat surface.
         </div>
       </div>
     </div>

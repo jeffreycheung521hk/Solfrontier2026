@@ -412,6 +412,7 @@ pub fn wire_chat_handler() -> Option<ChatHandlerRef> {
 pub fn wire_chat_handler_with_registry(
     registry: &ToolRegistry,
     env: &dyn EnvProvider,
+    w5e_repo: Option<Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>>,
 ) -> Result<Option<ChatHandlerRef>, LlmProviderConfigError> {
     let llm = match build_chat_provider_from_env(env)? {
         Some(c) => c,
@@ -448,16 +449,28 @@ pub fn wire_chat_handler_with_registry(
             handler = handler.with_w5d_bridge(Arc::new(fetcher));
         }
     }
+    // W5e — attach the durable rule repository so accepted commands
+    // persist a real WatchRule and the result carries
+    // `rule_persisted=true`. Absent => preview-only (the chat-route
+    // card carries `rule_persisted=false` and the UI must reflect
+    // the no-overclaim banner).
+    if let Some(repo) = w5e_repo {
+        handler = handler.with_w5e_repo(repo);
+    }
     Ok(Some(handler.into_handler_ref()))
 }
 
 /// Convenience: read from the real process env. Used by the daemon at
 /// startup. Tests inject a mock `EnvProvider` via
 /// [`wire_chat_handler_with_registry`].
+///
+/// W5e — the daemon supplies the optional `Stage2WatchRuleRepository`
+/// it constructed from its `Database` handle; this entry forwards it.
 pub fn wire_chat_handler_from_std_env(
     registry: &ToolRegistry,
+    w5e_repo: Option<Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>>,
 ) -> Result<Option<ChatHandlerRef>, LlmProviderConfigError> {
-    wire_chat_handler_with_registry(registry, &StdEnvProvider)
+    wire_chat_handler_with_registry(registry, &StdEnvProvider, w5e_repo)
 }
 
 /// Bridge from the API-layer `ChatHandler` trait to the runtime's
@@ -495,6 +508,14 @@ pub struct GatewayChatHandler {
     /// pre-W5d (LLM-only). The chat route never broadcasts a tx —
     /// the live-send path is reserved for the env-gated W5c harness.
     w5d_bridge: Option<Arc<dyn crate::stage2_demo_apr_bridge::W5dAprFetcher>>,
+    /// W5e — optional state-store repository for persisting demo
+    /// watch rules. When present (daemon wires it from `Database`),
+    /// `handle_demo_command_v2` will insert the rule and set
+    /// `rule_persisted=true`. When absent, the bridge returns a
+    /// preview-only result with `rule_persisted=false`.
+    w5e_repo: Option<
+        Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>,
+    >,
 }
 
 impl GatewayChatHandler {
@@ -510,6 +531,7 @@ impl GatewayChatHandler {
             system_prompt,
             caps,
             w5d_bridge: None,
+            w5e_repo: None,
         }
     }
 
@@ -524,6 +546,20 @@ impl GatewayChatHandler {
         fetcher: Arc<dyn crate::stage2_demo_apr_bridge::W5dAprFetcher>,
     ) -> Self {
         self.w5d_bridge = Some(fetcher);
+        self
+    }
+
+    /// W5e — attach a `Stage2WatchRuleRepository` so demo commands
+    /// persist a real `WatchRule`. Caller must ensure the repository
+    /// is built from the same `Database` the rest of the daemon uses
+    /// (so dashboard / `repo.get(rule_id)` queries see the persisted
+    /// rule). Without this call, the chat handler returns
+    /// `rule_persisted=false`.
+    pub fn with_w5e_repo(
+        mut self,
+        repo: Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>,
+    ) -> Self {
+        self.w5e_repo = Some(repo);
         self
     }
 
@@ -560,7 +596,12 @@ impl ChatHandler for GatewayChatHandler {
             if let Some(fetcher) = &self.w5d_bridge {
                 if crate::stage2_demo_apr_bridge::looks_like_w5d_command(&message)
                 {
-                    return handle_w5d_demo_command(fetcher.as_ref(), &message).await;
+                    return handle_w5d_demo_command(
+                        fetcher.as_ref(),
+                        self.w5e_repo.as_deref(),
+                        &message,
+                    )
+                    .await;
                 }
             }
 
@@ -595,10 +636,12 @@ impl ChatHandler for GatewayChatHandler {
 /// `W5dConditionalDepositResultDto`) the api crate exposes.
 async fn handle_w5d_demo_command(
     fetcher: &(dyn crate::stage2_demo_apr_bridge::W5dAprFetcher + 'static),
+    repo: Option<&claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>,
     message: &str,
 ) -> ChatRouteOutcome {
     const TOOL_NAME: &str = "w5d_conditional_deposit";
-    match crate::stage2_demo_apr_bridge::handle_demo_command(fetcher, message).await {
+    match crate::stage2_demo_apr_bridge::handle_demo_command_v2(fetcher, repo, message).await
+    {
         Ok(result) => {
             let dto = W5dConditionalDepositResultDto {
                 input_text: result.input_text,
@@ -611,6 +654,16 @@ async fn handle_w5d_demo_command(
                 execution_attempted: result.execution_attempted,
                 status: result.status,
                 tx_signature: result.tx_signature,
+                controlled_wallet: result.controlled_wallet,
+                source_usdc_ata: result.source_usdc_ata,
+                required_budget_raw: result.required_budget_raw,
+                current_budget_raw: result.current_budget_raw,
+                budget_status: result.budget_status,
+                last_checked_slot: result.last_checked_slot,
+                expires_at_slot: result.expires_at_slot,
+                rule_id_hex: result.rule_id_hex,
+                canonical_rule_hash_hex: result.canonical_rule_hash_hex,
+                rule_persisted: result.rule_persisted,
             };
             ChatRouteOutcome::Ok(ChatResponse::W5dConditionalDeposit { result: dto })
         }
@@ -1641,7 +1694,7 @@ mod p5e_env_gate_tests {
     #[test]
     fn p5e_wire_with_registry_returns_none_when_env_disabled() {
         let env = MockEnv::empty();
-        let result = wire_chat_handler_with_registry(&stub_registry(), &env)
+        let result = wire_chat_handler_with_registry(&stub_registry(), &env, None)
             .expect("disabled env must be Ok(None)");
         assert!(result.is_none());
     }
@@ -1656,7 +1709,7 @@ mod p5e_env_gate_tests {
             ("OPENAI_API_KEY", "sk-test-fixture"),
         ]);
         let empty = ToolRegistry::new();
-        let result = wire_chat_handler_with_registry(&empty, &env);
+        let result = wire_chat_handler_with_registry(&empty, &env, None);
         match result {
             Err(LlmProviderConfigError::InvalidProviderConfig { .. }) => {}
             // Result's Ok arm contains `Option<ChatHandlerRef>` (no Debug);
@@ -1681,7 +1734,7 @@ mod w5d_chat_route_tests {
     use super::*;
     use crate::stage2_demo_apr_bridge::{
         looks_like_w5d_command, DemoParsed, EvaluationError, W5dAprFetcher,
-        W5dEvaluationResult, W5D_RESERVE_BS58,
+        W5dEvaluationResult,
     };
     use async_trait::async_trait;
     use claw_api::state::ChatResponse;
@@ -1690,6 +1743,8 @@ mod w5d_chat_route_tests {
     #[derive(Debug, Clone)]
     struct MockFetcher {
         current_apr_bps: u32,
+        current_budget_raw: u64,
+        last_checked_slot: u64,
     }
     #[async_trait]
     impl W5dAprFetcher for MockFetcher {
@@ -1698,24 +1753,17 @@ mod w5d_chat_route_tests {
             input_text: &str,
             parsed: &DemoParsed,
         ) -> Result<W5dEvaluationResult, EvaluationError> {
-            let condition_met = self.current_apr_bps > parsed.threshold_bps;
-            let status = if condition_met {
-                "ready_to_execute".to_string()
-            } else {
-                "condition_not_met".to_string()
-            };
-            Ok(W5dEvaluationResult {
-                input_text: input_text.to_string(),
-                source: "onchain_reserve_b_o1".to_string(),
-                reserve_pubkey: W5D_RESERVE_BS58.to_string(),
-                current_apr_bps: self.current_apr_bps,
-                threshold_bps: parsed.threshold_bps,
-                threshold_pct_label: parsed.threshold_pct_label.clone(),
-                condition_met,
-                execution_attempted: false,
-                status,
-                tx_signature: None,
-            })
+            let (controlled_wallet, source_usdc_ata) =
+                crate::stage2_demo_apr_bridge::controlled_wallet_addresses();
+            Ok(crate::stage2_demo_apr_bridge::compose_w5e_result(
+                input_text,
+                parsed,
+                self.current_apr_bps,
+                self.current_budget_raw,
+                self.last_checked_slot,
+                controlled_wallet,
+                source_usdc_ata,
+            ))
         }
     }
 
@@ -1728,43 +1776,57 @@ mod w5d_chat_route_tests {
         assert!(!looks_like_w5d_command("deposit my USDC into Save"));
     }
 
-    /// False branch — current+300 cannot exceed itself, so
-    /// `condition_met=false`, `status="condition_not_met"`, and the
-    /// chat handler must NOT have called any send path.
+    /// W5e false branch — condition not met but budget reserved →
+    /// `status="watching"`, `budget_status="reserved"`, the chat handler
+    /// must NOT have called any send path, and the result must carry
+    /// a rule_id + canonical hash (derived by `handle_demo_command_v2`).
     #[tokio::test]
-    async fn handle_w5d_false_command_returns_condition_not_met() {
+    async fn handle_w5d_false_command_returns_watching() {
         let fetcher = MockFetcher {
             current_apr_bps: 163,
+            current_budget_raw: 500_000, // ≥ 250_000, budget reserved
+            last_checked_slot: 42_424_242,
         };
         let outcome = handle_w5d_demo_command(
             &fetcher,
+            None,
             "If Solend Main Pool USDC deposit APR is above 4.63%, deposit 0.25 USDC from my bounded executor wallet into Solend.",
         )
         .await;
         match outcome {
             ChatRouteOutcome::Ok(ChatResponse::W5dConditionalDeposit { result }) => {
                 assert!(!result.condition_met);
-                assert_eq!(result.status, "condition_not_met");
+                assert_eq!(result.status, "watching");
+                assert_eq!(result.budget_status, "reserved");
                 assert!(!result.execution_attempted);
                 assert!(result.tx_signature.is_none());
                 assert_eq!(result.current_apr_bps, 163);
                 assert_eq!(result.threshold_bps, 463);
                 assert_eq!(result.source, "onchain_reserve_b_o1");
+                assert_eq!(result.last_checked_slot, 42_424_242);
+                assert!(result.expires_at_slot.is_some());
+                assert!(result.rule_id_hex.is_some());
+                assert!(result.canonical_rule_hash_hex.is_some());
+                // No repo wired → preview-only, must not claim persisted.
+                assert!(!result.rule_persisted);
             }
             other => panic!("expected W5dConditionalDeposit, got {other:?}"),
         }
     }
 
-    /// True branch — current-1% always less than current, so
-    /// `condition_met=true`. The chat route NEVER broadcasts, so
-    /// `status` is `"ready_to_execute"` and `tx_signature` stays None.
+    /// W5e true branch — condition met + budget reserved →
+    /// `status="ready_to_execute"`. The chat route NEVER broadcasts,
+    /// so `tx_signature` stays None and `execution_attempted=false`.
     #[tokio::test]
     async fn handle_w5d_true_command_returns_ready_to_execute() {
         let fetcher = MockFetcher {
             current_apr_bps: 163,
+            current_budget_raw: 500_000,
+            last_checked_slot: 42_424_242,
         };
         let outcome = handle_w5d_demo_command(
             &fetcher,
+            None,
             "If Solend Main Pool USDC deposit APR is above 0.63%, deposit 0.25 USDC from my bounded executor wallet into Solend.",
         )
         .await;
@@ -1772,8 +1834,10 @@ mod w5d_chat_route_tests {
             ChatRouteOutcome::Ok(ChatResponse::W5dConditionalDeposit { result }) => {
                 assert!(result.condition_met);
                 assert_eq!(result.status, "ready_to_execute");
+                assert_eq!(result.budget_status, "reserved");
                 assert!(!result.execution_attempted);
                 assert!(result.tx_signature.is_none());
+                assert!(!result.rule_persisted);
             }
             other => panic!("expected W5dConditionalDeposit, got {other:?}"),
         }
@@ -1786,11 +1850,14 @@ mod w5d_chat_route_tests {
     async fn handle_w5d_parse_error_surfaces_as_tool_error() {
         let fetcher = MockFetcher {
             current_apr_bps: 163,
+            current_budget_raw: 500_000,
+            last_checked_slot: 42_424_242,
         };
         // The detector matches (pool name + "deposit apr" present),
         // but the amount is unsupported (1.0 instead of 0.25).
         let outcome = handle_w5d_demo_command(
             &fetcher,
+            None,
             "If Solend Main Pool USDC deposit APR is above 10%, deposit 1.0 USDC from my bounded executor wallet into Solend.",
         )
         .await;
@@ -1822,7 +1889,11 @@ mod w5d_chat_route_tests {
             "alignment".to_string(),
             CapabilitySet::empty(),
         )
-        .with_w5d_bridge(Arc::new(MockFetcher { current_apr_bps: 1 }));
+        .with_w5d_bridge(Arc::new(MockFetcher {
+            current_apr_bps: 1,
+            current_budget_raw: 500_000,
+            last_checked_slot: 1,
+        }));
         // Handler holds the fetcher; we don't have a getter (intentional
         // — internal state). Verify via the detector helper that a
         // non-W5d message does NOT match, so the handler would skip

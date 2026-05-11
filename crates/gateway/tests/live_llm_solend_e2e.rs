@@ -768,7 +768,7 @@ async fn run_live_llm_solend_e2e() {
     );
 
     // ── Build the chat handler over the same registry ─────────────────────
-    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider) {
+    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider, None) {
         Ok(Some(c)) => c,
         Ok(None) => panic!(
             "chat provider env gate returned None despite {ENV_LLM_OPT_IN}=1; \
@@ -850,6 +850,11 @@ async fn run_live_llm_solend_e2e() {
         ),
         ChatRouteOutcome::Ok(ChatResponse::ToolError { tool_name, message }) => panic!(
             "Branch D: tool refused proposal ({tool_name}): {message}"
+        ),
+        ChatRouteOutcome::Ok(ChatResponse::W5dConditionalDeposit { result }) => panic!(
+            "Branch D: Solend live LLM test must dispatch solend_deposit_usdc, \
+             but the W5d demo-bridge intercepted with status={}; result={result:?}",
+            result.status,
         ),
         ChatRouteOutcome::Ok(ChatResponse::PendingActionExists { reason })
         | ChatRouteOutcome::Conflict(ChatResponse::PendingActionExists { reason }) => panic!(

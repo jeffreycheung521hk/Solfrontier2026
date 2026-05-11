@@ -69,6 +69,7 @@ use claw_state_store::{
     audit::{AuditRepository, AuditSeverity},
     db::{Database, DatabaseConfig},
     spend::SpendRepository,
+    stage2_watch_rules::Stage2WatchRuleRepository,
     tool_traces::ToolTraceRepository,
 };
 use claw_tool_system::{
@@ -931,8 +932,18 @@ impl GatewayDaemon {
         // any precondition is missing the chat route returns 503; when
         // the env opts in but the config is broken, daemon startup
         // surfaces the typed error.
+        //
+        // W5e — also build a Stage2WatchRuleRepository from the daemon
+        // database so the chat route can persist conditional orders
+        // when a W5d-shape command is accepted.
+        let w5e_repo = std::sync::Arc::new(Stage2WatchRuleRepository::new(
+            db.pool().clone(),
+        ));
         let chat_handler_ref: Option<ChatHandlerRef> =
-            match crate::runtime::chat_wiring::wire_chat_handler_from_std_env(&registry) {
+            match crate::runtime::chat_wiring::wire_chat_handler_from_std_env(
+                &registry,
+                Some(w5e_repo.clone()),
+            ) {
                 Ok(opt) => {
                     if opt.is_some() {
                         info!("chat route enabled with explicit provider opt-in");

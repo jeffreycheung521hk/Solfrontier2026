@@ -373,7 +373,7 @@ async fn live_chat_provider_dry_run() {
 
     // ── Build chat handler against the real provider ────────────────────
     let registry = stub_registry();
-    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &env) {
+    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &env, None) {
         Ok(Some(c)) => c,
         Ok(None) => {
             panic!("provider config gate returned None despite explicit opt-in");

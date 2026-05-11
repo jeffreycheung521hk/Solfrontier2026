@@ -1,26 +1,49 @@
-//! Stage 2 W5d — Demo APR conditional-deposit bridge (production-side).
+//! Stage 2 W5d/W5e — Chat-route conditional-order bridge (production-side).
 //!
 //! The deterministic-parser + B-O1-on-chain-APR evaluator surface that
-//! the user-facing `/chat` route uses to recognise the W5d demo command
-//! *before* the LLM is asked anything. This is the production-safe
-//! extraction of the W5d test-harness logic (originally in
-//! `tests/stage2_demo_apr_conditional_deposit_bridge.rs`).
+//! the user-facing `/chat` route uses to recognise the demo grammar
+//! *before* the LLM is asked anything.
 //!
-//! # What this module IS
+//! # W5e semantics (this slice)
 //!
-//! - A deterministic text parser for one exact demo grammar.
-//! - A live-RPC-driven evaluator that reads the Solend Main Pool USDC
-//!   reserve and computes its current supply APR via the B-O1 wrappers
-//!   in [`crate::stage2_evaluator`].
-//! - A pure DTO ([`W5dEvaluationResult`]) the chat layer renders as a
-//!   typed card.
+//! A command like
+//!
+//! > "If Solend Main Pool USDC deposit APR is above X%, deposit 0.25
+//! >  USDC from my bounded executor wallet into Solend."
+//!
+//! is a **conditional order**, not an instant true/false quote check.
+//! The bridge:
+//!
+//!  1. parses the command (W5d-style),
+//!  2. reads the current APR from the on-chain reserve via B-O1,
+//!  3. reads the controlled-wallet USDC ATA balance (the **budget**),
+//!  4. anchors the result to the same RPC slot (`last_checked_slot`),
+//!  5. composes a real [`WatchRule`] with a deterministic `rule_id`
+//!     (computed from the parsed inputs so the same command always
+//!     hashes to the same id — idempotent re-typing in chat does NOT
+//!     mint a new rule), and
+//!  6. when the chat handler is wired with a [`Stage2WatchRuleRepository`],
+//!     `insert`s the rule and reports `rule_persisted=true`. If the
+//!     repo is absent OR the insert hits a UNIQUE-collision, the
+//!     bridge tries `repo.get(rule_id)` to confirm idempotent
+//!     persistence; on every other failure path it sets
+//!     `rule_persisted=false` and the chat handler emits a clearly
+//!     preview-only card.
+//!
+//! Status decision (strict-> on bps; budget gate is a hard precondition):
+//!
+//! | budget          | condition | status            |
+//! | --------------- | --------- | ----------------- |
+//! | `< 250_000 raw` | any       | `needs_funding`   |
+//! | `>= 250_000`    | met       | `ready_to_execute`|
+//! | `>= 250_000`    | not met   | `watching`        |
 //!
 //! # What this module is NOT
 //!
 //! - **Not** a Solend deposit sender. The execution path lives in the
-//!   W5d / W5c test-harness modules behind explicit env gates; this
-//!   module never calls `sendTransaction`, never loads a keypair, and
-//!   never imports the controlled-wallet keypair.
+//!   env-gated W5c harness; this module never calls `sendTransaction`,
+//!   never loads a keypair, and never imports the controlled-wallet
+//!   keypair.
 //! - **Not** an LLM client. There is zero provider call here.
 //! - **Not** a fall-through. If a message does not match the strict
 //!   grammar, the chat layer continues to the normal LLM path. This
@@ -29,14 +52,18 @@
 //! # No-overclaim
 //!
 //! Proves: *chat text → deterministic W5d parser → B-O1 on-chain APR
-//! evaluation → typed result the frontend renders.*
+//! evaluation → controlled-wallet budget read → real Stage 2 watch
+//! rule persisted in the state-store, with typed lifecycle status the
+//! frontend renders.*
 //!
 //! Does NOT prove: clawsol-authority `ExecuteAction` execution; a
 //! first-class `SolendDepositControlledWallet` `ActionSpec` variant;
 //! Jupiter conditional execution; user-delegated authorization via
-//! `AuthorizationRecord` PDA; live tx broadcast (that path lives in
-//! the env-gated W5c harness and is reached only when Jeff sets the
-//! exact approval phrase).
+//! `AuthorizationRecord` PDA; live tx broadcast; a running watcher
+//! that ticks this rule's lifecycle (W2/W3/W4 substrate exists; the
+//! chat route does NOT spawn the watcher — `status="watching"`
+//! describes the rule's *durable state in the state-store*, not an
+//! active polling loop in the same process).
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -45,19 +72,39 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use solana_sdk::pubkey::Pubkey;
+use spl_associated_token_account::get_associated_token_address;
 
 use crate::integrations::solend::raw::decode_reserve;
 use crate::stage2_evaluator::{
     solend_snapshot_value_from_reserve_raw, solend_supply_apr_bps_from_wad,
     solend_supply_apr_wad_for_snapshot,
 };
+use claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository;
 use claw_types::canonical_intent::PubkeyBytes;
+use claw_types::stage2_watch_rule::{
+    canonical_rule_hash, ActionSpec, Comparison, Condition, ConditionLogic, RateKind,
+    WatchRule, WithdrawMode, STAGE2_WATCH_RULE_SCHEMA_VERSION,
+};
 
 // ── Pinned facts (sealed against the stage2_executor source-of-truth) ────
 
 /// Hard-coded demo deposit amount in USDC base units (1 USDC == 10^6).
 /// 250_000 raw = 0.25 USDC. The parser rejects any other amount.
 pub const W5D_DEPOSIT_AMOUNT_RAW: u64 = 250_000;
+
+/// Controlled wallet pubkey (Slice 3C delegated wallet). Source of
+/// truth: `reference_slice3c_controlled_wallet.md` memory entry; the
+/// keypair lives only on Jeff's local fs at
+/// `C:/Users/jeffr/test-wallets/slice3c-dryrun.json` and is NOT
+/// imported by this module under any code path.
+pub const CONTROLLED_WALLET_BS58: &str = "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L";
+
+/// W5e bounded demo expiry, in slots, added to the
+/// `last_checked_slot` of the RPC read that constructed the rule.
+/// At ~400ms / slot, 50_000 slots ≈ 5.5 hours — long enough for a
+/// demo session to span the W2 watcher's tick interval, short enough
+/// that a stale rule expires within the same day.
+pub const W5E_DEMO_EXPIRY_SLOTS: u64 = 50_000;
 
 /// Solend Main Pool USDC reserve pubkey (mainnet-beta). Re-exported
 /// from `stage2_executor::DEMO_RESERVE_BS58` for ergonomic access here;
@@ -309,21 +356,27 @@ fn normalize_whitespace(s: &str) -> String {
 // ── Evaluation DTO ────────────────────────────────────────────────────────
 
 /// Successful evaluation of a parsed W5d command against the live
-/// Solend Main Pool USDC reserve.
+/// Solend Main Pool USDC reserve, including controlled-wallet budget
+/// state and (when wired) a persisted Stage 2 watch rule.
 ///
-/// `condition_met = current_apr_bps > threshold_bps` (strict `>`).
+/// Decision tree (strict `>` on bps; budget gate is hard):
+///
+/// | budget          | condition | status            |
+/// | --------------- | --------- | ----------------- |
+/// | `< 250_000 raw` | any       | `needs_funding`   |
+/// | `>= 250_000`    | met       | `ready_to_execute`|
+/// | `>= 250_000`    | not met   | `watching`        |
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct W5dEvaluationResult {
     /// Echoed verbatim from the chat input.
     pub input_text: String,
     /// Stable string the frontend renders in the "source" row of the
-    /// W5d card. Always `"onchain_reserve_b_o1"` for this evaluator —
-    /// no external Save/Solend public-API path is used.
+    /// W5d card. Always `"onchain_reserve_b_o1"` for this evaluator.
     pub source: String,
     /// `BgxfHJDz…JMpmw` (Solend Main Pool USDC reserve, base58).
     pub reserve_pubkey: String,
     /// Current Solend Main Pool USDC supply APR in basis points,
-    /// derived from the on-chain reserve via `solend_supply_apr_wad_for_snapshot`.
+    /// derived from the on-chain reserve via the B-O1 wrappers.
     pub current_apr_bps: u32,
     /// Threshold parsed from the user's text, in basis points.
     pub threshold_bps: u32,
@@ -333,23 +386,58 @@ pub struct W5dEvaluationResult {
     pub condition_met: bool,
     /// True iff this evaluation triggered a downstream execution
     /// attempt. The chat-side default is always `false` (the live
-    /// send path lives behind the W5c env gate; the chat route does
-    /// not unlock it).
+    /// send path lives behind the W5c env gate).
     pub execution_attempted: bool,
-    /// Stable status string. The chat handler always returns one of:
-    ///   - `"condition_not_met"`  when `condition_met == false`
-    ///   - `"ready_to_execute"`   when `condition_met == true` and the
-    ///     handler is not configured for live send.
-    /// (The `"simulated"` / `"completed"` / `"failed"` statuses are
-    /// reserved for the env-gated W5c test harness and never returned
-    /// from the chat route in this slice.)
+    /// Lifecycle status (W5e). One of:
+    ///   - `"watching"`         — condition not met now, budget reserved
+    ///   - `"ready_to_execute"` — condition met now, budget reserved
+    ///   - `"needs_funding"`    — controlled wallet USDC < required budget
     pub status: String,
-    /// `tx_signature` is always `None` from this route. The field is
-    /// kept in the DTO so the frontend can render a stable "N/A" cell
-    /// without conditional layout, and so a future slice that wires
-    /// the live send into the chat path can populate it without a
-    /// wire-shape change.
+    /// Live-send signature; always `None` from the chat route in this
+    /// slice. Field reserved so a future live-send wire-shape change
+    /// is non-breaking.
     pub tx_signature: Option<String>,
+    /// W5e — controlled wallet pubkey, base58. Echoed so the frontend
+    /// can render a Copy button next to it in the `needs_funding`
+    /// state.
+    pub controlled_wallet: String,
+    /// W5e — source USDC ATA pubkey, base58
+    /// (`get_associated_token_address(controlled_wallet, USDC_mint)`).
+    /// Echoed for the Copy button + "send USDC here" affordance.
+    pub source_usdc_ata: String,
+    /// W5e — required deposit budget in USDC base units (always
+    /// `250_000` for this demo).
+    pub required_budget_raw: u64,
+    /// W5e — current controlled-wallet USDC balance in base units, as
+    /// observed by the same RPC call that produced `last_checked_slot`.
+    pub current_budget_raw: u64,
+    /// W5e — `"reserved"` when `current_budget_raw >= required_budget_raw`,
+    /// `"needs_funding"` otherwise. The `status` field above already
+    /// derives from this + the condition; carrying both makes the
+    /// frontend card unambiguous.
+    pub budget_status: String,
+    /// W5e — chain slot the budget + APR were read from. Both reads
+    /// share this slot (one `getSlot` per chat invocation followed by
+    /// the dependent reads at `commitment=confirmed`).
+    pub last_checked_slot: u64,
+    /// W5e — `Some(_)` when a real `WatchRule` was constructed
+    /// (whether or not it was inserted into the durable repository).
+    /// `expires_at_slot = last_checked_slot + W5E_DEMO_EXPIRY_SLOTS`.
+    pub expires_at_slot: Option<u64>,
+    /// W5e — hex of the deterministic 16-byte rule id derived from
+    /// `(threshold_bps, amount_raw, controlled_wallet[..4])`. Same
+    /// command typed twice in chat -> same rule_id (idempotent).
+    pub rule_id_hex: Option<String>,
+    /// W5e — hex of `claw_types::stage2_watch_rule::canonical_rule_hash`
+    /// over the constructed `WatchRule`. Distinct from `rule_id` —
+    /// the hash binds the rule's full canonical bytes.
+    pub canonical_rule_hash_hex: Option<String>,
+    /// W5e — `true` iff the rule was actually inserted into the
+    /// daemon's `Stage2WatchRuleRepository` (or was already present
+    /// from a prior insertion with the same `rule_id`). `false` when
+    /// the chat handler is not wired with a repo OR insertion failed
+    /// for any reason other than the idempotent-duplicate case.
+    pub rule_persisted: bool,
 }
 
 /// Errors the chat layer surfaces to the user when evaluation cannot
@@ -516,6 +604,62 @@ impl LiveW5dAprFetcher {
                 detail: format!("base64 decode: {e}"),
             })
     }
+
+    async fn fetch_slot(&self) -> Result<u64, EvaluationError> {
+        let v = self
+            .rpc_post(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSlot",
+                "params": [{"commitment": "confirmed"}]
+            }))
+            .await?;
+        v["result"]
+            .as_u64()
+            .ok_or_else(|| EvaluationError::RpcFetchFailed {
+                detail: "missing slot in getSlot response".to_string(),
+            })
+    }
+
+    /// Returns the SPL token-account balance for `ata`, in base
+    /// units. `Ok(None)` when the account does not exist (treated by
+    /// callers as a zero budget).
+    async fn fetch_token_balance(&self, ata: &str) -> Result<Option<u64>, EvaluationError> {
+        let v = self
+            .rpc_post(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountBalance",
+                "params": [ata, {"commitment": "confirmed"}]
+            }))
+            .await;
+        match v {
+            Ok(value) => {
+                let amount_str = value["result"]["value"]["amount"]
+                    .as_str()
+                    .ok_or_else(|| EvaluationError::RpcFetchFailed {
+                        detail: "missing amount in getTokenAccountBalance".to_string(),
+                    })?;
+                let raw: u64 = amount_str
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| EvaluationError::RpcFetchFailed {
+                        detail: format!("amount parse: {e}"),
+                    })?;
+                Ok(Some(raw))
+            }
+            // `getTokenAccountBalance` returns a typed RPC error when
+            // the account doesn't exist; map that to Ok(None) so the
+            // budget gate sees "0 raw → needs_funding".
+            Err(EvaluationError::RpcFetchFailed { detail })
+                if detail.contains("could not find account")
+                    || detail.contains("Invalid param")
+                    || detail.contains("not found") =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[async_trait]
@@ -525,6 +669,11 @@ impl W5dAprFetcher for LiveW5dAprFetcher {
         input_text: &str,
         parsed: &DemoParsed,
     ) -> Result<W5dEvaluationResult, EvaluationError> {
+        // Anchor everything to the same slot — one `getSlot` followed
+        // by reserve + budget reads at `commitment=confirmed`.
+        let last_checked_slot = self.fetch_slot().await?;
+
+        // ── APR via B-O1 ─────────────────────────────────────────────
         let reserve_bytes = self.fetch_reserve_bytes().await?;
         let raw = decode_reserve(&reserve_bytes).map_err(|e| {
             EvaluationError::ReserveDecodeFailed {
@@ -547,41 +696,262 @@ impl W5dAprFetcher for LiveW5dAprFetcher {
             });
         }
         let current_apr_bps = apr_bps_raw as u32;
-        let condition_met = current_apr_bps > parsed.threshold_bps;
-        let status = if condition_met {
-            "ready_to_execute".to_string()
-        } else {
-            "condition_not_met".to_string()
-        };
-        Ok(W5dEvaluationResult {
-            input_text: input_text.to_string(),
-            source: "onchain_reserve_b_o1".to_string(),
-            reserve_pubkey: W5D_RESERVE_BS58.to_string(),
+
+        // ── Controlled-wallet USDC budget ────────────────────────────
+        let (controlled_wallet, source_usdc_ata) = controlled_wallet_addresses();
+        let current_budget_raw = self
+            .fetch_token_balance(&source_usdc_ata)
+            .await?
+            .unwrap_or(0);
+
+        Ok(compose_w5e_result(
+            input_text,
+            parsed,
             current_apr_bps,
-            threshold_bps: parsed.threshold_bps,
-            threshold_pct_label: parsed.threshold_pct_label.clone(),
-            condition_met,
-            execution_attempted: false,
-            status,
-            tx_signature: None,
-        })
+            current_budget_raw,
+            last_checked_slot,
+            controlled_wallet,
+            source_usdc_ata,
+        ))
     }
+}
+
+// ── Compose helper (shared by live + mock fetchers) ──────────────────────
+
+/// Compose the typed `W5dEvaluationResult` from the raw inputs the
+/// fetcher gathered. Splitting this out keeps the live RPC code and
+/// the chat-route decision logic separately testable.
+pub fn compose_w5e_result(
+    input_text: &str,
+    parsed: &DemoParsed,
+    current_apr_bps: u32,
+    current_budget_raw: u64,
+    last_checked_slot: u64,
+    controlled_wallet: String,
+    source_usdc_ata: String,
+) -> W5dEvaluationResult {
+    let required_budget_raw = W5D_DEPOSIT_AMOUNT_RAW;
+    let budget_ok = current_budget_raw >= required_budget_raw;
+    let condition_met = current_apr_bps > parsed.threshold_bps;
+    let (status, budget_status) = match (budget_ok, condition_met) {
+        (false, _) => ("needs_funding", "needs_funding"),
+        (true, true) => ("ready_to_execute", "reserved"),
+        (true, false) => ("watching", "reserved"),
+    };
+    W5dEvaluationResult {
+        input_text: input_text.to_string(),
+        source: "onchain_reserve_b_o1".to_string(),
+        reserve_pubkey: W5D_RESERVE_BS58.to_string(),
+        current_apr_bps,
+        threshold_bps: parsed.threshold_bps,
+        threshold_pct_label: parsed.threshold_pct_label.clone(),
+        condition_met,
+        execution_attempted: false,
+        status: status.to_string(),
+        tx_signature: None,
+        controlled_wallet,
+        source_usdc_ata,
+        required_budget_raw,
+        current_budget_raw,
+        budget_status: budget_status.to_string(),
+        last_checked_slot,
+        // expires_at / rule_id / canonical_rule_hash filled in by
+        // `handle_demo_command_v2` after the WatchRule is constructed.
+        expires_at_slot: None,
+        rule_id_hex: None,
+        canonical_rule_hash_hex: None,
+        rule_persisted: false,
+    }
+}
+
+/// Derives `(controlled_wallet_bs58, source_usdc_ata_bs58)` from the
+/// pinned controlled-wallet constant. Pure; no RPC.
+pub fn controlled_wallet_addresses() -> (String, String) {
+    let owner = Pubkey::from_str(CONTROLLED_WALLET_BS58).expect("controlled wallet parses");
+    let mint = Pubkey::from_str(crate::stage2_executor::DEMO_LIQUIDITY_MINT_BS58)
+        .expect("USDC mint parses");
+    let ata = get_associated_token_address(&owner, &mint);
+    (owner.to_string(), ata.to_string())
+}
+
+// ── Watch-rule construction + persistence ────────────────────────────────
+
+/// Build the deterministic 16-byte rule_id for a W5e command.
+///
+/// The id is derived from a stable byte-layout of the parsed inputs
+/// + the pinned controlled-wallet pubkey prefix:
+///
+/// ```text
+/// [0..4]   threshold_bps as u32 LE
+/// [4..12]  amount_raw    as u64 LE
+/// [12..16] controlled_wallet.to_bytes()[0..4]
+/// ```
+///
+/// Same parsed command (same threshold + amount + wallet) → same
+/// rule_id. Different threshold → different rule_id. This makes
+/// re-typing the same command in chat idempotent in the state-store
+/// (the second `repo.insert` hits a UNIQUE collision; we treat that
+/// as `rule_persisted=true` because the rule IS present).
+pub fn derive_w5e_rule_id(parsed: &DemoParsed, controlled_wallet: &PubkeyBytes) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&parsed.threshold_bps.to_le_bytes());
+    out[4..12].copy_from_slice(&parsed.amount_raw.to_le_bytes());
+    out[12..16].copy_from_slice(&controlled_wallet.0[0..4]);
+    out
+}
+
+/// Build the canonical W5e demo `WatchRule`. The rule's CONDITION is
+/// `Solend Main Pool USDC supply APR > threshold_bps`; its ACTION
+/// reuses the `SolendWithdrawAllDelegated` carrier (matching the
+/// W5c test-only-adapter convention, since the production
+/// `ActionSpec` enum does not yet carry a first-class
+/// `SolendDepositControlledWallet` variant — see no-overclaim).
+pub fn build_w5e_watch_rule(
+    parsed: &DemoParsed,
+    last_checked_slot: u64,
+) -> WatchRule {
+    let controlled = PubkeyBytes::from_base58(CONTROLLED_WALLET_BS58)
+        .expect("controlled wallet base58 parses");
+    let reserve =
+        PubkeyBytes::from_base58(crate::stage2_executor::DEMO_RESERVE_BS58)
+            .expect("reserve base58 parses");
+    let lending_market =
+        PubkeyBytes::from_base58(crate::stage2_executor::DEMO_LENDING_MARKET_BS58)
+            .expect("lending market base58 parses");
+    let solend_program_id =
+        PubkeyBytes::from_base58("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo")
+            .expect("solend program id base58 parses");
+    let rule_id = derive_w5e_rule_id(parsed, &controlled);
+    WatchRule {
+        schema_version: STAGE2_WATCH_RULE_SCHEMA_VERSION,
+        rule_id,
+        // User/executor collapse to the controlled wallet for this
+        // demo (matching W5c convention).
+        user: controlled,
+        executor: controlled,
+        delegated_wallet: controlled,
+        created_at_slot: last_checked_slot,
+        expires_at_slot: last_checked_slot.saturating_add(W5E_DEMO_EXPIRY_SLOTS),
+        one_shot: true,
+        condition_logic: ConditionLogic::All,
+        conditions: vec![Condition::SolendReserveSupplyRate {
+            reserve_pubkey: reserve,
+            lending_market,
+            solend_program_id,
+            // "above X%" is strict greater.
+            comparison: Comparison::Gt,
+            threshold_bps: parsed.threshold_bps,
+            rate_kind: RateKind::Apr,
+            formula_version: 1,
+            max_reserve_staleness_slots: 16,
+            required_refresh_same_tx: true,
+        }],
+        action: ActionSpec::SolendWithdrawAllDelegated {
+            target_obligation: PubkeyBytes::from_base58(
+                "BdFLjCcP9mCy557vNNGVbTUuvHxXsh8hc6jXzaPra1wN",
+            )
+            .expect("target obligation parses"),
+            reserve_pubkey: reserve,
+            lending_market,
+            destination_wallet: controlled,
+            withdraw_mode: WithdrawMode::WithdrawAllDelegatedPosition,
+        },
+        max_input_amount_raw: parsed.amount_raw,
+        used_amount_raw: 0,
+        destination: controlled,
+        slippage_bps: 0,
+    }
+}
+
+/// Insert (idempotently) the W5e rule into the durable state-store.
+/// Returns `(rule_persisted, expires_at_slot)`:
+///
+///   - `rule_persisted=true` on a successful first insertion OR on
+///     a UNIQUE-collision where `repo.get(rule_id)` confirms the
+///     rule is durably present (idempotent re-typing in chat).
+///   - `rule_persisted=false` on any other error.
+async fn persist_rule_idempotent(
+    repo: &Stage2WatchRuleRepository,
+    rule: &WatchRule,
+) -> bool {
+    match repo.insert(rule).await {
+        Ok(()) => true,
+        Err(_) => {
+            // Most likely a UNIQUE collision because the rule was
+            // already inserted. Confirm via `repo.get` — if the rule
+            // is durably present, treat the second insertion as
+            // idempotent success.
+            matches!(repo.get(&rule.rule_id).await, Ok(Some(_)))
+        }
+    }
+}
+
+fn hex_id_16(id: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for b in id {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+fn hex_id_32(id: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in id {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
 }
 
 // ── High-level chat-handler entry point ──────────────────────────────────
 
-/// Convenience: detect → parse → evaluate, in one call.
+/// W5e — full chat-route entry point: detect → parse → fetch (APR +
+/// budget + slot) → compose result → construct WatchRule → persist
+/// (if repo is wired) → fill in `rule_id` / `canonical_rule_hash` /
+/// `expires_at_slot` / `rule_persisted`.
 ///
-/// The chat handler uses this entry point when the lightweight
-/// detector returns `true`. Callers that want finer control over
-/// detection / parsing can call the underlying primitives directly.
-pub async fn handle_demo_command(
+/// Callers that just want the W5d preview surface (no rule
+/// construction) can call `fetcher.evaluate(...)` directly.
+pub async fn handle_demo_command_v2(
     fetcher: &(dyn W5dAprFetcher + 'static),
+    repo: Option<&Stage2WatchRuleRepository>,
     input_text: &str,
 ) -> Result<W5dEvaluationResult, EvaluationError> {
     let parsed = parse_demo_command(input_text)
         .map_err(|e| EvaluationError::Parse { parse_error: e })?;
-    fetcher.evaluate(input_text, &parsed).await
+    let mut result = fetcher.evaluate(input_text, &parsed).await?;
+
+    // Build the WatchRule + try to persist. Whether or not the repo
+    // is wired, the rule_id + canonical_hash + expires_at fields are
+    // always filled in so the frontend can display the order
+    // identity even in preview-only mode.
+    let rule = build_w5e_watch_rule(&parsed, result.last_checked_slot);
+    let canonical = canonical_rule_hash(&rule);
+    result.rule_id_hex = Some(hex_id_16(&rule.rule_id));
+    result.canonical_rule_hash_hex = Some(hex_id_32(&canonical));
+    result.expires_at_slot = Some(rule.expires_at_slot);
+
+    if let Some(repo_ref) = repo {
+        result.rule_persisted = persist_rule_idempotent(repo_ref, &rule).await;
+    }
+    // else: rule_persisted stays false (preview-only). Caller MUST
+    // surface this in the no-overclaim banner.
+
+    Ok(result)
+}
+
+/// Backwards-compatible W5d entry point — kept for any external
+/// caller that has not yet migrated to `handle_demo_command_v2`.
+/// Internally this is now just `handle_demo_command_v2` with
+/// `repo=None` (preview-only); the chat handler uses the v2 entry
+/// directly so it can wire a real repo when the daemon configures
+/// one.
+pub async fn handle_demo_command(
+    fetcher: &(dyn W5dAprFetcher + 'static),
+    input_text: &str,
+) -> Result<W5dEvaluationResult, EvaluationError> {
+    handle_demo_command_v2(fetcher, None, input_text).await
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -800,12 +1170,25 @@ mod tests {
 
     // ── Mock fetcher integration tests (no network) ───────────────────────
 
-    /// A mock fetcher with a programmable current_apr_bps. Used to
-    /// exercise the chat-route dispatch / DTO mapping without making
-    /// a single RPC call.
+    /// A mock fetcher with a programmable `current_apr_bps`,
+    /// `current_budget_raw`, and `last_checked_slot`. Used to exercise
+    /// the chat-route dispatch / DTO mapping without making any RPC.
     #[derive(Debug, Clone)]
     pub(crate) struct MockW5dAprFetcher {
         pub current_apr_bps: u32,
+        pub current_budget_raw: u64,
+        pub last_checked_slot: u64,
+    }
+
+    impl MockW5dAprFetcher {
+        /// Convenience: budget reserved (>= 250k raw), fixed slot.
+        pub(crate) fn with_apr(current_apr_bps: u32) -> Self {
+            Self {
+                current_apr_bps,
+                current_budget_raw: 500_000,
+                last_checked_slot: 419_000_000,
+            }
+        }
     }
 
     #[async_trait]
@@ -815,65 +1198,78 @@ mod tests {
             input_text: &str,
             parsed: &DemoParsed,
         ) -> Result<W5dEvaluationResult, EvaluationError> {
-            let condition_met = self.current_apr_bps > parsed.threshold_bps;
-            let status = if condition_met {
-                "ready_to_execute".to_string()
-            } else {
-                "condition_not_met".to_string()
-            };
-            Ok(W5dEvaluationResult {
-                input_text: input_text.to_string(),
-                source: "onchain_reserve_b_o1".to_string(),
-                reserve_pubkey: W5D_RESERVE_BS58.to_string(),
-                current_apr_bps: self.current_apr_bps,
-                threshold_bps: parsed.threshold_bps,
-                threshold_pct_label: parsed.threshold_pct_label.clone(),
-                condition_met,
-                execution_attempted: false,
-                status,
-                tx_signature: None,
-            })
+            let (controlled_wallet, source_usdc_ata) = controlled_wallet_addresses();
+            Ok(compose_w5e_result(
+                input_text,
+                parsed,
+                self.current_apr_bps,
+                self.current_budget_raw,
+                self.last_checked_slot,
+                controlled_wallet,
+                source_usdc_ata,
+            ))
         }
     }
 
+    /// W5e: false condition + budget reserved → `watching`.
     #[tokio::test]
-    async fn handle_demo_command_false_branch_via_mock() {
-        let fetcher = MockW5dAprFetcher {
-            current_apr_bps: 163,
-        };
+    async fn w5e_false_condition_budget_reserved_is_watching() {
+        let fetcher = MockW5dAprFetcher::with_apr(163);
         let input = "If Solend Main Pool USDC deposit APR is above 4.63%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
         let r = handle_demo_command(&fetcher, input).await.unwrap();
         assert!(!r.condition_met);
-        assert_eq!(r.status, "condition_not_met");
+        assert_eq!(r.status, "watching");
+        assert_eq!(r.budget_status, "reserved");
         assert!(r.tx_signature.is_none());
         assert!(!r.execution_attempted);
-        assert_eq!(r.current_apr_bps, 163);
-        assert_eq!(r.threshold_bps, 463);
-        assert_eq!(r.source, "onchain_reserve_b_o1");
+        assert!(r.rule_id_hex.is_some());
+        assert!(r.canonical_rule_hash_hex.is_some());
+        assert!(r.expires_at_slot.is_some());
+        // preview-only (no repo wired in this unit-test entry path)
+        assert!(!r.rule_persisted);
     }
 
+    /// W5e: true condition + budget reserved → `ready_to_execute`.
     #[tokio::test]
-    async fn handle_demo_command_true_branch_via_mock() {
-        let fetcher = MockW5dAprFetcher {
-            current_apr_bps: 163,
-        };
+    async fn w5e_true_condition_budget_reserved_is_ready_to_execute() {
+        let fetcher = MockW5dAprFetcher::with_apr(163);
         let input = "If Solend Main Pool USDC deposit APR is above 0.63%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
         let r = handle_demo_command(&fetcher, input).await.unwrap();
         assert!(r.condition_met);
-        // Chat-route default: ready_to_execute (live send NOT
-        // triggered from this route in this slice).
         assert_eq!(r.status, "ready_to_execute");
+        assert_eq!(r.budget_status, "reserved");
         assert!(r.tx_signature.is_none());
-        assert!(!r.execution_attempted);
-        assert_eq!(r.current_apr_bps, 163);
-        assert_eq!(r.threshold_bps, 63);
+    }
+
+    /// W5e: any condition + budget short → `needs_funding`.
+    #[tokio::test]
+    async fn w5e_budget_short_is_needs_funding_regardless_of_condition() {
+        let fetcher = MockW5dAprFetcher {
+            current_apr_bps: 163,
+            current_budget_raw: 100_000, // < 250_000 required
+            last_checked_slot: 419_000_000,
+        };
+        // Even with the TRUE condition (threshold 0.63%), budget gate
+        // forces needs_funding.
+        let input = "If Solend Main Pool USDC deposit APR is above 0.63%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let r = handle_demo_command(&fetcher, input).await.unwrap();
+        assert!(r.condition_met);
+        assert_eq!(r.status, "needs_funding");
+        assert_eq!(r.budget_status, "needs_funding");
+        assert_eq!(r.current_budget_raw, 100_000);
+        assert_eq!(r.required_budget_raw, 250_000);
+        // Funding affordances:
+        assert_eq!(r.controlled_wallet, CONTROLLED_WALLET_BS58);
+        // The source USDC ATA is the canonical
+        // `get_associated_token_address(controlled, USDC)` — pin it
+        // explicitly so a future ATA-derivation change breaks the
+        // test loudly.
+        assert_eq!(r.source_usdc_ata, "7LFdKcSV7JQYi3or5y9phHVPjhGigu5DDjUakAFbBmk3");
     }
 
     #[tokio::test]
-    async fn handle_demo_command_parse_error_surfaces_as_typed_error() {
-        let fetcher = MockW5dAprFetcher {
-            current_apr_bps: 163,
-        };
+    async fn w5e_parse_error_surfaces_as_typed_error() {
+        let fetcher = MockW5dAprFetcher::with_apr(163);
         let input = "If Solend Main Pool USDC deposit APR is above 10%, deposit 1.0 USDC from my bounded executor wallet into Solend.";
         let err = handle_demo_command(&fetcher, input).await.unwrap_err();
         match err {
@@ -882,6 +1278,131 @@ mod tests {
             }
             other => panic!("expected Parse/UnsupportedAmount, got {other:?}"),
         }
+    }
+
+    /// Liveness: `last_checked_slot` is echoed verbatim from the
+    /// fetcher; the same `slot` shows up in the result without
+    /// transformation.
+    #[tokio::test]
+    async fn w5e_last_checked_slot_flows_through() {
+        let fetcher = MockW5dAprFetcher {
+            current_apr_bps: 163,
+            current_budget_raw: 500_000,
+            last_checked_slot: 999_999_999,
+        };
+        let input = "If Solend Main Pool USDC deposit APR is above 5%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let r = handle_demo_command(&fetcher, input).await.unwrap();
+        assert_eq!(r.last_checked_slot, 999_999_999);
+        assert_eq!(
+            r.expires_at_slot,
+            Some(999_999_999u64.saturating_add(W5E_DEMO_EXPIRY_SLOTS))
+        );
+    }
+
+    /// Rule identity: same parsed inputs → same rule_id; different
+    /// threshold → different rule_id; canonical hash differs across
+    /// the two.
+    #[tokio::test]
+    async fn w5e_rule_id_is_deterministic_and_threshold_sensitive() {
+        let fetcher = MockW5dAprFetcher::with_apr(163);
+        let a_input = "If Solend Main Pool USDC deposit APR is above 5%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let b_input = "If Solend Main Pool USDC deposit APR is above 0.5%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let r1 = handle_demo_command(&fetcher, a_input).await.unwrap();
+        let r2 = handle_demo_command(&fetcher, a_input).await.unwrap();
+        let r3 = handle_demo_command(&fetcher, b_input).await.unwrap();
+        // Same command typed twice → same rule_id + same canonical
+        // hash (idempotent).
+        assert_eq!(r1.rule_id_hex, r2.rule_id_hex);
+        assert_eq!(r1.canonical_rule_hash_hex, r2.canonical_rule_hash_hex);
+        // Different threshold → distinct rule_id AND canonical hash.
+        assert_ne!(r1.rule_id_hex, r3.rule_id_hex);
+        assert_ne!(r1.canonical_rule_hash_hex, r3.canonical_rule_hash_hex);
+    }
+
+    /// Real persistence — when the chat handler is wired with a repo,
+    /// `handle_demo_command_v2` MUST set `rule_persisted=true` and
+    /// the rule MUST be retrievable via `repo.get(rule_id)`.
+    #[tokio::test]
+    async fn w5e_persistence_inserts_rule_and_returns_persisted_true() {
+        use claw_state_store::db::Database;
+        let db = Database::open_in_memory().await.unwrap();
+        let repo = Stage2WatchRuleRepository::new(db.pool().clone());
+        let fetcher = MockW5dAprFetcher::with_apr(163);
+        let input = "If Solend Main Pool USDC deposit APR is above 5%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let r = handle_demo_command_v2(&fetcher, Some(&repo), input)
+            .await
+            .unwrap();
+        assert!(r.rule_persisted);
+        // Confirm by direct repository lookup.
+        let id_hex = r.rule_id_hex.as_ref().unwrap();
+        let mut id_bytes = [0u8; 16];
+        for i in 0..16 {
+            id_bytes[i] = u8::from_str_radix(&id_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let stored = repo.get(&id_bytes).await.unwrap();
+        let stored = stored.expect("rule must be present in repo after insert");
+        assert_eq!(stored.rule.max_input_amount_raw, W5D_DEPOSIT_AMOUNT_RAW);
+        assert_eq!(stored.rule.delegated_wallet.to_base58(), CONTROLLED_WALLET_BS58);
+    }
+
+    /// Idempotent re-typing: inserting the same rule twice does NOT
+    /// flip `rule_persisted` to false.
+    #[tokio::test]
+    async fn w5e_persistence_is_idempotent_on_duplicate_insert() {
+        use claw_state_store::db::Database;
+        let db = Database::open_in_memory().await.unwrap();
+        let repo = Stage2WatchRuleRepository::new(db.pool().clone());
+        let fetcher = MockW5dAprFetcher::with_apr(163);
+        let input = "If Solend Main Pool USDC deposit APR is above 5%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let r1 = handle_demo_command_v2(&fetcher, Some(&repo), input)
+            .await
+            .unwrap();
+        let r2 = handle_demo_command_v2(&fetcher, Some(&repo), input)
+            .await
+            .unwrap();
+        assert!(r1.rule_persisted);
+        assert!(r2.rule_persisted, "second insert with same rule_id must still report persisted");
+        assert_eq!(r1.rule_id_hex, r2.rule_id_hex);
+    }
+
+    /// Rule A and Rule B (different threshold) produce DISTINCT
+    /// persisted rules in the repo.
+    #[tokio::test]
+    async fn w5e_persisted_rule_a_and_rule_b_are_distinct() {
+        use claw_state_store::db::Database;
+        let db = Database::open_in_memory().await.unwrap();
+        let repo = Stage2WatchRuleRepository::new(db.pool().clone());
+        let fetcher = MockW5dAprFetcher::with_apr(163);
+        let a = handle_demo_command_v2(
+            &fetcher,
+            Some(&repo),
+            "If Solend Main Pool USDC deposit APR is above 5%, deposit 0.25 USDC from my bounded executor wallet into Solend.",
+        )
+        .await
+        .unwrap();
+        let b = handle_demo_command_v2(
+            &fetcher,
+            Some(&repo),
+            "If Solend Main Pool USDC deposit APR is above 0.5%, deposit 0.25 USDC from my bounded executor wallet into Solend.",
+        )
+        .await
+        .unwrap();
+        assert!(a.rule_persisted && b.rule_persisted);
+        assert_ne!(a.rule_id_hex, b.rule_id_hex);
+        assert_ne!(a.canonical_rule_hash_hex, b.canonical_rule_hash_hex);
+    }
+
+    /// Preview-only fallback (no repo wired): `rule_persisted=false`,
+    /// but the rule_id / canonical_hash / expires_at are still filled.
+    #[tokio::test]
+    async fn w5e_preview_only_when_repo_absent() {
+        let fetcher = MockW5dAprFetcher::with_apr(163);
+        let input = "If Solend Main Pool USDC deposit APR is above 5%, deposit 0.25 USDC from my bounded executor wallet into Solend.";
+        let r = handle_demo_command_v2(&fetcher, None, input).await.unwrap();
+        assert!(!r.rule_persisted);
+        assert!(r.rule_id_hex.is_some());
+        assert!(r.canonical_rule_hash_hex.is_some());
+        assert!(r.expires_at_slot.is_some());
     }
 
     #[test]

@@ -265,8 +265,9 @@ export interface ChatRequest {
 ///
 /// Produced by the chat handler's W5d demo-bridge interceptor when the
 /// user types the deterministic demo grammar. The chat route NEVER
-/// broadcasts a tx in this slice — `tx_signature` is always `null`
-/// and `status` is one of `"condition_not_met"` | `"ready_to_execute"`.
+/// broadcasts a tx — `tx_signature` is always `null`. W5e extended the
+/// status enum to `"watching" | "ready_to_execute" | "needs_funding"`
+/// and added budget / liveness / rule-id fields.
 export interface W5dConditionalDepositResult {
   input_text: string;
   /// Always `"onchain_reserve_b_o1"` from the chat route — the live
@@ -285,12 +286,46 @@ export interface W5dConditionalDepositResult {
   threshold_pct_label: string;
   /// Strict `current_apr_bps > threshold_bps`.
   condition_met: boolean;
-  /// Always `false` from the chat route in the present slice.
+  /// Always `false` from the chat route.
   execution_attempted: boolean;
-  /// `"condition_not_met"` | `"ready_to_execute"`.
+  /// W5e status enum: `"watching"` (condition false, budget reserved) |
+  /// `"ready_to_execute"` (condition true, budget reserved) |
+  /// `"needs_funding"` (controlled-wallet USDC balance below required
+  /// budget — hard precondition, decided before condition_met).
   status: string;
-  /// Reserved; always `null` in the present slice.
+  /// Reserved; always `null` from the chat route (no broadcast).
   tx_signature: string | null;
+
+  // ── W5e budget + liveness + persistence ──────────────────────────────
+
+  /// Base58 of the pinned controlled wallet (the bounded executor).
+  controlled_wallet: string;
+  /// Base58 of the controlled wallet's USDC ATA — the source account
+  /// for the would-be deposit; the UI surfaces this for Copy buttons.
+  source_usdc_ata: string;
+  /// Required budget in raw USDC units (1 USDC = 1_000_000). Constant
+  /// `250_000` for the W5d/W5e deposit grammar.
+  required_budget_raw: number;
+  /// Live USDC balance at the controlled wallet's USDC ATA, raw units.
+  current_budget_raw: number;
+  /// `"reserved"` when `current_budget_raw >= required_budget_raw`;
+  /// `"needs_funding"` otherwise. Independent of `condition_met`.
+  budget_status: string;
+  /// Solana slot at which the reserve + balance were read. Liveness
+  /// anchor — the UI must surface this so the user can verify freshness.
+  last_checked_slot: number;
+  /// `last_checked_slot + W5E_DEMO_EXPIRY_SLOTS` (50 000 slots ≈ 6 h).
+  expires_at_slot: number | null;
+  /// 16-byte hex of the deterministic rule id derived from the parsed
+  /// command + controlled wallet. Same command ⇒ same id (idempotent);
+  /// changed threshold ⇒ different id.
+  rule_id_hex: string | null;
+  /// 32-byte hex of the canonical Borsh-encoded rule hash. Lets the UI
+  /// surface an integrity anchor distinct from the rule id.
+  canonical_rule_hash_hex: string | null;
+  /// True iff the gateway successfully persisted (or found existing)
+  /// the rule via `Stage2WatchRuleRepository`. False ⇒ preview-only.
+  rule_persisted: boolean;
 }
 
 /// Discriminated union mirroring Rust's `ChatResponse` enum.
