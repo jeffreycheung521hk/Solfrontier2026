@@ -254,3 +254,148 @@ export function formatUsdcBaseUnits(
 export function solscanTxUrl(signature: string): string {
   return `https://solscan.io/tx/${signature}`;
 }
+
+// ── Confirmation watcher (getSignatureStatuses polling) ───────────────────
+//
+// Replaces the previous `Connection.confirmTransaction({ blockhash,
+// lastValidBlockHeight }, ...)` path that gave up at the block-height
+// window even when the tx finalized after that window. The new helper
+// polls `getSignatureStatuses` with `searchTransactionHistory: true`
+// so a tx that landed late (after the block-height window) is still
+// observed and reported as `finalized`.
+//
+// Empirical reference: tx
+// 5RWXZhGeFWohJAdSv2iUrM1qiBFSNnaxkqq8dEBErauoLi2y8rGvqavSDKv4WVhgomDkhH55r7yZ5UiTmvGr6Px9
+// (slot 418961171, err=None, fee=80000 lamports) finalized cleanly on
+// mainnet but the OLD `confirmTransaction` path raised "block height
+// exceeded" before the tx landed. The poller below would have
+// reported `kind: "finalized"` for the same signature.
+//
+// SAFETY invariants upheld here:
+//   - Bounded loop. `MAX_POLL_ATTEMPTS_DEFAULT = 60` × 2 s = 120 s
+//     ceiling; the helper never loops indefinitely.
+//   - Read-only. Calls `getSignatureStatuses` only. Never re-sends,
+//     never re-signs, never broadcasts.
+//   - Treats `status.err !== null` as a real failure — never reports
+//     `finalized` for a tx whose on-chain error is set.
+//   - Reports a `timeout` outcome when the chain is silent past the
+//     cap; the caller is expected to surface "the tx may still
+//     land — verify on Solscan" copy, NOT a destructive failure.
+
+/// Structural projection of the web3.js `Connection` surface this
+/// helper depends on. Keeps the helper testable with a tiny mock and
+/// avoids importing the full `Connection` type into pure-logic land.
+export interface SignatureStatusFetcher {
+  getSignatureStatuses(
+    signatures: string[],
+    opts: { searchTransactionHistory: boolean },
+  ): Promise<{
+    value: Array<{
+      err: unknown | null;
+      confirmationStatus?: string | null;
+    } | null>;
+  }>;
+}
+
+export type SignatureStatusPollResult =
+  | { kind: "finalized" }
+  | { kind: "failed_on_chain"; err: unknown }
+  | { kind: "timeout" };
+
+/// Thrown by `pollSignatureStatus` when `getSignatureStatuses` raises
+/// more than 3 times in a row. The caller catches and reports
+/// "Network error polling status; verify on Solscan: <signature>"
+/// without losing the signature.
+export class SignatureStatusNetworkError extends Error {
+  public readonly consecutiveErrors: number;
+  public readonly lastError: unknown;
+  constructor(consecutiveErrors: number, lastError: unknown) {
+    super(
+      `getSignatureStatuses failed ${consecutiveErrors} times in a row` +
+        (lastError instanceof Error ? `: ${lastError.message}` : ""),
+    );
+    this.name = "SignatureStatusNetworkError";
+    this.consecutiveErrors = consecutiveErrors;
+    this.lastError = lastError;
+  }
+}
+
+export interface PollSignatureStatusOptions {
+  /** Hard upper bound on poll iterations. Default 60 (≈120 s with
+   *  `intervalMs = 2000`). */
+  maxAttempts: number;
+  /** Sleep between successful polls, in milliseconds. */
+  intervalMs: number;
+  /** Optional progress callback — fired with the 1-indexed attempt
+   *  number every iteration. UI uses this to update the "attempt
+   *  N of M" copy. */
+  onAttempt?: (n: number) => void;
+}
+
+export const MAX_POLL_ATTEMPTS_DEFAULT = 60;
+export const POLL_INTERVAL_MS_DEFAULT = 2_000;
+
+/// Poll `getSignatureStatuses([signature])` with
+/// `searchTransactionHistory: true` until one of:
+///   - the entry's `err === null` AND `confirmationStatus` ∈
+///     {"confirmed","finalized"}     → `{ kind: "finalized" }`
+///   - the entry's `err !== null`     → `{ kind: "failed_on_chain", err }`
+///   - we hit `maxAttempts` with the entry still `null`
+///                                    → `{ kind: "timeout" }`
+///   - the fetch itself throws > 3 consecutive times
+///                                    → `throw SignatureStatusNetworkError`
+///
+/// Note: a `"processed"` confirmation status is NOT terminal here —
+/// we keep polling until the cluster promotes it to `"confirmed"` or
+/// `"finalized"` (or we time out). This matches the prompt's spec.
+export async function pollSignatureStatus(
+  connection: SignatureStatusFetcher,
+  signature: string,
+  opts: PollSignatureStatusOptions,
+): Promise<SignatureStatusPollResult> {
+  let consecutiveNetworkErrors = 0;
+  let lastNetworkError: unknown = null;
+  for (let attempt = 1; attempt <= opts.maxAttempts; attempt++) {
+    opts.onAttempt?.(attempt);
+    let statuses;
+    try {
+      statuses = await connection.getSignatureStatuses([signature], {
+        searchTransactionHistory: true,
+      });
+      consecutiveNetworkErrors = 0;
+    } catch (err) {
+      consecutiveNetworkErrors += 1;
+      lastNetworkError = err;
+      if (consecutiveNetworkErrors > 3) {
+        throw new SignatureStatusNetworkError(
+          consecutiveNetworkErrors,
+          lastNetworkError,
+        );
+      }
+      // Treat transient throw as a no-op poll: don't increment the
+      // logical attempt counter further (we already did), but DO
+      // sleep before retrying so we don't hammer the RPC.
+      await sleep(opts.intervalMs);
+      continue;
+    }
+    const status = statuses.value[0] ?? null;
+    if (status !== null) {
+      if (status.err !== null && status.err !== undefined) {
+        return { kind: "failed_on_chain", err: status.err };
+      }
+      const cs = status.confirmationStatus;
+      if (cs === "confirmed" || cs === "finalized") {
+        return { kind: "finalized" };
+      }
+      // "processed" or unknown — keep polling.
+    }
+    if (attempt < opts.maxAttempts) {
+      await sleep(opts.intervalMs);
+    }
+  }
+  return { kind: "timeout" };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

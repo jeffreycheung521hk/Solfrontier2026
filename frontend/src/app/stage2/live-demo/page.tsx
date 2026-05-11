@@ -41,11 +41,15 @@ import {
   CONTROLLED_WALLET_BASE58,
   FUNDING_AMOUNT_BASE_UNITS,
   FUNDING_AMOUNT_UI_LABEL,
+  MAX_POLL_ATTEMPTS_DEFAULT,
+  POLL_INTERVAL_MS_DEFAULT,
+  SignatureStatusNetworkError,
   USDC_DECIMALS,
   USDC_MINT_BASE58,
   buildFundingTransaction,
   deriveAtaPubkey,
   formatUsdcBaseUnits,
+  pollSignatureStatus,
   solscanTxUrl,
 } from "@/lib/stage2-funding";
 
@@ -71,9 +75,21 @@ type FundingState =
   | { kind: "preparing" }
   | { kind: "awaiting_signature" }
   | { kind: "broadcasting" }
-  | { kind: "confirming"; signature: string }
+  /// Right after sendRawTransaction returns. The signature is on the
+  /// wire — show signature + Solscan link immediately so the user
+  /// has the proof they can verify externally even if our poll
+  /// later times out.
+  | { kind: "submitted"; signature: string }
+  /// Polling getSignatureStatuses with searchTransactionHistory:true.
+  /// `attempts` drives both the "attempt N of M" UI label and the
+  /// "switch headline to 'Confirmation delayed'" timing (after the
+  /// first few seconds).
+  | { kind: "confirming"; signature: string; attempts: number }
   | { kind: "finalized"; signature: string }
-  | { kind: "error"; reason: string };
+  /// `signature` is optional because some pre-broadcast errors
+  /// (e.g. RPC blockhash fetch failure, Phantom rejection) never
+  /// produce a signature.
+  | { kind: "error"; reason: string; signature?: string };
 
 interface SourceAccount {
   pubkey: PublicKey;
@@ -249,6 +265,7 @@ function LiveDemoBody() {
     state.kind === "preparing" ||
     state.kind === "awaiting_signature" ||
     state.kind === "broadcasting" ||
+    state.kind === "submitted" ||
     state.kind === "confirming";
 
   const disabled =
@@ -356,36 +373,62 @@ function LiveDemoBody() {
       return;
     }
 
-    // 5. Confirm.
-    setState({ kind: "confirming", signature });
+    // 5. Submitted — bytes are on the wire. Show the signature
+    //    immediately so the operator can verify on Solscan even if
+    //    the poll below times out.
+    setState({ kind: "submitted", signature });
+
+    // 6. Confirm via getSignatureStatuses polling.
+    //    Replaces the old `confirmTransaction({ blockhash,
+    //    lastValidBlockHeight: 0 }, ...)` path that raised
+    //    "block height exceeded" before late-landing txs finalized.
+    //    The poller uses `searchTransactionHistory: true` so a
+    //    signature that landed AFTER its blockhash window expired
+    //    is still observed and reported as `finalized`.
+    //    Reference: tx 5RWXZh…r6Px9 (slot 418961171, err=None) —
+    //    finalized cleanly on mainnet but the OLD path gave up at
+    //    block-height-exceeded BEFORE the tx landed.
     try {
-      const conf = await connection.confirmTransaction(
-        { signature, blockhash, lastValidBlockHeight: 0 },
-        "confirmed",
-      );
-      if (conf.value.err !== null) {
+      const result = await pollSignatureStatus(connection, signature, {
+        maxAttempts: MAX_POLL_ATTEMPTS_DEFAULT,
+        intervalMs: POLL_INTERVAL_MS_DEFAULT,
+        onAttempt: (n) => {
+          setState({ kind: "confirming", signature, attempts: n });
+        },
+      });
+      if (result.kind === "finalized") {
+        setState({ kind: "finalized", signature });
+        // Refresh balances so the UI shows the new state.
+        void refreshBalances();
+      } else if (result.kind === "failed_on_chain") {
         setState({
           kind: "error",
-          reason: `Transaction confirmed with error: ${JSON.stringify(
-            conf.value.err,
-          )}`,
+          reason: `Transaction failed on chain: ${JSON.stringify(result.err)}`,
+          signature,
+        });
+      } else {
+        // timeout — the tx MAY still land; we just stopped polling.
+        // Keep the signature visible so the operator can verify on
+        // Solscan. Distinct from a real on-chain failure; the UI
+        // renders this in amber, not red.
+        setState({
+          kind: "error",
+          reason:
+            `Confirmation timeout after ${(MAX_POLL_ATTEMPTS_DEFAULT * POLL_INTERVAL_MS_DEFAULT) / 1000}s. ` +
+            "The tx may still land — verify on Solscan.",
+          signature,
+        });
+      }
+    } catch (err) {
+      if (err instanceof SignatureStatusNetworkError) {
+        setState({
+          kind: "error",
+          reason: "Network error polling status; verify on Solscan.",
+          signature,
         });
         return;
       }
-      setState({ kind: "finalized", signature });
-      // Refresh balances so the UI shows the new state.
-      void refreshBalances();
-    } catch (err) {
-      // Confirmation can fail with a transient error even though the
-      // signature DID broadcast. Surface the signature so the
-      // operator can verify on Solscan.
-      setState({
-        kind: "error",
-        reason:
-          err instanceof Error
-            ? `Confirmation poll failed (tx may still land — check ${signature}): ${err.message}`
-            : `Confirmation poll failed; signature: ${signature}`,
-      });
+      throw err;
     }
   }, [
     balanceSufficient,
@@ -586,17 +629,22 @@ function LiveDemoBody() {
         </Alert>
       )}
 
-      {state.kind === "error" && (
+      {(state.kind === "submitted" ||
+        state.kind === "confirming" ||
+        state.kind === "finalized" ||
+        (state.kind === "error" && state.signature !== undefined)) && (
+        <SignaturePanel state={state} />
+      )}
+
+      {/* Pre-broadcast errors (no signature) get the plain red banner
+          since the user has nothing to verify on Solscan. */}
+      {state.kind === "error" && state.signature === undefined && (
         <Alert variant="destructive">
           <AlertTitle className="text-sm">Funding error</AlertTitle>
           <AlertDescription className="text-xs break-words">
             {state.reason}
           </AlertDescription>
         </Alert>
-      )}
-
-      {(state.kind === "confirming" || state.kind === "finalized") && (
-        <SignaturePanel state={state} />
       )}
 
       <Separator />
@@ -625,11 +673,13 @@ function LiveDemoBody() {
               ? "Awaiting Phantom…"
               : state.kind === "broadcasting"
                 ? "Broadcasting…"
-                : state.kind === "confirming"
-                  ? "Confirming…"
-                  : state.kind === "finalized"
-                    ? "Funded ✓"
-                    : "Fund Controlled Wallet (5 USDC)"}
+                : state.kind === "submitted"
+                  ? "Submitted, confirming…"
+                  : state.kind === "confirming"
+                    ? `Confirming… (attempt ${state.attempts}/${MAX_POLL_ATTEMPTS_DEFAULT})`
+                    : state.kind === "finalized"
+                      ? "Funded ✓"
+                      : "Fund Controlled Wallet (5 USDC)"}
         </Button>
       </div>
 
@@ -644,44 +694,127 @@ function LiveDemoBody() {
 
 // ── Sub-components ───────────────────────────────────────────────────────
 
+/// Threshold (in poll attempts) past which we promote the
+/// "submitted" headline to "Confirmation delayed". At
+/// POLL_INTERVAL_MS_DEFAULT = 2 000 ms this is ≈ 5 s after the
+/// first poll fires — matches the prompt's "after the first 5
+/// seconds" guidance.
+const CONFIRMATION_DELAYED_AFTER_ATTEMPTS = 3;
+
 function SignaturePanel({
   state,
 }: {
   state:
-    | { kind: "confirming"; signature: string }
-    | { kind: "finalized"; signature: string };
+    | { kind: "submitted"; signature: string }
+    | { kind: "confirming"; signature: string; attempts: number }
+    | { kind: "finalized"; signature: string }
+    | { kind: "error"; reason: string; signature?: string };
 }) {
-  const finalized = state.kind === "finalized";
+  const meta = panelMeta(state);
   return (
     <Alert
-      className={finalized ? "border-green-500/40" : "border-foreground/15"}
-      data-testid={`funding-${state.kind}`}
+      className={meta.borderClass}
+      data-testid={`funding-${state.kind}${
+        state.kind === "error"
+          ? meta.errorVariant === "on_chain"
+            ? "-failed-on-chain"
+            : "-timeout"
+          : ""
+      }`}
     >
-      <AlertTitle className="text-sm">
-        {finalized ? "Funding confirmed" : "Confirming on chain…"}
-      </AlertTitle>
+      <AlertTitle className="text-sm">{meta.headline}</AlertTitle>
       <AlertDescription className="text-xs space-y-1">
         <div>
           tx{" "}
-          <a
-            href={solscanTxUrl(state.signature)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="font-mono underline hover:text-foreground"
-            data-testid="solscan-link"
-          >
-            {state.signature.slice(0, 8)}…{state.signature.slice(-6)}
-          </a>
+          {state.signature !== undefined ? (
+            <a
+              href={solscanTxUrl(state.signature)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-mono underline hover:text-foreground"
+              data-testid="solscan-link"
+            >
+              {state.signature.slice(0, 8)}…{state.signature.slice(-6)}
+            </a>
+          ) : (
+            <span className="text-muted-foreground italic">—</span>
+          )}
         </div>
-        {finalized && (
-          <div className="text-muted-foreground">
-            5 USDC now in the controlled wallet. Automation may act only
-            on this wallet&apos;s funds; your main wallet is untouched.
-          </div>
+        {meta.body && (
+          <div className="text-muted-foreground">{meta.body}</div>
         )}
       </AlertDescription>
     </Alert>
   );
+}
+
+interface PanelMeta {
+  headline: string;
+  body: string | null;
+  borderClass: string;
+  /** Only set when `state.kind === "error"`; drives data-testid. */
+  errorVariant?: "on_chain" | "timeout";
+}
+
+function panelMeta(state: {
+  kind: "submitted" | "confirming" | "finalized" | "error";
+  signature?: string;
+  reason?: string;
+  attempts?: number;
+}): PanelMeta {
+  if (state.kind === "submitted") {
+    return {
+      headline: "Transaction submitted",
+      body:
+        "Signed bytes are on the wire. The frontend is now polling " +
+        "getSignatureStatuses with searchTransactionHistory enabled — " +
+        "this will observe finalization even if the blockhash window expires.",
+      // Neutral / amber per spec — NOT red, NOT green.
+      borderClass: "border-amber-500/40",
+    };
+  }
+  if (state.kind === "confirming") {
+    const attempts = state.attempts ?? 0;
+    const delayed = attempts > CONFIRMATION_DELAYED_AFTER_ATTEMPTS;
+    return {
+      headline: delayed
+        ? "Confirmation delayed — checking chain status"
+        : "Transaction submitted",
+      body: `Polling getSignatureStatuses… attempt ${attempts} of ${MAX_POLL_ATTEMPTS_DEFAULT}`,
+      borderClass: "border-amber-500/40",
+    };
+  }
+  if (state.kind === "finalized") {
+    return {
+      headline: "Finalized on mainnet",
+      body:
+        `${FUNDING_AMOUNT_UI_LABEL} moved to the controlled wallet. ` +
+        "Automation may act only on this wallet's funds; your main wallet is untouched.",
+      borderClass: "border-green-500/40",
+    };
+  }
+  // state.kind === "error" (signature defined → render via panel)
+  const reason = state.reason ?? "Funding error.";
+  const isOnChainFailure = /^Transaction failed on chain/i.test(reason);
+  if (isOnChainFailure) {
+    return {
+      headline: "Transaction failed on chain",
+      body: reason.replace(/^Transaction failed on chain:\s*/i, ""),
+      // Red border for an actual on-chain failure (status.err set).
+      borderClass: "border-destructive/40",
+      errorVariant: "on_chain",
+    };
+  }
+  // Confirmation timeout / network error during polling — the tx
+  // MAY still land. Amber, NOT red, per the prompt's UX rule.
+  return {
+    headline: "Confirmation timeout",
+    body:
+      "Waited past the poll cap without seeing the tx confirm. " +
+      "The tx may still land — verify on Solscan.",
+    borderClass: "border-amber-500/40",
+    errorVariant: "timeout",
+  };
 }
 
 function KeyValueRow({ k, v }: { k: string; v: React.ReactNode }) {
