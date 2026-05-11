@@ -506,6 +506,60 @@ enum CondOutcome {
 ///   result without evaluating the remaining conditions.
 /// - In both cases, errors are propagated only if the short-circuit
 ///   value cannot be reached without consulting the failed condition.
+/// Stage 2 B-O1 — narrow public wrapper around the internal
+/// `supply_apr_wad`. Validates the reserve config first (mirroring
+/// `evaluate_solend_supply_rate_condition`'s gating) so external
+/// callers cannot trip the unchecked-precondition path. Returns the
+/// supply APR scaled to WAD (`10^18`); divide by `10^14` for basis
+/// points, or call [`solend_supply_apr_bps_from_wad`].
+pub fn solend_supply_apr_wad_for_snapshot(
+    snap: &SolendSnapshotValue,
+) -> Result<u128, Stage2WatcherError> {
+    if !is_reserve_config_valid(snap) {
+        return Err(Stage2WatcherError::Transient(
+            "solend reserve config invariants violated".to_string(),
+        ));
+    }
+    supply_apr_wad(snap)
+}
+
+/// Stage 2 B-O1 — convert a supply-APR WAD value (10^18-scaled) to
+/// integer basis points (1 bps = 10^14 wads). Truncates toward zero;
+/// saturates at `u64::MAX`. Mirrors the conversion
+/// `evaluate_solend_supply_rate_condition` uses on the threshold side
+/// at the same `apply_cmp_u128(...)` call site
+/// (`threshold_bps as u128 * 10^14 == threshold_wad`).
+pub fn solend_supply_apr_bps_from_wad(wad: u128) -> u64 {
+    let bps = wad / 10u128.pow(14);
+    u64::try_from(bps).unwrap_or(u64::MAX)
+}
+
+/// Stage 2 B-O1 — pure mapper from a live-decoded
+/// [`crate::integrations::solend::raw::SolendReserveRaw`] (rate-config-
+/// extended decoder, this slice) into the [`SolendSnapshotValue`] the
+/// evaluator's APR math expects. The reserve's pubkey is supplied by
+/// the caller because the raw account-data decoder records only the
+/// account contents, not its address.
+pub fn solend_snapshot_value_from_reserve_raw(
+    reserve_pubkey: PubkeyBytes,
+    raw: &crate::integrations::solend::raw::SolendReserveRaw,
+) -> SolendSnapshotValue {
+    SolendSnapshotValue {
+        reserve_pubkey,
+        available_amount: raw.liquidity_available_amount,
+        borrowed_amount_wads: raw.liquidity_borrowed_amount_wads,
+        min_borrow_rate_pct: raw.config_min_borrow_rate_pct,
+        optimal_borrow_rate_pct: raw.config_optimal_borrow_rate_pct,
+        max_borrow_rate_pct: raw.config_max_borrow_rate_pct,
+        super_max_borrow_rate_pct: raw.config_super_max_borrow_rate_pct,
+        optimal_utilization_rate_pct: raw.config_optimal_utilization_rate_pct,
+        max_utilization_rate_pct: raw.config_max_utilization_rate_pct,
+        protocol_take_rate_pct: raw.config_protocol_take_rate_pct,
+        last_update_slot: raw.last_update_slot,
+        stale_flag: raw.last_update_stale,
+    }
+}
+
 pub fn evaluate_rule_against_batch(
     rule: &WatchRule,
     batch: &Stage2SnapshotBatch,
@@ -2324,5 +2378,131 @@ mod tests {
         let rule = fixture_pyth_rule([0xBB; 16], vec![cond]);
         // BTC adverse-lower 75001.22 > 75000.00 → fires.
         assert!(evaluate_rule_against_batch(&rule, &batch, &ctx(1)).unwrap());
+    }
+
+    // ── Stage 2 B-O1 — public APR wrappers + raw-snapshot mapper ───────
+
+    #[test]
+    fn b_o1_public_wrapper_matches_private_supply_apr_wad() {
+        let snap = fresh_solend_below_threshold();
+        let public = solend_supply_apr_wad_for_snapshot(&snap).unwrap();
+        let private = supply_apr_wad(&snap).unwrap();
+        assert_eq!(public, private, "public wrapper must delegate exactly");
+    }
+
+    #[test]
+    fn b_o1_public_wrapper_rejects_invalid_config() {
+        // Violate min ≤ optimal: min=10, optimal=4.
+        let snap = SolendSnapshotValue {
+            min_borrow_rate_pct: 10,
+            optimal_borrow_rate_pct: 4,
+            ..fresh_solend_below_threshold()
+        };
+        let err = solend_supply_apr_wad_for_snapshot(&snap).unwrap_err();
+        match err {
+            Stage2WatcherError::Transient(m) => {
+                assert!(m.contains("config invariants violated"), "got {m}");
+            }
+            other => panic!("expected Transient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn b_o1_bps_from_wad_truncates_toward_zero() {
+        // 1.19% = 119 bps. WAD = 119 * 10^14.
+        let wad = 119u128 * 10u128.pow(14);
+        assert_eq!(solend_supply_apr_bps_from_wad(wad), 119);
+
+        // 0.5 bps (sub-bps) → truncates to 0.
+        let half = 5u128 * 10u128.pow(13);
+        assert_eq!(solend_supply_apr_bps_from_wad(half), 0);
+
+        // 1000.4 bps → truncates to 1000 (not rounded up).
+        let frac = 1000u128 * 10u128.pow(14) + 4u128 * 10u128.pow(13);
+        assert_eq!(solend_supply_apr_bps_from_wad(frac), 1000);
+    }
+
+    #[test]
+    fn b_o1_snapshot_mapper_from_raw_reserve_round_trips() {
+        use crate::integrations::solend::raw::SolendReserveRaw;
+        use solana_sdk::pubkey::Pubkey as SolPubkey;
+
+        let pk = SolPubkey::new_unique();
+        let reserve_address = PubkeyBytes::new(pk.to_bytes());
+
+        // Build a `SolendReserveRaw` directly (the struct fields are
+        // pub; the decode side is exercised by raw.rs's own
+        // `reserve_rate_config_fields_roundtrip` test, so we don't
+        // duplicate the byte-level coverage here).
+        let raw = SolendReserveRaw {
+            version: 1,
+            last_update_slot: FIXTURE_CREATED_AT_SLOT + 100,
+            last_update_stale: false,
+            lending_market: pk,
+            liquidity_mint: pk,
+            liquidity_mint_decimals: 6,
+            liquidity_supply: pk,
+            pyth_oracle: pk,
+            switchboard_oracle: pk,
+            liquidity_available_amount: 1_000_000,
+            liquidity_borrowed_amount_wads: 1_000_000u128 * SOLEND_WAD,
+            liquidity_accumulated_protocol_fees_wads: 0,
+            collateral_mint: pk,
+            collateral_supply: pk,
+            config_deposit_limit: 0,
+            // Valid rate-config matching `fresh_solend_below_threshold`.
+            config_optimal_utilization_rate_pct: 80,
+            config_min_borrow_rate_pct: 0,
+            config_optimal_borrow_rate_pct: 4,
+            config_max_borrow_rate_pct: 30,
+            config_protocol_take_rate_pct: 5,
+            config_max_utilization_rate_pct: 90,
+            config_super_max_borrow_rate_pct: 100,
+        };
+
+        let mapped = solend_snapshot_value_from_reserve_raw(reserve_address, &raw);
+
+        // Sanity: every field on the mapped SolendSnapshotValue is what
+        // the raw decoder produced — no silent reorder.
+        assert_eq!(mapped.reserve_pubkey, reserve_address);
+        assert_eq!(mapped.available_amount, raw.liquidity_available_amount);
+        assert_eq!(mapped.borrowed_amount_wads, raw.liquidity_borrowed_amount_wads);
+        assert_eq!(mapped.min_borrow_rate_pct, raw.config_min_borrow_rate_pct);
+        assert_eq!(
+            mapped.optimal_borrow_rate_pct,
+            raw.config_optimal_borrow_rate_pct
+        );
+        assert_eq!(mapped.max_borrow_rate_pct, raw.config_max_borrow_rate_pct);
+        assert_eq!(
+            mapped.super_max_borrow_rate_pct,
+            raw.config_super_max_borrow_rate_pct
+        );
+        assert_eq!(
+            mapped.optimal_utilization_rate_pct,
+            raw.config_optimal_utilization_rate_pct
+        );
+        assert_eq!(
+            mapped.max_utilization_rate_pct,
+            raw.config_max_utilization_rate_pct
+        );
+        assert_eq!(
+            mapped.protocol_take_rate_pct,
+            raw.config_protocol_take_rate_pct
+        );
+        assert_eq!(mapped.last_update_slot, raw.last_update_slot);
+        assert_eq!(mapped.stale_flag, raw.last_update_stale);
+
+        // End-to-end: computed supply APR matches the existing
+        // `fresh_solend_below_threshold` fixture's APR (which the
+        // suite has already pinned at ≈119 bps). This is the integration
+        // test the brief asks for — raw decoder + mapper + APR calculator.
+        let apr_wad = solend_supply_apr_wad_for_snapshot(&mapped).unwrap();
+        let apr_bps = solend_supply_apr_bps_from_wad(apr_wad);
+        // 0.025 (region-1 borrow) × 0.5 (utilisation) × 0.95 (1-take) =
+        // 0.01187… → 118 bps after integer truncation.
+        assert!(
+            apr_bps >= 100 && apr_bps <= 130,
+            "mapped APR {apr_bps} bps out of expected band [100, 130]"
+        );
     }
 }

@@ -138,13 +138,13 @@ const OBL_LIQ_BORROWED_AMOUNT_WADS_OFF: usize = 48;
 //   227   32   collateral.mint_pubkey (Pubkey)
 //   259   8    collateral.mint_total_supply              — SKIPPED
 //   267   32   collateral.supply_pubkey (Pubkey)
-//   299   1    config.optimal_utilization_rate           — SKIPPED
+//   299   1    config.optimal_utilization_rate (u8)      — READ (B-O1)
 //   300   1    config.loan_to_value_ratio                — SKIPPED
 //   301   1    config.liquidation_bonus                  — SKIPPED
 //   302   1    config.liquidation_threshold              — SKIPPED
-//   303   1    config.min_borrow_rate                    — SKIPPED
-//   304   1    config.optimal_borrow_rate                — SKIPPED
-//   305   1    config.max_borrow_rate                    — SKIPPED
+//   303   1    config.min_borrow_rate (u8)               — READ (B-O1)
+//   304   1    config.optimal_borrow_rate (u8)           — READ (B-O1)
+//   305   1    config.max_borrow_rate (u8)               — READ (B-O1)
 //   306   8    config.fees.borrow_fee_wad                — SKIPPED
 //   314   8    config.fees.flash_loan_fee_wad            — SKIPPED
 //   322   1    config.fees.host_fee_percentage           — SKIPPED
@@ -152,12 +152,38 @@ const OBL_LIQ_BORROWED_AMOUNT_WADS_OFF: usize = 48;
 //   331   8    config.borrow_limit                       — SKIPPED
 //   339   32   config.fee_receiver                       — SKIPPED
 //   371   1    config.protocol_liquidation_fee           — SKIPPED
-//   372   1    config.protocol_take_rate                 — SKIPPED
+//   372   1    config.protocol_take_rate (u8)            — READ (B-O1)
 //   373   16   liquidity.accumulated_protocol_fees_wads  — READ (Slice 3D(iii))
 //   389   56   rate_limiter (RATE_LIMITER_LEN = 56)      — SKIPPED
 //   445   8    config.added_borrow_weight_bps            — SKIPPED
-//   ...   ...  (remaining extension fields)              — SKIPPED
+//   453   16   liquidity.smoothed_market_price           — SKIPPED
+//   469   1    config.asset_type / reserve_type          — SKIPPED
+//   470   1    config.max_utilization_rate (u8)          — READ (B-O1)
+//   471   8    config.super_max_borrow_rate (u64 LE)     — READ (B-O1)
+//   479   1    config.max_liquidation_bonus              — SKIPPED
+//   480   1    config.max_liquidation_threshold          — SKIPPED
+//   481   8    config.scaled_price_offset_bps            — SKIPPED
+//   489   32   config.extra_oracle_pubkey                — SKIPPED
+//   521   1    liquidity.extra_market_price_flag         — SKIPPED
+//   522   16   liquidity.extra_market_price              — SKIPPED
+//   538   16   attributed_borrow_value                   — SKIPPED
+//   554   8    config.attributed_borrow_limit_open       — SKIPPED
+//   562   8    config.attributed_borrow_limit_close      — SKIPPED
+//   570   49   _padding                                  — SKIPPED
 //   619 total  (RESERVE_LEN)
+//
+// **B-O1 verification (2026-05-11)** — the 7 rate-config fields
+// flagged READ above were re-verified against the upstream
+// `solendprotocol/solana-program-library` mainnet branch source at
+// `token-lending/sdk/src/state/reserve.rs` (line 1245-onwards). The
+// `mut_array_refs!` field order in `impl Pack for Reserve` and the
+// `RATE_LIMITER_LEN = 56` constant from
+// `token-lending/sdk/src/state/rate_limiter.rs` give the exact
+// offsets pinned in the constants below. The cumulative sum
+// (1+8+1+32+32+1+32+32+32+8+16+16+16+32+8+32+1+1+1+1+1+1+1+8+8+1+8+8+
+// 32+1+1+16+56+8+16+1+1+8+1+1+8+32+1+16+16+8+8+49) equals 619 ==
+// RESERVE_LEN; a divergence here would break Pack invariance and is
+// caught by `reserve_rate_config_fields_roundtrip`.
 
 pub const RESERVE_LEN: usize = 619;
 
@@ -176,6 +202,28 @@ const RES_COLL_MINT_OFF: usize = 227;
 const RES_COLL_SUPPLY_OFF: usize = 267;
 const RES_CONFIG_DEPOSIT_LIMIT_OFF: usize = 323;
 const RES_LIQ_ACCUMULATED_PROTOCOL_FEES_WADS_OFF: usize = 373;
+
+// Stage 2 B-O1 — rate-config offsets verified against
+// solendprotocol/solana-program-library, `mainnet` branch,
+// `token-lending/sdk/src/state/reserve.rs::pack_into_slice` field
+// order at the `mut_array_refs!` macro call. The first 5 offsets fall
+// within the existing decoder's read window (≤ 372) and were already
+// documented in the byte-layout comment above; the last 2 fall in the
+// "remaining extension fields" range (offsets 470-471) that the
+// research doc `STAGE2_SOLEND_APY_RESEARCH.md` § B-O1 flagged as
+// open. They are derived deterministically from `RATE_LIMITER_LEN =
+// 56` (`token-lending/sdk/src/state/rate_limiter.rs`) plus the
+// post-rate-limiter field widths (added_borrow_weight_bps:u64=8,
+// liquidity_smoothed_market_price:u128=16, asset_type:u8=1) which
+// puts `config_max_utilization_rate` at 389+56+8+16+1 = 470 and
+// `config_super_max_borrow_rate` at 471.
+const RES_CONFIG_OPTIMAL_UTILIZATION_RATE_OFF: usize = 299;
+const RES_CONFIG_MIN_BORROW_RATE_OFF: usize = 303;
+const RES_CONFIG_OPTIMAL_BORROW_RATE_OFF: usize = 304;
+const RES_CONFIG_MAX_BORROW_RATE_OFF: usize = 305;
+const RES_CONFIG_PROTOCOL_TAKE_RATE_OFF: usize = 372;
+const RES_CONFIG_MAX_UTILIZATION_RATE_OFF: usize = 470;
+const RES_CONFIG_SUPER_MAX_BORROW_RATE_OFF: usize = 471;
 
 /// Decimal wad scale used by Solend (`10^18`). The packed representation
 /// of any Solend `Decimal` field is the `u128` scaled-value where one wad
@@ -256,6 +304,41 @@ pub struct SolendReserveRaw {
     /// underlying base units. Zero here means deposits are disabled on
     /// this reserve via config, not that the reserve is "empty".
     pub config_deposit_limit: u64,
+
+    // ── Stage 2 B-O1 — rate-config fields used by W3 evaluator's
+    // `supply_apr_wad` path. All offsets pinned against the upstream
+    // `mainnet` branch `pack_into_slice` field order; see the byte-layout
+    // comment block at the top of this file. Without these, a live
+    // SolendReserveRaw cannot be mapped to a `Stage2SnapshotValue` and
+    // the APR comparator cannot be evaluated against live state.
+    /// `ReserveConfig::optimal_utilization_rate` — percent (`u8`), 0..=100.
+    /// Read from byte offset 299. Used as the breakpoint between the
+    /// linear and kinked regions of the borrow-rate curve.
+    pub config_optimal_utilization_rate_pct: u8,
+    /// `ReserveConfig::min_borrow_rate` — percent (`u8`), 0..=100.
+    /// Read from byte offset 303. Floor of the kinked borrow-rate curve.
+    pub config_min_borrow_rate_pct: u8,
+    /// `ReserveConfig::optimal_borrow_rate` — percent (`u8`), 0..=100.
+    /// Read from byte offset 304. Rate at `optimal_utilization_rate`.
+    pub config_optimal_borrow_rate_pct: u8,
+    /// `ReserveConfig::max_borrow_rate` — percent (`u8`), 0..=100.
+    /// Read from byte offset 305. Rate at `max_utilization_rate`.
+    pub config_max_borrow_rate_pct: u8,
+    /// `ReserveConfig::protocol_take_rate` — percent (`u8`), 0..=100.
+    /// Read from byte offset 372. Fraction of supply yield that goes
+    /// to the protocol; `supply_apr = borrow_apr × util × (1 − take)`.
+    pub config_protocol_take_rate_pct: u8,
+    /// `ReserveConfig::max_utilization_rate` — percent (`u8`), 0..=100.
+    /// Read from byte offset 470 (mainnet extension field). Breakpoint
+    /// between the kinked and super-kinked regions of the curve.
+    pub config_max_utilization_rate_pct: u8,
+    /// `ReserveConfig::super_max_borrow_rate` — percent (`u64`).
+    /// Read from byte offset 471 (mainnet extension field). Width is
+    /// `u64` not `u8` — the deployed mainnet program uses values that
+    /// can exceed 255% in stress scenarios; truncating to `u8` would
+    /// silently break the third region of the kinked rate model (see
+    /// audit C-3 in `stage2_evaluator.rs`).
+    pub config_super_max_borrow_rate_pct: u64,
 }
 
 impl SolendReserveRaw {
@@ -465,9 +548,11 @@ pub fn decode_obligation(data: &[u8]) -> Result<SolendObligationRaw, DecodeError
 
 /// Decode the read-model-minimum subset of a Solend Reserve account.
 ///
-/// Only the fields Part 6B §64.2 lists as required for the Deposit-only
-/// slice are populated. Borrow-rate / config / rate-limiter fields are
-/// skipped.
+/// Reads the Deposit-only Part 6B §64.2 fields **plus** the 7 rate-config
+/// fields the Stage 2 W3 evaluator's `supply_apr_wad` path needs (Stage 2
+/// B-O1, May 2026). The borrow-fee config, fee-receiver, rate-limiter
+/// state, and most extension-padding fields remain skipped because no
+/// current evaluation surface reads them.
 pub fn decode_reserve(data: &[u8]) -> Result<SolendReserveRaw, DecodeError> {
     if data.len() != RESERVE_LEN {
         return Err(DecodeError::ReserveWrongSize(data.len()));
@@ -502,6 +587,17 @@ pub fn decode_reserve(data: &[u8]) -> Result<SolendReserveRaw, DecodeError> {
         collateral_mint: read_pubkey(data, RES_COLL_MINT_OFF),
         collateral_supply: read_pubkey(data, RES_COLL_SUPPLY_OFF),
         config_deposit_limit: read_u64_le(data, RES_CONFIG_DEPOSIT_LIMIT_OFF),
+        config_optimal_utilization_rate_pct: data
+            [RES_CONFIG_OPTIMAL_UTILIZATION_RATE_OFF],
+        config_min_borrow_rate_pct: data[RES_CONFIG_MIN_BORROW_RATE_OFF],
+        config_optimal_borrow_rate_pct: data[RES_CONFIG_OPTIMAL_BORROW_RATE_OFF],
+        config_max_borrow_rate_pct: data[RES_CONFIG_MAX_BORROW_RATE_OFF],
+        config_protocol_take_rate_pct: data[RES_CONFIG_PROTOCOL_TAKE_RATE_OFF],
+        config_max_utilization_rate_pct: data[RES_CONFIG_MAX_UTILIZATION_RATE_OFF],
+        config_super_max_borrow_rate_pct: read_u64_le(
+            data,
+            RES_CONFIG_SUPER_MAX_BORROW_RATE_OFF,
+        ),
     })
 }
 
@@ -701,6 +797,33 @@ mod tests {
             ..RES_LIQ_ACCUMULATED_PROTOCOL_FEES_WADS_OFF + 16]
             .copy_from_slice(&accumulated_fees_wads.to_le_bytes());
         out
+    }
+
+    /// Stage 2 B-O1 — overlay the 7 rate-config bytes onto a reserve
+    /// fixture already produced by [`synth_reserve_with_deposit_limit_fields`].
+    /// Kept as a separate helper so existing deposit-limit tests are
+    /// untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn overlay_reserve_rate_config_fields(
+        bytes: &mut [u8],
+        optimal_utilization_rate_pct: u8,
+        min_borrow_rate_pct: u8,
+        optimal_borrow_rate_pct: u8,
+        max_borrow_rate_pct: u8,
+        protocol_take_rate_pct: u8,
+        max_utilization_rate_pct: u8,
+        super_max_borrow_rate_pct: u64,
+    ) {
+        assert_eq!(bytes.len(), RESERVE_LEN);
+        bytes[RES_CONFIG_OPTIMAL_UTILIZATION_RATE_OFF] = optimal_utilization_rate_pct;
+        bytes[RES_CONFIG_MIN_BORROW_RATE_OFF] = min_borrow_rate_pct;
+        bytes[RES_CONFIG_OPTIMAL_BORROW_RATE_OFF] = optimal_borrow_rate_pct;
+        bytes[RES_CONFIG_MAX_BORROW_RATE_OFF] = max_borrow_rate_pct;
+        bytes[RES_CONFIG_PROTOCOL_TAKE_RATE_OFF] = protocol_take_rate_pct;
+        bytes[RES_CONFIG_MAX_UTILIZATION_RATE_OFF] = max_utilization_rate_pct;
+        bytes[RES_CONFIG_SUPER_MAX_BORROW_RATE_OFF
+            ..RES_CONFIG_SUPER_MAX_BORROW_RATE_OFF + 8]
+            .copy_from_slice(&super_max_borrow_rate_pct.to_le_bytes());
     }
 
     #[test]
@@ -1122,6 +1245,101 @@ mod tests {
         let sentinel: Pubkey = SOLEND_NULL_ORACLE_SENTINEL_BS58.parse().expect("parse");
         assert!(is_null_oracle_sentinel(&sentinel));
         assert!(!is_null_oracle_sentinel(&Pubkey::new_unique()));
+    }
+
+    /// Stage 2 B-O1 — round-trip the 7 rate-config fields through the
+    /// pinned offsets. Each field is given a distinct, recognizable
+    /// non-zero value so a silently swapped offset would break the
+    /// per-field assertion. The values are chosen to satisfy the
+    /// evaluator's `is_reserve_config_valid` ordering check
+    /// (`min ≤ optimal ≤ max ≤ super_max`,
+    ///  `optimal_util ≤ max_util ≤ 100`,
+    ///  `protocol_take ≤ 100`).
+    #[test]
+    fn reserve_rate_config_fields_roundtrip() {
+        let pk = Pubkey::new_unique();
+        let mut bytes = synth_reserve_with_deposit_limit_fields(
+            pk, pk, 6, pk, pk, pk, 0, pk, pk, 0, false, 0, 0, 0,
+        );
+        // Distinct values per field, all under 100 except super_max.
+        const OPTIMAL_UTIL: u8 = 80;
+        const MIN_BORROW: u8 = 1;
+        const OPTIMAL_BORROW: u8 = 4;
+        const MAX_BORROW: u8 = 50;
+        const PROTOCOL_TAKE: u8 = 20;
+        const MAX_UTIL: u8 = 95;
+        const SUPER_MAX_BORROW: u64 = 300; // 300% — must fit u64, not u8.
+        overlay_reserve_rate_config_fields(
+            &mut bytes,
+            OPTIMAL_UTIL,
+            MIN_BORROW,
+            OPTIMAL_BORROW,
+            MAX_BORROW,
+            PROTOCOL_TAKE,
+            MAX_UTIL,
+            SUPER_MAX_BORROW,
+        );
+
+        let out = decode_reserve(&bytes).expect("decode");
+        assert_eq!(out.config_optimal_utilization_rate_pct, OPTIMAL_UTIL);
+        assert_eq!(out.config_min_borrow_rate_pct, MIN_BORROW);
+        assert_eq!(out.config_optimal_borrow_rate_pct, OPTIMAL_BORROW);
+        assert_eq!(out.config_max_borrow_rate_pct, MAX_BORROW);
+        assert_eq!(out.config_protocol_take_rate_pct, PROTOCOL_TAKE);
+        assert_eq!(out.config_max_utilization_rate_pct, MAX_UTIL);
+        assert_eq!(out.config_super_max_borrow_rate_pct, SUPER_MAX_BORROW);
+
+        // Defence in depth: total bytes is still RESERVE_LEN — the new
+        // offsets did NOT push the total past 619.
+        assert_eq!(bytes.len(), RESERVE_LEN);
+    }
+
+    /// Stage 2 B-O1 — explicit byte-cursor sanity: the cumulative widths
+    /// of every field documented in the layout comment (whether READ or
+    /// SKIPPED) must equal `RESERVE_LEN`. Catches any future field-list
+    /// drift against the upstream Pack layout.
+    #[test]
+    fn reserve_layout_width_sum_equals_reserve_len() {
+        let widths: &[usize] = &[
+            1, 8, 1, 32, 32, 1, 32, 32, 32, 8, 16, 16, 16, 32, 8, 32, 1, 1, 1,
+            1, 1, 1, 1, 8, 8, 1, 8, 8, 32, 1, 1, 16, 56, // rate_limiter
+            8, 16, 1, 1, 8, 1, 1, 8, 32, 1, 16, 16, 8, 8, 49,
+        ];
+        let total: usize = widths.iter().sum();
+        assert_eq!(total, RESERVE_LEN, "field-width sum must equal RESERVE_LEN");
+        // Spot-checks: the two B-O1 extension offsets fall in the
+        // post-rate-limiter window the layout comment claims.
+        assert_eq!(RES_CONFIG_MAX_UTILIZATION_RATE_OFF, 470);
+        assert_eq!(RES_CONFIG_SUPER_MAX_BORROW_RATE_OFF, 471);
+        // And the pre-rate-limiter offsets are unchanged.
+        assert_eq!(RES_CONFIG_OPTIMAL_UTILIZATION_RATE_OFF, 299);
+        assert_eq!(RES_CONFIG_PROTOCOL_TAKE_RATE_OFF, 372);
+    }
+
+    /// Stage 2 B-O1 — defence in depth: the 7 new fields fall in
+    /// disjoint, non-overlapping byte ranges. Catches a swapped offset
+    /// constant that happens to round-trip a single test value by luck.
+    #[test]
+    fn reserve_rate_config_offsets_are_disjoint() {
+        let ranges: &[(usize, usize, &'static str)] = &[
+            (RES_CONFIG_OPTIMAL_UTILIZATION_RATE_OFF, 1, "optimal_utilization"),
+            (RES_CONFIG_MIN_BORROW_RATE_OFF, 1, "min_borrow"),
+            (RES_CONFIG_OPTIMAL_BORROW_RATE_OFF, 1, "optimal_borrow"),
+            (RES_CONFIG_MAX_BORROW_RATE_OFF, 1, "max_borrow"),
+            (RES_CONFIG_PROTOCOL_TAKE_RATE_OFF, 1, "protocol_take"),
+            (RES_CONFIG_MAX_UTILIZATION_RATE_OFF, 1, "max_utilization"),
+            (RES_CONFIG_SUPER_MAX_BORROW_RATE_OFF, 8, "super_max_borrow"),
+        ];
+        for (i, (o1, l1, n1)) in ranges.iter().enumerate() {
+            let end1 = o1 + l1;
+            assert!(end1 <= RESERVE_LEN, "{n1} runs past RESERVE_LEN");
+            for (o2, l2, n2) in &ranges[i + 1..] {
+                let end2 = o2 + l2;
+                // disjoint: [o1, end1) ∩ [o2, end2) == ∅
+                let disjoint = end1 <= *o2 || end2 <= *o1;
+                assert!(disjoint, "{n1}@{o1}..{end1} overlaps {n2}@{o2}..{end2}");
+            }
+        }
     }
 }
 
