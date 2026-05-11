@@ -846,6 +846,7 @@ async fn a1_execute_daemon_path_reaches_mainnet_confirmed() {
         wallets: WalletDirectoryRef::new(Arc::new(NoopWalletDir)),
         demo_seeder: None,
         chat: None,
+        chat_execute: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

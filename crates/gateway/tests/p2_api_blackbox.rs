@@ -347,6 +347,7 @@ async fn build_harness(opts: HarnessOptions) -> Harness {
         wallets:           WalletDirectoryRef::new(wallet_d),
         demo_seeder,
         chat:              None,
+        chat_execute:      None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

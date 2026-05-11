@@ -470,6 +470,22 @@ export interface W5gConditionalExecutionResult {
   decision_source?: string | null;
 }
 
+/// Wire body for `POST /sessions/:id/stage2/w5g/execute`. Mirrors
+/// `claw_api::state::ChatExecuteRequestDto`. All three fields are
+/// required and must be the exact strings from the `ready_to_execute`
+/// W5f card plus the literal operator-approval phrase.
+export interface ChatExecuteRequest {
+  rule_id_hex: string;
+  canonical_rule_hash_hex: string;
+  approval_phrase: string;
+}
+
+/// Literal approval phrase the W5g backend requires both in env and
+/// in the HTTP request body. Exposed as a constant so the UI can
+/// match user input verbatim before enabling the Execute button.
+export const W5G_REQUIRED_APPROVAL_PHRASE =
+  "W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED";
+
 /// Discriminated union mirroring Rust's `ChatResponse` enum.
 /// `status` is the discriminant; the runtime guarantees no other shape.
 export type ChatResponse =

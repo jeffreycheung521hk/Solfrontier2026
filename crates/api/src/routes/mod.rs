@@ -16,6 +16,7 @@ pub mod sessions;
 pub mod solend_jit_signing;
 pub mod solend_signatures;
 pub mod solend_withdraw_jit_signing;
+pub mod stage2_chat_execute;
 pub mod wallets;
 pub mod wallet_challenges;
 pub mod wallet_signatures;

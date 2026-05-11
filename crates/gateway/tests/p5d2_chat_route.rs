@@ -369,6 +369,7 @@ async fn build_ctx_with_registry(
         wallets:           WalletDirectoryRef::new(Arc::new(StubWalletDir)),
         demo_seeder:       None,
         chat:              chat_ref,
+        chat_execute:      None,
     };
     let router = claw_api::create_router(state, HealthRegistry::new());
     Ctx { router, sid, scripted }

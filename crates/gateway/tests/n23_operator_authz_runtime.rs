@@ -154,6 +154,7 @@ async fn self_claimed_higher_role_is_rejected() {
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
         chat: None,
+        chat_execute: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());
@@ -226,6 +227,7 @@ async fn operator_with_correct_role_passes_role_check() {
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
         chat: None,
+        chat_execute: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());
@@ -345,6 +347,7 @@ async fn token_mapped_role_can_approve_required_role_request() {
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
         chat: None,
+        chat_execute: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());
@@ -427,6 +430,7 @@ async fn multi_role_operator_uses_first_role_when_body_omits_role() {
         wallets: WalletDirectoryRef::noop(),
         demo_seeder: None,
         chat: None,
+        chat_execute: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

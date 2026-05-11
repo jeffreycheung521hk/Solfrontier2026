@@ -25,6 +25,7 @@ import {
   createWalletBindChallenge,
   getOrCreateSession,
   postChat,
+  postW5gExecute,
 } from "@/lib/api";
 import { IS_SHOWCASE, MODE } from "@/lib/mode";
 import { signMessage } from "@/lib/phantom";
@@ -36,6 +37,7 @@ import type {
   W5dConditionalDepositResult,
   W5gConditionalExecutionResult,
 } from "@/lib/types";
+import { W5G_REQUIRED_APPROVAL_PHRASE } from "@/lib/types";
 
 /// Approval phrase the chat-route requires inside the user's W5g
 /// execute command. Hard-coded copy — the frontend never inspects it
@@ -291,7 +293,9 @@ export default function ChatPage() {
             {messages.map((m) => (
               <li key={m.id}>
                 {m.kind === "user" && <UserBubble text={m.text} />}
-                {m.kind === "assistant" && <AssistantBubble result={m.result} />}
+                {m.kind === "assistant" && (
+                  <AssistantBubble result={m.result} sessionId={sessionId} />
+                )}
                 {m.kind === "system" && <SystemNotice text={m.text} />}
                 {m.kind === "local_w5g_safe_error" && (
                   <LocalW5gSafeErrorCard
@@ -532,7 +536,13 @@ function UserBubble({ text }: { text: string }) {
   );
 }
 
-function AssistantBubble({ result }: { result: ChatRouteResult }) {
+function AssistantBubble({
+  result,
+  sessionId,
+}: {
+  result: ChatRouteResult;
+  sessionId: SessionId | null;
+}) {
   // ── HTTP-envelope-level branches first ───────────────────────────────
   if (result.kind === "disabled") {
     return (
@@ -575,10 +585,16 @@ function AssistantBubble({ result }: { result: ChatRouteResult }) {
   }
 
   // ── 200 OK domain variants ───────────────────────────────────────────
-  return <ChatResponseCard response={result.response} />;
+  return <ChatResponseCard response={result.response} sessionId={sessionId} />;
 }
 
-function ChatResponseCard({ response }: { response: ChatResponse }) {
+function ChatResponseCard({
+  response,
+  sessionId,
+}: {
+  response: ChatResponse;
+  sessionId: SessionId | null;
+}) {
   switch (response.status) {
     case "assistant_text":
       return (
@@ -649,7 +665,12 @@ function ChatResponseCard({ response }: { response: ChatResponse }) {
     case "w5d_conditional_deposit":
       // W5d demo-bridge: deterministic-parser + B-O1 on-chain APR.
       // Render a typed card — never a raw JSON blob.
-      return <W5dConditionalDepositCard result={response.result} />;
+      return (
+        <W5dConditionalDepositCard
+          result={response.result}
+          sessionId={sessionId}
+        />
+      );
 
     case "w5g_conditional_execution":
       // W5g chat-first execution result. The user's second chat
@@ -733,8 +754,10 @@ function CopyButton({
 
 function W5dConditionalDepositCard({
   result,
+  sessionId,
 }: {
   result: W5dConditionalDepositResult;
+  sessionId: SessionId | null;
 }) {
   const conditionLabel = result.condition_met ? "true" : "false";
   // W5e status enum: watching | ready_to_execute | needs_funding.
@@ -822,6 +845,20 @@ function W5dConditionalDepositCard({
             <ReadyToExecuteCommandPanel
               ruleIdHex={result.rule_id_hex}
               canonicalRuleHashHex={result.canonical_rule_hash_hex}
+            />
+          )}
+
+        {/* ── W5g direct-execute panel (DEDICATED ROUTE, button-driven) ── */}
+        {showW5gReadyPanel &&
+          result.rule_id_hex &&
+          result.canonical_rule_hash_hex && (
+            <DirectExecutePanel
+              sessionId={sessionId}
+              ruleIdHex={result.rule_id_hex}
+              canonicalRuleHashHex={result.canonical_rule_hash_hex}
+              controlledWallet={result.controlled_wallet}
+              sourceUsdcAta={result.source_usdc_ata}
+              requiredBudgetRaw={result.required_budget_raw}
             />
           )}
 
@@ -1045,6 +1082,179 @@ function ReadyToExecuteCommandPanel({
           chat or execute anything itself.
         </span>
       </div>
+    </div>
+  );
+}
+
+/// W5g direct-execute panel — the dedicated-route alternative to the
+/// copy-command panel above. POSTs to
+/// `/sessions/:id/stage2/w5g/execute` after the operator types the
+/// exact approval phrase into the input box AND clicks the Execute
+/// button. The button is disabled until the typed phrase matches
+/// `W5G_REQUIRED_APPROVAL_PHRASE` verbatim. While the request is
+/// in-flight a pending state is shown; on response the result is
+/// rendered inline using the existing W5g typed card.
+///
+/// # No-overclaim
+///
+///  - The button is disabled by default. No code path enables it
+///    without the exact approval phrase.
+///  - The card explicitly warns the operator that this sends a real
+///    mainnet transaction from the controlled wallet.
+///  - On `prechecks_failed` / `execution_failed` / `broadcasted_timeout`
+///    the panel does NOT show a "Finalized" badge.
+function DirectExecutePanel({
+  sessionId,
+  ruleIdHex,
+  canonicalRuleHashHex,
+  controlledWallet,
+  sourceUsdcAta,
+  requiredBudgetRaw,
+}: {
+  sessionId: SessionId | null;
+  ruleIdHex: string;
+  canonicalRuleHashHex: string;
+  controlledWallet: string;
+  sourceUsdcAta: string;
+  requiredBudgetRaw: number;
+}) {
+  const [phrase, setPhrase] = useState("");
+  const [pending, setPending] = useState(false);
+  const [result, setResult] = useState<W5gConditionalExecutionResult | null>(
+    null,
+  );
+  const [transportError, setTransportError] = useState<string | null>(null);
+  const phraseMatches = phrase === W5G_REQUIRED_APPROVAL_PHRASE;
+  const canExecute =
+    phraseMatches &&
+    !pending &&
+    sessionId !== null &&
+    result === null; // never allow a second click after a response is rendered
+
+  const onExecute = useCallback(async () => {
+    if (!canExecute || sessionId === null) return;
+    setPending(true);
+    setTransportError(null);
+    try {
+      const envelope = await postW5gExecute(sessionId, {
+        rule_id_hex: ruleIdHex,
+        canonical_rule_hash_hex: canonicalRuleHashHex,
+        approval_phrase: phrase,
+      });
+      if (envelope.kind === "ok") {
+        setResult(envelope.response);
+      } else {
+        setTransportError(
+          `${envelope.kind} (${"httpStatus" in envelope ? envelope.httpStatus : ""}): ${envelope.error}`,
+        );
+      }
+    } catch (e) {
+      setTransportError(
+        e instanceof Error
+          ? `${e.name}: ${e.message}`
+          : "network error (unknown)",
+      );
+    } finally {
+      setPending(false);
+    }
+  }, [canExecute, sessionId, ruleIdHex, canonicalRuleHashHex, phrase]);
+
+  const requiredUsdc = (requiredBudgetRaw / 1_000_000).toFixed(2);
+
+  return (
+    <div
+      data-testid="w5g-direct-execute-panel"
+      className="mt-3 rounded border border-amber-300 bg-amber-50/40 p-3 space-y-2"
+    >
+      <div className="text-sm font-medium text-amber-950">
+        Direct-execute (dedicated route)
+      </div>
+      <p
+        className="text-xs text-rose-800 font-medium"
+        data-testid="w5g-mainnet-warning"
+      >
+        This sends a real mainnet transaction from the controlled wallet.
+      </p>
+      <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
+        <dt className="text-muted-foreground">amount</dt>
+        <dd>
+          {requiredBudgetRaw} raw ({requiredUsdc} USDC)
+        </dd>
+        <dt className="text-muted-foreground">controlled wallet</dt>
+        <dd className="font-mono break-all">{controlledWallet}</dd>
+        <dt className="text-muted-foreground">source USDC ATA</dt>
+        <dd className="font-mono break-all">{sourceUsdcAta}</dd>
+        <dt className="text-muted-foreground">rule_id</dt>
+        <dd className="font-mono break-all">{ruleIdHex}</dd>
+      </dl>
+      <label className="block text-xs">
+        <span className="text-amber-900/90">
+          Type the exact approval phrase to enable Execute:
+        </span>
+        <input
+          type="text"
+          value={phrase}
+          onChange={(e) => setPhrase(e.target.value)}
+          disabled={pending || result !== null}
+          data-testid="w5g-approval-phrase-input"
+          className="mt-1 w-full rounded border border-amber-300 bg-white px-2 py-1 font-mono text-[11px]"
+          placeholder={W5G_REQUIRED_APPROVAL_PHRASE}
+          aria-label="W5G approval phrase"
+          spellCheck={false}
+          autoComplete="off"
+        />
+      </label>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onExecute}
+          disabled={!canExecute}
+          data-testid="w5g-execute-button"
+          data-can-execute={canExecute ? "true" : "false"}
+          className={
+            canExecute
+              ? "rounded bg-amber-600 text-white px-3 py-1 text-xs font-medium hover:bg-amber-700"
+              : "rounded bg-muted text-muted-foreground px-3 py-1 text-xs font-medium cursor-not-allowed"
+          }
+        >
+          {pending
+            ? "Executing & confirming on Mainnet…"
+            : "Execute controlled-wallet deposit"}
+        </button>
+        {!phraseMatches && phrase.length > 0 && (
+          <span
+            className="text-[11px] text-rose-800"
+            data-testid="w5g-phrase-mismatch"
+          >
+            Phrase does not match.
+          </span>
+        )}
+        {sessionId === null && (
+          <span className="text-[11px] text-muted-foreground">
+            session not ready
+          </span>
+        )}
+      </div>
+      {transportError !== null && (
+        <Alert>
+          <AlertTitle>Execute request failed</AlertTitle>
+          <AlertDescription>
+            <span className="break-words" data-testid="w5g-transport-error">
+              {transportError}
+            </span>
+            <span className="block mt-1 text-[11px]">
+              The backend gates remain in effect. If you saw a 503 the daemon
+              does not have W5g wired; if you saw a 400 the request body was
+              rejected before any RPC call.
+            </span>
+          </AlertDescription>
+        </Alert>
+      )}
+      {result !== null && (
+        <div className="mt-2">
+          <W5gConditionalExecutionCard result={result} />
+        </div>
+      )}
     </div>
   );
 }

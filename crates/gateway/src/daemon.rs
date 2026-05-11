@@ -962,6 +962,28 @@ impl GatewayDaemon {
                 }
             };
 
+        // W5g — chat-card controlled-wallet Solend deposit execution.
+        //
+        // Default: `None` (route returns 503). Wired ONLY when every
+        // env gate is set AND the controlled-wallet keypair loads
+        // successfully AND the matching `LiveSaveDisplayApyFetcher` /
+        // `LiveW5dAprFetcher` / RPC URL are also available. Any
+        // missing piece keeps the route fail-closed; the orchestrator
+        // itself also fails-closed on a per-request basis in case the
+        // daemon was misconfigured between startup and request time.
+        let chat_execute_ref: Option<claw_api::state::ChatExecuteHandlerRef> = {
+            let cfg = crate::stage2_chat_execute::Stage2ChatExecuteConfig::from_std_env();
+            if !cfg.master_gate_on {
+                info!(
+                    "W5g chat-execute disabled (CLAW_STAGE2_LIVE_CHAT_EXECUTION != \"1\"); \
+                     POST /sessions/:id/stage2/w5g/execute will return 503"
+                );
+                None
+            } else {
+                wire_w5g_executor(cfg, w5e_repo.clone())
+            }
+        };
+
         // Phase 6B Window 2 — JIT prepare handler. Bridges the API
         // trait (`SolendJitPrepareHandler`) to the gateway-internal
         // dependencies (approval store, external wallet, jit-ready
@@ -1078,6 +1100,7 @@ impl GatewayDaemon {
             wallets:           wallet_dir_ref,
             demo_seeder:       demo_seeder_ref,
             chat:              chat_handler_ref,
+            chat_execute:      chat_execute_ref,
         };
 
         let api_handle = claw_api::start(
@@ -2687,4 +2710,95 @@ impl WalletChallengeHandler for GatewayWalletChallengeHandler {
             Ok(verified_pubkey)
         })
     }
+}
+
+/// W5g — daemon-startup helper that constructs the
+/// `Stage2ChatExecutor` from env. Returns `None` (route → 503) on
+/// ANY missing piece. The orchestrator itself fail-closes on a
+/// per-request basis too — this function only short-circuits the
+/// daemon-startup wiring when it would obviously be unusable.
+fn wire_w5g_executor(
+    cfg: crate::stage2_chat_execute::Stage2ChatExecuteConfig,
+    w5e_repo: std::sync::Arc<
+        claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository,
+    >,
+) -> Option<claw_api::state::ChatExecuteHandlerRef> {
+    // Resolve RPC URL (env wins over file-config conventions used
+    // elsewhere; we reuse the W5d/W5f env var convention here).
+    let rpc_url = std::env::var("HELIUS_RPC_URL")
+        .or_else(|_| std::env::var("CLAW_RPC_URL"))
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let rpc_url = match rpc_url {
+        Some(u) => u,
+        None => {
+            info!(
+                "W5g chat-execute disabled (no HELIUS_RPC_URL / CLAW_RPC_URL); \
+                 POST /sessions/:id/stage2/w5g/execute will return 503"
+            );
+            return None;
+        }
+    };
+    let keypair_path = std::env::var(
+        crate::stage2_chat_execute::W5G_ENV_DELEGATED_KEYPAIR_PATH,
+    )
+    .ok()
+    .filter(|s| !s.trim().is_empty());
+    let keypair_path = match keypair_path {
+        Some(p) => p,
+        None => {
+            info!(
+                "W5g chat-execute disabled (no {} set)",
+                crate::stage2_chat_execute::W5G_ENV_DELEGATED_KEYPAIR_PATH
+            );
+            return None;
+        }
+    };
+    let live_sender = match crate::stage2_chat_execute::LiveStage2ChatExecuteSender::from_paths(
+        &keypair_path,
+        rpc_url.clone(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            info!(
+                "W5g chat-execute disabled (live sender build failed): {e}; \
+                 POST /sessions/:id/stage2/w5g/execute will return 503"
+            );
+            return None;
+        }
+    };
+    // Reuse the SAME fetcher impls the chat-route already builds —
+    // they hit the same Helius RPC and the same Solend REST API.
+    let save_apy_fetcher: std::sync::Arc<
+        dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher,
+    > = std::sync::Arc::new(
+        crate::stage2_demo_apr_bridge::LiveSaveDisplayApyFetcher::with_default_base_url(),
+    );
+    let apr_fetcher: std::sync::Arc<
+        dyn crate::stage2_demo_apr_bridge::W5dAprFetcher,
+    > = match crate::stage2_demo_apr_bridge::LiveW5dAprFetcher::new(rpc_url.clone()) {
+        Some(f) => std::sync::Arc::new(f),
+        None => {
+            info!(
+                "W5g chat-execute disabled (LiveW5dAprFetcher rejected RPC URL); \
+                 POST /sessions/:id/stage2/w5g/execute will return 503"
+            );
+            return None;
+        }
+    };
+    let executor = std::sync::Arc::new(crate::stage2_chat_execute::Stage2ChatExecutor::new(
+        std::sync::Arc::new(live_sender),
+        save_apy_fetcher,
+        apr_fetcher,
+        w5e_repo,
+        cfg,
+    ));
+    let adapter =
+        crate::runtime::stage2_chat_execute_wiring::GatewayChatExecuteAdapter::new(executor);
+    info!(
+        "W5g chat-execute ENABLED — POST /sessions/:id/stage2/w5g/execute will dispatch \
+         live mainnet broadcasts under env-gated approval. Every request still runs the \
+         full precheck chain (approval phrase + canonical hash + Save APY re-check + budget)."
+    );
+    Some(adapter.into_handler_ref())
 }

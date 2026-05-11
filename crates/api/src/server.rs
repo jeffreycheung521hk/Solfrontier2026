@@ -59,6 +59,7 @@ use crate::{
         solend_jit_signing::prepare_solend_signing,
         solend_signatures::{get_solend_signature, submit_solend_signature},
         solend_withdraw_jit_signing::prepare_solend_withdraw_signing,
+        stage2_chat_execute::post_w5g_execute,
         wallets::list_wallets,
         wallet_challenges::{create_wallet_challenge, confirm_wallet_challenge},
         wallet_signatures::{bind_wallet, list_wallet_signatures, submit_wallet_signature},
@@ -124,6 +125,16 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         .route(
             "/sessions/:id/chat",
             post(post_chat).layer(DefaultBodyLimit::max(4096)),
+        )
+        // W5g — chat-card controlled-wallet Solend deposit execution.
+        // The route is opt-in via the daemon's env gates; when the
+        // executor isn't wired the handler returns 503. Body limit is
+        // 2 KB — well above the maximum legitimate payload (a 32-char
+        // rule_id + 64-char canonical hash + 64-char approval phrase +
+        // JSON envelope is < 300 bytes).
+        .route(
+            "/sessions/:id/stage2/w5g/execute",
+            post(post_w5g_execute).layer(DefaultBodyLimit::max(2048)),
         )
         // Wallet ownership proof (challenge-response)
         .route("/sessions/:id/wallet-bind-challenge", post(create_wallet_challenge))

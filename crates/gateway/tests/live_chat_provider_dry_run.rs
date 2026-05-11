@@ -232,6 +232,7 @@ fn build_router(chat_ref: ChatHandlerRef, sid: &SessionId) -> axum::Router {
         wallets:           WalletDirectoryRef::new(Arc::new(StubWalletDir)),
         demo_seeder:       None,
         chat:              Some(chat_ref),
+        chat_execute:      None,
     };
     claw_api::create_router(state, HealthRegistry::new())
 }

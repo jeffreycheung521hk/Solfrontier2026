@@ -57,6 +57,13 @@ pub mod stage2_executor;
 // `sendTransaction` site; no keypair; no LLM call. Live RPC is the
 // `LiveW5dAprFetcher` impl; tests use a mock.
 pub mod stage2_demo_apr_bridge;
+// Stage 2 W5g — chat-card controlled-wallet Solend deposit execution.
+// Production-side orchestrator + injectable sender trait. The route
+// is the only place outside the W5c env-gated test harness that
+// invokes a live Solend deposit; every gate is fail-closed by
+// default. No Phantom popup, no user-main-wallet signer, no
+// clawsol-authority ExecuteAction, no AuthorizationRecord PDA.
+pub mod stage2_chat_execute;
 pub mod session_policy;
 pub mod supervisor;
 pub mod tools;

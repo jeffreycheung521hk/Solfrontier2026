@@ -557,6 +557,7 @@ async fn a2_prep_http_messages_ingress_drives_jupiter_tool_to_park() {
         wallets: WalletDirectoryRef::new(Arc::new(NoopWalletDir)),
         demo_seeder: None,
         chat: None,
+        chat_execute: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

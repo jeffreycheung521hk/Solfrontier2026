@@ -746,6 +746,7 @@ async fn a2_execute_llm_mainnet_full_daemon_path() {
         wallets: WalletDirectoryRef::new(Arc::new(NoopWalletDir)),
         demo_seeder: None,
         chat: None,
+        chat_execute: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

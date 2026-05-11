@@ -18,6 +18,7 @@ pub mod auth;
 pub mod errors;
 pub mod rate_limit;
 pub mod routes;
+pub mod serde_str;
 pub mod server;
 pub mod state;
 
@@ -25,6 +26,8 @@ pub use errors::ApiError;
 pub use server::{create_router, start};
 pub use state::{
     AppState, ApprovalHandler, ApprovalHandlerRef,
+    ChatExecuteHandler, ChatExecuteHandlerRef, ChatExecuteRequestDto,
+    ChatExecuteResultDto, ChatExecuteRouteOutcome,
     ChatHandler, ChatHandlerRef, ChatResponse, ChatRouteOutcome,
     EventSubscriber, EventSubscriberRef,
     MessageHandler, MessageHandlerRef, SessionManagerRef, SessionOps,

@@ -8,6 +8,7 @@ import type {
   ApproveRequest,
   ApproveResponse,
   AuditRow,
+  ChatExecuteRequest,
   ChatRequest,
   ChatResponse,
   ChatRouteResult,
@@ -22,6 +23,7 @@ import type {
   SolendWithdrawJitPrepareResult,
   TransactionProposal,
   Uuid,
+  W5gConditionalExecutionResult,
   WalletSummary,
 } from "@/lib/types";
 import {
@@ -284,6 +286,76 @@ export async function postChat(
   if (res.status === 404) return { kind: "not_found", error: errorText };
   if (res.status === 503) return { kind: "disabled", error: errorText };
 
+  return { kind: "unexpected", httpStatus: res.status, error: errorText };
+}
+
+/// W5g — typed envelope around `POST /sessions/:id/stage2/w5g/execute`.
+/// The backend always returns the `ChatExecuteResultDto` shape on 200;
+/// 400 / 404 / 503 carry an `{ error: string }` body.
+export type W5gExecuteResult =
+  | { kind: "ok"; response: W5gConditionalExecutionResult }
+  | { kind: "bad_request"; error: string }
+  | { kind: "not_found"; error: string }
+  | { kind: "disabled"; error: string }
+  | { kind: "unexpected"; httpStatus: number; error: string };
+
+/// Posts the W5g execution request. Default request timeout is
+/// unbounded on the frontend side — the backend has a bounded
+/// `getSignatureStatuses` poll window (~120 s) and will return a
+/// `broadcasted_timeout` DTO rather than hang the HTTP call.
+///
+/// SHOWCASE MODE: returns a deterministic `prechecks_failed` result
+/// so the showcase doesn't pretend to broadcast.
+export async function postW5gExecute(
+  sessionId: SessionId,
+  body: ChatExecuteRequest,
+): Promise<W5gExecuteResult> {
+  if (IS_SHOWCASE) {
+    return {
+      kind: "ok",
+      response: {
+        status: "prechecks_failed",
+        rule_id_hex: body.rule_id_hex,
+        canonical_rule_hash_hex: body.canonical_rule_hash_hex,
+        error_code: "master_gate_missing",
+        error_reason:
+          "Showcase mode: W5g live execution is disabled. No on-chain send was attempted.",
+        tx_signature: null,
+        solscan_url: null,
+        confirmation_slot: null,
+      },
+    };
+  }
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+
+  const res = await fetch(
+    `${GATEWAY_URL}/sessions/${sessionId}/stage2/w5g/execute`,
+    {
+      method: "POST",
+      headers,
+      cache: "no-store",
+      body: JSON.stringify(body),
+    },
+  );
+
+  if (res.ok) {
+    const parsed = (await res.json()) as W5gConditionalExecutionResult;
+    return { kind: "ok", response: parsed };
+  }
+
+  let errorText = "";
+  try {
+    const errBody = (await res.json()) as { error?: string };
+    errorText = errBody.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+
+  if (res.status === 400) return { kind: "bad_request", error: errorText };
+  if (res.status === 404) return { kind: "not_found", error: errorText };
+  if (res.status === 503) return { kind: "disabled", error: errorText };
   return { kind: "unexpected", httpStatus: res.status, error: errorText };
 }
 

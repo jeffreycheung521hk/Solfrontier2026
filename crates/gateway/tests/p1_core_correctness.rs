@@ -508,6 +508,7 @@ fn build_state(
         wallets:           WalletDirectoryRef::noop(),
         demo_seeder:       None,
         chat:              None,
+        chat_execute:      None,
     }
 }
 

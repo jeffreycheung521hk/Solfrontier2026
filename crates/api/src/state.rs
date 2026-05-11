@@ -1261,4 +1261,129 @@ pub struct AppState {
     /// chosen by the daemon's provider config). When `None`, the
     /// `POST /sessions/:id/chat` route returns 503.
     pub chat:                Option<ChatHandlerRef>,
+    /// W5g — backend seam for `POST /sessions/:id/stage2/w5g/execute`.
+    /// `None` unless the daemon was started with the W5g env gates
+    /// (`CLAW_STAGE2_LIVE_CHAT_EXECUTION=1` + approval phrase +
+    /// keypair path + cluster + RPC). When `None`, the route returns
+    /// `503`; the orchestrator itself fails-closed when any gate is
+    /// missing, but daemons typically don't wire the handler at all
+    /// in dev configurations.
+    pub chat_execute:        Option<ChatExecuteHandlerRef>,
+}
+
+/// W5g — wire DTO mirroring `claw_gateway::stage2_chat_execute::
+/// ChatExecuteRequest`. The chat-route `ready_to_execute` card POSTs
+/// this to the backend at `/sessions/:id/stage2/w5g/execute`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatExecuteRequestDto {
+    /// 32-char hex of the persisted `WatchRule.rule_id`. Echoed from
+    /// the `W5dConditionalDepositResult.rule_id_hex` of the
+    /// `ready_to_execute` card.
+    pub rule_id_hex: String,
+    /// 64-char hex of the persisted rule's canonical Borsh hash.
+    /// Used as the rule-identity anchor to prevent re-applying an
+    /// execution against a rule that has been replaced.
+    pub canonical_rule_hash_hex: String,
+    /// Operator-approval phrase — MUST equal exactly
+    /// `"W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED"`. Mismatch is
+    /// fail-closed with a typed precheck error.
+    pub approval_phrase: String,
+}
+
+/// W5g — wire DTO returned by the W5g execution route.
+///
+/// All u64/i64-like raw fields are serialized as **JSON strings** to
+/// avoid JS-number precision loss on amounts, slots, and byte counts
+/// (the W5g backend DTO addendum). bps fields stay as numbers
+/// because their integer range (u32) is comfortably within
+/// `Number.MAX_SAFE_INTEGER`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatExecuteResultDto {
+    /// `"completed"` | `"broadcasted_timeout"` | `"prechecks_failed"`
+    /// | `"execution_failed"`.
+    pub status: String,
+    pub rule_id_hex: String,
+    pub canonical_rule_hash_hex: String,
+    pub tx_signature: Option<String>,
+    pub solscan_url: Option<String>,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub confirmation_slot: Option<u64>,
+
+    /// Decision metric in basis points at re-check time (Save UI APY).
+    pub used_save_display_apy_bps: Option<u32>,
+    /// Audit metric in basis points at re-check time (B-O1 native).
+    pub used_native_onchain_apr_bps: Option<u32>,
+    /// Threshold extracted from the persisted rule, in basis points.
+    pub used_threshold_bps: Option<u32>,
+
+    // ── Token balance deltas, all u64/i64-as-string ──────────────────────
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub before_usdc_raw: Option<u64>,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub after_usdc_raw: Option<u64>,
+    #[serde(default, with = "crate::serde_str::opt_i64_string")]
+    pub usdc_delta_raw: Option<i64>,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub before_ctoken_amount: Option<u64>,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub after_ctoken_amount: Option<u64>,
+    #[serde(default, with = "crate::serde_str::opt_i64_string")]
+    pub ctoken_delta_raw: Option<i64>,
+
+    // ── TX audit (W5g addendum) ──────────────────────────────────────────
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub serialized_tx_bytes: Option<u64>,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub instruction_count: Option<u64>,
+    pub ctoken_ata_create_included: Option<bool>,
+
+    /// Snake-case error variant from
+    /// `claw_gateway::stage2_chat_execute::ChatExecuteErrorCode`, or
+    /// `None` on the happy path.
+    pub error_code: Option<String>,
+    pub error_reason: Option<String>,
+}
+
+/// Domain-level outcome returned by `Stage2ChatExecuteHandler::execute`.
+/// Mirrors `ChatRouteOutcome`'s shape — HTTP status mapping is the
+/// route's responsibility, not the handler's.
+#[derive(Debug, Clone)]
+pub enum ChatExecuteRouteOutcome {
+    /// Happy or failure-with-DTO path; the route maps to 200 + JSON.
+    Ok(ChatExecuteResultDto),
+    /// Bad request body (empty / missing fields). Route maps to 400.
+    BadRequest(String),
+    /// Session not active. Route maps to 404.
+    SessionNotActive,
+    /// Handler not wired — env gates absent at daemon startup. Route
+    /// maps to 503.
+    Disabled(String),
+}
+
+/// Backend seam the W5g route depends on. The gateway adapter
+/// (`crates/gateway/src/stage2_chat_execute.rs` →
+/// `Stage2ChatExecutor`) implements this; the API crate stays free of
+/// any reference to the gateway crate.
+pub trait ChatExecuteHandler: Send + Sync + 'static {
+    fn execute(
+        &self,
+        session_id: &SessionId,
+        request: ChatExecuteRequestDto,
+    ) -> Pin<Box<dyn Future<Output = ChatExecuteRouteOutcome> + Send + '_>>;
+}
+
+#[derive(Clone)]
+pub struct ChatExecuteHandlerRef(pub Arc<dyn ChatExecuteHandler>);
+
+impl ChatExecuteHandlerRef {
+    pub fn new(inner: Arc<dyn ChatExecuteHandler>) -> Self {
+        Self(inner)
+    }
+    pub async fn execute(
+        &self,
+        session_id: &SessionId,
+        request: ChatExecuteRequestDto,
+    ) -> ChatExecuteRouteOutcome {
+        self.0.execute(session_id, request).await
+    }
 }

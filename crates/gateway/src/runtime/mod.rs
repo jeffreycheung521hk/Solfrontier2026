@@ -25,4 +25,5 @@ pub mod solend_jit_prepare_wiring;
 pub mod solend_submit_wiring;
 pub mod solend_wiring;
 pub mod solend_withdraw_jit_prepare_wiring;
+pub mod stage2_chat_execute_wiring;
 pub mod tool_output_explainer;
