@@ -1546,9 +1546,25 @@ async fn stage2_w5c_live_conditional_solend_deposit() {
         "executor must transition rule to completed on Ok receipt"
     );
     assert!(after.completed, "completed flag must be set");
-    // The state-store `StoredWatchRule` exposes the inner rule
-    // (post-execution); `used_amount_raw` lives on the WatchRule body.
-    assert_eq!(after.rule.used_amount_raw, cfg.amount_raw);
+    // The state-store keeps `used_amount_raw` in a SQL column that is
+    // updated by `mark_completed`; the JSON-serialised `rule_json`
+    // column is frozen at insert time (so `after.rule.used_amount_raw`
+    // stays at 0 — the original `WatchRule` value — even though the
+    // SQL column carries the runtime amount the executor wrote back).
+    // Cross-check the SQL column directly, matching the pattern used
+    // by claw-state-store's own tests.
+    let used_in_sql: (i64,) = sqlx::query_as(
+        "SELECT used_amount_raw FROM stage2_watch_rules WHERE rule_id = ?",
+    )
+    .bind(hex_id(&rule.rule_id))
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("STOP — SELECT used_amount_raw: {e}"));
+    assert_eq!(
+        used_in_sql.0 as u64,
+        cfg.amount_raw,
+        "state-store SQL column used_amount_raw must equal amount_raw"
+    );
 
     // Re-fetch USDC + obligation for hard delta assertions.
     let source_after = retry(
