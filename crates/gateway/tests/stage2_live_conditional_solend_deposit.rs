@@ -2,10 +2,30 @@
 //!
 //! First real Stage 2 live conditional path: a `condition_met` rule in
 //! the state-store → W4 [`Stage2Executor`] atomic CAS lease → test-local
-//! [`LiveSolendDepositExecutionClient`] (implements the existing
-//! `Stage2ExecutionClient` trait) → controlled wallet signs a direct
-//! Solend deposit on mainnet → confirmation → rule transitions to
-//! `completed` or `failed`.
+//! [`common::w5c_deposit_support::LiveSolendDepositExecutionClient`]
+//! (implements the existing `Stage2ExecutionClient` trait) → controlled
+//! wallet signs a direct Solend deposit on mainnet → confirmation →
+//! rule transitions to `completed` or `failed`.
+//!
+//! # 2026-05-11 W5d-prep refactor
+//!
+//! The W5c-specific *behaviour* in this file is unchanged. The deposit
+//! client, RPC plumbing, fixture-rule builder, P5c invariants, and
+//! retry/poll helpers have moved verbatim into
+//! [`common::w5c_deposit_support`] so the W5d demo-bridge harness can
+//! reuse them without duplicating the live broadcast logic. What
+//! stays here:
+//!
+//!   1. W5c env-var names + the W5c-specific `HarnessConfig` reader.
+//!   2. `FIXTURE_RULE_ID` (W5c uses a single id; W5d uses two).
+//!   3. `FORBIDDEN_CALL_FORMS` (this file's own source-scan deny-list).
+//!   4. The W5c live-test function + its banner.
+//!   5. The unit tests that originally sat in this file — they still
+//!      cover W5c's invariants end-to-end via the moved-but-otherwise-
+//!      unchanged code path.
+//!
+//! See the module doc at the top of `common/w5c_deposit_support.rs`
+//! for the full extraction policy.
 //!
 //! # Test-only adapter
 //!
@@ -14,190 +34,65 @@
 //! verifier. The controlled wallet is the direct signer of the Solend
 //! ix list.
 //!
-//! The state-store `WatchRule` action field is
-//! `ActionSpec::SolendWithdrawAllDelegated` because that variant exists
-//! in [`claw_types::stage2_watch_rule::ActionSpec`]; adding a dedicated
-//! `SolendDepositControlledWallet` variant would force a workspace-wide
-//! schema-version bump and invalidate every pinned `canonical_rule_hash`
-//! fixture. So instead, the [`LiveSolendDepositExecutionClient`]'s
-//! `send_and_confirm` reinterprets the resulting
-//! `Stage2ExecuteActionRequest`'s `target_obligation` + `reserve` +
-//! `liquidity_mint` + `ctoken_mint` + oracle fields as a **deposit**
-//! against that obligation. The W4 state machine, the CAS lease, and
-//! the executor invocation are all real production code.
-//!
-//! The final report must call this out: the durable enum is unchanged,
-//! and a future slice will land the actual deposit `ActionSpec` variant.
-//!
-//! # Architecture map
-//!
-//! ```text
-//! [state-store: status=condition_met]
-//!         │
-//!         ▼   Stage2Executor::execute_rule_once
-//! [process_rule]
-//!  ├─ action_type_allowlist guard
-//!  ├─ same-process in-flight guard
-//!  ├─ CAS: mark_executing_if_condition_met(rule_id, nonce+1)
-//!  │       └─ on lose: LeaseLost (no client call)
-//!  ├─ build Stage2ExecuteActionRequest from rule + demo fixture
-//!  ├─ client.send_and_confirm(request)
-//!  │   └─ LiveSolendDepositExecutionClient:
-//!  │        - verify request.delegated_wallet == controlled wallet keypair pubkey
-//!  │        - fetch reserve account, decode via decode_reserve
-//!  │        - verify reserve P5c tuple at send time (defence in depth)
-//!  │        - build [CB, CB, CreateIdempotentATA?, RefreshReserve, DepositReserveLiquidityAndObligationCollateral]
-//!  │        - fresh blockhash, sign with controlled wallet only
-//!  │        - sendTransaction (skipPreflight=false maxRetries=0)
-//!  │        - poll getSignatureStatuses (searchTransactionHistory=true)
-//!  │        - return Stage2ExecutionReceipt
-//!  ├─ on Ok:  mark_completed(rule_id, used_amount, slot)
-//!  └─ on Err: mark_failed_best_effort(rule_id, detail)
-//! ```
-//!
 //! # Two-phase env gating
 //!
 //! - **Phase 0** (`CLAW_STAGE2_LIVE_CONDITIONAL_DEPOSIT=1`):
 //!   Insert fixture rule → mark_condition_met_if_active → BUILD and
 //!   SIMULATE the deposit tx (no CAS, no broadcast, durable state
-//!   unchanged). Print `W5C LIVE CONDITIONAL DEPOSIT RESULT` banner
-//!   with `leased_status: N/A` and `final_status: simulated`. STOP.
+//!   unchanged). Print banner. STOP.
 //!
 //! - **Phase 2** (`CLAW_STAGE2_CONDITIONAL_DEPOSIT_APPROVED="W5C LIVE
 //!   CONDITIONAL DEPOSIT APPROVED"`): require both env vars. Insert
 //!   fixture rule → mark_condition_met_if_active → invoke
 //!   `executor.execute_rule_once(rule_id, ctx)` → wait for finalized →
-//!   reload rule and assert `status == completed` → print full banner
-//!   with `leased_status: executing` and `final_status: completed`.
-//!
-//! # Required env
-//!
-//! | Variable | Purpose |
-//! | --- | --- |
-//! | `CLAW_STAGE2_LIVE_CONDITIONAL_DEPOSIT=1`                | master Phase 0 gate |
-//! | `HELIUS_RPC_URL` *or* `CLAW_RPC_URL`                    | Helius standard RPC |
-//! | `CLAW_STAGE2_CLUSTER=mainnet-beta`                       | cluster sanity |
-//! | `CLAW_STAGE2_DELEGATED_KEYPAIR_PATH=…`                   | controlled-wallet keypair JSON |
-//! | `CLAW_STAGE2_CONDITIONAL_DEPOSIT_AMOUNT_RAW=250000`      | deposit amount raw (default 250,000 = 0.25 USDC) |
-//! | `CLAW_STAGE2_CONDITIONAL_DEPOSIT_APPROVED=…`             | exact approval phrase for Phase 2 |
-//!
-//! # Sources of truth (Solend mainnet, deployed program)
-//!
-//! - `token-lending/sdk/src/instruction.rs`:
-//!   `RefreshReserve` (tag 3), `InitObligation` (tag 6),
-//!   `DepositReserveLiquidityAndObligationCollateral` (tag 14),
-//!   `WithdrawObligationCollateralAndRedeemReserveCollateral` (tag 15)
-//! - `token-lending/program/src/processor.rs`: `Clock::get()?` sysvar
-//!   syscall in deposit handler — no Clock account in deposit/withdraw
-//!   ix lists on mainnet branch.
-//! - Repo's mainnet-verified builders:
-//!   [`claw_gateway::integrations::solend::deposit`] and
-//!   [`claw_gateway::integrations::solend::refresh`] — pinned by the
-//!   May 2026 Phase 6I-K mainnet recovery audit.
+//!   reload rule and assert `status == completed` → print banner.
+
+mod common;
 
 use std::env;
-use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use serde_json::{json, Value};
-use solana_sdk::{
-    hash::Hash,
-    instruction::Instruction,
-    message::Message,
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    transaction::Transaction,
-};
-use spl_associated_token_account::{
-    get_associated_token_address,
-    instruction::create_associated_token_account_idempotent,
-};
+use solana_sdk::{pubkey::Pubkey, signature::Signer};
 
-use claw_gateway::integrations::solend::deposit::{
-    build_deposit_reserve_liquidity_and_obligation_collateral_instruction,
-    DepositInstructionInputs,
-};
-use claw_gateway::integrations::solend::raw::{
-    decode_obligation, decode_reserve, SolendObligationRaw, SolendReserveRaw,
-};
-use claw_gateway::integrations::solend::refresh::{
-    build_refresh_instructions, RefreshPlanInputs, ReserveRefreshInput,
-};
-use claw_gateway::lending::UnderlyingAmount;
+use claw_gateway::integrations::solend::raw::decode_obligation;
 use claw_gateway::stage2_executor::{
-    MockExecutionClient, Stage2ExecuteActionRequest, Stage2ExecutionClient,
-    Stage2ExecutionError, Stage2ExecutionReceipt, Stage2Executor, Stage2ExecutorRuleResult,
-    DEMO_CTOKEN_MINT_BS58, DEMO_LENDING_MARKET_BS58, DEMO_LIQUIDITY_MINT_BS58,
-    DEMO_PYTH_ORACLE_BS58, DEMO_RESERVE_BS58,
+    MockExecutionClient, Stage2Executor, Stage2ExecutorRuleResult,
 };
 use claw_gateway::stage2_watcher::Stage2TickContext;
 
 use claw_state_store::db::Database;
-use claw_state_store::stage2_watch_rules::{
-    Stage2WatchRuleRepository, WatchRuleStatus,
-};
+use claw_state_store::stage2_watch_rules::{Stage2WatchRuleRepository, WatchRuleStatus};
 
-use claw_types::canonical_intent::PubkeyBytes;
-use claw_types::stage2_watch_rule::{
-    ActionSpec, Comparison, Condition, ConditionLogic, RateKind, WatchRule, WithdrawMode,
-    STAGE2_WATCH_RULE_SCHEMA_VERSION,
-};
+use common::w5c_deposit_support::*;
 
-// ── env var names ─────────────────────────────────────────────────────────
+// ── W5c-specific env var names + approval phrase ──────────────────────────
 
 const ENV_GATE: &str = "CLAW_STAGE2_LIVE_CONDITIONAL_DEPOSIT";
-const ENV_APPROVAL: &str = "CLAW_STAGE2_CONDITIONAL_DEPOSIT_APPROVED";
-const APPROVAL_PHRASE: &str = "W5C LIVE CONDITIONAL DEPOSIT APPROVED";
-
 const ENV_RPC_PRIMARY: &str = "HELIUS_RPC_URL";
 const ENV_RPC_SECONDARY: &str = "CLAW_RPC_URL";
 const ENV_CLUSTER: &str = "CLAW_STAGE2_CLUSTER";
 const ENV_KEYPAIR_PATH: &str = "CLAW_STAGE2_DELEGATED_KEYPAIR_PATH";
 const ENV_DEPOSIT_AMOUNT_RAW: &str = "CLAW_STAGE2_CONDITIONAL_DEPOSIT_AMOUNT_RAW";
 
-// ── pinned facts (sealed against stage2_executor's source-of-truth) ──────
+// Approval phrase + env var are sourced from the common module
+// (`W5C_ENV_APPROVAL`, `W5C_APPROVAL_PHRASE`) so the W5d bridge reads
+// the same constants when deciding whether to forward live-send
+// authorisation.
 
-const CONTROLLED_WALLET_BS58: &str = "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L";
-const DEFAULT_TARGET_OBLIGATION_BS58: &str = "BdFLjCcP9mCy557vNNGVbTUuvHxXsh8hc6jXzaPra1wN";
-const SOLEND_PROGRAM_ID_BS58: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
-
-const USDC_DECIMALS: u8 = 6;
-/// 0.25 USDC; brief default for W5c.
-const DEFAULT_DEPOSIT_AMOUNT_RAW: u64 = 250_000;
-
-const SPL_TOKEN_PROGRAM_BS58: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const COMPUTE_BUDGET_PROGRAM_BS58: &str = "ComputeBudget111111111111111111111111111111";
-
-const COMPUTE_BUDGET_IX_TAG_SET_UNIT_LIMIT: u8 = 2;
-const COMPUTE_BUDGET_IX_TAG_SET_UNIT_PRICE: u8 = 3;
-
-/// Compute-unit limit. RefreshReserve + Deposit (with 3 SPL Token
-/// sub-CPIs) consumed 87,803 CU on the W5b mainnet run; 400_000 is
-/// a generous ceiling.
-const COMPUTE_UNIT_LIMIT: u32 = 400_000;
-/// Priority fee per CU in micro-lamports. 50_000 μ/CU keeps total
-/// priority fee modest while still incentivising leader pickup:
-/// 400_000 CU * 50_000 μ/CU / 1_000_000 = 20_000 lamports = 0.00002 SOL.
-const COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 50_000;
-
-// Retry / polling
-const RPC_MAX_RETRY_ATTEMPTS: usize = 3;
-const RPC_INITIAL_BACKOFF_MS: u64 = 500;
-const REQUEST_TIMEOUT_MS: u64 = 15_000;
-const STATUS_POLL_INTERVAL_MS: u64 = 2_000;
-const STATUS_POLL_MAX_ATTEMPTS: usize = 60;
-
-// Test-deterministic ids for the fixture rule.
+// Test-deterministic id for the fixture rule.
 const FIXTURE_RULE_ID: [u8; 16] = [
     0xC0, 0x5E, 0x05, 0x1C, 0xDE, 0x10, 0x5C, 0x57,
     0x05, 0xC0, 0x05, 0xC0, 0x05, 0xC0, 0x05, 0xC0,
 ];
 
-// Source-scan list. Each forbidden token may appear at most once
-// (the FORBIDDEN_CALL_FORMS allowlist entry itself counts as 1).
+/// Source-scan list specific to this binary. The
+/// `no_send_path_default_invariant` test enforces that none of these
+/// tokens appear more than once (the FORBIDDEN_CALL_FORMS allowlist
+/// entry itself counts as 1). Tokens reachable only through the
+/// gated common-module call sites (`sendTransaction`) are NOT in this
+/// list — that's the common module's surface.
 const FORBIDDEN_CALL_FORMS: &[&str] = &[
     "approve(",
     "setAuthority(",
@@ -214,26 +109,6 @@ const FORBIDDEN_CALL_FORMS: &[&str] = &[
     "Helius-Sender",
     "helius-sender",
 ];
-
-// ── cluster ───────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Cluster {
-    MainnetBeta,
-    Devnet,
-    Localnet,
-}
-
-impl Cluster {
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "mainnet-beta" | "mainnet" => Some(Cluster::MainnetBeta),
-            "devnet" => Some(Cluster::Devnet),
-            "localnet" => Some(Cluster::Localnet),
-            _ => None,
-        }
-    }
-}
 
 // ── env-reader ────────────────────────────────────────────────────────────
 
@@ -310,7 +185,7 @@ impl HarnessConfig {
         if amount_raw == 0 {
             return EnvStatus::Mismatch(format!("{ENV_DEPOSIT_AMOUNT_RAW} must be > 0"));
         }
-        let approved = getter(ENV_APPROVAL).as_deref() == Some(APPROVAL_PHRASE);
+        let approved = getter(W5C_ENV_APPROVAL).as_deref() == Some(W5C_APPROVAL_PHRASE);
         EnvStatus::Ready(Box::new(HarnessConfig {
             rpc_url,
             cluster,
@@ -319,947 +194,6 @@ impl HarnessConfig {
             approved,
         }))
     }
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────
-
-fn redact_url(url: &str) -> String {
-    let mut redacted = String::with_capacity(url.len());
-    let mut in_query = false;
-    let mut chars = url.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '?' {
-            in_query = true;
-            redacted.push(c);
-            continue;
-        }
-        if in_query {
-            let mut name = String::new();
-            name.push(c);
-            while let Some(&n) = chars.peek() {
-                if n == '=' || n == '&' {
-                    break;
-                }
-                name.push(n);
-                chars.next();
-            }
-            redacted.push_str(&name);
-            if let Some(&'=') = chars.peek() {
-                redacted.push('=');
-                chars.next();
-                let lower = name.to_ascii_lowercase();
-                let secret = lower.contains("api-key")
-                    || lower.contains("api_key")
-                    || lower.contains("token");
-                while let Some(&n) = chars.peek() {
-                    if n == '&' {
-                        break;
-                    }
-                    chars.next();
-                    if !secret {
-                        redacted.push(n);
-                    }
-                }
-                if secret {
-                    redacted.push_str("***REDACTED***");
-                }
-            }
-            continue;
-        }
-        redacted.push(c);
-    }
-    redacted
-}
-
-fn load_keypair_from_file(path: &str) -> Result<Keypair, String> {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("read keypair file '{path}': {e}"))?;
-    let bytes: Vec<u8> = serde_json::from_str(&raw)
-        .map_err(|e| format!("parse keypair file '{path}' as JSON byte array: {e}"))?;
-    if bytes.len() != 64 {
-        return Err(format!(
-            "keypair file '{path}' contained {} bytes (expected 64)",
-            bytes.len()
-        ));
-    }
-    Keypair::from_bytes(&bytes).map_err(|e| format!("Keypair::from_bytes: {e}"))
-}
-
-async fn retry<F, Fut, T, E>(
-    op: F,
-    max_attempts: usize,
-    initial_backoff: Duration,
-) -> Result<T, E>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
-{
-    let mut last: Option<E> = None;
-    let mut attempt = 0;
-    while attempt < max_attempts {
-        attempt += 1;
-        match op().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                last = Some(e);
-                if attempt < max_attempts {
-                    let backoff =
-                        initial_backoff.saturating_mul(1u32 << (attempt - 1).min(8) as u32);
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
-    }
-    Err(last.expect("retry exited without recording an error"))
-}
-
-// ── RPC helpers ───────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-enum RpcErr {
-    Transport(String),
-    Status(u16),
-    Body(String),
-}
-
-impl std::fmt::Display for RpcErr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RpcErr::Transport(s) => write!(f, "transport: {s}"),
-            RpcErr::Status(c) => write!(f, "http {c}"),
-            RpcErr::Body(s) => write!(f, "body: {s}"),
-        }
-    }
-}
-
-async fn rpc_post(client: &reqwest::Client, url: &str, body: Value) -> Result<Value, RpcErr> {
-    let resp = client
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| RpcErr::Transport(e.to_string()))?;
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        return Err(RpcErr::Status(status));
-    }
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| RpcErr::Body(e.to_string()))?;
-    if let Some(err) = v.get("error") {
-        return Err(RpcErr::Body(err.to_string()));
-    }
-    Ok(v)
-}
-
-async fn rpc_get_version(c: &reqwest::Client, url: &str) -> Result<String, RpcErr> {
-    let v = rpc_post(c, url, json!({"jsonrpc":"2.0","id":1,"method":"getVersion"})).await?;
-    v["result"]["solana-core"]
-        .as_str()
-        .ok_or_else(|| RpcErr::Body("missing solana-core".into()))
-        .map(|s| s.to_string())
-}
-
-async fn rpc_get_slot(c: &reqwest::Client, url: &str) -> Result<u64, RpcErr> {
-    let v = rpc_post(c, url, json!({"jsonrpc":"2.0","id":1,"method":"getSlot"})).await?;
-    v["result"]
-        .as_u64()
-        .ok_or_else(|| RpcErr::Body("missing slot".into()))
-}
-
-#[derive(Debug)]
-struct TokenAmount {
-    raw: u64,
-    decimals: u8,
-}
-
-async fn rpc_get_token_account_balance(
-    c: &reqwest::Client,
-    url: &str,
-    ata: &Pubkey,
-) -> Result<Option<TokenAmount>, RpcErr> {
-    let v = rpc_post(
-        c,
-        url,
-        json!({
-            "jsonrpc":"2.0","id":1,"method":"getTokenAccountBalance",
-            "params":[ata.to_string(), {"commitment":"confirmed"}]
-        }),
-    )
-    .await;
-    match v {
-        Ok(value) => {
-            let val = &value["result"]["value"];
-            let raw_str = val["amount"]
-                .as_str()
-                .ok_or_else(|| RpcErr::Body("missing amount".into()))?;
-            let raw: u64 = raw_str
-                .parse()
-                .map_err(|e: std::num::ParseIntError| RpcErr::Body(format!("amount parse: {e}")))?;
-            let decimals = val["decimals"].as_u64().unwrap_or(USDC_DECIMALS as u64) as u8;
-            Ok(Some(TokenAmount { raw, decimals }))
-        }
-        Err(RpcErr::Body(s))
-            if s.contains("could not find account")
-                || s.contains("Invalid param")
-                || s.contains("not found") =>
-        {
-            Ok(None)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-#[derive(Debug)]
-struct LatestBlockhash {
-    hash: Hash,
-    last_valid_block_height: u64,
-}
-
-async fn rpc_get_latest_blockhash(
-    c: &reqwest::Client,
-    url: &str,
-) -> Result<LatestBlockhash, RpcErr> {
-    let v = rpc_post(
-        c,
-        url,
-        json!({
-            "jsonrpc":"2.0","id":1,"method":"getLatestBlockhash",
-            "params":[{"commitment":"finalized"}]
-        }),
-    )
-    .await?;
-    let bh_str = v["result"]["value"]["blockhash"]
-        .as_str()
-        .ok_or_else(|| RpcErr::Body("missing blockhash".into()))?;
-    let lvbh = v["result"]["value"]["lastValidBlockHeight"]
-        .as_u64()
-        .ok_or_else(|| RpcErr::Body("missing lastValidBlockHeight".into()))?;
-    let hash = Hash::from_str(bh_str).map_err(|e| RpcErr::Body(format!("hash parse: {e}")))?;
-    Ok(LatestBlockhash {
-        hash,
-        last_valid_block_height: lvbh,
-    })
-}
-
-async fn rpc_get_account_exists(
-    c: &reqwest::Client,
-    url: &str,
-    pk: &Pubkey,
-) -> Result<bool, RpcErr> {
-    let v = rpc_post(
-        c,
-        url,
-        json!({
-            "jsonrpc":"2.0","id":1,"method":"getAccountInfo",
-            "params":[pk.to_string(), {"encoding":"base64","commitment":"confirmed"}]
-        }),
-    )
-    .await?;
-    Ok(!v["result"]["value"].is_null())
-}
-
-async fn rpc_get_account_data(
-    c: &reqwest::Client,
-    url: &str,
-    pk: &Pubkey,
-) -> Result<Option<Vec<u8>>, RpcErr> {
-    let v = rpc_post(
-        c,
-        url,
-        json!({
-            "jsonrpc":"2.0","id":1,"method":"getAccountInfo",
-            "params":[pk.to_string(), {"encoding":"base64","commitment":"confirmed"}]
-        }),
-    )
-    .await?;
-    let val = &v["result"]["value"];
-    if val.is_null() {
-        return Ok(None);
-    }
-    let data_arr = val
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| RpcErr::Body("missing data array".into()))?;
-    let b64 = data_arr
-        .first()
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| RpcErr::Body("missing data[0] base64 string".into()))?;
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| RpcErr::Body(format!("base64 decode: {e}")))?;
-    Ok(Some(bytes))
-}
-
-#[derive(Debug, Clone)]
-struct SimResult {
-    err: Option<Value>,
-    units_consumed: Option<u64>,
-    logs: Vec<String>,
-}
-
-async fn rpc_simulate_transaction(
-    c: &reqwest::Client,
-    url: &str,
-    tx_b64: &str,
-) -> Result<SimResult, RpcErr> {
-    let v = rpc_post(
-        c,
-        url,
-        json!({
-            "jsonrpc":"2.0","id":1,"method":"simulateTransaction",
-            "params":[tx_b64, {
-                "encoding":"base64",
-                "commitment":"confirmed",
-                "sigVerify": true,
-                "replaceRecentBlockhash": false,
-            }]
-        }),
-    )
-    .await?;
-    let val = &v["result"]["value"];
-    let err = val
-        .get("err")
-        .and_then(|e| if e.is_null() { None } else { Some(e.clone()) });
-    let units_consumed = val.get("unitsConsumed").and_then(|u| u.as_u64());
-    let logs = val
-        .get("logs")
-        .and_then(|l| l.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    Ok(SimResult {
-        err,
-        units_consumed,
-        logs,
-    })
-}
-
-async fn rpc_send_transaction_base64(
-    c: &reqwest::Client,
-    url: &str,
-    tx_b64: &str,
-) -> Result<String, RpcErr> {
-    let v = rpc_post(
-        c,
-        url,
-        json!({
-            "jsonrpc":"2.0","id":1,"method":"sendTransaction",
-            "params":[tx_b64, {
-                "encoding":"base64",
-                "skipPreflight": false,
-                "preflightCommitment":"confirmed",
-                "maxRetries": 0
-            }]
-        }),
-    )
-    .await?;
-    v["result"]
-        .as_str()
-        .ok_or_else(|| RpcErr::Body("missing signature in sendTransaction result".into()))
-        .map(|s| s.to_string())
-}
-
-#[derive(Debug, Clone)]
-enum SigStatus {
-    NotFound,
-    Pending,
-    Failed(Value),
-    Succeeded { slot: u64, confirmation: String },
-}
-
-async fn rpc_get_signature_status(
-    c: &reqwest::Client,
-    url: &str,
-    signature: &str,
-) -> Result<SigStatus, RpcErr> {
-    let v = rpc_post(
-        c,
-        url,
-        json!({
-            "jsonrpc":"2.0","id":1,"method":"getSignatureStatuses",
-            "params":[[signature], {"searchTransactionHistory": true}]
-        }),
-    )
-    .await?;
-    let val = &v["result"]["value"][0];
-    if val.is_null() {
-        return Ok(SigStatus::NotFound);
-    }
-    if let Some(err) = val.get("err") {
-        if !err.is_null() {
-            return Ok(SigStatus::Failed(err.clone()));
-        }
-    }
-    let conf = val
-        .get("confirmationStatus")
-        .and_then(|s| s.as_str())
-        .unwrap_or("processed")
-        .to_string();
-    if conf == "confirmed" || conf == "finalized" {
-        let slot = val.get("slot").and_then(|s| s.as_u64()).unwrap_or(0);
-        Ok(SigStatus::Succeeded {
-            slot,
-            confirmation: conf,
-        })
-    } else {
-        Ok(SigStatus::Pending)
-    }
-}
-
-// ── compute-budget ix builders ────────────────────────────────────────────
-
-fn compute_budget_set_unit_limit(units: u32) -> Instruction {
-    let mut data = Vec::with_capacity(5);
-    data.push(COMPUTE_BUDGET_IX_TAG_SET_UNIT_LIMIT);
-    data.extend_from_slice(&units.to_le_bytes());
-    Instruction {
-        program_id: Pubkey::from_str(COMPUTE_BUDGET_PROGRAM_BS58).unwrap(),
-        accounts: vec![],
-        data,
-    }
-}
-
-fn compute_budget_set_unit_price(micro_lamports_per_cu: u64) -> Instruction {
-    let mut data = Vec::with_capacity(9);
-    data.push(COMPUTE_BUDGET_IX_TAG_SET_UNIT_PRICE);
-    data.extend_from_slice(&micro_lamports_per_cu.to_le_bytes());
-    Instruction {
-        program_id: Pubkey::from_str(COMPUTE_BUDGET_PROGRAM_BS58).unwrap(),
-        accounts: vec![],
-        data,
-    }
-}
-
-/// Priority-fee math (`compute_unit_limit * micro_lamports_per_cu /
-/// 1_000_000 = priority_fee_lamports`). The deposit ix's actual CU
-/// consumption is bounded by the limit; this is the worst case.
-fn estimated_priority_fee_lamports(cu_limit: u32, price_micro_lamports: u64) -> u64 {
-    (cu_limit as u64) * price_micro_lamports / 1_000_000
-}
-
-// ── reserve / obligation invariant checks ─────────────────────────────────
-
-#[derive(Debug)]
-struct ReserveInvariantFail(String);
-
-fn verify_reserve_p5c(decoded: &SolendReserveRaw) -> Result<(), ReserveInvariantFail> {
-    let pin_lm = Pubkey::from_str(DEMO_LENDING_MARKET_BS58).unwrap();
-    let pin_liq = Pubkey::from_str(DEMO_LIQUIDITY_MINT_BS58).unwrap();
-    let pin_coll = Pubkey::from_str(DEMO_CTOKEN_MINT_BS58).unwrap();
-    let pin_pyth = Pubkey::from_str(DEMO_PYTH_ORACLE_BS58).unwrap();
-    if decoded.lending_market != pin_lm {
-        return Err(ReserveInvariantFail(format!(
-            "reserve.lending_market {} != P5c {pin_lm}",
-            decoded.lending_market
-        )));
-    }
-    if decoded.liquidity_mint != pin_liq {
-        return Err(ReserveInvariantFail(format!(
-            "reserve.liquidity_mint {} != P5c {pin_liq}",
-            decoded.liquidity_mint
-        )));
-    }
-    if decoded.collateral_mint != pin_coll {
-        return Err(ReserveInvariantFail(format!(
-            "reserve.collateral_mint {} != P5c {pin_coll}",
-            decoded.collateral_mint
-        )));
-    }
-    if decoded.pyth_oracle != pin_pyth {
-        return Err(ReserveInvariantFail(format!(
-            "reserve.pyth_oracle {} != P5c {pin_pyth}",
-            decoded.pyth_oracle
-        )));
-    }
-    if decoded.liquidity_mint_decimals != USDC_DECIMALS {
-        return Err(ReserveInvariantFail(format!(
-            "reserve.liquidity_mint_decimals {} != {USDC_DECIMALS}",
-            decoded.liquidity_mint_decimals
-        )));
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-struct ObligationInvariantFail(String);
-
-fn verify_obligation_p5c(
-    decoded: &SolendObligationRaw,
-    controlled: &Pubkey,
-) -> Result<(), ObligationInvariantFail> {
-    let pin_lm = Pubkey::from_str(DEMO_LENDING_MARKET_BS58).unwrap();
-    if decoded.owner != *controlled {
-        return Err(ObligationInvariantFail(format!(
-            "obligation.owner {} != controlled wallet {controlled}",
-            decoded.owner
-        )));
-    }
-    if decoded.lending_market != pin_lm {
-        return Err(ObligationInvariantFail(format!(
-            "obligation.lending_market {} != P5c {pin_lm}",
-            decoded.lending_market
-        )));
-    }
-    Ok(())
-}
-
-fn obligation_pinned_reserve_amount(decoded: &SolendObligationRaw) -> u64 {
-    let pin_reserve = Pubkey::from_str(DEMO_RESERVE_BS58).unwrap();
-    decoded
-        .deposits
-        .iter()
-        .filter(|d| d.deposit_reserve == pin_reserve)
-        .map(|d| d.deposited_amount)
-        .sum()
-}
-
-// ── Live Solend deposit execution client ──────────────────────────────────
-//
-// The first concrete `Stage2ExecutionClient` impl that does a live
-// mainnet send. The mock client in `stage2_executor.rs` is for the
-// pre-W5c unit-test surface only.
-
-/// Construction-time inputs for the live client.
-#[derive(Debug)]
-struct LiveSolendDepositExecutionClient {
-    keypair: Keypair,
-    rpc_url: String,
-    http: reqwest::Client,
-    /// The obligation we'll deposit into. Forwarded into the deposit ix
-    /// builder verbatim. We treat the executor's
-    /// `Stage2ExecuteActionRequest.solend.target_obligation` as the
-    /// authoritative source — this field is just a sanity-cross-check.
-    expected_target_obligation: Pubkey,
-}
-
-impl LiveSolendDepositExecutionClient {
-    fn new(
-        keypair: Keypair,
-        rpc_url: String,
-        expected_target_obligation: Pubkey,
-    ) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
-            .build()
-            .expect("build reqwest client");
-        Self {
-            keypair,
-            rpc_url,
-            http,
-            expected_target_obligation,
-        }
-    }
-
-    /// Phase 0 path. Build + simulate the deposit transaction WITHOUT
-    /// broadcasting. Returns the (live-blockhash, simulation) pair so
-    /// the caller can display logs / CU consumption.
-    async fn simulate_only(
-        &self,
-        request: &Stage2ExecuteActionRequest,
-    ) -> Result<(LatestBlockhash, SimResult, BuiltTx), Stage2ExecutionError> {
-        let plan = self.build_tx_plan(request).await?;
-        let latest = retry(
-            || rpc_get_latest_blockhash(&self.http, &self.rpc_url),
-            RPC_MAX_RETRY_ATTEMPTS,
-            Duration::from_millis(RPC_INITIAL_BACKOFF_MS),
-        )
-        .await
-        .map_err(|e| Stage2ExecutionError::Internal(format!("getLatestBlockhash: {e}")))?;
-        let tx_b64 = self.assemble_and_sign(&plan, &latest)?;
-        let sim = retry(
-            || rpc_simulate_transaction(&self.http, &self.rpc_url, &tx_b64),
-            RPC_MAX_RETRY_ATTEMPTS,
-            Duration::from_millis(RPC_INITIAL_BACKOFF_MS),
-        )
-        .await
-        .map_err(|e| Stage2ExecutionError::Internal(format!("simulateTransaction: {e}")))?;
-        Ok((latest, sim, plan))
-    }
-
-    /// Build the deposit instruction plan from the executor's strongly
-    /// typed request. This is the seam where the test-only adapter
-    /// reinterprets a "withdraw" request as a deposit: the request's
-    /// `solend.target_obligation` / `solend.reserve` / oracle pubkeys
-    /// are exactly the inputs the deposit builder needs.
-    async fn build_tx_plan(
-        &self,
-        request: &Stage2ExecuteActionRequest,
-    ) -> Result<BuiltTx, Stage2ExecutionError> {
-        // ── Wallet identity guard ────────────────────────────────────
-        let payer_pubkey = self.keypair.pubkey();
-        let delegated = Pubkey::new_from_array(request.delegated_wallet.0);
-        if delegated != payer_pubkey {
-            return Err(Stage2ExecutionError::InvalidRequest(format!(
-                "delegated_wallet {delegated} != keypair pubkey {payer_pubkey}"
-            )));
-        }
-        let expected_controlled = Pubkey::from_str(CONTROLLED_WALLET_BS58).unwrap();
-        if payer_pubkey != expected_controlled {
-            return Err(Stage2ExecutionError::InvalidRequest(format!(
-                "keypair pubkey {payer_pubkey} != pinned controlled wallet {expected_controlled}"
-            )));
-        }
-
-        let solend_payload = request
-            .solend
-            .as_ref()
-            .ok_or_else(|| {
-                Stage2ExecutionError::InvalidRequest(
-                    "Stage2ExecuteActionRequest.solend missing".to_string(),
-                )
-            })?;
-        let target_obligation =
-            Pubkey::new_from_array(solend_payload.target_obligation.0);
-        if target_obligation != self.expected_target_obligation {
-            return Err(Stage2ExecutionError::InvalidRequest(format!(
-                "solend.target_obligation {target_obligation} != expected {}",
-                self.expected_target_obligation
-            )));
-        }
-
-        // ── Live reserve decode (defence in depth) ───────────────────
-        let solend_program_id = Pubkey::from_str(SOLEND_PROGRAM_ID_BS58).unwrap();
-        let reserve_pubkey = Pubkey::new_from_array(solend_payload.reserve.0);
-        let reserve_bytes = retry(
-            || rpc_get_account_data(&self.http, &self.rpc_url, &reserve_pubkey),
-            RPC_MAX_RETRY_ATTEMPTS,
-            Duration::from_millis(RPC_INITIAL_BACKOFF_MS),
-        )
-        .await
-        .map_err(|e| Stage2ExecutionError::Internal(format!("getAccountInfo(reserve): {e}")))?
-        .ok_or_else(|| {
-            Stage2ExecutionError::Internal(format!(
-                "reserve account does not exist: {reserve_pubkey}"
-            ))
-        })?;
-        let reserve = decode_reserve(&reserve_bytes)
-            .map_err(|e| Stage2ExecutionError::Internal(format!("decode_reserve: {e}")))?;
-        verify_reserve_p5c(&reserve)
-            .map_err(|e| Stage2ExecutionError::InvalidRequest(format!("reserve P5c: {}", e.0)))?;
-
-        // ── Live obligation decode + delegated-owner check ───────────
-        let obligation_bytes = retry(
-            || rpc_get_account_data(&self.http, &self.rpc_url, &target_obligation),
-            RPC_MAX_RETRY_ATTEMPTS,
-            Duration::from_millis(RPC_INITIAL_BACKOFF_MS),
-        )
-        .await
-        .map_err(|e| {
-            Stage2ExecutionError::Internal(format!("getAccountInfo(obligation): {e}"))
-        })?
-        .ok_or_else(|| {
-            Stage2ExecutionError::Internal(format!(
-                "obligation account does not exist: {target_obligation}"
-            ))
-        })?;
-        let obligation = decode_obligation(&obligation_bytes)
-            .map_err(|e| Stage2ExecutionError::Internal(format!("decode_obligation: {e}")))?;
-        verify_obligation_p5c(&obligation, &payer_pubkey).map_err(|e| {
-            Stage2ExecutionError::InvalidRequest(format!("obligation P5c: {}", e.0))
-        })?;
-
-        // ── Derive ATAs + cToken-ATA existence ───────────────────────
-        let usdc_mint = Pubkey::from_str(DEMO_LIQUIDITY_MINT_BS58).unwrap();
-        let ctoken_mint = Pubkey::from_str(DEMO_CTOKEN_MINT_BS58).unwrap();
-        let source_usdc_ata = get_associated_token_address(&payer_pubkey, &usdc_mint);
-        let ctoken_ata = get_associated_token_address(&payer_pubkey, &ctoken_mint);
-        let ctoken_ata_exists = retry(
-            || rpc_get_account_exists(&self.http, &self.rpc_url, &ctoken_ata),
-            RPC_MAX_RETRY_ATTEMPTS,
-            Duration::from_millis(RPC_INITIAL_BACKOFF_MS),
-        )
-        .await
-        .map_err(|e| {
-            Stage2ExecutionError::Internal(format!("getAccountInfo(cToken ATA): {e}"))
-        })?;
-
-        // ── Source-balance gate ──────────────────────────────────────
-        let source = retry(
-            || rpc_get_token_account_balance(&self.http, &self.rpc_url, &source_usdc_ata),
-            RPC_MAX_RETRY_ATTEMPTS,
-            Duration::from_millis(RPC_INITIAL_BACKOFF_MS),
-        )
-        .await
-        .map_err(|e| {
-            Stage2ExecutionError::Internal(format!("getTokenAccountBalance(source): {e}"))
-        })?
-        .ok_or_else(|| {
-            Stage2ExecutionError::InvalidRequest(format!(
-                "source USDC ATA does not exist: {source_usdc_ata}"
-            ))
-        })?;
-        if source.decimals != USDC_DECIMALS {
-            return Err(Stage2ExecutionError::InvalidRequest(format!(
-                "source ATA decimals={} != {USDC_DECIMALS}",
-                source.decimals
-            )));
-        }
-        if source.raw < request.input_amount_raw {
-            return Err(Stage2ExecutionError::InvalidRequest(format!(
-                "source USDC balance {} raw < deposit amount {} raw — controlled wallet \
-                 needs refunding first",
-                source.raw, request.input_amount_raw
-            )));
-        }
-
-        // ── Build instruction list ───────────────────────────────────
-        let spl_token = Pubkey::from_str(SPL_TOKEN_PROGRAM_BS58).unwrap();
-
-        let refresh_plan = build_refresh_instructions(RefreshPlanInputs {
-            solend_program_id,
-            reserves: vec![ReserveRefreshInput {
-                reserve_pubkey,
-                pyth_oracle: reserve.pyth_oracle,
-                switchboard_oracle: reserve.switchboard_oracle,
-            }],
-            obligation: None,
-        });
-
-        let deposit_ix =
-            build_deposit_reserve_liquidity_and_obligation_collateral_instruction(
-                DepositInstructionInputs {
-                    solend_program_id,
-                    amount: UnderlyingAmount::new(request.input_amount_raw),
-                    source_liquidity: source_usdc_ata,
-                    user_collateral: ctoken_ata,
-                    reserve: reserve_pubkey,
-                    reserve_liquidity_supply: reserve.liquidity_supply,
-                    reserve_collateral_mint: reserve.collateral_mint,
-                    lending_market: reserve.lending_market,
-                    destination_deposit_collateral: reserve.collateral_supply,
-                    obligation: target_obligation,
-                    obligation_owner: payer_pubkey,
-                    pyth_oracle: reserve.pyth_oracle,
-                    switchboard_oracle: reserve.switchboard_oracle,
-                    user_transfer_authority: payer_pubkey,
-                },
-            )
-            .map_err(|e| Stage2ExecutionError::Internal(format!("build deposit ix: {e}")))?;
-
-        let mut ixs: Vec<Instruction> = Vec::with_capacity(5);
-        ixs.push(compute_budget_set_unit_limit(COMPUTE_UNIT_LIMIT));
-        ixs.push(compute_budget_set_unit_price(
-            COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
-        ));
-        if !ctoken_ata_exists {
-            ixs.push(create_associated_token_account_idempotent(
-                &payer_pubkey,
-                &payer_pubkey,
-                &ctoken_mint,
-                &spl_token,
-            ));
-        }
-        for ix in refresh_plan.instructions {
-            ixs.push(ix);
-        }
-        ixs.push(deposit_ix);
-
-        Ok(BuiltTx {
-            ixs,
-            payer: payer_pubkey,
-            source_usdc_ata,
-            ctoken_ata,
-            target_obligation,
-            reserve_pubkey,
-            ctoken_ata_existed_before: ctoken_ata_exists,
-            source_usdc_before: source.raw,
-            obligation_pinned_reserve_amount_before:
-                obligation_pinned_reserve_amount(&obligation),
-            obligation_deposits_len_before: obligation.deposits.len(),
-        })
-    }
-
-    fn assemble_and_sign(
-        &self,
-        plan: &BuiltTx,
-        latest: &LatestBlockhash,
-    ) -> Result<String, Stage2ExecutionError> {
-        let message = Message::new(&plan.ixs, Some(&plan.payer));
-        let mut tx = Transaction::new_unsigned(message);
-        tx.sign(&[&self.keypair], latest.hash);
-        let tx_bytes = bincode::serialize(&tx)
-            .map_err(|e| Stage2ExecutionError::Internal(format!("serialize tx: {e}")))?;
-        use base64::Engine as _;
-        Ok(base64::engine::general_purpose::STANDARD.encode(&tx_bytes))
-    }
-
-    /// Live broadcast helper. Caller has already simulated; this path
-    /// re-fetches a fresh blockhash, re-signs, sends, and polls.
-    async fn broadcast_and_confirm(
-        &self,
-        plan: &BuiltTx,
-    ) -> Result<(String, u64, String), Stage2ExecutionError> {
-        let fresh = retry(
-            || rpc_get_latest_blockhash(&self.http, &self.rpc_url),
-            RPC_MAX_RETRY_ATTEMPTS,
-            Duration::from_millis(RPC_INITIAL_BACKOFF_MS),
-        )
-        .await
-        .map_err(|e| Stage2ExecutionError::SendFailed(format!("fresh blockhash: {e}")))?;
-        let tx_b64 = self.assemble_and_sign(plan, &fresh)?;
-        let signature = retry(
-            || rpc_send_transaction_base64(&self.http, &self.rpc_url, &tx_b64),
-            RPC_MAX_RETRY_ATTEMPTS,
-            Duration::from_millis(RPC_INITIAL_BACKOFF_MS),
-        )
-        .await
-        .map_err(|e| Stage2ExecutionError::SendFailed(format!("sendTransaction: {e}")))?;
-
-        let mut attempts = 0;
-        let mut last_seen: Option<SigStatus> = None;
-        while attempts < STATUS_POLL_MAX_ATTEMPTS {
-            attempts += 1;
-            tokio::time::sleep(Duration::from_millis(STATUS_POLL_INTERVAL_MS)).await;
-            let st = match retry(
-                || rpc_get_signature_status(&self.http, &self.rpc_url, &signature),
-                RPC_MAX_RETRY_ATTEMPTS,
-                Duration::from_millis(RPC_INITIAL_BACKOFF_MS),
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            match st {
-                SigStatus::NotFound | SigStatus::Pending => {
-                    last_seen = Some(st);
-                    continue;
-                }
-                SigStatus::Failed(err) => {
-                    return Err(Stage2ExecutionError::ConfirmationFailed(format!(
-                        "tx failed on chain: {err} (signature {signature})"
-                    )));
-                }
-                SigStatus::Succeeded { slot, confirmation } => {
-                    last_seen = Some(SigStatus::Succeeded {
-                        slot,
-                        confirmation: confirmation.clone(),
-                    });
-                    if confirmation == "finalized" {
-                        return Ok((signature, slot, confirmation));
-                    }
-                    // "confirmed" — keep polling for finalized.
-                }
-            }
-        }
-        Err(Stage2ExecutionError::ConfirmationFailed(format!(
-            "timeout after {STATUS_POLL_MAX_ATTEMPTS} attempts; last seen {last_seen:?}; signature {signature}"
-        )))
-    }
-}
-
-#[async_trait]
-impl Stage2ExecutionClient for LiveSolendDepositExecutionClient {
-    async fn send_and_confirm(
-        &self,
-        request: Stage2ExecuteActionRequest,
-    ) -> Result<Stage2ExecutionReceipt, Stage2ExecutionError> {
-        let plan = self.build_tx_plan(&request).await?;
-        let (signature, slot, _confirmation) = self.broadcast_and_confirm(&plan).await?;
-        Ok(Stage2ExecutionReceipt {
-            rule_id: request.rule_id,
-            execution_nonce: request.execution_nonce,
-            confirmation_slot: slot,
-            used_amount_raw: request.input_amount_raw,
-            signature_sentinel: signature,
-        })
-    }
-}
-
-/// Output of [`LiveSolendDepositExecutionClient::build_tx_plan`].
-/// Several fields aren't read after construction (their values flow
-/// into the banner) — kept for the future "Display"-style banner
-/// extension without forcing extra RPC calls.
-#[allow(dead_code)]
-#[derive(Debug)]
-struct BuiltTx {
-    ixs: Vec<Instruction>,
-    payer: Pubkey,
-    source_usdc_ata: Pubkey,
-    ctoken_ata: Pubkey,
-    target_obligation: Pubkey,
-    reserve_pubkey: Pubkey,
-    ctoken_ata_existed_before: bool,
-    source_usdc_before: u64,
-    obligation_pinned_reserve_amount_before: u64,
-    obligation_deposits_len_before: usize,
-}
-
-// ── Test fixture rule builder ─────────────────────────────────────────────
-
-/// Construct a deterministic-id fixture rule that:
-/// - matches the demo P5c reserve + lending market (so the executor's
-///   `DemoSolendExecutionFixture::build_payload` accepts it),
-/// - has `delegated_wallet = controlled wallet`,
-/// - has `max_input_amount_raw = amount_raw` (one-shot v1 → executor
-///   sets `request.input_amount_raw = max - used = max`).
-fn fixture_rule(
-    amount_raw: u64,
-    target_obligation_bs58: &str,
-    user_bs58: &str,
-    executor_bs58: &str,
-    expires_at_slot: u64,
-) -> WatchRule {
-    let pk = |s: &str| PubkeyBytes::from_base58(s).unwrap();
-    let target_obligation = pk(target_obligation_bs58);
-    let reserve = pk(DEMO_RESERVE_BS58);
-    let lending_market = pk(DEMO_LENDING_MARKET_BS58);
-    let solend_program_id = pk(SOLEND_PROGRAM_ID_BS58);
-    let delegated = pk(CONTROLLED_WALLET_BS58);
-    WatchRule {
-        schema_version: STAGE2_WATCH_RULE_SCHEMA_VERSION,
-        rule_id: FIXTURE_RULE_ID,
-        user: pk(user_bs58),
-        executor: pk(executor_bs58),
-        delegated_wallet: delegated,
-        created_at_slot: 415_500_000,
-        expires_at_slot,
-        one_shot: true,
-        condition_logic: ConditionLogic::All,
-        conditions: vec![Condition::SolendReserveSupplyRate {
-            reserve_pubkey: reserve,
-            lending_market,
-            solend_program_id,
-            comparison: Comparison::Lt,
-            threshold_bps: 1_000,
-            rate_kind: RateKind::Apr,
-            formula_version: 1,
-            max_reserve_staleness_slots: 16,
-            required_refresh_same_tx: true,
-        }],
-        action: ActionSpec::SolendWithdrawAllDelegated {
-            target_obligation,
-            reserve_pubkey: reserve,
-            lending_market,
-            destination_wallet: delegated,
-            withdraw_mode: WithdrawMode::WithdrawAllDelegatedPosition,
-        },
-        max_input_amount_raw: amount_raw,
-        used_amount_raw: 0,
-        destination: delegated,
-        slippage_bps: 0,
-    }
-}
-
-async fn insert_and_mark_condition_met(
-    repo: &Stage2WatchRuleRepository,
-    rule: &WatchRule,
-) -> Result<(), String> {
-    repo.insert(rule)
-        .await
-        .map_err(|e| format!("repo.insert: {e}"))?;
-    let updated = repo
-        .mark_condition_met_if_active(&rule.rule_id)
-        .await
-        .map_err(|e| format!("mark_condition_met_if_active: {e}"))?;
-    if updated != 1 {
-        return Err(format!(
-            "mark_condition_met_if_active touched {updated} rows (expected 1)"
-        ));
-    }
-    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1338,12 +272,9 @@ async fn stage2_w5c_live_conditional_solend_deposit() {
     eprintln!("✓ RPC OK            solana-core={ver} chain_slot={chain_slot}");
 
     let rule = fixture_rule(
+        FIXTURE_RULE_ID,
         cfg.amount_raw,
         DEFAULT_TARGET_OBLIGATION_BS58,
-        // user / executor — not signers; the fixture just needs valid
-        // pubkeys. Use the controlled wallet for symmetry, since this
-        // demo path collapses the user / executor / delegated identities
-        // for substrate purposes.
         CONTROLLED_WALLET_BS58,
         CONTROLLED_WALLET_BS58,
         chain_slot.saturating_add(50_000), // expiry well ahead
@@ -1427,16 +358,14 @@ async fn stage2_w5c_live_conditional_solend_deposit() {
     eprintln!("  reserve                {}", plan.reserve_pubkey);
     eprintln!("  cToken minted to ATA   {}", plan.ctoken_ata);
     eprintln!("");
-    eprintln!("Awaiting exact approval phrase: {APPROVAL_PHRASE}");
+    eprintln!("Awaiting exact approval phrase: {W5C_APPROVAL_PHRASE}");
     eprintln!("To proceed to Phase 2 live send, re-run with env var:");
-    eprintln!("  {ENV_APPROVAL}=\"{APPROVAL_PHRASE}\"");
+    eprintln!("  {W5C_ENV_APPROVAL}=\"{W5C_APPROVAL_PHRASE}\"");
     eprintln!(
         "──────────────────────────────────────────────────────────────"
     );
 
     if !cfg.approved {
-        // Reload to confirm Phase 0 did NOT mutate durable state past
-        // the condition_met transition.
         let after = repo
             .get(&rule.rule_id)
             .await
@@ -1498,7 +427,6 @@ async fn stage2_w5c_live_conditional_solend_deposit() {
             (signature_sentinel, confirmation_slot, used_amount_raw)
         }
         Stage2ExecutorRuleResult::Failed { error, .. } => {
-            // Reload rule for banner before panicking.
             let after = repo
                 .get(&rule.rule_id)
                 .await
@@ -1533,7 +461,6 @@ async fn stage2_w5c_live_conditional_solend_deposit() {
     eprintln!("✓ signature  {signature}");
     eprintln!("  Solscan:   https://solscan.io/tx/{signature}");
 
-    // Reload + assert state writeback.
     let after = repo
         .get(&rule.rule_id)
         .await
@@ -1546,13 +473,11 @@ async fn stage2_w5c_live_conditional_solend_deposit() {
         "executor must transition rule to completed on Ok receipt"
     );
     assert!(after.completed, "completed flag must be set");
-    // The state-store keeps `used_amount_raw` in a SQL column that is
-    // updated by `mark_completed`; the JSON-serialised `rule_json`
-    // column is frozen at insert time (so `after.rule.used_amount_raw`
-    // stays at 0 — the original `WatchRule` value — even though the
-    // SQL column carries the runtime amount the executor wrote back).
-    // Cross-check the SQL column directly, matching the pattern used
-    // by claw-state-store's own tests.
+
+    // The state-store keeps `used_amount_raw` in a SQL column updated
+    // by `mark_completed`; the JSON-serialised `rule_json` column is
+    // frozen at insert time. Cross-check the SQL column directly,
+    // matching the pattern used by claw-state-store's own tests.
     let used_in_sql: (i64,) = sqlx::query_as(
         "SELECT used_amount_raw FROM stage2_watch_rules WHERE rule_id = ?",
     )
@@ -1612,7 +537,6 @@ async fn stage2_w5c_live_conditional_solend_deposit() {
         after_ctoken - plan.obligation_pinned_reserve_amount_before
     );
 
-    // Banner.
     let priority_fee_actual =
         estimated_priority_fee_lamports(COMPUTE_UNIT_LIMIT, COMPUTE_UNIT_PRICE_MICRO_LAMPORTS);
     print_banner(BannerInputs {
@@ -1716,15 +640,6 @@ fn opt(x: Option<u64>) -> String {
     x.map(|n| n.to_string()).unwrap_or_else(|| "N/A".to_string())
 }
 
-fn hex_id(rule_id: &[u8; 16]) -> String {
-    let mut s = String::with_capacity(32);
-    for b in rule_id {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // Unit tests (always run; non-live; no network; no keypair)
 // ──────────────────────────────────────────────────────────────────────────
@@ -1732,7 +647,15 @@ fn hex_id(rule_id: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claw_gateway::stage2_executor::Stage2ExecutorRuleResult;
+    use async_trait::async_trait;
+    use claw_gateway::stage2_executor::{
+        Stage2ExecuteActionRequest, Stage2ExecutionClient, Stage2ExecutionError,
+        Stage2ExecutionReceipt, DEMO_CTOKEN_MINT_BS58, DEMO_LENDING_MARKET_BS58,
+        DEMO_RESERVE_BS58,
+    };
+    use claw_types::canonical_intent::PubkeyBytes;
+    use claw_types::stage2_watch_rule::STAGE2_WATCH_RULE_SCHEMA_VERSION;
+    use solana_sdk::signature::Keypair;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ── env-reader tests ──────────────────────────────────────────────────
@@ -1832,7 +755,7 @@ mod tests {
             "HELIUS_RPC_URL" => Some("https://example.invalid/".to_string()),
             "CLAW_STAGE2_CLUSTER" => Some("mainnet-beta".to_string()),
             "CLAW_STAGE2_DELEGATED_KEYPAIR_PATH" => Some("/tmp/fake".to_string()),
-            "CLAW_STAGE2_CONDITIONAL_DEPOSIT_APPROVED" => Some(APPROVAL_PHRASE.to_string()),
+            "CLAW_STAGE2_CONDITIONAL_DEPOSIT_APPROVED" => Some(W5C_APPROVAL_PHRASE.to_string()),
             _ => None,
         });
         match status {
@@ -1851,18 +774,13 @@ mod tests {
     #[test]
     fn priority_fee_math_matches_spec() {
         // 400_000 CU × 50_000 μ/CU / 1_000_000 = 20_000 lamports
-        assert_eq!(
-            estimated_priority_fee_lamports(400_000, 50_000),
-            20_000
-        );
+        assert_eq!(estimated_priority_fee_lamports(400_000, 50_000), 20_000);
         // 87_803 CU (W5b empirical) × 50_000 / 1_000_000 = 4_390 lamports
         assert_eq!(estimated_priority_fee_lamports(87_803, 50_000), 4_390);
     }
 
     #[test]
     fn pin_constants_match_stage2_executor() {
-        // Sanity: the executor's source-of-truth re-exports match what
-        // the harness uses for live-account verification.
         assert_eq!(
             DEMO_RESERVE_BS58,
             claw_gateway::stage2_executor::DEMO_RESERVE_BS58
@@ -1878,11 +796,6 @@ mod tests {
     }
 
     // ── State-machine tests using MockExecutionClient ─────────────────────
-    //
-    // These exercise the W4 path the live test relies on, with no
-    // network calls. The live `LiveSolendDepositExecutionClient` is not
-    // involved here — that's the *concrete* implementation; the mock
-    // covers the *generic* behavior the executor relies on.
 
     async fn test_repo() -> (Database, Stage2WatchRuleRepository) {
         let db = Database::open_in_memory().await.unwrap();
@@ -1902,15 +815,14 @@ mod tests {
     async fn cas_lease_prevents_double_execution() {
         let (_db, repo) = test_repo().await;
         let rule = fixture_rule(
+            FIXTURE_RULE_ID,
             250_000,
             DEFAULT_TARGET_OBLIGATION_BS58,
             CONTROLLED_WALLET_BS58,
             CONTROLLED_WALLET_BS58,
             415_700_000,
         );
-        insert_and_mark_condition_met(&repo, &rule)
-            .await
-            .unwrap();
+        insert_and_mark_condition_met(&repo, &rule).await.unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -1942,13 +854,10 @@ mod tests {
             }),
         );
 
-        // First call: lease + dispatch.
         let r1 = executor.execute_rule_once(rule.rule_id, ctx()).await;
         assert!(matches!(r1, Stage2ExecutorRuleResult::Completed { .. }));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        // Second call: rule is now `completed`, CAS should miss
-        // (rule no longer in `condition_met`).
         let r2 = executor.execute_rule_once(rule.rule_id, ctx()).await;
         assert!(
             matches!(r2, Stage2ExecutorRuleResult::LeaseLost { .. }),
@@ -1963,10 +872,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_signature_without_confirmation_does_not_mark_completed() {
-        // A failed client invocation must NOT mark completed. The
-        // executor maps `Err(...)` → `mark_failed`, not `mark_completed`.
         let (_db, repo) = test_repo().await;
         let rule = fixture_rule(
+            FIXTURE_RULE_ID,
             250_000,
             DEFAULT_TARGET_OBLIGATION_BS58,
             CONTROLLED_WALLET_BS58,
@@ -1992,11 +900,9 @@ mod tests {
 
     #[tokio::test]
     async fn failure_marks_failed_and_no_retry() {
-        // Two consecutive ticks with a failing client. First marks
-        // failed; second observes terminal state and emits LeaseLost
-        // (no retry).
         let (_db, repo) = test_repo().await;
         let rule = fixture_rule(
+            FIXTURE_RULE_ID,
             250_000,
             DEFAULT_TARGET_OBLIGATION_BS58,
             CONTROLLED_WALLET_BS58,
@@ -2007,7 +913,6 @@ mod tests {
 
         let mock = MockExecutionClient::new();
         mock.push_failure(Stage2ExecutionError::SendFailed("RPC down".into()));
-        // Second outcome is never reached if no-retry holds.
         mock.push_failure(Stage2ExecutionError::SendFailed("should not fire".into()));
         let executor = Stage2Executor::new(repo.clone(), Arc::new(mock));
 
@@ -2021,6 +926,7 @@ mod tests {
     async fn revoked_rule_ignored() {
         let (_db, repo) = test_repo().await;
         let rule = fixture_rule(
+            FIXTURE_RULE_ID,
             250_000,
             DEFAULT_TARGET_OBLIGATION_BS58,
             CONTROLLED_WALLET_BS58,
@@ -2044,13 +950,13 @@ mod tests {
     async fn active_rule_not_in_condition_met_is_ignored() {
         let (_db, repo) = test_repo().await;
         let rule = fixture_rule(
+            FIXTURE_RULE_ID,
             250_000,
             DEFAULT_TARGET_OBLIGATION_BS58,
             CONTROLLED_WALLET_BS58,
             CONTROLLED_WALLET_BS58,
             415_700_000,
         );
-        // Inserted but NOT marked condition_met — still `active`.
         repo.insert(&rule).await.unwrap();
         let executor = Stage2Executor::new(
             repo.clone(),
@@ -2067,6 +973,7 @@ mod tests {
     async fn completed_rule_is_ignored() {
         let (_db, repo) = test_repo().await;
         let rule = fixture_rule(
+            FIXTURE_RULE_ID,
             250_000,
             DEFAULT_TARGET_OBLIGATION_BS58,
             CONTROLLED_WALLET_BS58,
@@ -2074,7 +981,6 @@ mod tests {
             415_700_000,
         );
         insert_and_mark_condition_met(&repo, &rule).await.unwrap();
-        // Externally mark completed.
         repo.mark_completed(&rule.rule_id, 250_000, 415_500_001)
             .await
             .unwrap();
@@ -2091,9 +997,6 @@ mod tests {
 
     #[tokio::test]
     async fn live_client_rejects_mismatching_delegated_wallet() {
-        // The live client's identity guard: a request whose
-        // `delegated_wallet` differs from the keypair's pubkey must
-        // fail early — before any network call.
         let kp = Keypair::new();
         let other = Pubkey::new_unique();
         let client = LiveSolendDepositExecutionClient::new(
@@ -2101,8 +1004,6 @@ mod tests {
             "https://example.invalid/".to_string(),
             Pubkey::from_str(DEFAULT_TARGET_OBLIGATION_BS58).unwrap(),
         );
-        // Fabricate a request whose delegated_wallet is NOT the
-        // keypair's pubkey.
         let bogus_request = Stage2ExecuteActionRequest {
             rule_id: [0; 16],
             canonical_rule_hash: [0; 32],
@@ -2144,11 +1045,6 @@ mod tests {
             );
         }
     }
-
-    // (`send_path_is_singular_and_gated` and `no_confirm_transaction_path`
-    // were redundant with `no_send_path_default_invariant` and added
-    // false-positive self-references to the very tokens they tried to
-    // forbid. The forbidden-call-form table is the source of truth.)
 
     #[test]
     fn retry_policy_is_bounded() {
