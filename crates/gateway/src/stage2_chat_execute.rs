@@ -1039,6 +1039,46 @@ fn signed_delta(before: u64, after: u64) -> i64 {
     (after as i128 - before as i128) as i64
 }
 
+// ── Refusing sender (defense-in-depth) ───────────────────────────────────
+
+/// A no-op sender that always returns `TxBuildFailed`. The daemon
+/// wires this when the live env gate chain isn't fully satisfied
+/// (master gate off, keypair path missing, keypair load failed,
+/// etc.) so the orchestrator can ALWAYS be constructed and per-
+/// request pre-checks run. By the time a request reaches this
+/// sender's `build_sign_send_poll`, the orchestrator's pre-check
+/// chain has already short-circuited with the appropriate typed
+/// `PrechecksFailed` outcome — calling this sender is the
+/// defense-in-depth fallback for a bug-in-orchestrator case.
+#[derive(Debug)]
+pub struct RefusingStage2ChatExecuteSender {
+    reason: String,
+}
+
+impl RefusingStage2ChatExecuteSender {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Stage2ChatExecuteSender for RefusingStage2ChatExecuteSender {
+    async fn build_sign_send_poll(
+        &self,
+        _request: ChatExecuteSendRequest,
+    ) -> ChatExecuteSendOutcome {
+        ChatExecuteSendOutcome::TxBuildFailed {
+            reason: format!(
+                "refusing sender: {} — this code path should be unreachable; \
+                 the orchestrator pre-check chain must fail-closed first",
+                self.reason
+            ),
+        }
+    }
+}
+
 // ── Live sender impl ─────────────────────────────────────────────────────
 
 /// The production sender. Loads the controlled-wallet keypair from
@@ -2139,6 +2179,35 @@ mod tests {
         // cleanly without panic.
         assert_eq!(signed_delta(403_487, 153_487), -250_000);
         assert_eq!(signed_delta(0, 192_876), 192_876);
+    }
+
+    /// W5g — orchestrator built with a `RefusingStage2ChatExecuteSender`
+    /// + `master_gate_on=false` returns typed `PrechecksFailed` for
+    /// any well-formed request, WITHOUT calling the sender. This is
+    /// the gates-off chat-route behavior the daemon ships in
+    /// production.
+    #[tokio::test]
+    async fn refusing_sender_path_returns_prechecks_failed_when_gates_off() {
+        let rule = fixture_rule(180, W5G_DEPOSIT_AMOUNT_RAW);
+        let (_db, repo) = test_repo().await;
+        repo.insert(&rule).await.unwrap();
+        let req = good_request_for(&rule);
+        let mut cfg = config_all_on();
+        cfg.master_gate_on = false; // simulate the daemon-startup case
+        let exec = Stage2ChatExecutor::new(
+            Arc::new(RefusingStage2ChatExecuteSender::new("test: master gate off")),
+            Arc::new(StubSaveFetcher::apy_bps(210)),
+            Arc::new(StubAprFetcher { native_apr_bps: 165, budget_raw: 500_000 }),
+            repo.clone(),
+            cfg,
+        );
+        let o = exec.execute(req).await;
+        assert_eq!(o.status, ChatExecuteStatus::PrechecksFailed);
+        assert_eq!(o.error, Some(ChatExecuteErrorCode::MasterGateMissing));
+        assert!(o.tx_signature.is_none(), "no broadcast on gates-off path");
+        // Rule must stay Active — never marked completed.
+        let stored = repo.get(&rule.rule_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, WatchRuleStatus::Active);
     }
 
     #[test]

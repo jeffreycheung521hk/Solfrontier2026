@@ -941,14 +941,19 @@ impl GatewayDaemon {
         ));
         // W5g — chat-card controlled-wallet Solend deposit execution.
         //
-        // Default: `None` (chat-route W5g approval command surfaces a
-        // typed ToolError; dedicated route returns 503). Wired ONLY
-        // when every env gate is set AND the controlled-wallet keypair
-        // loads successfully AND the matching `LiveSaveDisplayApyFetcher`
-        // / `LiveW5dAprFetcher` / RPC URL are also available. The
-        // orchestrator itself also fails-closed on a per-request basis
-        // in case the daemon was misconfigured between startup and
-        // request time.
+        // Constructed unconditionally whenever the RPC URL is set, so
+        // the orchestrator's per-request pre-check chain runs and
+        // returns a typed `prechecks_failed` card for every misconfig
+        // case (master gate off, keypair missing, cluster mismatch,
+        // rule lookup miss, Save APY re-check fail, budget short).
+        // The sender variant chosen at startup determines what
+        // happens if the pre-check chain ever DOESN'T fail-closed:
+        //   - LiveStage2ChatExecuteSender when every live gate is set
+        //     AND the keypair loads.
+        //   - RefusingStage2ChatExecuteSender (defense-in-depth) when
+        //     any live gate is off — its `TxBuildFailed` outcome
+        //     should be unreachable in production because the
+        //     orchestrator's pre-checks always fire first.
         //
         // Built BEFORE the chat handler so the SAME `Arc` is shared
         // by both consumers (chat-route detection + dedicated route).
@@ -956,16 +961,7 @@ impl GatewayDaemon {
             std::sync::Arc<crate::stage2_chat_execute::Stage2ChatExecutor>,
         > = {
             let cfg = crate::stage2_chat_execute::Stage2ChatExecuteConfig::from_std_env();
-            if !cfg.master_gate_on {
-                info!(
-                    "W5g chat-execute disabled (CLAW_STAGE2_LIVE_CHAT_EXECUTION != \"1\"); \
-                     chat-route W5g approval command will surface ToolError and \
-                     POST /sessions/:id/stage2/w5g/execute will return 503"
-                );
-                None
-            } else {
-                build_w5g_executor(cfg, w5e_repo.clone())
-            }
+            build_w5g_executor(cfg, w5e_repo.clone())
         };
 
         let chat_handler_ref: Option<ChatHandlerRef> =
@@ -2748,40 +2744,14 @@ fn build_w5g_executor(
         Some(u) => u,
         None => {
             info!(
-                "W5g chat-execute disabled (no HELIUS_RPC_URL / CLAW_RPC_URL); \
-                 chat-route ToolError + 503 on /stage2/w5g/execute"
+                "W5g chat-execute orchestrator NOT built (no HELIUS_RPC_URL / \
+                 CLAW_RPC_URL). chat-route W5g command will surface ToolError; \
+                 POST /sessions/:id/stage2/w5g/execute will return 503."
             );
             return None;
         }
     };
-    let keypair_path = std::env::var(
-        crate::stage2_chat_execute::W5G_ENV_DELEGATED_KEYPAIR_PATH,
-    )
-    .ok()
-    .filter(|s| !s.trim().is_empty());
-    let keypair_path = match keypair_path {
-        Some(p) => p,
-        None => {
-            info!(
-                "W5g chat-execute disabled (no {} set)",
-                crate::stage2_chat_execute::W5G_ENV_DELEGATED_KEYPAIR_PATH
-            );
-            return None;
-        }
-    };
-    let live_sender = match crate::stage2_chat_execute::LiveStage2ChatExecuteSender::from_paths(
-        &keypair_path,
-        rpc_url.clone(),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            info!(
-                "W5g chat-execute disabled (live sender build failed): {e}; \
-                 chat-route ToolError + 503 on /stage2/w5g/execute"
-            );
-            return None;
-        }
-    };
+
     let save_apy_fetcher: std::sync::Arc<
         dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher,
     > = std::sync::Arc::new(
@@ -2793,23 +2763,80 @@ fn build_w5g_executor(
         Some(f) => std::sync::Arc::new(f),
         None => {
             info!(
-                "W5g chat-execute disabled (LiveW5dAprFetcher rejected RPC URL)"
+                "W5g chat-execute orchestrator NOT built (LiveW5dAprFetcher \
+                 rejected the RPC URL)."
             );
             return None;
         }
     };
+
+    // Choose the sender. The Live variant requires master gate on AND
+    // a loadable keypair. Any other shape uses the Refusing variant
+    // so the orchestrator is still constructible — its pre-check
+    // chain returns a typed `prechecks_failed` BEFORE the sender is
+    // touched, which is what we want the operator to see.
+    let sender: std::sync::Arc<dyn crate::stage2_chat_execute::Stage2ChatExecuteSender> = {
+        let keypair_path = std::env::var(
+            crate::stage2_chat_execute::W5G_ENV_DELEGATED_KEYPAIR_PATH,
+        )
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+        match (cfg.master_gate_on, cfg.keypair_path_present, keypair_path) {
+            (true, true, Some(path)) => {
+                match crate::stage2_chat_execute::LiveStage2ChatExecuteSender::from_paths(
+                    &path,
+                    rpc_url.clone(),
+                ) {
+                    Ok(live) => {
+                        info!(
+                            "W5g chat-execute LIVE sender wired — keypair loaded, \
+                             every live gate satisfied; per-request pre-checks still apply."
+                        );
+                        std::sync::Arc::new(live)
+                    }
+                    Err(e) => {
+                        info!(
+                            "W5g chat-execute REFUSING sender wired (keypair load \
+                             failed: {e}); orchestrator pre-check chain will surface \
+                             typed prechecks_failed."
+                        );
+                        std::sync::Arc::new(
+                            crate::stage2_chat_execute::RefusingStage2ChatExecuteSender::new(
+                                format!("keypair load failed at daemon startup: {e}"),
+                            ),
+                        )
+                    }
+                }
+            }
+            _ => {
+                info!(
+                    "W5g chat-execute REFUSING sender wired (master_gate_on={}, \
+                     keypair_path_present={}); orchestrator pre-check chain will \
+                     surface typed prechecks_failed for every W5g approval command.",
+                    cfg.master_gate_on, cfg.keypair_path_present
+                );
+                std::sync::Arc::new(
+                    crate::stage2_chat_execute::RefusingStage2ChatExecuteSender::new(
+                        "master gate or keypair gate not enabled at daemon startup",
+                    ),
+                )
+            }
+        }
+    };
+
     let executor = std::sync::Arc::new(crate::stage2_chat_execute::Stage2ChatExecutor::new(
-        std::sync::Arc::new(live_sender),
+        sender,
         save_apy_fetcher,
         apr_fetcher,
         w5e_repo,
         cfg,
     ));
     info!(
-        "W5g chat-execute ENABLED — the chat-route W5g approval command and \
-         POST /sessions/:id/stage2/w5g/execute share the same orchestrator. \
-         Each request runs the full precheck chain (approval phrase + canonical \
-         hash + Save APY re-check + budget) before the sender is touched."
+        "W5g chat-execute orchestrator constructed. The chat-route W5g \
+         approval command and POST /sessions/:id/stage2/w5g/execute share \
+         the same orchestrator; every request runs the full pre-check chain \
+         (env gates + approval phrase + canonical hash + Save APY re-check + \
+         budget) before the sender is touched."
     );
     Some(executor)
 }
