@@ -1258,19 +1258,20 @@ impl Stage2ChatExecuteSender for LiveStage2ChatExecuteSender {
                 ),
             };
         }
-        let before_ctoken = if ctoken_ata_exists {
-            match rpc_get_token_account_balance(&self.http, &self.rpc_url, &ctoken_ata).await {
-                Ok(Some(t)) => t.raw,
-                Ok(None) => 0,
-                Err(e) => {
-                    return ChatExecuteSendOutcome::TxBuildFailed {
-                        reason: format!("before getTokenAccountBalance(ctoken): {e}"),
-                    }
-                }
-            }
-        } else {
-            0
-        };
+        // The before-cToken collateral is read from the OBLIGATION's
+        // `deposits[]` entry for the pinned reserve — NOT the user's
+        // cToken ATA. Solend's
+        // `DepositReserveLiquidityAndObligationCollateral` instruction
+        // mints cToken directly into the obligation's collateral
+        // supply; the controlled wallet's cToken ATA stays at 0 by
+        // design, so reading it here would always report a zero
+        // delta even on a perfectly successful deposit (the bug we
+        // surfaced during the W5g live-test window on 2026-05-12).
+        //
+        // We reuse the `obligation` already decoded above for the
+        // invariant check — no extra RPC needed for the BEFORE read.
+        let before_ctoken =
+            obligation_pinned_reserve_collateral(&obligation, &request.reserve_pubkey);
 
         // ── Build instruction list ───────────────────────────────────
         let solend_program_id =
@@ -1395,16 +1396,29 @@ impl Stage2ChatExecuteSender for LiveStage2ChatExecuteSender {
                 .flatten()
                 .map(|t| t.raw)
                 .unwrap_or(before_usdc);
-                let after_ctoken = rpc_get_token_account_balance(
+                // After-cToken: re-fetch the obligation account, decode,
+                // and sum the deposits[] entry for the pinned reserve.
+                // This is the SAME computation as `before_ctoken` (just
+                // post-finality). If any step fails we fall back to
+                // `before_ctoken` so the delta reads 0 — that's still
+                // honest (we couldn't read the after state) and the
+                // operator sees the tx signature + Solscan to verify.
+                let after_ctoken = match rpc_get_account_data(
                     &self.http,
                     &self.rpc_url,
-                    &ctoken_ata,
+                    &request.target_obligation,
                 )
                 .await
-                .ok()
-                .flatten()
-                .map(|t| t.raw)
-                .unwrap_or(before_ctoken);
+                {
+                    Ok(Some(bytes)) => match decode_obligation(&bytes) {
+                        Ok(after_obl) => obligation_pinned_reserve_collateral(
+                            &after_obl,
+                            &request.reserve_pubkey,
+                        ),
+                        Err(_) => before_ctoken,
+                    },
+                    _ => before_ctoken,
+                };
                 ChatExecuteSendOutcome::Finalized {
                     tx_signature: signature,
                     confirmation_slot: slot,
@@ -1534,6 +1548,32 @@ fn verify_main_pool_obligation(
         ));
     }
     Ok(())
+}
+
+/// Sum the cToken collateral in the obligation's `deposits[]` for
+/// the pinned reserve. Pure; the obligation is already-decoded.
+///
+/// Solend's `DepositReserveLiquidityAndObligationCollateral` mints
+/// cToken into the obligation's collateral slot for the reserve,
+/// NOT into the user's cToken ATA. The W5g reporter therefore reads
+/// from this function — the user's cToken ATA stays empty on a
+/// deposit-and-collateralize tx, so reading it would always report
+/// a zero delta even on a successful deposit.
+///
+/// Implementation: linear scan over `deposits` (Solend caps the
+/// list at 8 entries, so the cost is trivially constant). Multiple
+/// entries for the same reserve are summed for robustness even
+/// though the program collapses them to one in normal operation.
+pub fn obligation_pinned_reserve_collateral(
+    obligation: &SolendObligationRaw,
+    reserve_pubkey: &Pubkey,
+) -> u64 {
+    obligation
+        .deposits
+        .iter()
+        .filter(|d| d.deposit_reserve == *reserve_pubkey)
+        .map(|d| d.deposited_amount)
+        .sum()
 }
 
 fn assemble_and_sign(
@@ -2179,6 +2219,158 @@ mod tests {
         // cleanly without panic.
         assert_eq!(signed_delta(403_487, 153_487), -250_000);
         assert_eq!(signed_delta(0, 192_876), 192_876);
+    }
+
+    // ── W5g reporter regression (2026-05-12) ──────────────────────────
+    //
+    // The cToken delta MUST be measured from the obligation's
+    // `deposits[]` entry for the pinned reserve, NOT from the user's
+    // cToken ATA. Solend's deposit-and-collateralize ix mints cToken
+    // directly into the obligation's collateral supply, so the user's
+    // cToken ATA stays at 0 even on a successful deposit. The bug we
+    // hit on the W5g live send (tx ftXu…oCz, slot 419139121) was:
+    // ATA-derived delta said `0` while the obligation actually grew
+    // by +192 822 cToken.
+
+    fn mk_obligation_with_collateral(
+        pinned_reserve_amount: u64,
+    ) -> crate::integrations::solend::raw::SolendObligationRaw {
+        use crate::integrations::solend::raw::{
+            SolendObligationCollateralRaw, SolendObligationRaw,
+        };
+        let pinned =
+            Pubkey::from_str(DEMO_RESERVE_BS58).expect("pinned reserve parses");
+        let other = Pubkey::from_str("So11111111111111111111111111111111111111112")
+            .expect("placeholder pubkey parses");
+        let lending_market = Pubkey::from_str(DEMO_LENDING_MARKET_BS58)
+            .expect("lending market parses");
+        let owner = Pubkey::from_str(W5G_CONTROLLED_WALLET_BS58)
+            .expect("controlled wallet parses");
+        SolendObligationRaw {
+            version: 1,
+            last_update_slot: 419_139_121,
+            last_update_stale: false,
+            lending_market,
+            owner,
+            // Two collateral entries: a noise entry for a different
+            // reserve, plus the pinned one. The helper must sum only
+            // the pinned entry.
+            deposits: vec![
+                SolendObligationCollateralRaw {
+                    deposit_reserve: other,
+                    deposited_amount: 12_345_678,
+                },
+                SolendObligationCollateralRaw {
+                    deposit_reserve: pinned,
+                    deposited_amount: pinned_reserve_amount,
+                },
+            ],
+            borrows: Vec::new(),
+            borrowed_value_upper_bound_wads: 0,
+            borrowing_isolated_asset: false,
+            super_unhealthy_borrow_value_wads: 0,
+            unweighted_borrowed_value_wads: 0,
+            closeable: false,
+        }
+    }
+
+    #[test]
+    fn obligation_pinned_reserve_collateral_sums_only_pinned_entries() {
+        let pinned =
+            Pubkey::from_str(DEMO_RESERVE_BS58).expect("pinned reserve parses");
+
+        // Zero collateral for the pinned reserve.
+        let before = mk_obligation_with_collateral(0);
+        assert_eq!(
+            obligation_pinned_reserve_collateral(&before, &pinned),
+            0,
+            "pre-deposit obligation must report 0 collateral for the pinned reserve"
+        );
+
+        // After a deposit of 192 822 cToken (real value observed in
+        // the W5g live-send tx).
+        let after = mk_obligation_with_collateral(192_822);
+        assert_eq!(
+            obligation_pinned_reserve_collateral(&after, &pinned),
+            192_822,
+            "post-deposit obligation must report the deposit amount as collateral"
+        );
+
+        // Delta computation matches the W5g reporter's intent.
+        let delta = signed_delta(
+            obligation_pinned_reserve_collateral(&before, &pinned),
+            obligation_pinned_reserve_collateral(&after, &pinned),
+        );
+        assert_eq!(delta, 192_822);
+    }
+
+    /// W5g reporter regression: when two unrelated collateral entries
+    /// exist alongside the pinned one, the helper ignores the noise.
+    /// This proves the fix for the W5g live-send symptom — the user's
+    /// cToken ATA had two unrelated balances elsewhere in the system
+    /// (a different reserve's cToken supply, the controlled wallet's
+    /// empty ATA), and only the obligation's pinned-reserve entry
+    /// must be summed.
+    #[test]
+    fn obligation_pinned_reserve_collateral_ignores_other_reserves() {
+        use crate::integrations::solend::raw::{
+            SolendObligationCollateralRaw, SolendObligationRaw,
+        };
+        let pinned =
+            Pubkey::from_str(DEMO_RESERVE_BS58).expect("pinned reserve parses");
+        let other_a = Pubkey::from_str("11111111111111111111111111111111").unwrap();
+        let other_b = Pubkey::from_str("So11111111111111111111111111111111111111112")
+            .expect("other pubkey parses");
+        let lending_market = Pubkey::from_str(DEMO_LENDING_MARKET_BS58).unwrap();
+        let owner = Pubkey::from_str(W5G_CONTROLLED_WALLET_BS58).unwrap();
+        let obl = SolendObligationRaw {
+            version: 1,
+            last_update_slot: 419_139_121,
+            last_update_stale: false,
+            lending_market,
+            owner,
+            deposits: vec![
+                SolendObligationCollateralRaw {
+                    deposit_reserve: other_a,
+                    deposited_amount: 999_999,
+                },
+                SolendObligationCollateralRaw {
+                    deposit_reserve: pinned,
+                    deposited_amount: 192_822,
+                },
+                SolendObligationCollateralRaw {
+                    deposit_reserve: other_b,
+                    deposited_amount: 1_234_567,
+                },
+            ],
+            borrows: Vec::new(),
+            borrowed_value_upper_bound_wads: 0,
+            borrowing_isolated_asset: false,
+            super_unhealthy_borrow_value_wads: 0,
+            unweighted_borrowed_value_wads: 0,
+            closeable: false,
+        };
+        assert_eq!(
+            obligation_pinned_reserve_collateral(&obl, &pinned),
+            192_822,
+            "noise from other reserves must not contaminate the pinned-reserve sum"
+        );
+    }
+
+    /// Reporter regression — direct delta of two obligations with a
+    /// deposit between them. Pinned at 0 → 192_822 should produce a
+    /// `ctoken_delta_raw` of +192_822 (the W5g live-send actual).
+    #[test]
+    fn obligation_collateral_delta_matches_w5g_live_send_actual() {
+        let pinned =
+            Pubkey::from_str(DEMO_RESERVE_BS58).expect("pinned reserve parses");
+        let before = mk_obligation_with_collateral(0);
+        let after = mk_obligation_with_collateral(192_822);
+        let before_c = obligation_pinned_reserve_collateral(&before, &pinned);
+        let after_c = obligation_pinned_reserve_collateral(&after, &pinned);
+        assert_eq!(before_c, 0);
+        assert_eq!(after_c, 192_822);
+        assert_eq!(signed_delta(before_c, after_c), 192_822_i64);
     }
 
     /// W5g — orchestrator built with a `RefusingStage2ChatExecuteSender`
