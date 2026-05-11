@@ -1281,26 +1281,47 @@ pub fn build_w5e_watch_rule(
     }
 }
 
+/// Typed outcome of the idempotent insert. The orchestrator needs
+/// more than a `bool` because the rule's canonical hash and
+/// `expires_at_slot` change with every `last_checked_slot` — so a
+/// freshly-built rule and the persisted rule with the same
+/// deterministic `rule_id` will compute DIFFERENT canonical hashes.
+/// The chat-route response must echo the PERSISTED rule's metadata
+/// so the W5g approval command (which carries the canonical hash as
+/// an integrity anchor) survives an idempotent re-typing.
+#[derive(Debug, Clone)]
+pub enum PersistOutcome {
+    /// Fresh insert. The just-built rule is now the durable rule;
+    /// the orchestrator should echo its metadata.
+    Inserted,
+    /// UNIQUE collision. The DB already has a rule with this
+    /// `rule_id`; carry the persisted rule back so the orchestrator
+    /// can overwrite the fresh-rule fields with persisted ones.
+    AlreadyPresent { persisted: WatchRule },
+    /// `repo.insert` failed AND `repo.get` couldn't confirm the
+    /// rule. Almost certainly a transient DB issue; the orchestrator
+    /// reports `rule_persisted=false` and keeps the fresh metadata.
+    Failed,
+}
+
 /// Insert (idempotently) the W5e rule into the durable state-store.
-/// Returns `(rule_persisted, expires_at_slot)`:
-///
-///   - `rule_persisted=true` on a successful first insertion OR on
-///     a UNIQUE-collision where `repo.get(rule_id)` confirms the
-///     rule is durably present (idempotent re-typing in chat).
-///   - `rule_persisted=false` on any other error.
-async fn persist_rule_idempotent(
+/// On UNIQUE collision the persisted rule is returned so the
+/// orchestrator can substitute its metadata into the response (the
+/// canonical hash depends on `last_checked_slot` / `expires_at_slot`
+/// / `created_at_slot`, all of which differ between a fresh build
+/// and a previously-persisted rule with the same `rule_id`).
+pub async fn persist_rule_idempotent(
     repo: &Stage2WatchRuleRepository,
     rule: &WatchRule,
-) -> bool {
+) -> PersistOutcome {
     match repo.insert(rule).await {
-        Ok(()) => true,
-        Err(_) => {
-            // Most likely a UNIQUE collision because the rule was
-            // already inserted. Confirm via `repo.get` — if the rule
-            // is durably present, treat the second insertion as
-            // idempotent success.
-            matches!(repo.get(&rule.rule_id).await, Ok(Some(_)))
-        }
+        Ok(()) => PersistOutcome::Inserted,
+        Err(_) => match repo.get(&rule.rule_id).await {
+            Ok(Some(stored)) => PersistOutcome::AlreadyPresent {
+                persisted: stored.rule,
+            },
+            _ => PersistOutcome::Failed,
+        },
     }
 }
 
@@ -1385,26 +1406,58 @@ pub async fn handle_demo_command_v3(
     result.status = status.to_string();
     result.budget_status = budget_status.to_string();
 
-    // 5. WatchRule construction + persistence — unchanged from W5e.
+    // 5. WatchRule construction + persistence.
     //
     // NOTE on metric divergence: the rule's Condition is
     // `SolendReserveSupplyRate` (native on-chain APR), while the chat
     // card's `condition_met` follows Save display APY. The W2 watcher
     // (when run) will evaluate the rule against native APR. The card
     // surfaces both numbers so the gap is visible to the user.
-    let rule = build_w5e_watch_rule(&parsed, result.last_checked_slot);
-    let canonical = canonical_rule_hash(&rule);
-    result.rule_id_hex = Some(hex_id_16(&rule.rule_id));
-    result.canonical_rule_hash_hex = Some(hex_id_32(&canonical));
-    result.expires_at_slot = Some(rule.expires_at_slot);
+    let fresh_rule = build_w5e_watch_rule(&parsed, result.last_checked_slot);
+    // Always start by echoing the FRESH rule's metadata. If the repo
+    // is wired and the insert hits a UNIQUE-collision, we overwrite
+    // these with the PERSISTED rule's metadata so the integrity
+    // anchor (canonical_rule_hash_hex) survives an idempotent
+    // re-typing — without this overwrite, the W5g approval command
+    // would refuse with `canonical_hash_mismatch` for any rule that
+    // had been persisted earlier with different
+    // last_checked_slot / expires_at_slot / created_at_slot.
+    apply_rule_metadata_to_result(&mut result, &fresh_rule);
 
     if let Some(repo_ref) = repo {
-        result.rule_persisted = persist_rule_idempotent(repo_ref, &rule).await;
+        match persist_rule_idempotent(repo_ref, &fresh_rule).await {
+            PersistOutcome::Inserted => {
+                result.rule_persisted = true;
+            }
+            PersistOutcome::AlreadyPresent { persisted } => {
+                result.rule_persisted = true;
+                // Echo the PERSISTED rule's metadata so the operator
+                // can use the returned canonical_rule_hash_hex
+                // verbatim in the W5g approval command.
+                apply_rule_metadata_to_result(&mut result, &persisted);
+            }
+            PersistOutcome::Failed => {
+                result.rule_persisted = false;
+            }
+        }
     }
     // else: rule_persisted stays false (preview-only). Caller MUST
     // surface this in the no-overclaim banner.
 
     Ok(result)
+}
+
+/// Overwrite the rule-identity fields of an evaluation result with
+/// the metadata of the supplied `WatchRule`. Used twice in
+/// `handle_demo_command_v3`: once with the fresh rule (default), then
+/// again with the persisted rule on UNIQUE-collision fallback so the
+/// response surfaces the durable canonical hash, not the just-built
+/// hash that the DB never accepted.
+fn apply_rule_metadata_to_result(result: &mut W5dEvaluationResult, rule: &WatchRule) {
+    let canonical = canonical_rule_hash(rule);
+    result.rule_id_hex = Some(hex_id_16(&rule.rule_id));
+    result.canonical_rule_hash_hex = Some(hex_id_32(&canonical));
+    result.expires_at_slot = Some(rule.expires_at_slot);
 }
 
 /// W5e wrapper kept for back-compat. Mirrors `handle_demo_command_v3`
@@ -1426,14 +1479,27 @@ pub async fn handle_demo_command_v2(
     // is wired, the rule_id + canonical_hash + expires_at fields are
     // always filled in so the frontend can display the order
     // identity even in preview-only mode.
-    let rule = build_w5e_watch_rule(&parsed, result.last_checked_slot);
-    let canonical = canonical_rule_hash(&rule);
-    result.rule_id_hex = Some(hex_id_16(&rule.rule_id));
-    result.canonical_rule_hash_hex = Some(hex_id_32(&canonical));
-    result.expires_at_slot = Some(rule.expires_at_slot);
+    //
+    // On UNIQUE-collision fallback the response's identity fields
+    // are overwritten with the persisted rule's values so the W5g
+    // approval command can use the canonical_rule_hash_hex returned
+    // here as a stable integrity anchor.
+    let fresh_rule = build_w5e_watch_rule(&parsed, result.last_checked_slot);
+    apply_rule_metadata_to_result(&mut result, &fresh_rule);
 
     if let Some(repo_ref) = repo {
-        result.rule_persisted = persist_rule_idempotent(repo_ref, &rule).await;
+        match persist_rule_idempotent(repo_ref, &fresh_rule).await {
+            PersistOutcome::Inserted => {
+                result.rule_persisted = true;
+            }
+            PersistOutcome::AlreadyPresent { persisted } => {
+                result.rule_persisted = true;
+                apply_rule_metadata_to_result(&mut result, &persisted);
+            }
+            PersistOutcome::Failed => {
+                result.rule_persisted = false;
+            }
+        }
     }
     // else: rule_persisted stays false (preview-only). Caller MUST
     // surface this in the no-overclaim banner.
@@ -1903,6 +1969,101 @@ mod tests {
         assert!(r.rule_id_hex.is_some());
         assert!(r.canonical_rule_hash_hex.is_some());
         assert!(r.expires_at_slot.is_some());
+    }
+
+    /// REGRESSION (W5g live-send blocker, 2026-05-12): when the W5e
+    /// bridge re-types the same deterministic-rule_id command in a
+    /// fresh chat call, the durable rule already exists in the repo
+    /// with DIFFERENT `last_checked_slot` / `expires_at_slot` /
+    /// `created_at_slot` than the just-built rule. Pre-fix, the
+    /// response echoed the freshly-computed `canonical_rule_hash_hex`
+    /// — which the W5g approval command then carried back to the
+    /// orchestrator, where the canonical-hash precheck refused
+    /// because the persisted rule's hash differed.
+    ///
+    /// Post-fix: when `persist_rule_idempotent` returns
+    /// `AlreadyPresent { persisted }`, the orchestrator overwrites
+    /// the response's identity fields with the persisted rule's
+    /// values, so the W5g approval can use the returned hash
+    /// verbatim.
+    #[tokio::test]
+    async fn w5e_collision_fallback_returns_persisted_canonical_hash() {
+        use claw_state_store::db::Database;
+        let db = Database::open_in_memory().await.unwrap();
+        let repo = Stage2WatchRuleRepository::new(db.pool().clone());
+        let input = "If Solend Main Pool USDC deposit APR is above 5%, \
+                     deposit 0.25 USDC from my bounded executor wallet into Solend.";
+
+        // First chat call at slot S1 — fresh insert. Capture the
+        // persisted rule's canonical hash + expires_at.
+        let fetcher1 = MockW5dAprFetcher {
+            current_apr_bps: 163,
+            current_budget_raw: 500_000,
+            last_checked_slot: 100_000_000,
+        };
+        let r1 = handle_demo_command_v2(&fetcher1, Some(&repo), input)
+            .await
+            .unwrap();
+        assert!(r1.rule_persisted, "first insert must succeed");
+        let persisted_hash = r1.canonical_rule_hash_hex.clone().expect("hex");
+        let persisted_expires = r1.expires_at_slot.expect("expires");
+        let persisted_rule_id = r1.rule_id_hex.clone().expect("rule_id");
+
+        // Second chat call at slot S2 (different slot → fresh rule
+        // would have DIFFERENT canonical hash / expires_at). Bridge
+        // must NOT echo the fresh values; it must overwrite with
+        // the persisted rule's values from `repo.get(rule_id)`.
+        let fetcher2 = MockW5dAprFetcher {
+            current_apr_bps: 163,
+            current_budget_raw: 500_000,
+            last_checked_slot: 200_000_000,
+        };
+        let r2 = handle_demo_command_v2(&fetcher2, Some(&repo), input)
+            .await
+            .unwrap();
+        assert!(r2.rule_persisted, "idempotent re-type must report persisted");
+
+        // Critical asserts (the W5g blocker we fixed).
+        assert_eq!(
+            r2.rule_id_hex,
+            Some(persisted_rule_id),
+            "rule_id is deterministic — must match the persisted id"
+        );
+        assert_eq!(
+            r2.canonical_rule_hash_hex,
+            Some(persisted_hash.clone()),
+            "BUG REGRESSION: response must echo PERSISTED canonical_hash on \
+             UNIQUE collision (was returning the fresh hash, which would \
+             then refuse to match the persisted rule during the W5g \
+             canonical-hash precheck)"
+        );
+        assert_eq!(
+            r2.expires_at_slot,
+            Some(persisted_expires),
+            "expires_at_slot must also be the persisted value"
+        );
+
+        // Sanity: the LIVENESS anchor (last_checked_slot) is still
+        // the FRESH one — that's a read-time observation, not a
+        // rule-identity field. The card uses it to show the operator
+        // "how stale is this view?".
+        assert_eq!(r2.last_checked_slot, 200_000_000);
+
+        // Sanity: a hypothetical fresh rule built at slot 200_000_000
+        // would have a DIFFERENT hash. Build it directly and confirm
+        // the fix actually overrode that fresh hash.
+        let parsed = parse_demo_command(input).unwrap();
+        let fresh_rule = build_w5e_watch_rule(&parsed, 200_000_000);
+        let fresh_hash_hex = hex_id_32(&canonical_rule_hash(&fresh_rule));
+        assert_ne!(
+            fresh_hash_hex, persisted_hash,
+            "test invariant: fresh hash must differ from persisted hash for the assertion to be meaningful"
+        );
+        assert_ne!(
+            r2.canonical_rule_hash_hex,
+            Some(fresh_hash_hex),
+            "response must NOT echo the freshly-built hash"
+        );
     }
 
     #[test]

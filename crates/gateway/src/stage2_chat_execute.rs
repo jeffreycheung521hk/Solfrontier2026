@@ -2210,6 +2210,123 @@ mod tests {
         assert_eq!(stored.status, WatchRuleStatus::Active);
     }
 
+    /// REGRESSION (W5g live-send blocker, 2026-05-12): end-to-end
+    /// trace from bridge re-type to orchestrator approval.
+    ///
+    ///   1. First chat call inserts rule A at slot S1 → canonical
+    ///      hash H1.
+    ///   2. Second chat call at slot S2 hits the UNIQUE collision
+    ///      in `repo.insert`. Post-fix, the response echoes H1
+    ///      (the PERSISTED hash), not the freshly-built H2.
+    ///   3. Build a `ChatExecuteRequest` from the second call's
+    ///      response (rule_id + H1 + literal phrase).
+    ///   4. Hand the request to the orchestrator with a Finalized
+    ///      mock sender. Pre-fix this would fail with
+    ///      `CanonicalHashMismatch`; post-fix it must reach the
+    ///      sender and return `Completed`.
+    #[tokio::test]
+    async fn w5g_approval_after_collision_passes_canonical_precheck() {
+        use crate::stage2_demo_apr_bridge::{
+            compose_w5e_result, controlled_wallet_addresses, handle_demo_command_v2,
+            DemoParsed, W5dEvaluationResult,
+        };
+
+        // Local mock with programmable last_checked_slot (the bridge's
+        // own MockW5dAprFetcher lives in its `cfg(test)` module and
+        // isn't visible across modules).
+        #[derive(Debug, Clone)]
+        struct SlotControlledAprFetcher {
+            native_apr_bps: u32,
+            budget_raw: u64,
+            slot: u64,
+        }
+        #[async_trait]
+        impl W5dAprFetcher for SlotControlledAprFetcher {
+            async fn evaluate(
+                &self,
+                input_text: &str,
+                parsed: &DemoParsed,
+            ) -> Result<W5dEvaluationResult, EvaluationError> {
+                let (controlled_wallet, source_usdc_ata) =
+                    controlled_wallet_addresses();
+                Ok(compose_w5e_result(
+                    input_text,
+                    parsed,
+                    self.native_apr_bps,
+                    self.budget_raw,
+                    self.slot,
+                    controlled_wallet,
+                    source_usdc_ata,
+                ))
+            }
+        }
+
+        let (_db, repo) = test_repo().await;
+        let input = "If Solend Main Pool USDC deposit APR is above 1%, \
+                     deposit 0.25 USDC from my bounded executor wallet into Solend.";
+
+        // Step 1: insert rule at slot S1 via the bridge.
+        let fetcher1 = SlotControlledAprFetcher {
+            native_apr_bps: 163,
+            budget_raw: 500_000,
+            slot: 100_000_000,
+        };
+        let r1 = handle_demo_command_v2(&fetcher1, Some(&repo), input)
+            .await
+            .unwrap();
+        let h1 = r1.canonical_rule_hash_hex.clone().unwrap();
+        let id1 = r1.rule_id_hex.clone().unwrap();
+
+        // Step 2: re-type at slot S2. Response MUST echo H1.
+        let fetcher2 = SlotControlledAprFetcher {
+            native_apr_bps: 163,
+            budget_raw: 500_000,
+            slot: 200_000_000,
+        };
+        let r2 = handle_demo_command_v2(&fetcher2, Some(&repo), input)
+            .await
+            .unwrap();
+        assert_eq!(r2.canonical_rule_hash_hex.as_deref(), Some(h1.as_str()));
+        assert_eq!(r2.rule_id_hex.as_deref(), Some(id1.as_str()));
+
+        // Step 3: build the W5g approval request from r2's identity.
+        let req = ChatExecuteRequest {
+            rule_id_hex: id1.clone(),
+            canonical_rule_hash_hex: h1.clone(),
+            approval_phrase: W5G_REQUIRED_APPROVAL_PHRASE.to_string(),
+        };
+
+        // Step 4: dispatch through the orchestrator with all gates
+        // on + mocked Finalized sender. We use Save APY 210 + threshold
+        // 100 (from the bridge command above) so the condition is met.
+        let exec = Stage2ChatExecutor::new(
+            Arc::new(StubSender::programmed(Programmed::Finalized)),
+            Arc::new(StubSaveFetcher::apy_bps(210)),
+            Arc::new(StubAprFetcher {
+                native_apr_bps: 165,
+                budget_raw: 500_000,
+            }),
+            repo.clone(),
+            config_all_on(),
+        );
+        let o = exec.execute(req).await;
+
+        // Critical assert: canonical-hash precheck must pass when the
+        // request carries the hash returned by the bridge after a
+        // UNIQUE-collision fallback. Pre-fix this was
+        // `error=CanonicalHashMismatch`; post-fix the orchestrator
+        // reaches the sender and reports Finalized.
+        assert_ne!(
+            o.error,
+            Some(ChatExecuteErrorCode::CanonicalHashMismatch),
+            "BUG REGRESSION: canonical-hash precheck must accept the \
+             hash returned by handle_demo_command_v2 even after a \
+             UNIQUE-collision fallback"
+        );
+        assert_eq!(o.status, ChatExecuteStatus::Completed);
+        assert_eq!(o.tx_signature.as_deref(), Some("SiG4mock4test"));
+    }
+
     #[test]
     fn rule_status_is_executable_table() {
         assert!(rule_status_is_executable(WatchRuleStatus::Active));
