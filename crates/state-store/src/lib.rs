@@ -29,6 +29,7 @@ pub mod pending_state;
 pub mod session_policy;
 pub mod sessions;
 pub mod spend;
+pub mod stage2_w5h_funding;
 pub mod stage2_watch_rules;
 pub mod tool_traces;
 pub mod tracking;
@@ -46,6 +47,10 @@ pub use pending_state::PendingStateRepository;
 pub use session_policy::SessionPolicyRepository;
 pub use sessions::SessionRepository;
 pub use spend::SpendRepository;
+pub use stage2_w5h_funding::{
+    NewW5hFundingIntent, Stage2W5hFundingIntentRepository, W5hFundingIntent,
+    W5hIntentStatus,
+};
 pub use stage2_watch_rules::{
     Stage2WatchRuleRepository, StoredWatchRule, WatchRuleStatus,
 };

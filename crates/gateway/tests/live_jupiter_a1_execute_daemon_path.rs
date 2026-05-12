@@ -847,6 +847,8 @@ async fn a1_execute_daemon_path_reaches_mainnet_confirmed() {
         demo_seeder: None,
         chat: None,
         chat_execute: None,
+        chat_funding_confirm: None,
+        chat_refund: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

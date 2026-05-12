@@ -348,6 +348,8 @@ async fn build_harness(opts: HarnessOptions) -> Harness {
         demo_seeder,
         chat:              None,
         chat_execute:      None,
+        chat_funding_confirm: None,
+        chat_refund:       None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());

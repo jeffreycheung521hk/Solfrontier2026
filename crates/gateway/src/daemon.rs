@@ -1114,6 +1114,13 @@ impl GatewayDaemon {
             demo_seeder:       demo_seeder_ref,
             chat:              chat_handler_ref,
             chat_execute:      chat_execute_ref,
+            // W5h handlers — to be wired in a follow-up daemon pass.
+            // Default None means the routes return 503 until the
+            // wiring lands; the chat-route W5h detector still
+            // dispatches through the bridge below regardless of
+            // these handlers.
+            chat_funding_confirm: None,
+            chat_refund:          None,
         };
 
         let api_handle = claw_api::start(

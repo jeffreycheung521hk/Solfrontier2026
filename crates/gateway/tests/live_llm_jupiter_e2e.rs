@@ -346,6 +346,11 @@ async fn run_live_llm_jupiter_e2e() {
              but the W5g chat-route interceptor matched (status={}); result={result:?}",
             result.status,
         ),
+        ChatRouteOutcome::Ok(ChatResponse::W5hConditionalOrder { result }) => panic!(
+            "Jupiter live LLM test must dispatch submit_jupiter_swap, \
+             but the W5h chat-route interceptor matched (status={}); result={result:?}",
+            result.status,
+        ),
     };
 
     // Assert: LLM picked submit_jupiter_swap.

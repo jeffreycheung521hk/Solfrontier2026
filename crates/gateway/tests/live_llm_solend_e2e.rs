@@ -871,6 +871,11 @@ async fn run_live_llm_solend_e2e() {
              but the W5g chat-route interceptor matched (status={}); result={result:?}",
             result.status,
         ),
+        ChatRouteOutcome::Ok(ChatResponse::W5hConditionalOrder { result }) => panic!(
+            "Branch D: Solend live LLM test must dispatch solend_deposit_usdc, \
+             but the W5h chat-route interceptor matched (status={}); result={result:?}",
+            result.status,
+        ),
     };
     assert_eq!(
         tool_name, "solend_deposit_usdc",

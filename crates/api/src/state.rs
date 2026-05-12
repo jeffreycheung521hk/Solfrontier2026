@@ -1092,6 +1092,244 @@ pub enum ChatResponse {
     /// protocol failures past send are `status="execution_failed"`
     /// / `"broadcasted_timeout"`.
     W5gConditionalExecution { result: ChatExecuteResultDto },
+    /// W5h — chat-budget funding + 3-minute expiry / refund flow.
+    /// Emitted when the chat-route sees a W5h command (e.g.
+    /// "If Save APY > 1%, deposit 0.25 USDC, expires in 3 minutes").
+    /// The result DTO carries the new funding intent's identity
+    /// (rule_id + canonical_rule_hash), the funding affordances
+    /// (controlled wallet USDC ATA, required amount), the decision
+    /// metric snapshot at creation, and the current status —
+    /// `funding_required` on a fresh intent, or the persisted state
+    /// for an idempotent re-type.
+    W5hConditionalOrder { result: W5hConditionalOrderResultDto },
+}
+
+// ── W5h DTOs ───────────────────────────────────────────────────────────────
+//
+// All u64 / i64 raw fields are serialized as JSON strings via
+// `crate::serde_str::*` so JS consumers don't truncate large
+// integers (slots, raw token amounts, ms epoch values).
+
+/// Wire DTO returned by the W5h chat-route bridge when a "If APY >
+/// X%, deposit 0.25 USDC, expires in 3 minutes" command is accepted.
+///
+/// Frontend renders this with three affordances:
+///   1. The controlled wallet USDC ATA to fund (Copy button).
+///   2. The required raw amount (250 000) and 0.25 USDC label.
+///   3. The expiry deadline (`expires_at_ms`) and current `status`.
+///
+/// The W5h flow has the user sign a Phantom transfer FROM their
+/// wallet TO `controlled_usdc_ata` for exactly 250 000 raw USDC,
+/// then POST the signature to
+/// `/sessions/:id/stage2/w5h/funding/confirm`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct W5hConditionalOrderResultDto {
+    pub input_text: String,
+    /// Status: `funding_required` | `funding_submitted` | `funding_invalid`
+    /// | `budget_reserved` | `executing` | `completed` | `expired`
+    /// | `refunding` | `refunded` | `failed`.
+    pub status: String,
+    pub rule_id_hex: String,
+    pub canonical_rule_hash_hex: String,
+
+    /// Wallets/ATAs the frontend renders + Phantom funds.
+    pub user_wallet: String,
+    pub user_usdc_ata: String,
+    pub controlled_wallet: String,
+    pub controlled_usdc_ata: String,
+
+    #[serde(with = "crate::serde_str::u64_string")]
+    pub amount_raw: u64,
+    pub threshold_bps: u32,
+    pub threshold_pct_label: String,
+
+    /// Save UI display APY at creation time. The W5g execution path
+    /// will re-fetch the live APY at send time; this field is the
+    /// snapshot the user saw when the order was minted.
+    pub save_display_apy_bps_at_creation: u32,
+    /// B-O1 native APR at creation time (audit only).
+    pub native_onchain_apr_bps_at_creation: u32,
+
+    /// Epoch milliseconds. Both serialized as JSON strings.
+    #[serde(with = "crate::serde_str::i64_string")]
+    pub created_at_ms: i64,
+    #[serde(with = "crate::serde_str::i64_string")]
+    pub expires_at_ms: i64,
+
+    pub funding_signature: Option<String>,
+    pub execution_signature: Option<String>,
+    pub refund_signature: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// Wire body for `POST /sessions/:id/stage2/w5h/funding/confirm`.
+/// The frontend submits the Phantom signature plus the source +
+/// destination context so the backend can verify the token-balance
+/// delta against the on-chain transaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct W5hFundingConfirmRequestDto {
+    pub rule_id_hex: String,
+    pub funding_signature: String,
+    pub user_wallet: String,
+    pub user_usdc_ata: String,
+    pub controlled_wallet: String,
+    pub controlled_usdc_ata: String,
+    /// Always `"250000"` (a JSON string). Defends against JS float
+    /// coercion. The backend asserts this against the on-chain
+    /// `postTokenBalances - preTokenBalances` of the controlled
+    /// USDC ATA.
+    #[serde(with = "crate::serde_str::u64_string")]
+    pub amount_raw: u64,
+}
+
+/// Wire DTO returned by the funding-confirm route. Mirrors the
+/// intent's current status. `status="funding_pending"` is the
+/// RPC-delay path: the frontend retries the POST after a short
+/// backoff.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct W5hFundingConfirmResultDto {
+    /// Status: `funding_pending` (tx not yet visible / finalized) |
+    /// `budget_reserved` (verified) | `funding_invalid` (terminal —
+    /// wrong delta / wrong mint / wrong destination / on-chain err) |
+    /// `already_completed` / `already_refunded` / `already_failed` /
+    /// `intent_not_found`.
+    pub status: String,
+    pub rule_id_hex: String,
+    pub canonical_rule_hash_hex: String,
+
+    pub funding_signature: String,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub funding_finalized_slot: Option<u64>,
+    #[serde(with = "crate::serde_str::i64_string")]
+    pub expires_at_ms: i64,
+
+    /// Save APY at re-check time. Echoes the W5f decision metric so
+    /// the frontend can re-render the condition banner without a
+    /// separate fetch.
+    pub save_display_apy_bps: Option<u32>,
+    pub native_onchain_apr_bps: Option<u32>,
+    pub threshold_bps: u32,
+
+    pub error_code: Option<String>,
+    pub error_reason: Option<String>,
+}
+
+/// Wire body for `POST /sessions/:id/stage2/w5h/refund`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct W5hRefundRequestDto {
+    pub rule_id_hex: String,
+    /// MUST equal exactly
+    /// `"W5H REFUND EXPIRED BUDGET APPROVED"` after env-gate match.
+    pub approval_phrase: String,
+}
+
+/// Wire DTO returned by the refund route. Mirrors the W5g
+/// `ChatExecuteResultDto` shape closely — the orchestrator chain is
+/// similar (env gates → CAS lease → tx build → size guard → send →
+/// bounded backoff polling → mark refunded).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct W5hRefundResultDto {
+    /// Status: `refunded` | `broadcasted_timeout` | `prechecks_failed`
+    /// | `execution_failed`.
+    pub status: String,
+    pub rule_id_hex: String,
+    pub canonical_rule_hash_hex: String,
+
+    pub tx_signature: Option<String>,
+    pub solscan_url: Option<String>,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub confirmation_slot: Option<u64>,
+
+    /// Controlled wallet USDC balance deltas (raw, signed).
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub before_controlled_usdc_raw: Option<u64>,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub after_controlled_usdc_raw: Option<u64>,
+    #[serde(default, with = "crate::serde_str::opt_i64_string")]
+    pub controlled_usdc_delta_raw: Option<i64>,
+
+    /// User USDC balance deltas (raw, signed).
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub before_user_usdc_raw: Option<u64>,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub after_user_usdc_raw: Option<u64>,
+    #[serde(default, with = "crate::serde_str::opt_i64_string")]
+    pub user_usdc_delta_raw: Option<i64>,
+
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub serialized_tx_bytes: Option<u64>,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub instruction_count: Option<u64>,
+
+    pub error_code: Option<String>,
+    pub error_reason: Option<String>,
+}
+
+/// Domain-level outcome returned by `W5hFundingConfirmHandler::execute`.
+#[derive(Debug, Clone)]
+pub enum W5hFundingConfirmRouteOutcome {
+    Ok(W5hFundingConfirmResultDto),
+    BadRequest(String),
+    SessionNotActive,
+    Disabled(String),
+}
+
+/// Domain-level outcome returned by `W5hRefundHandler::execute`.
+#[derive(Debug, Clone)]
+pub enum W5hRefundRouteOutcome {
+    Ok(W5hRefundResultDto),
+    BadRequest(String),
+    SessionNotActive,
+    Disabled(String),
+}
+
+/// Backend seam — gateway adapter implements this.
+pub trait W5hFundingConfirmHandler: Send + Sync + 'static {
+    fn execute(
+        &self,
+        session_id: &SessionId,
+        request: W5hFundingConfirmRequestDto,
+    ) -> Pin<Box<dyn Future<Output = W5hFundingConfirmRouteOutcome> + Send + '_>>;
+}
+
+#[derive(Clone)]
+pub struct W5hFundingConfirmHandlerRef(pub Arc<dyn W5hFundingConfirmHandler>);
+
+impl W5hFundingConfirmHandlerRef {
+    pub fn new(inner: Arc<dyn W5hFundingConfirmHandler>) -> Self {
+        Self(inner)
+    }
+    pub async fn execute(
+        &self,
+        session_id: &SessionId,
+        request: W5hFundingConfirmRequestDto,
+    ) -> W5hFundingConfirmRouteOutcome {
+        self.0.execute(session_id, request).await
+    }
+}
+
+pub trait W5hRefundHandler: Send + Sync + 'static {
+    fn execute(
+        &self,
+        session_id: &SessionId,
+        request: W5hRefundRequestDto,
+    ) -> Pin<Box<dyn Future<Output = W5hRefundRouteOutcome> + Send + '_>>;
+}
+
+#[derive(Clone)]
+pub struct W5hRefundHandlerRef(pub Arc<dyn W5hRefundHandler>);
+
+impl W5hRefundHandlerRef {
+    pub fn new(inner: Arc<dyn W5hRefundHandler>) -> Self {
+        Self(inner)
+    }
+    pub async fn execute(
+        &self,
+        session_id: &SessionId,
+        request: W5hRefundRequestDto,
+    ) -> W5hRefundRouteOutcome {
+        self.0.execute(session_id, request).await
+    }
 }
 
 /// Wire DTO mirroring `claw_gateway::stage2_demo_apr_bridge::W5dEvaluationResult`.
@@ -1285,6 +1523,18 @@ pub struct AppState {
     /// missing, but daemons typically don't wire the handler at all
     /// in dev configurations.
     pub chat_execute:        Option<ChatExecuteHandlerRef>,
+    /// W5h — backend seam for `POST /sessions/:id/stage2/w5h/funding/confirm`.
+    /// `None` unless the daemon was started with the W5h substrate
+    /// (Save APY fetcher + APR fetcher + the W5h funding-intent
+    /// repo). The route returns `503` when this is `None`. The
+    /// handler is read-only; it does not require any live-send env
+    /// gate (no keypair, no broadcast — only signature verification).
+    pub chat_funding_confirm: Option<W5hFundingConfirmHandlerRef>,
+    /// W5h — backend seam for `POST /sessions/:id/stage2/w5h/refund`.
+    /// `None` unless the W5h refund env gates are set
+    /// (`CLAW_STAGE2_LIVE_W5H_REFUND=1` + approval phrase + keypair
+    /// + cluster + RPC). The route returns `503` when this is `None`.
+    pub chat_refund:          Option<W5hRefundHandlerRef>,
 }
 
 /// W5g — wire DTO mirroring `claw_gateway::stage2_chat_execute::

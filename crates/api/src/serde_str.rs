@@ -32,6 +32,19 @@ pub mod u64_string {
     }
 }
 
+pub mod i64_string {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &i64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(D::Error::custom)
+    }
+}
+
 pub mod opt_u64_string {
     use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
 

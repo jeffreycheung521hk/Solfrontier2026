@@ -64,6 +64,15 @@ pub mod stage2_demo_apr_bridge;
 // default. No Phantom popup, no user-main-wallet signer, no
 // clawsol-authority ExecuteAction, no AuthorizationRecord PDA.
 pub mod stage2_chat_execute;
+// Stage 2 W5h — chat-budget funding + 3-minute expiry / refund
+// state machine. Adds a new parser shape on top of the W5d/W5e/W5f
+// grammar, a funding-intent store (state-store), funding-verify +
+// refund routes, and a CAS-lease gate that protects W5g execution
+// vs. W5h refund as competing terminal paths over the same 0.25
+// USDC budget.
+pub mod stage2_w5h_bridge;
+pub mod stage2_w5h_chat;
+pub mod stage2_w5h_funding_confirm;
 pub mod session_policy;
 pub mod supervisor;
 pub mod tools;

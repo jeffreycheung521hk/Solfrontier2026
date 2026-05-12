@@ -1325,7 +1325,7 @@ pub async fn persist_rule_idempotent(
     }
 }
 
-fn hex_id_16(id: &[u8; 16]) -> String {
+pub fn hex_id_16(id: &[u8; 16]) -> String {
     let mut s = String::with_capacity(32);
     for b in id {
         use std::fmt::Write as _;
@@ -1334,7 +1334,7 @@ fn hex_id_16(id: &[u8; 16]) -> String {
     s
 }
 
-fn hex_id_32(id: &[u8; 32]) -> String {
+pub fn hex_id_32(id: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for b in id {
         use std::fmt::Write as _;

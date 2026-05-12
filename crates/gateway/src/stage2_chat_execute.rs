@@ -541,6 +541,23 @@ pub struct Stage2ChatExecutor {
     apr_fetcher: Arc<dyn W5dAprFetcher>,
     repo: Arc<Stage2WatchRuleRepository>,
     config: Stage2ChatExecuteConfig,
+    /// W5h funding-intent repo. When wired, the executor:
+    ///   - Refuses to execute if the rule has no W5h intent OR if
+    ///     the intent isn't in `budget_reserved`.
+    ///   - CAS-leases `budget_reserved → executing` BEFORE building
+    ///     the tx. Refund cannot lease while we hold this lease.
+    ///   - On `Finalized`, marks the intent `completed` and binds
+    ///     the execution signature.
+    ///   - On any failure past the lease, releases the lease back
+    ///     to `budget_reserved` (so refund can still claim after
+    ///     expiry).
+    ///
+    /// When `None`, the executor falls back to the pre-W5h behavior:
+    /// every rule that survives the regular pre-checks proceeds to
+    /// the sender. This keeps existing W5g tests (no W5h intent)
+    /// working unchanged.
+    w5h_intent_repo:
+        Option<Arc<claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository>>,
 }
 
 impl std::fmt::Debug for Stage2ChatExecutor {
@@ -565,7 +582,19 @@ impl Stage2ChatExecutor {
             apr_fetcher,
             repo,
             config,
+            w5h_intent_repo: None,
         }
+    }
+
+    /// W5h — attach the funding-intent repo. When present, the
+    /// executor gates `budget_reserved → executing` via a CAS lease
+    /// and marks the intent `completed` after Finalized.
+    pub fn with_w5h_intent_repo(
+        mut self,
+        repo: Arc<claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository>,
+    ) -> Self {
+        self.w5h_intent_repo = Some(repo);
+        self
     }
 
     /// Single entry point. Routes the request through every gate and
@@ -792,7 +821,41 @@ impl Stage2ChatExecutor {
             );
         }
 
-        // 11. Hand to the sender.
+        // 11a. W5h funding-intent gate (race-safe lease).
+        //
+        // If the executor was constructed with a W5h intent repo,
+        // require the intent to be present + in `budget_reserved` +
+        // not-expired BEFORE any tx work. Acquire the
+        // `budget_reserved → executing` lease via CAS; refund cannot
+        // lease while we hold it. Lease failure → typed
+        // PrechecksFailed.
+        if let Some(intent_repo) = &self.w5h_intent_repo {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let leased = match intent_repo
+                .lease_execution_if_budget_reserved(&request.rule_id_hex, now_ms)
+                .await
+            {
+                Ok(n) => n == 1,
+                Err(e) => {
+                    return precheck_failure(
+                        &request,
+                        ChatExecuteErrorCode::RepoUpdateFailed,
+                        format!("W5h intent_repo.lease_execution failed: {e}"),
+                    );
+                }
+            };
+            if !leased {
+                return precheck_failure(
+                    &request,
+                    ChatExecuteErrorCode::RuleNotExecutable,
+                    "W5h funding intent is not in `budget_reserved` (or already \
+                     leased / refunding / completed / expired); execution lease \
+                     could not be acquired".to_string(),
+                );
+            }
+        }
+
+        // 11b. Hand to the sender.
         let send_request = ChatExecuteSendRequest {
             controlled_wallet,
             amount_raw: W5G_DEPOSIT_AMOUNT_RAW,
@@ -856,6 +919,17 @@ impl Stage2ChatExecutor {
                     .await
                     .map(|n| n == 1)
                     .unwrap_or(false);
+                // W5h — terminal-success transition on the funding
+                // intent. Idempotent; if the executor isn't wired
+                // with the intent repo, this is a no-op.
+                if let Some(intent_repo) = &self.w5h_intent_repo {
+                    let _ = intent_repo
+                        .mark_completed_if_executing(
+                            &request.rule_id_hex,
+                            &tx_signature,
+                        )
+                        .await;
+                }
                 let mut o = base_outcome;
                 o.status = ChatExecuteStatus::Completed;
                 o.tx_signature = Some(tx_signature.clone());
@@ -902,6 +976,17 @@ impl Stage2ChatExecutor {
                 o
             }
             ChatExecuteSendOutcome::TxBuildFailed { reason } => {
+                // W5h — pre-broadcast failure: release the execution
+                // lease so refund can claim after expiry. (No tx
+                // signature, no on-chain side effect.)
+                if let Some(intent_repo) = &self.w5h_intent_repo {
+                    let _ = intent_repo
+                        .release_execution_lease_to_budget_reserved(
+                            &request.rule_id_hex,
+                            &format!("tx build failed: {reason}"),
+                        )
+                        .await;
+                }
                 let mut o = base_outcome;
                 o.status = ChatExecuteStatus::ExecutionFailed;
                 o.error = Some(ChatExecuteErrorCode::TxBuildFailed);
@@ -913,6 +998,17 @@ impl Stage2ChatExecutor {
                 instruction_count,
                 ctoken_ata_create_included,
             } => {
+                // W5h — pre-broadcast size guard: release the lease.
+                if let Some(intent_repo) = &self.w5h_intent_repo {
+                    let _ = intent_repo
+                        .release_execution_lease_to_budget_reserved(
+                            &request.rule_id_hex,
+                            &format!(
+                                "tx size {serialized_tx_bytes} > 1232 limit"
+                            ),
+                        )
+                        .await;
+                }
                 let mut o = base_outcome;
                 o.status = ChatExecuteStatus::ExecutionFailed;
                 o.serialized_tx_bytes = Some(serialized_tx_bytes);
@@ -925,6 +1021,16 @@ impl Stage2ChatExecutor {
                 o
             }
             ChatExecuteSendOutcome::BroadcastFailed { reason } => {
+                // W5h — sendTransaction rejected the tx before it
+                // landed; no signature exists. Release the lease.
+                if let Some(intent_repo) = &self.w5h_intent_repo {
+                    let _ = intent_repo
+                        .release_execution_lease_to_budget_reserved(
+                            &request.rule_id_hex,
+                            &format!("broadcast failed: {reason}"),
+                        )
+                        .await;
+                }
                 let mut o = base_outcome;
                 o.status = ChatExecuteStatus::ExecutionFailed;
                 o.error = Some(ChatExecuteErrorCode::BroadcastFailed);
@@ -938,6 +1044,20 @@ impl Stage2ChatExecutor {
                 instruction_count,
                 ctoken_ata_create_included,
             } => {
+                // W5h — tx finalized but failed on-chain. The
+                // budget is still in the controlled wallet (USDC
+                // wasn't transferred; the program returned an err).
+                // Mark the intent FAILED (terminal) — neither
+                // re-execute nor refund makes sense here without
+                // operator review.
+                if let Some(intent_repo) = &self.w5h_intent_repo {
+                    let _ = intent_repo
+                        .mark_failed(
+                            &request.rule_id_hex,
+                            &format!("on-chain failure: {reason}"),
+                        )
+                        .await;
+                }
                 let mut o = base_outcome;
                 o.status = ChatExecuteStatus::ExecutionFailed;
                 o.tx_signature = Some(tx_signature.clone());
@@ -2517,6 +2637,260 @@ mod tests {
         );
         assert_eq!(o.status, ChatExecuteStatus::Completed);
         assert_eq!(o.tx_signature.as_deref(), Some("SiG4mock4test"));
+    }
+
+    // ── W5h × W5g integration: race-safe execution gate ────────────────
+
+    async fn insert_w5h_intent(
+        repo: &claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository,
+        rule_id_hex: &str,
+        canonical_hash_hex: &str,
+        expires_at_ms: i64,
+    ) {
+        use claw_state_store::stage2_w5h_funding::NewW5hFundingIntent;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        repo.insert(&NewW5hFundingIntent {
+            intent_id: rule_id_hex.to_string(),
+            rule_id_hex: rule_id_hex.to_string(),
+            canonical_rule_hash_hex: canonical_hash_hex.to_string(),
+            user_wallet: "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW".to_string(),
+            user_usdc_ata: "TestUserUsdcAta1111111111111111111111111111".to_string(),
+            controlled_wallet: W5G_CONTROLLED_WALLET_BS58.to_string(),
+            controlled_usdc_ata: "7LFdKcSV7JQYi3or5y9phHVPjhGigu5DDjUakAFbBmk3"
+                .to_string(),
+            amount_raw: W5G_DEPOSIT_AMOUNT_RAW,
+            threshold_bps: 100,
+            save_display_apy_bps_at_creation: 210,
+            native_onchain_apr_bps_at_creation: 165,
+            created_at_ms: now_ms,
+            expires_at_ms,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Happy path: rule + W5h intent in `budget_reserved` → execute
+    /// reaches the sender, returns `Completed`, marks the intent
+    /// completed in the repo.
+    #[tokio::test]
+    async fn w5h_executor_with_budget_reserved_intent_completes() {
+        use claw_state_store::stage2_w5h_funding::{
+            Stage2W5hFundingIntentRepository, W5hIntentStatus,
+        };
+        let rule = fixture_rule(180, W5G_DEPOSIT_AMOUNT_RAW);
+        let (_db, repo) = test_repo().await;
+        repo.insert(&rule).await.unwrap();
+        // Build a W5h intent for the same rule_id.
+        let intent_repo = Arc::new(Stage2W5hFundingIntentRepository::new(
+            repo.pool().clone(),
+        ));
+        let req = good_request_for(&rule);
+        let canonical = req.canonical_rule_hash_hex.clone();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        insert_w5h_intent(
+            &intent_repo,
+            &req.rule_id_hex,
+            &canonical,
+            now_ms + 180_000,
+        )
+        .await;
+        // Advance intent to budget_reserved.
+        intent_repo
+            .mark_funding_submitted_if_required(&req.rule_id_hex, "FundingSig1")
+            .await
+            .unwrap();
+        intent_repo
+            .mark_budget_reserved_if_submitted(&req.rule_id_hex, "FundingSig1", 1)
+            .await
+            .unwrap();
+
+        let exec = Stage2ChatExecutor::new(
+            Arc::new(StubSender::programmed(Programmed::Finalized)),
+            Arc::new(StubSaveFetcher::apy_bps(210)),
+            Arc::new(StubAprFetcher { native_apr_bps: 165, budget_raw: 500_000 }),
+            repo.clone(),
+            config_all_on(),
+        )
+        .with_w5h_intent_repo(intent_repo.clone());
+        let o = exec.execute(req.clone()).await;
+        assert_eq!(o.status, ChatExecuteStatus::Completed);
+        // W5h intent must now be Completed.
+        let stored = intent_repo.get(&req.rule_id_hex).await.unwrap().unwrap();
+        assert_eq!(stored.status, W5hIntentStatus::Completed);
+        assert_eq!(stored.execution_signature.as_deref(), Some("SiG4mock4test"));
+    }
+
+    /// Refuse path: rule exists but W5h intent is still in
+    /// `funding_required` (user hasn't paid yet) → execute is
+    /// blocked with `RuleNotExecutable`, no broadcast.
+    #[tokio::test]
+    async fn w5h_executor_with_funding_required_intent_refuses() {
+        use claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository;
+        let rule = fixture_rule(180, W5G_DEPOSIT_AMOUNT_RAW);
+        let (_db, repo) = test_repo().await;
+        repo.insert(&rule).await.unwrap();
+        let intent_repo = Arc::new(Stage2W5hFundingIntentRepository::new(
+            repo.pool().clone(),
+        ));
+        let req = good_request_for(&rule);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        insert_w5h_intent(
+            &intent_repo,
+            &req.rule_id_hex,
+            &req.canonical_rule_hash_hex,
+            now_ms + 180_000,
+        )
+        .await;
+        // Leave intent in funding_required.
+        let exec = Stage2ChatExecutor::new(
+            Arc::new(StubSender::programmed(Programmed::Finalized)),
+            Arc::new(StubSaveFetcher::apy_bps(210)),
+            Arc::new(StubAprFetcher { native_apr_bps: 165, budget_raw: 500_000 }),
+            repo.clone(),
+            config_all_on(),
+        )
+        .with_w5h_intent_repo(intent_repo.clone());
+        let o = exec.execute(req).await;
+        assert_eq!(o.status, ChatExecuteStatus::PrechecksFailed);
+        assert_eq!(o.error, Some(ChatExecuteErrorCode::RuleNotExecutable));
+        assert!(o.tx_signature.is_none());
+    }
+
+    /// Refuse path: W5h intent has expired (now > expires_at_ms) →
+    /// execute lease fails; refund window is open.
+    #[tokio::test]
+    async fn w5h_executor_refuses_expired_intent() {
+        use claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository;
+        let rule = fixture_rule(180, W5G_DEPOSIT_AMOUNT_RAW);
+        let (_db, repo) = test_repo().await;
+        repo.insert(&rule).await.unwrap();
+        let intent_repo = Arc::new(Stage2W5hFundingIntentRepository::new(
+            repo.pool().clone(),
+        ));
+        let req = good_request_for(&rule);
+        // Expiry in the past.
+        insert_w5h_intent(
+            &intent_repo,
+            &req.rule_id_hex,
+            &req.canonical_rule_hash_hex,
+            1, // expired long ago
+        )
+        .await;
+        intent_repo
+            .mark_funding_submitted_if_required(&req.rule_id_hex, "FundingSig1")
+            .await
+            .unwrap();
+        intent_repo
+            .mark_budget_reserved_if_submitted(&req.rule_id_hex, "FundingSig1", 1)
+            .await
+            .unwrap();
+        let exec = Stage2ChatExecutor::new(
+            Arc::new(StubSender::programmed(Programmed::Finalized)),
+            Arc::new(StubSaveFetcher::apy_bps(210)),
+            Arc::new(StubAprFetcher { native_apr_bps: 165, budget_raw: 500_000 }),
+            repo.clone(),
+            config_all_on(),
+        )
+        .with_w5h_intent_repo(intent_repo);
+        let o = exec.execute(req).await;
+        assert_eq!(o.status, ChatExecuteStatus::PrechecksFailed);
+        assert_eq!(o.error, Some(ChatExecuteErrorCode::RuleNotExecutable));
+    }
+
+    /// Race: refund won the lease first → execute is refused, no
+    /// broadcast call.
+    #[tokio::test]
+    async fn w5h_executor_refuses_when_refund_already_leased() {
+        use claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository;
+        let rule = fixture_rule(180, W5G_DEPOSIT_AMOUNT_RAW);
+        let (_db, repo) = test_repo().await;
+        repo.insert(&rule).await.unwrap();
+        let intent_repo = Arc::new(Stage2W5hFundingIntentRepository::new(
+            repo.pool().clone(),
+        ));
+        let req = good_request_for(&rule);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        insert_w5h_intent(
+            &intent_repo,
+            &req.rule_id_hex,
+            &req.canonical_rule_hash_hex,
+            now_ms - 1, // already expired
+        )
+        .await;
+        intent_repo
+            .mark_funding_submitted_if_required(&req.rule_id_hex, "FundingSig1")
+            .await
+            .unwrap();
+        intent_repo
+            .mark_budget_reserved_if_submitted(&req.rule_id_hex, "FundingSig1", 1)
+            .await
+            .unwrap();
+        // Refund acquires the lease first.
+        let n = intent_repo
+            .lease_refund_if_expired_or_past(&req.rule_id_hex, now_ms)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // Execute attempt — refused.
+        let exec = Stage2ChatExecutor::new(
+            Arc::new(StubSender::programmed(Programmed::Finalized)),
+            Arc::new(StubSaveFetcher::apy_bps(210)),
+            Arc::new(StubAprFetcher { native_apr_bps: 165, budget_raw: 500_000 }),
+            repo.clone(),
+            config_all_on(),
+        )
+        .with_w5h_intent_repo(intent_repo);
+        let o = exec.execute(req).await;
+        assert_eq!(o.status, ChatExecuteStatus::PrechecksFailed);
+        assert_eq!(o.error, Some(ChatExecuteErrorCode::RuleNotExecutable));
+    }
+
+    /// Sender returns `TxBuildFailed` after the lease was acquired
+    /// → W5h intent is released back to `budget_reserved`, NOT left
+    /// stuck in `executing` (otherwise a future refund couldn't
+    /// claim the budget).
+    #[tokio::test]
+    async fn w5h_executor_releases_lease_on_tx_build_failed() {
+        use claw_state_store::stage2_w5h_funding::{
+            Stage2W5hFundingIntentRepository, W5hIntentStatus,
+        };
+        let rule = fixture_rule(180, W5G_DEPOSIT_AMOUNT_RAW);
+        let (_db, repo) = test_repo().await;
+        repo.insert(&rule).await.unwrap();
+        let intent_repo = Arc::new(Stage2W5hFundingIntentRepository::new(
+            repo.pool().clone(),
+        ));
+        let req = good_request_for(&rule);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        insert_w5h_intent(
+            &intent_repo,
+            &req.rule_id_hex,
+            &req.canonical_rule_hash_hex,
+            now_ms + 180_000,
+        )
+        .await;
+        intent_repo
+            .mark_funding_submitted_if_required(&req.rule_id_hex, "FundingSig1")
+            .await
+            .unwrap();
+        intent_repo
+            .mark_budget_reserved_if_submitted(&req.rule_id_hex, "FundingSig1", 1)
+            .await
+            .unwrap();
+        let exec = Stage2ChatExecutor::new(
+            Arc::new(StubSender::programmed(Programmed::TxBuildFailed)),
+            Arc::new(StubSaveFetcher::apy_bps(210)),
+            Arc::new(StubAprFetcher { native_apr_bps: 165, budget_raw: 500_000 }),
+            repo.clone(),
+            config_all_on(),
+        )
+        .with_w5h_intent_repo(intent_repo.clone());
+        let o = exec.execute(req.clone()).await;
+        assert_eq!(o.status, ChatExecuteStatus::ExecutionFailed);
+        assert_eq!(o.error, Some(ChatExecuteErrorCode::TxBuildFailed));
+        let stored = intent_repo.get(&req.rule_id_hex).await.unwrap().unwrap();
+        assert_eq!(stored.status, W5hIntentStatus::BudgetReserved);
+        assert!(stored.last_error.is_some());
     }
 
     #[test]
