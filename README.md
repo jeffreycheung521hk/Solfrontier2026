@@ -21,6 +21,27 @@ A natural-language user message drove a real OpenAI provider through the strict 
 
 ---
 
+## 📅 Weekly Engineering Record — Start Here
+
+> **For the dated, chronological view of every milestone, scope decision, and
+> fail-closed defense, read [`docs/WEEKLY_UPDATES.md`](docs/WEEKLY_UPDATES.md).**
+> It is the most concentrated single read in this repo for evaluating
+> ClawSolana's pace, discipline, and honesty.
+
+Among other things, `WEEKLY_UPDATES.md` walks through:
+
+- **W2 (Apr 14–20)** — wire-shape milestone (374 tests) + first Jupiter mainnet finalizations (A1 daemon-driven, A2 LLM-driven)
+- **W3 (Apr 21–27)** — Solend full pipeline + the first natural-language → live OpenAI → mainnet-finalized Solend deposit (Phase 5G), with a 4-attempt fail-closed defense record on the deposit path
+- **W5 May 8** — Phase 6I-K Solend withdraw-all mainnet recovery, with a second 4-attempt fail-closed sequence against the deployed Solend processor's account-meta requirements
+- **W5 May 12** — W5e/W5f/W5g chat-first conditional execution shipped end-to-end; the W5h-lite final-sprint compromise (funding-gated; auto-refund deferred); and ★★ **W5i — first live autonomous Solend deposit on mainnet**, where a 30-second polling watcher brokered the deposit using only the controlled wallet's keypair, with no human signature between funding and execution
+
+Every dated entry quotes its on-chain tx signature (with Solscan link), names
+exactly what was proven, and **explicitly names what was not proven** in the
+same breath — the no-overclaim discipline runs throughout. **Read that file
+first.**
+
+---
+
 ## Why This Matters
 
 AI agents are getting access to wallets. Most agent-wallet integrations are one of two extremes: **the agent holds the private key** (zero governance), or **a human approves every action** (zero autonomy). Neither scales.
@@ -155,8 +176,10 @@ Four-plane architecture: Intent → Control → Execution → Observer, with exp
 
 | Doc | Purpose |
 |-----|---------|
+| **[`docs/WEEKLY_UPDATES.md`](docs/WEEKLY_UPDATES.md)** | **★ Start here** — dated chronological record of every milestone, mainnet finalization, fail-closed defense, and scope decision (W1 through W5 / May 12 W5i autonomous-execution) |
 | [`docs/proofs/INDEX.md`](docs/proofs/INDEX.md) | Every mainnet / live-LLM artifact in one table |
 | [`docs/proofs/PHASE5_CLOSEOUT.md`](docs/proofs/PHASE5_CLOSEOUT.md) | Phase 5 milestone seal — security model, fail-closed record, components |
+| [`ROADMAP.md`](ROADMAP.md) | Phase 6 Stage 1 Tail framing + Long-term Vision (Stage 2) |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | System invariants, security posture, crate map, API surface, ADRs |
 | [`DEBT.md`](DEBT.md) | Technical debt ledger with explicit migration triggers |
 | [`PITCH.md`](PITCH.md) | Hackathon pitch — problem, solution, demo path, proof |
