@@ -61,6 +61,7 @@ use crate::{
         solend_withdraw_jit_signing::prepare_solend_withdraw_signing,
         stage2_chat_execute::post_w5g_execute,
         stage2_w5h_funding_confirm::post_w5h_funding_confirm,
+        stage2_w5h_order_status::get_w5h_order_status,
         wallets::list_wallets,
         wallet_challenges::{create_wallet_challenge, confirm_wallet_challenge},
         wallet_signatures::{bind_wallet, list_wallet_signatures, submit_wallet_signature},
@@ -149,6 +150,14 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         .route(
             "/sessions/:id/stage2/w5h/funding/confirm",
             post(post_w5h_funding_confirm).layer(DefaultBodyLimit::max(2048)),
+        )
+        // W5i — read-only order-status endpoint. Frontend polls this
+        // after `budget_reserved` to detect the watcher's terminal
+        // status (completed / broadcasted_timeout / failed). Pure DB
+        // read; 503 when the daemon didn't wire the handler.
+        .route(
+            "/sessions/:id/stage2/w5h/order/:rule_id_hex",
+            get(get_w5h_order_status),
         )
         // Wallet ownership proof (challenge-response)
         .route("/sessions/:id/wallet-bind-challenge", post(create_wallet_challenge))

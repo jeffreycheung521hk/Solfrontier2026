@@ -132,6 +132,7 @@ fn build_router(
         chat_execute: None,
         chat_funding_confirm: None,
         chat_refund: None,
+        chat_order_status: None,
     };
 
     let router = claw_api::create_router(state, HealthRegistry::new());
@@ -232,6 +233,7 @@ async fn rate_limit_independent_tokens() {
         chat_execute: None,
         chat_funding_confirm: None,
         chat_refund: None,
+        chat_order_status: None,
     };
     let router = claw_api::create_router(state, HealthRegistry::new());
 

@@ -37,6 +37,8 @@ pub use state::{
     W5hFundingConfirmResultDto, W5hFundingConfirmRouteOutcome,
     W5hRefundHandler, W5hRefundHandlerRef, W5hRefundRequestDto,
     W5hRefundResultDto, W5hRefundRouteOutcome,
+    W5hOrderStatusDto, W5hOrderStatusHandler, W5hOrderStatusHandlerRef,
+    W5hOrderStatusRouteOutcome,
     WalletChallengeHandler, WalletChallengeHandlerRef, WalletChallengeInfo,
     WalletSignatureHandler, WalletSignatureHandlerRef, WalletSignatureOutcome,
     PendingWalletSignatureInfo,

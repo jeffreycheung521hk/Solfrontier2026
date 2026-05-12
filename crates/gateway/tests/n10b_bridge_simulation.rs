@@ -295,6 +295,7 @@ fn setup() -> TestHarness {
         chat_execute: None,
         chat_funding_confirm: None,
         chat_refund: None,
+        chat_order_status: None,
     };
 
     let health = HealthRegistry::new();

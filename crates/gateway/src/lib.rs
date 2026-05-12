@@ -73,6 +73,7 @@ pub mod stage2_chat_execute;
 pub mod stage2_w5h_bridge;
 pub mod stage2_w5h_chat;
 pub mod stage2_w5h_funding_confirm;
+pub mod stage2_w5i_auto_execute;
 pub mod session_policy;
 pub mod supervisor;
 pub mod tools;

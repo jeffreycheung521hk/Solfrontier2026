@@ -41,6 +41,22 @@ use claw_state_store::stage2_w5h_funding::{
 /// controlled-ATA delta is for a different mint.
 pub const USDC_MINT_BS58: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
+// ── On-chain memo pin (W5h/W5i addendum) ────────────────────────────────
+
+/// SPL Memo program (v2). The funding tx MUST include exactly one
+/// memo instruction issued by this program. The memo payload must
+/// be `claw:w5h:<rule_id_hex>:<canonical_rule_hash_hex>`.
+///
+/// Anchoring the typed rule identity on-chain prevents a Phantom-
+/// signed TransferChecked from being attributed to a W5h order it
+/// was NOT minted for. The memo is the cryptographic link from the
+/// off-chain rule artifact to the on-chain funding event.
+pub const MEMO_PROGRAM_BS58: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+
+/// Memo payload prefix. Anything not starting with this prefix is a
+/// rejected memo.
+pub const MEMO_PAYLOAD_PREFIX: &str = "claw:w5h:";
+
 // ── Tx fetcher (injectable for tests) ─────────────────────────────────────
 
 /// What the verifier needs from `getTransaction`. The shape mirrors
@@ -67,6 +83,20 @@ pub struct FetchedTokenBalance {
     pub amount_raw_str: String,
 }
 
+/// Decoded payload of a single instruction the funding tx executed.
+/// We only need the `program_id` (resolved to a pubkey) and the
+/// UTF-8 data for memo verification — other instruction fields are
+/// not used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedInstruction {
+    /// Base58 pubkey of the program the instruction invoked, resolved
+    /// via the merged account-keys list (static + ALT-loaded).
+    pub program_id: String,
+    /// Raw instruction `data` bytes. For SPL Memo program calls this
+    /// is the UTF-8 memo payload directly.
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedTx {
     /// Slot the tx confirmed at (also the finalized slot when the
@@ -78,6 +108,9 @@ pub struct FetchedTx {
     pub pre_token_balances: Vec<FetchedTokenBalance>,
     /// Token balances AFTER the tx executed.
     pub post_token_balances: Vec<FetchedTokenBalance>,
+    /// Outer instructions (post-resolution). Used to find the SPL
+    /// Memo payload that anchors the typed rule identity to this tx.
+    pub instructions: Vec<FetchedInstruction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +190,11 @@ pub enum W5hFundingConfirmErrorCode {
     /// omitted `maxSupportedTransactionVersion`). Returned alongside
     /// `FundingPending` — never `FundingInvalid`.
     VerifierUnsupported,
+    /// Funding tx is missing the SPL Memo instruction OR the memo
+    /// payload does not match `claw:w5h:<rule_id>:<canonical_hash>`.
+    /// Terminal: a real demo funding tx MUST anchor the rule
+    /// identity on-chain. Mismatched memo → funding_invalid.
+    MemoMissingOrMismatch,
 }
 
 /// Rich orchestrator outcome. The route adapter collapses this into
@@ -287,6 +325,67 @@ pub fn verify_funding_delta(
     }
 
     Ok(tx.slot)
+}
+
+/// W5h/W5i addendum — verify the funding tx anchors the typed rule
+/// identity on-chain via an SPL Memo instruction. Required payload:
+///
+///   claw:w5h:<rule_id_hex>:<canonical_rule_hash_hex>
+///
+/// Exactly equal (case-sensitive). Missing memo OR mismatched memo
+/// → typed funding_invalid; the orchestrator persists `funding_invalid`
+/// and the W5i watcher will never see this intent in `budget_reserved`.
+///
+/// Anchoring rule_id + canonical_hash on-chain is the cryptographic
+/// link between the off-chain typed rule artifact and the on-chain
+/// funding event. We do NOT put the full natural-language command
+/// on-chain (avoids leaking user phrasing).
+pub fn verify_funding_memo(
+    tx: &FetchedTx,
+    rule_id_hex: &str,
+    canonical_rule_hash_hex: &str,
+) -> Result<(), (W5hFundingConfirmErrorCode, String)> {
+    let expected =
+        format!("{MEMO_PAYLOAD_PREFIX}{rule_id_hex}:{canonical_rule_hash_hex}");
+    let memos: Vec<&FetchedInstruction> = tx
+        .instructions
+        .iter()
+        .filter(|ix| ix.program_id == MEMO_PROGRAM_BS58)
+        .collect();
+    if memos.is_empty() {
+        return Err((
+            W5hFundingConfirmErrorCode::MemoMissingOrMismatch,
+            format!(
+                "funding tx has no SPL Memo (program {MEMO_PROGRAM_BS58}) \
+                 instruction; expected payload {expected:?}"
+            ),
+        ));
+    }
+    // Accept the tx if ANY memo instruction's payload matches exactly.
+    // This is forgiving against frontends that append extra (e.g.
+    // priority-fee compute-budget) instructions, while still strictly
+    // requiring the typed identity anchor.
+    for memo in &memos {
+        let payload = std::str::from_utf8(&memo.data).unwrap_or("");
+        if payload == expected {
+            return Ok(());
+        }
+    }
+    let observed: Vec<String> = memos
+        .iter()
+        .map(|m| {
+            std::str::from_utf8(&m.data)
+                .map(str::to_string)
+                .unwrap_or_else(|_| format!("<{} non-utf8 bytes>", m.data.len()))
+        })
+        .collect();
+    Err((
+        W5hFundingConfirmErrorCode::MemoMissingOrMismatch,
+        format!(
+            "no SPL Memo payload matched expected {expected:?}; \
+             observed memos = {observed:?}"
+        ),
+    ))
 }
 
 /// Defense-in-depth: even though we matched by pubkey, assert the
@@ -545,7 +644,35 @@ impl Stage2W5hFundingConfirmExecutor {
             }
         };
 
-        // ── 6. Delta-verify (USDC mint + controlled-owner +250 000) ─
+        // ── 6a. Memo-verify (rule identity anchor on-chain) ────────
+        //
+        // The funding tx MUST include an SPL Memo instruction whose
+        // payload is exactly `claw:w5h:<rule_id>:<canonical_hash>`.
+        // Missing or mismatched memo → terminal funding_invalid, NO
+        // budget_reserved, W5i watcher will never see this intent.
+        if let Err((code, reason)) = verify_funding_memo(
+            &tx,
+            &stored.rule_id_hex,
+            &stored.canonical_rule_hash_hex,
+        ) {
+            let _ = self
+                .intent_repo
+                .mark_funding_invalid_if_submitted(
+                    &request.rule_id_hex,
+                    &request.funding_signature,
+                    &reason,
+                )
+                .await;
+            return self.terminal_outcome(
+                &stored,
+                request.funding_signature,
+                W5hFundingConfirmStatus::FundingInvalid,
+                code,
+                reason,
+            ).await;
+        }
+
+        // ── 6b. Delta-verify (USDC mint + controlled-owner +250 000) ─
         match verify_funding_delta(
             &tx,
             &request.controlled_usdc_ata,
@@ -962,6 +1089,24 @@ pub(crate) fn parse_get_transaction_result(
         }
     };
 
+    // ── Parse outer instructions (resolve program_id via keys + ALT) ─
+    //
+    // The funding tx is a v0 transaction containing at least:
+    //   - SPL Memo (claw:w5h:<rule>:<hash>)
+    //   - SPL Token TransferChecked (+250 000 raw to controlled ATA)
+    //
+    // We only need program_id + data for the memo check. ALL other
+    // instruction fields are ignored. If an instruction references an
+    // unresolved programIdIndex, fail closed with VerifierUnsupported.
+    let instructions = match parse_instructions_array(result, &keys) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(TxFetchOutcome::VerifierUnsupported(format!(
+                "unresolved instructions (alt_present={alt_present}): {e}"
+            )))
+        }
+    };
+
     // `resolve` is kept above for future per-entry lookups; current
     // call sites use `keys` directly via `parse_token_balance_array`.
     let _ = resolve;
@@ -971,7 +1116,56 @@ pub(crate) fn parse_get_transaction_result(
         err,
         pre_token_balances,
         post_token_balances,
+        instructions,
     }))
+}
+
+fn parse_instructions_array(
+    result: &JsonValue,
+    keys: &[String],
+) -> Result<Vec<FetchedInstruction>, String> {
+    let arr = result
+        .get("transaction")
+        .and_then(|t| t.get("message"))
+        .and_then(|m| m.get("instructions"))
+        .and_then(|a| a.as_array());
+    let arr = match arr {
+        Some(a) => a,
+        None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let program_id_index = entry
+            .get("programIdIndex")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| "instruction missing programIdIndex".to_string())?;
+        let program_id = keys
+            .get(program_id_index as usize)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "programIdIndex {program_id_index} out of resolved-keys range \
+                     (len={}); unresolved address-table-lookup entry",
+                    keys.len()
+                )
+            })?;
+        // Solana JSON-RPC encodes instruction `data` as base58 by
+        // default (encoding=json). Decode it into raw bytes so the
+        // memo check operates on the actual payload bytes.
+        let data_str = entry
+            .get("data")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        let data = if data_str.is_empty() {
+            Vec::new()
+        } else {
+            bs58::decode(data_str)
+                .into_vec()
+                .map_err(|e| format!("instruction data base58 decode: {e}"))?
+        };
+        out.push(FetchedInstruction { program_id, data });
+    }
+    Ok(out)
 }
 
 fn parse_token_balance_array(
@@ -1090,6 +1284,23 @@ mod tests {
         }
     }
 
+    /// Build the canonical W5h memo payload for the pinned demo
+    /// fixture. The orchestrator tests using `fixture()` need this
+    /// memo to be present in the FetchedTx so funding-confirm
+    /// advances to budget_reserved.
+    fn pinned_memo_payload() -> Vec<u8> {
+        format!("{MEMO_PAYLOAD_PREFIX}{RULE_ID}:{CANON_HASH}")
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn pinned_memo_ix() -> FetchedInstruction {
+        FetchedInstruction {
+            program_id: MEMO_PROGRAM_BS58.to_string(),
+            data: pinned_memo_payload(),
+        }
+    }
+
     fn tx_with_delta(pre_raw: u64, post_raw: u64, mint: &str, owner: &str) -> FetchedTx {
         FetchedTx {
             slot: 419_200_000,
@@ -1108,6 +1319,7 @@ mod tests {
                 owner: owner.to_string(),
                 amount_raw_str: post_raw.to_string(),
             }],
+            instructions: vec![pinned_memo_ix()],
         }
     }
 
@@ -1204,6 +1416,7 @@ mod tests {
                 owner: CONTROLLED_WALLET.to_string(),
                 amount_raw_str: "250000".to_string(),
             }],
+            instructions: vec![pinned_memo_ix()],
         };
         let slot = verify_funding_delta(
             &tx,
@@ -1257,6 +1470,7 @@ mod tests {
                     amount_raw_str: "4750000".to_string(),
                 },
             ],
+            instructions: vec![pinned_memo_ix()],
         };
         let slot = verify_funding_delta(
             &tx,
@@ -1290,6 +1504,7 @@ mod tests {
                 owner: CONTROLLED_WALLET.to_string(),
                 amount_raw_str: "250000".to_string(),
             }],
+            instructions: vec![pinned_memo_ix()],
         };
         let err = verify_funding_delta(
             &tx,
@@ -1302,6 +1517,81 @@ mod tests {
             err.0,
             W5hFundingConfirmErrorCode::DestinationNotControlledUsdcAta
         );
+    }
+
+    // ── Memo verifier (W5h/W5i addendum) ──────────────────────────────
+
+    #[test]
+    fn memo_verifier_accepts_exact_payload() {
+        let tx = tx_with_delta(0, 250_000, USDC_MINT_BS58, CONTROLLED_WALLET);
+        verify_funding_memo(&tx, RULE_ID, CANON_HASH).unwrap();
+    }
+
+    #[test]
+    fn memo_verifier_rejects_missing_memo() {
+        let mut tx = tx_with_delta(0, 250_000, USDC_MINT_BS58, CONTROLLED_WALLET);
+        tx.instructions.clear();
+        let err = verify_funding_memo(&tx, RULE_ID, CANON_HASH).unwrap_err();
+        assert_eq!(err.0, W5hFundingConfirmErrorCode::MemoMissingOrMismatch);
+        assert!(err.1.contains("no SPL Memo"));
+    }
+
+    #[test]
+    fn memo_verifier_rejects_wrong_rule_id() {
+        let mut tx = tx_with_delta(0, 250_000, USDC_MINT_BS58, CONTROLLED_WALLET);
+        tx.instructions[0].data =
+            format!("{MEMO_PAYLOAD_PREFIX}{}:{}", "ff".repeat(16), CANON_HASH)
+                .into_bytes();
+        let err = verify_funding_memo(&tx, RULE_ID, CANON_HASH).unwrap_err();
+        assert_eq!(err.0, W5hFundingConfirmErrorCode::MemoMissingOrMismatch);
+    }
+
+    #[test]
+    fn memo_verifier_rejects_wrong_canonical_hash() {
+        let mut tx = tx_with_delta(0, 250_000, USDC_MINT_BS58, CONTROLLED_WALLET);
+        tx.instructions[0].data =
+            format!("{MEMO_PAYLOAD_PREFIX}{}:{}", RULE_ID, "ff".repeat(32))
+                .into_bytes();
+        let err = verify_funding_memo(&tx, RULE_ID, CANON_HASH).unwrap_err();
+        assert_eq!(err.0, W5hFundingConfirmErrorCode::MemoMissingOrMismatch);
+    }
+
+    #[test]
+    fn memo_verifier_rejects_wrong_prefix() {
+        let mut tx = tx_with_delta(0, 250_000, USDC_MINT_BS58, CONTROLLED_WALLET);
+        tx.instructions[0].data =
+            format!("attacker:w5h:{RULE_ID}:{CANON_HASH}").into_bytes();
+        let err = verify_funding_memo(&tx, RULE_ID, CANON_HASH).unwrap_err();
+        assert_eq!(err.0, W5hFundingConfirmErrorCode::MemoMissingOrMismatch);
+    }
+
+    #[test]
+    fn memo_verifier_rejects_wrong_program_id() {
+        // SPL Memo program substituted with an attacker-controlled
+        // program id. Even though the payload bytes match, the
+        // program_id filter excludes it → no memo seen → rejected.
+        let mut tx = tx_with_delta(0, 250_000, USDC_MINT_BS58, CONTROLLED_WALLET);
+        tx.instructions[0].program_id =
+            "AttackerProgram111111111111111111111111111".to_string();
+        let err = verify_funding_memo(&tx, RULE_ID, CANON_HASH).unwrap_err();
+        assert_eq!(err.0, W5hFundingConfirmErrorCode::MemoMissingOrMismatch);
+    }
+
+    #[test]
+    fn memo_verifier_accepts_when_canonical_memo_is_one_of_many() {
+        // Frontends may add extra memos (priority-fee compute-budget
+        // memos, etc.). As long as the canonical claw:w5h:... memo
+        // is present from the SPL Memo program, the verifier
+        // accepts.
+        let mut tx = tx_with_delta(0, 250_000, USDC_MINT_BS58, CONTROLLED_WALLET);
+        tx.instructions.insert(
+            0,
+            FetchedInstruction {
+                program_id: MEMO_PROGRAM_BS58.to_string(),
+                data: b"some other memo, ignore".to_vec(),
+            },
+        );
+        verify_funding_memo(&tx, RULE_ID, CANON_HASH).unwrap();
     }
 
     // ── Orchestrator paths ────────────────────────────────────────────
@@ -1376,6 +1666,59 @@ mod tests {
         let stored = repo.get(RULE_ID).await.unwrap().unwrap();
         assert_eq!(stored.status, W5hIntentStatus::BudgetReserved);
         assert_eq!(stored.funding_finalized_slot, Some(419_200_000));
+    }
+
+    #[tokio::test]
+    async fn finalized_without_memo_marks_funding_invalid_and_blocks_budget_reserved() {
+        // Funding tx delta is correct, but the memo is missing.
+        // Orchestrator MUST mark funding_invalid and NEVER advance to
+        // budget_reserved — the W5i watcher would otherwise auto-
+        // execute against an order whose rule identity isn't
+        // anchored on-chain.
+        let (_db, repo) = fixture().await;
+        let mut tx = tx_with_delta(0, 250_000, USDC_MINT_BS58, CONTROLLED_WALLET);
+        tx.instructions.clear();
+        let exec = Stage2W5hFundingConfirmExecutor::new(
+            repo.clone(),
+            Arc::new(StubFetcher {
+                outcome: Ok(TxFetchOutcome::Available(tx)),
+            }),
+            None,
+            None,
+        );
+        let o = exec.execute(good_request("Sig1")).await;
+        assert_eq!(o.status, W5hFundingConfirmStatus::FundingInvalid);
+        assert_eq!(
+            o.error,
+            Some(W5hFundingConfirmErrorCode::MemoMissingOrMismatch)
+        );
+        let stored = repo.get(RULE_ID).await.unwrap().unwrap();
+        assert_eq!(stored.status, W5hIntentStatus::FundingInvalid);
+        assert!(stored.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn finalized_with_mismatched_memo_marks_funding_invalid() {
+        let (_db, repo) = fixture().await;
+        let mut tx = tx_with_delta(0, 250_000, USDC_MINT_BS58, CONTROLLED_WALLET);
+        // Wrong canonical hash in memo payload.
+        tx.instructions[0].data =
+            format!("{MEMO_PAYLOAD_PREFIX}{RULE_ID}:{}", "ff".repeat(32))
+                .into_bytes();
+        let exec = Stage2W5hFundingConfirmExecutor::new(
+            repo.clone(),
+            Arc::new(StubFetcher {
+                outcome: Ok(TxFetchOutcome::Available(tx)),
+            }),
+            None,
+            None,
+        );
+        let o = exec.execute(good_request("Sig1")).await;
+        assert_eq!(o.status, W5hFundingConfirmStatus::FundingInvalid);
+        assert_eq!(
+            o.error,
+            Some(W5hFundingConfirmErrorCode::MemoMissingOrMismatch)
+        );
     }
 
     #[tokio::test]
@@ -1602,6 +1945,56 @@ mod tests {
             .find(|b| b.pubkey == CONTROLLED_USDC_ATA)
             .expect("ALT-loaded controlled ATA must be resolvable");
         assert_eq!(post.account_index, 4);
+    }
+
+    #[test]
+    fn parse_get_transaction_extracts_memo_instruction() {
+        // accountKeys[3] is the SPL Memo program. The instruction
+        // at programIdIndex=3 with bs58-encoded data must round-trip
+        // to a FetchedInstruction with `program_id == MEMO_PROGRAM_BS58`
+        // and `data == claw:w5h:<rule>:<hash>` payload bytes.
+        let memo_payload =
+            format!("{MEMO_PAYLOAD_PREFIX}{RULE_ID}:{CANON_HASH}");
+        let memo_data_b58 = bs58::encode(memo_payload.as_bytes()).into_string();
+        let result = serde_json::json!({
+            "slot": 419_205_000u64,
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        "UserWalletPubkey111111111111111111111111111",
+                        USDC_MINT_BS58,
+                        CONTROLLED_USDC_ATA,
+                        MEMO_PROGRAM_BS58,
+                    ],
+                    "instructions": [
+                        {
+                            "programIdIndex": 3,
+                            "accounts": [],
+                            "data": memo_data_b58,
+                        },
+                    ],
+                },
+            },
+            "meta": {
+                "err": null,
+                "preTokenBalances": [],
+                "postTokenBalances": [
+                    {
+                        "accountIndex": 2,
+                        "mint": USDC_MINT_BS58,
+                        "owner": CONTROLLED_WALLET,
+                        "uiTokenAmount": { "amount": "250000", "decimals": 6 },
+                    },
+                ],
+            },
+        });
+        let outcome = super::parse_get_transaction_result(&result).unwrap();
+        let tx = match outcome {
+            TxFetchOutcome::Available(t) => t,
+            other => panic!("expected Available, got {other:?}"),
+        };
+        // Memo verifier accepts the round-tripped tx.
+        verify_funding_memo(&tx, RULE_ID, CANON_HASH).unwrap();
     }
 
     #[test]

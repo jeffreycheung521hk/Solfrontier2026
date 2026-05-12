@@ -194,6 +194,7 @@ fn error_label_owned(code: W5hFundingConfirmErrorCode) -> String {
         W5hFundingConfirmErrorCode::IntentAlreadyTerminal => "intent_already_terminal",
         W5hFundingConfirmErrorCode::RepoFailed => "repo_failed",
         W5hFundingConfirmErrorCode::VerifierUnsupported => "verifier_unsupported",
+        W5hFundingConfirmErrorCode::MemoMissingOrMismatch => "memo_missing_or_mismatch",
     }
     .to_string()
 }
@@ -331,6 +332,7 @@ mod tests {
             W5hFundingConfirmErrorCode::IntentAlreadyTerminal,
             W5hFundingConfirmErrorCode::RepoFailed,
             W5hFundingConfirmErrorCode::VerifierUnsupported,
+            W5hFundingConfirmErrorCode::MemoMissingOrMismatch,
         ];
         for code in codes {
             let lbl = error_label_owned(code);

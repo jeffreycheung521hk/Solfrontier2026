@@ -957,22 +957,29 @@ impl GatewayDaemon {
         //
         // Built BEFORE the chat handler so the SAME `Arc` is shared
         // by both consumers (chat-route detection + dedicated route).
-        let w5g_executor: Option<
-            std::sync::Arc<crate::stage2_chat_execute::Stage2ChatExecutor>,
-        > = {
-            let cfg = crate::stage2_chat_execute::Stage2ChatExecuteConfig::from_std_env();
-            build_w5g_executor(cfg, w5e_repo.clone())
-        };
-
-        // W5h-lite — chat-route dispatcher needs the funding-intent
-        // repo + a session-bound wallet resolver. The intent repo is
-        // constructed below alongside the funding-confirm route adapter;
-        // hoist the construction up so the chat handler can also see it.
+        // W5h-lite — chat-route dispatcher AND W5g executor AND W5i
+        // background watcher AND funding-confirm route all share the
+        // SAME `Stage2W5hFundingIntentRepository` Arc so every path
+        // sees / mutates the same intent row. This is what makes the
+        // budget_reserved -> executing CAS gate race-safe across the
+        // manual approval command and the auto-execute watcher.
+        //
+        // Constructed BEFORE the W5g executor so the executor can be
+        // built with `.with_w5h_intent_repo(...)` from the start —
+        // every W5g approval command (manual chat + future watcher)
+        // goes through the same CAS gate.
         let w5h_intent_repo_for_chat = std::sync::Arc::new(
             claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository::new(
                 db.pool().clone(),
             ),
         );
+
+        let w5g_executor: Option<
+            std::sync::Arc<crate::stage2_chat_execute::Stage2ChatExecutor>,
+        > = {
+            let cfg = crate::stage2_chat_execute::Stage2ChatExecuteConfig::from_std_env();
+            build_w5g_executor(cfg, w5e_repo.clone(), w5h_intent_repo_for_chat.clone())
+        };
         // ExternalWalletStore implements SessionBoundWallet via the
         // jupiter_swap trait — use it for the W5h user-wallet lookup
         // so the funding intent's `user_wallet` is the operator's
@@ -1056,6 +1063,70 @@ impl GatewayDaemon {
             }
             handler
         };
+
+        // W5i — auto-execution watcher. Spawned ONLY when every env
+        // gate is satisfied. Polls every 30 s, dispatches eligible
+        // funded conditional orders through the same Stage2ChatExecutor
+        // that the manual W5g approval command uses — they share the
+        // `lease_execution_if_budget_reserved` CAS so a race resolves
+        // to exactly one execution.
+        let w5i_cfg =
+            crate::stage2_w5i_auto_execute::Stage2W5iAutoExecuteConfig::from_std_env();
+        let w5i_enabled = w5i_cfg.fully_enabled();
+        if w5i_enabled {
+            if let Some(executor) = w5g_executor.clone() {
+                let save_apy: std::sync::Arc<
+                    dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher,
+                > = std::sync::Arc::new(
+                    crate::stage2_demo_apr_bridge::LiveSaveDisplayApyFetcher::with_default_base_url(),
+                );
+                let dispatcher: std::sync::Arc<
+                    dyn crate::stage2_w5i_auto_execute::W5iExecutionDispatcher,
+                > = executor;
+                let watcher = std::sync::Arc::new(
+                    crate::stage2_w5i_auto_execute::Stage2W5iAutoExecuteWatcher::new(
+                        w5h_intent_repo_for_chat.clone(),
+                        save_apy,
+                        dispatcher,
+                    ),
+                );
+                info!(
+                    "W5i auto-execution watcher WIRED — 30 s tick, \
+                     shared CAS with manual W5g approval, pinned demo \
+                     shape only (0.25 USDC into Solend Main Pool)."
+                );
+                spawn_supervised("w5i-auto-execute", move || {
+                    let watcher = watcher.clone();
+                    async move { watcher.run().await }
+                });
+            } else {
+                info!(
+                    "W5i auto-execution watcher NOT spawned: W5i env gates \
+                     pass but W5g executor is None ({}).",
+                    w5i_cfg.disabled_reason()
+                );
+            }
+        } else {
+            info!(
+                "W5i auto-execution watcher disabled ({}). Manual W5g \
+                 approval command remains available.",
+                w5i_cfg.disabled_reason()
+            );
+        }
+
+        // W5i — read-only order-status route adapter. Wired
+        // unconditionally so the frontend can poll for the final
+        // state regardless of whether the auto-execution watcher is
+        // enabled (manual W5g still updates the same intent row).
+        let chat_order_status_ref: Option<
+            claw_api::state::W5hOrderStatusHandlerRef,
+        > = Some(
+            crate::runtime::stage2_w5h_order_status_wiring::GatewayW5hOrderStatusAdapter::new(
+                w5h_intent_repo_for_chat.clone(),
+                w5i_enabled,
+            )
+            .into_handler_ref(),
+        );
 
         // Phase 6B Window 2 — JIT prepare handler. Bridges the API
         // trait (`SolendJitPrepareHandler`) to the gateway-internal
@@ -1181,6 +1252,7 @@ impl GatewayDaemon {
             // cancellation path.
             chat_funding_confirm: chat_funding_confirm_ref,
             chat_refund:          None,
+            chat_order_status:    chat_order_status_ref,
         };
 
         let api_handle = claw_api::start(
@@ -2802,6 +2874,9 @@ fn build_w5g_executor(
     w5e_repo: std::sync::Arc<
         claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository,
     >,
+    w5h_intent_repo: std::sync::Arc<
+        claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository,
+    >,
 ) -> Option<std::sync::Arc<crate::stage2_chat_execute::Stage2ChatExecutor>> {
     let rpc_url = std::env::var("HELIUS_RPC_URL")
         .or_else(|_| std::env::var("CLAW_RPC_URL"))
@@ -2891,13 +2966,23 @@ fn build_w5g_executor(
         }
     };
 
-    let executor = std::sync::Arc::new(crate::stage2_chat_execute::Stage2ChatExecutor::new(
-        sender,
-        save_apy_fetcher,
-        apr_fetcher,
-        w5e_repo,
-        cfg,
-    ));
+    // CRITICAL: wire the W5h intent repo into the executor so EVERY
+    // execution path (manual W5g approval command + W5i background
+    // watcher) goes through the same `lease_execution_if_budget_reserved`
+    // CAS gate. This is the race-safety belt: if the watcher and a
+    // manual approval command both reach the executor in the same
+    // tick, only one wins the CAS and broadcasts; the other returns
+    // `prechecks_failed / rule_not_executable` with NO tx attempted.
+    let executor = std::sync::Arc::new(
+        crate::stage2_chat_execute::Stage2ChatExecutor::new(
+            sender,
+            save_apy_fetcher,
+            apr_fetcher,
+            w5e_repo,
+            cfg,
+        )
+        .with_w5h_intent_repo(w5h_intent_repo),
+    );
     info!(
         "W5g chat-execute orchestrator constructed. The chat-route W5g \
          approval command and POST /sessions/:id/stage2/w5g/execute share \

@@ -235,6 +235,7 @@ fn build_router(chat_ref: ChatHandlerRef, sid: &SessionId) -> axum::Router {
         chat_execute:      None,
         chat_funding_confirm: None,
         chat_refund:       None,
+        chat_order_status:       None,
     };
     claw_api::create_router(state, HealthRegistry::new())
 }

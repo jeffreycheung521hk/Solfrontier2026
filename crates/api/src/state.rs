@@ -1304,6 +1304,86 @@ pub enum W5hFundingConfirmRouteOutcome {
     Disabled(String),
 }
 
+/// W5i — wire DTO returned by `GET /sessions/:id/stage2/w5h/order/:rule_id_hex`.
+/// Used by the frontend to poll for the W5i auto-execution watcher's
+/// final state (completed / failed / broadcasted_timeout) after
+/// `budget_reserved`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct W5hOrderStatusDto {
+    pub rule_id_hex: String,
+    pub canonical_rule_hash_hex: String,
+    /// Status: `funding_required` | `funding_submitted` |
+    /// `funding_invalid` | `budget_reserved` | `executing` |
+    /// `completed` | `expired` | `refunding` | `refunded` | `failed`.
+    pub status: String,
+    /// `"reserved"` when status is `budget_reserved` or `executing`;
+    /// `"completed"` when status is `completed`; etc. Lightweight
+    /// chip label for the card.
+    pub budget_status: String,
+    /// `true` when the daemon constructed the W5i watcher with all
+    /// env gates set. Frontend uses this to decide whether to
+    /// continue polling after `budget_reserved` (auto path) or
+    /// surface the manual W5g approval command (manual path).
+    pub auto_execution_enabled: bool,
+    pub user_wallet: String,
+    pub user_usdc_ata: String,
+    pub controlled_wallet: String,
+    pub controlled_usdc_ata: String,
+    #[serde(with = "crate::serde_str::u64_string")]
+    pub amount_raw: u64,
+    pub threshold_bps: u32,
+    pub save_display_apy_bps_at_creation: u32,
+    pub native_onchain_apr_bps_at_creation: u32,
+    #[serde(with = "crate::serde_str::i64_string")]
+    pub created_at_ms: i64,
+    #[serde(with = "crate::serde_str::i64_string")]
+    pub expires_at_ms: i64,
+    pub funding_signature: Option<String>,
+    #[serde(default, with = "crate::serde_str::opt_u64_string")]
+    pub funding_confirmation_slot: Option<u64>,
+    /// Set when the W5i auto-execution watcher (or manual W5g)
+    /// completes the Solend deposit. Same value for the
+    /// `tx_signature` shown on the W5g card.
+    pub execution_signature: Option<String>,
+    pub solscan_url: Option<String>,
+    pub refund_signature: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// Domain-level outcome returned by `W5hOrderStatusHandler::get`.
+#[derive(Debug, Clone)]
+pub enum W5hOrderStatusRouteOutcome {
+    Ok(W5hOrderStatusDto),
+    NotFound(String),
+    BadRequest(String),
+    SessionNotActive,
+    Disabled(String),
+}
+
+pub trait W5hOrderStatusHandler: Send + Sync + 'static {
+    fn get(
+        &self,
+        session_id: &SessionId,
+        rule_id_hex: &str,
+    ) -> Pin<Box<dyn Future<Output = W5hOrderStatusRouteOutcome> + Send + '_>>;
+}
+
+#[derive(Clone)]
+pub struct W5hOrderStatusHandlerRef(pub Arc<dyn W5hOrderStatusHandler>);
+
+impl W5hOrderStatusHandlerRef {
+    pub fn new(inner: Arc<dyn W5hOrderStatusHandler>) -> Self {
+        Self(inner)
+    }
+    pub async fn get(
+        &self,
+        session_id: &SessionId,
+        rule_id_hex: &str,
+    ) -> W5hOrderStatusRouteOutcome {
+        self.0.get(session_id, rule_id_hex).await
+    }
+}
+
 /// Domain-level outcome returned by `W5hRefundHandler::execute`.
 #[derive(Debug, Clone)]
 pub enum W5hRefundRouteOutcome {
@@ -1565,6 +1645,11 @@ pub struct AppState {
     /// (`CLAW_STAGE2_LIVE_W5H_REFUND=1` + approval phrase + keypair
     /// + cluster + RPC). The route returns `503` when this is `None`.
     pub chat_refund:          Option<W5hRefundHandlerRef>,
+    /// W5i — backend seam for `GET /sessions/:id/stage2/w5h/order/:rule_id_hex`.
+    /// Read-only view of a W5h funding intent's current state.
+    /// Frontend polls this to detect the watcher's terminal status
+    /// after `budget_reserved`. `None` makes the route return 503.
+    pub chat_order_status: Option<W5hOrderStatusHandlerRef>,
 }
 
 /// W5g — wire DTO mirroring `claw_gateway::stage2_chat_execute::

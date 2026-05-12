@@ -282,6 +282,34 @@ impl Stage2W5hFundingIntentRepository {
         rows.into_iter().map(row_to_intent).collect()
     }
 
+    /// W5i sweep helper: list intents currently in `budget_reserved`.
+    /// Bounded by `limit`. Ordered by `created_at_ms ASC` so older
+    /// orders are processed first.
+    ///
+    /// Returning a snapshot here is safe because the watcher does NOT
+    /// rely on the listed status — each intent then goes through the
+    /// executor's `lease_execution_if_budget_reserved` CAS, which
+    /// rejects 0 rows for any non-budget_reserved status.
+    pub async fn list_budget_reserved(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<W5hFundingIntent>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, RowRaw>(&format!(
+            "{} WHERE status = ?
+              ORDER BY created_at_ms ASC
+              LIMIT ?",
+            SELECT_ALL_SQL_PREFIX
+        ))
+        .bind(status::BUDGET_RESERVED)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_intent).collect()
+    }
+
     // ── State transitions (all CAS-guarded by status predicates) ────────
 
     /// `funding_required → funding_submitted`. The user POSTed a
@@ -943,6 +971,75 @@ mod tests {
             .await
             .unwrap(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn w5h_list_budget_reserved_returns_only_budget_reserved_ordered() {
+        let (_db, repo) = test_repo().await;
+        // Three intents: two in budget_reserved (different created_at),
+        // one in funding_required (must NOT appear).
+        let mut a = fixture(&"a".repeat(32), 2_000_000);
+        let mut b = fixture(&"b".repeat(32), 1_000_000); // older
+        let mut c = fixture(&"c".repeat(32), 3_000_000); // funding_required
+        for x in [&mut a, &mut b, &mut c] {
+            x.expires_at_ms = x.created_at_ms + 180_000;
+        }
+        repo.insert(&a).await.unwrap();
+        repo.insert(&b).await.unwrap();
+        repo.insert(&c).await.unwrap();
+        // Advance a + b to budget_reserved; leave c in funding_required.
+        for x in [&a, &b] {
+            repo.mark_funding_submitted_if_required(&x.intent_id, "Sig")
+                .await
+                .unwrap();
+            repo.mark_budget_reserved_if_submitted(&x.intent_id, "Sig", 100)
+                .await
+                .unwrap();
+        }
+
+        let list = repo.list_budget_reserved(10).await.unwrap();
+        // Must include exactly a + b (in created_at ASC order: b first, a second).
+        let ids: Vec<&str> = list.iter().map(|i| i.intent_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![b.intent_id.as_str(), a.intent_id.as_str()],
+            "list_budget_reserved must return budget_reserved-only, oldest first; \
+             funding_required intent c must be excluded"
+        );
+
+        // limit=0 → empty.
+        assert!(repo.list_budget_reserved(0).await.unwrap().is_empty());
+        // limit=1 → only oldest (b).
+        let one = repo.list_budget_reserved(1).await.unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].intent_id, b.intent_id);
+    }
+
+    #[tokio::test]
+    async fn w5h_list_budget_reserved_excludes_executing_completed_refunded() {
+        let (_db, repo) = test_repo().await;
+        let now = 1_000_000_i64;
+        let intent = fixture(&"a".repeat(32), now);
+        repo.insert(&intent).await.unwrap();
+        repo.mark_funding_submitted_if_required(&intent.intent_id, "Sig1")
+            .await
+            .unwrap();
+        repo.mark_budget_reserved_if_submitted(&intent.intent_id, "Sig1", 100)
+            .await
+            .unwrap();
+        // Lease execution → status flips to executing.
+        let n = repo
+            .lease_execution_if_budget_reserved(&intent.intent_id, now)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // list_budget_reserved must NOT include this intent anymore.
+        let list = repo.list_budget_reserved(10).await.unwrap();
+        assert!(
+            list.is_empty(),
+            "intent is executing; must not appear in list_budget_reserved (got {} items)",
+            list.len()
         );
     }
 
