@@ -97,12 +97,19 @@ function looksLikeW5gExecuteCommand(text: string): boolean {
 /// to re-type a 50-character bilingual conditional order.
 function looksLikeW5hChatCommand(text: string): boolean {
   const t = text.trim();
+  // English — accept BOTH the simplified W5h-lite grammar
+  //   "If Save APY > X%, deposit 0.25 USDC"
+  // and the original verbose form
+  //   "If Solend Main Pool USDC deposit APY is above X%, …"
   if (
-    /^If Solend Main Pool USDC deposit APY is above\s+\d/i.test(t) &&
-    /deposit\s+0\.25\s+USDC\s+from my wallet/i.test(t)
+    /^If\s+(?:Save\s+APY|Solend\s+Main\s+Pool\s+USDC\s+deposit\s+APY)/i.test(
+      t,
+    ) &&
+    /deposit\s+0\.25\s+USDC/i.test(t)
   ) {
     return true;
   }
+  // 繁中 — same broad shape; "有效期 N 分鐘" is optional in W5h-lite.
   if (/^如果\s*Save\s*APY/i.test(t) && /deposit\s*0\.25\s*USDC/i.test(t)) {
     return true;
   }
@@ -1226,11 +1233,33 @@ type W5hFundingFlow =
   | { kind: "submitted"; signature: string }
   /// Polling `getSignatureStatuses` for finalization.
   | { kind: "polling_chain"; signature: string; attempts: number }
-  /// Backend confirm POST in flight. Signature is finalised.
-  | { kind: "confirming_backend"; signature: string }
+  /// Backend confirm POST in flight, OR backend last returned
+  /// `funding_pending` and we're inside the bounded re-poll loop.
+  /// `attempts` is 1 on the first call and increments on each
+  /// funding_pending re-poll. Never claims `budget_reserved`.
+  | { kind: "confirming_backend"; signature: string; attempts: number }
   /// Backend confirm POST 4xx/5xx. Signature MAY have landed; we
   /// keep it so the operator can verify on Solscan.
   | { kind: "error"; reason: string; signature?: string };
+
+// ── Bounded backend confirm-poll loop ────────────────────────────────
+//
+// After Phantom funding tx is broadcast AND we observe chain
+// finality, we POST to the backend confirm route. If it answers
+// `funding_pending` the frontend keeps polling on a fixed interval
+// for up to a bounded number of attempts (≈75 s ceiling). During
+// the loop we keep the same "Funding submitted — waiting for chain
+// confirmation" copy visible. We NEVER mark the order as
+// `budget_reserved` client-side — only when the backend re-emits a
+// status that is not `funding_pending`.
+const W5H_BACKEND_CONFIRM_MAX_ATTEMPTS = 30;
+const W5H_BACKEND_CONFIRM_INTERVAL_MS = 2_500;
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
 
 function W5hConditionalOrderCard({
   initial,
@@ -1249,32 +1278,40 @@ function W5hConditionalOrderCard({
     [],
   );
 
-  // ── Countdown ─────────────────────────────────────────────────────
-  // A single 1s ticker drives the "expires in" label. We round down
-  // and clamp to zero — never negative.
+  // ── Expiry display (W5h-lite: informational only) ─────────────────
+  //
+  // W5h-lite (2026-05-12) scope reduction: the frontend no longer
+  // promises an automatic refund or auto-expiry. If the backend
+  // omits `expires_at_ms` we show NO countdown at all. If it carries
+  // one we show a live remaining-time label as INFORMATIONAL metadata
+  // only — never as a Fund-button gate, never as a status flip.
+  // Cancellation / refund are explicit manual operator actions.
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const hasExpiresAtMs =
+    typeof result.expires_at_ms === "string" &&
+    /^\d+$/.test(result.expires_at_ms);
   useEffect(() => {
+    if (!hasExpiresAtMs) return;
     const id = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [hasExpiresAtMs]);
   const expiresAtMs = useMemo(() => {
-    const raw = result.expires_at_ms;
-    if (!/^\d+$/.test(raw)) return null;
-    const n = Number(raw);
+    if (!hasExpiresAtMs) return null;
+    const n = Number(result.expires_at_ms);
     return Number.isSafeInteger(n) ? n : null;
-  }, [result.expires_at_ms]);
+  }, [hasExpiresAtMs, result.expires_at_ms]);
   const remainingMs =
     expiresAtMs === null ? null : Math.max(0, expiresAtMs - nowMs);
-  const countdownDone =
-    remainingMs !== null && remainingMs === 0;
-  // Display countdown only while the order is still gathering / live.
-  // After budget_reserved / ready_to_execute / expired the count is
-  // either superseded by an execution prompt or by the expired card.
+  // Show the row only when the backend gave us a value AND the order
+  // is still in a "live" state. After budget_reserved / etc. the
+  // information is largely irrelevant for the W5h-lite demo.
   const showCountdown =
-    result.status === "funding_required" ||
-    result.status === "watching" ||
-    result.status === "budget_reserved" ||
-    result.status === "ready_to_execute";
+    hasExpiresAtMs &&
+    (result.status === "funding_required" ||
+      result.status === "funding_pending" ||
+      result.status === "watching" ||
+      result.status === "budget_reserved" ||
+      result.status === "ready_to_execute");
 
   // ── Wallet gating ─────────────────────────────────────────────────
   const expectedUserWallet = result.user_wallet ?? null;
@@ -1301,8 +1338,7 @@ function W5hConditionalOrderCard({
     result.status === "funding_required" &&
     !fundInFlight &&
     walletOk &&
-    sessionId !== null &&
-    !countdownDone;
+    sessionId !== null;
 
   const handleFund = useCallback(async () => {
     if (!canFund) return;
@@ -1475,25 +1511,64 @@ function W5hConditionalOrderCard({
     // 7. Tell the backend so it re-reads on-chain authoritatively
     //    and flips the W5h state to budget_reserved / watching /
     //    ready_to_execute / funding_failed.
-    setFlow({ kind: "confirming_backend", signature });
+    //
+    //    W5h-lite addendum: the backend can answer `funding_pending`
+    //    while it's still catching up to the chain. The frontend
+    //    polls the confirm route on a bounded loop while that holds,
+    //    keeping the "Funding submitted — waiting for chain
+    //    confirmation" banner visible. We NEVER mark budget_reserved
+    //    client-side; only the backend can.
+    const confirmBody = {
+      rule_id_hex: result.rule_id_hex,
+      funding_signature: signature,
+      user_wallet: walletPubkey,
+      user_usdc_ata: sourceAta.toBase58(),
+      controlled_wallet: result.controlled_wallet,
+      controlled_usdc_ata: result.controlled_usdc_ata,
+      amount_raw: result.amount_raw,
+    };
+    setFlow({ kind: "confirming_backend", signature, attempts: 1 });
+    let attempt = 0;
     try {
-      const env = await confirmW5hFunding(sessionId, {
-        rule_id_hex: result.rule_id_hex,
-        funding_signature: signature,
-        user_wallet: walletPubkey,
-        user_usdc_ata: sourceAta.toBase58(),
-        controlled_wallet: result.controlled_wallet,
-        controlled_usdc_ata: result.controlled_usdc_ata,
-        amount_raw: result.amount_raw,
-      });
-      if (env.kind === "ok") {
+      while (true) {
+        attempt += 1;
+        const env = await confirmW5hFunding(sessionId, confirmBody);
+        if (env.kind !== "ok") {
+          setFlow({
+            kind: "error",
+            reason: `Backend confirm failed (${env.httpStatus}): ${env.error || "no error body"}`,
+            signature,
+          });
+          return;
+        }
+        // Mirror the backend's latest view into the card. This includes
+        // the funding_pending status — we do NOT swallow it.
         setResult(env.response);
-        setFlow({ kind: "idle" });
-      } else {
+        if (env.response.status !== "funding_pending") {
+          // Terminal (budget_reserved / watching / ready_to_execute /
+          // expired / refunded / funding_failed). Drop the loop;
+          // server status now drives the render.
+          setFlow({ kind: "idle" });
+          return;
+        }
+        // Still pending — bail if we've hit the bounded cap; otherwise
+        // sleep and retry while updating the attempts counter for UI.
+        if (attempt >= W5H_BACKEND_CONFIRM_MAX_ATTEMPTS) {
+          setFlow({
+            kind: "error",
+            reason:
+              `Backend still reports funding_pending after ` +
+              `${(attempt * W5H_BACKEND_CONFIRM_INTERVAL_MS) / 1000}s; ` +
+              "verify on Solscan and reload to retry.",
+            signature,
+          });
+          return;
+        }
+        await sleepMs(W5H_BACKEND_CONFIRM_INTERVAL_MS);
         setFlow({
-          kind: "error",
-          reason: `Backend confirm failed (${env.httpStatus}): ${env.error || "no error body"}`,
+          kind: "confirming_backend",
           signature,
+          attempts: attempt + 1,
         });
       }
     } catch (err) {
@@ -1599,11 +1674,19 @@ function W5hConditionalOrderCard({
                 <dd
                   className="font-mono"
                   data-testid="w5h-countdown"
-                  data-expired={countdownDone ? "true" : "false"}
+                  data-expired={
+                    remainingMs !== null && remainingMs === 0
+                      ? "true"
+                      : "false"
+                  }
+                  title="Informational only — the demo does not auto-expire or auto-refund from the frontend."
                 >
                   {remainingMs === null
                     ? "—"
                     : formatRemaining(remainingMs)}
+                  <span className="ml-2 text-[10px] text-muted-foreground italic">
+                    (informational)
+                  </span>
                 </dd>
               </>
             )}
@@ -1678,29 +1761,30 @@ function W5hConditionalOrderCard({
         )}
 
         {/* ── Fund button — the SINGLE allowed action button ──── */}
-        {result.status === "funding_required" && !countdownDone && (
-          <div className="mt-3 flex items-center gap-3 flex-wrap">
-            <Button
-              size="sm"
-              onClick={() => void handleFund()}
-              disabled={!canFund}
-              data-testid="w5h-fund-button"
+        {result.status === "funding_required" && (
+          <div className="mt-3 space-y-2">
+            <p
+              className="text-xs text-foreground"
+              data-testid="w5h-fund-helper-copy"
             >
-              {fundButtonLabel(flow, result.amount_raw)}
-            </Button>
-            <span className="text-[11px] text-muted-foreground italic">
-              Phantom will pop up only on this click. One signature; one
-              broadcast.
-            </span>
-          </div>
-        )}
-        {countdownDone && result.status === "funding_required" && (
-          <div
-            className="mt-3 rounded border border-rose-300 bg-rose-50/70 p-3 text-xs text-rose-900"
-            data-testid="w5h-countdown-expired"
-          >
-            Countdown expired before funding. This order is now invalid —
-            type a fresh W5h conditional-order command to retry.
+              Fund this conditional order with Phantom. The controlled
+              wallet will hold the 0.25 USDC budget until execution or
+              manual cancellation.
+            </p>
+            <div className="flex items-center gap-3 flex-wrap">
+              <Button
+                size="sm"
+                onClick={() => void handleFund()}
+                disabled={!canFund}
+                data-testid="w5h-fund-button"
+              >
+                {fundButtonLabel(flow, result.amount_raw)}
+              </Button>
+              <span className="text-[10px] text-muted-foreground italic">
+                Phantom pops up only on this click. One signature; one
+                broadcast.
+              </span>
+            </div>
           </div>
         )}
 
@@ -1752,20 +1836,19 @@ function W5hConditionalOrderCard({
           />
         )}
 
-        {/* ── Expired branch ──────────────────────────────────── */}
+        {/* ── Expired branch (W5h-lite: no refund promise) ─────── */}
         {result.status === "expired" && (
           <div
             className="mt-3 rounded border border-amber-300 bg-amber-50/70 p-3 text-xs text-amber-900"
             data-testid="w5h-expired-card"
           >
-            <div className="font-medium">
-              Expired — budget can be refunded
-            </div>
+            <div className="font-medium">Order window closed</div>
             <p className="mt-1">
-              The conditional order window passed without execution.
-              Refund flows are a backend-operator action — the frontend
-              never auto-refunds. If the backend later returns a refund
-              signature it will appear below.
+              The conditional order is no longer eligible for
+              execution. The W5h-lite demo does not promise an
+              automatic refund — cancellation / refund is a manual
+              operator action. If the backend later reports a refund
+              signature it will appear below for reference.
             </p>
             {result.refund_signature && (
               <div className="mt-2 font-mono break-all">
@@ -1883,9 +1966,9 @@ function fundButtonLabel(
     case "submitted":
       return "Submitted, confirming…";
     case "polling_chain":
-      return `Confirming… (${flow.attempts}/${MAX_POLL_ATTEMPTS_DEFAULT})`;
+      return `Confirming on chain… (${flow.attempts}/${MAX_POLL_ATTEMPTS_DEFAULT})`;
     case "confirming_backend":
-      return "Backend confirming…";
+      return `Backend confirming… (${flow.attempts}/${W5H_BACKEND_CONFIRM_MAX_ATTEMPTS})`;
     case "error":
       return "Funding failed";
     default: {
@@ -1942,7 +2025,7 @@ function w5hBanner(
     case "expired":
       return {
         tone: "bg-amber-50 text-amber-900 border-amber-200",
-        text: "Expired — order window closed.",
+        text: "Expired — order window closed. Cancellation / refund is a manual operator action in the W5h-lite demo.",
       };
     case "refunded":
       return {
@@ -1953,6 +2036,16 @@ function w5hBanner(
       return {
         tone: "bg-rose-50 text-rose-900 border-rose-200",
         text: "Funding failed — see error details below.",
+      };
+    case "funding_pending":
+      // The backend has the signature but hasn't observed on-chain
+      // budget yet. The frontend's bounded confirm-poll loop keeps
+      // hitting the confirm route every ~2.5 s while this status
+      // holds. We surface the SAME "waiting for chain confirmation"
+      // copy as the in-flight `confirming_backend` flow.
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Funding submitted — waiting for chain confirmation.",
       };
     case "funding_required":
       // Fall through to flow-dependent copy below.
@@ -1994,17 +2087,17 @@ function w5hBanner(
     case "submitted":
       return {
         tone: "bg-amber-50 text-amber-900 border-amber-200",
-        text: "Submitted — waiting for chain finalization.",
+        text: "Funding submitted — waiting for chain confirmation.",
       };
     case "polling_chain":
       return {
         tone: "bg-amber-50 text-amber-900 border-amber-200",
-        text: `Confirming on Mainnet… attempt ${flow.attempts} of ${MAX_POLL_ATTEMPTS_DEFAULT}.`,
+        text: `Funding submitted — confirming on chain (${flow.attempts}/${MAX_POLL_ATTEMPTS_DEFAULT}).`,
       };
     case "confirming_backend":
       return {
         tone: "bg-amber-50 text-amber-900 border-amber-200",
-        text: "Backend verifying budget reservation…",
+        text: `Funding submitted — waiting for chain confirmation (${flow.attempts}/${W5H_BACKEND_CONFIRM_MAX_ATTEMPTS}).`,
       };
     case "error":
       return {

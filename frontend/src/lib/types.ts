@@ -386,9 +386,20 @@ export interface W5hConditionalDepositResult {
 
   /// Server-side lifecycle status. See module doc for the full
   /// transition graph. The frontend's local in-flight states
-  /// (signing / submitted / pending) sit on top of these.
+  /// (signing / submitted / chain-polling) sit on top of these.
+  ///
+  /// `funding_pending` is the backend's "I accepted the funding
+  /// signature but haven't yet observed it as on-chain budget" state.
+  /// The frontend polls the confirm route on a bounded loop while
+  /// this status holds and does NOT treat it as failure.
+  ///
+  /// `expired` / `refunded` may still be emitted by the backend, but
+  /// the W5h-lite demo (2026-05-12) no longer promises an automatic
+  /// refund — manual operator action is the assumed cancellation
+  /// path. The frontend renders these informationally only.
   status:
     | "funding_required"
+    | "funding_pending"
     | "budget_reserved"
     | "watching"
     | "ready_to_execute"
@@ -431,7 +442,15 @@ export interface W5hConditionalDepositResult {
   /// Wall-clock expiry as Unix milliseconds. STRING because some
   /// chat commands could land us > 2^53 ms in the future
   /// hypothetically; defensive against any future expiry math.
-  expires_at_ms: string;
+  ///
+  /// OPTIONAL as of the W5h-lite simplification (2026-05-12). When
+  /// the user types the short grammar ("If Save APY > X%, deposit
+  /// 0.25 USDC") the chat-route may omit expiry entirely; the card
+  /// then renders no countdown and the Fund button is NOT gated on
+  /// any client-side timer. When present, the field is rendered as
+  /// informational metadata only — the demo does not auto-expire
+  /// or auto-refund from the frontend.
+  expires_at_ms?: string | null;
   /// Solana slot at which the reserve + balance were read. Liveness
   /// anchor.
   last_checked_slot?: string | null;

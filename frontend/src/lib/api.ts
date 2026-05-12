@@ -478,25 +478,37 @@ function parseShowcaseW5hConditional(
 ): ChatResponse | null {
   const trimmed = message.trim();
 
-  // English grammar:
-  //   If Solend Main Pool USDC deposit APY is above X%, deposit 0.25 USDC
-  //   from my wallet, expires in N minutes[.]
+  // English grammar — accepts BOTH:
+  //   simplified: "If Save APY > X%, deposit 0.25 USDC"
+  //   verbose:    "If Solend Main Pool USDC deposit APY is above X%,
+  //                deposit 0.25 USDC from my wallet[, expires in N minutes]"
+  // Capture groups: [1] = threshold percent label, [2] = optional
+  // expires-in minutes (undefined for the simplified grammar).
   const en = trimmed.match(
-    /^If Solend Main Pool USDC deposit APY is above\s+(\d+(?:\.\d+)?)%,\s+deposit\s+0\.25\s+USDC\s+from my wallet,\s+expires in\s+(\d+)\s+minutes?\.?\s*$/i,
+    /^If\s+(?:Save\s+APY|Solend\s+Main\s+Pool\s+USDC\s+deposit\s+APY)\s*(?:is\s+above|>)\s*(\d+(?:\.\d+)?)%[,]?\s*deposit\s+0\.25\s+USDC(?:\s+from\s+my\s+wallet)?(?:[,]?\s*expires\s+in\s+(\d+)\s+minutes?)?\.?\s*$/i,
   );
-  // 繁中 grammar:
-  //   如果 Save APY > X%，deposit 0.25 USDC，有效期 N 分鐘
-  // (allow optional spaces, half/full-width comma, optional 0 leading)
+  // 繁中 grammar — accepts BOTH:
+  //   simplified: "如果 Save APY > X%，deposit 0.25 USDC"
+  //   verbose:    "如果 Save APY > X%，deposit 0.25 USDC，有效期 N 分鐘"
+  // Capture groups: same shape as the English variant.
   const zh = trimmed.match(
-    /^如果\s*Save\s*APY\s*>\s*(\d+(?:\.\d+)?)%[，,]\s*deposit\s*0\.25\s*USDC[，,]\s*有效期\s*(\d+)\s*分鐘\s*$/i,
+    /^如果\s*Save\s*APY\s*>\s*(\d+(?:\.\d+)?)%[，,]\s*deposit\s*0\.25\s*USDC(?:[，,]\s*有效期\s*(\d+)\s*分鐘)?\s*$/i,
   );
   const m = en ?? zh;
   if (m === null) return null;
 
   const thresholdPctLabel = m[1];
-  const expireMinutes = Math.max(1, Math.min(60, parseInt(m[2], 10) || 3));
   const thresholdBps = Math.round(parseFloat(thresholdPctLabel) * 100);
-  const expiresAtMs = (Date.now() + expireMinutes * 60_000).toString();
+  // Simplified grammar (no expires clause) ⇒ omit expires_at_ms
+  // entirely so the card never renders a countdown. Verbose grammar
+  // produces an informational wall-clock timestamp.
+  const expiresAtMs =
+    typeof m[2] === "string"
+      ? (
+          Date.now() +
+          Math.max(1, Math.min(60, parseInt(m[2], 10) || 3)) * 60_000
+        ).toString()
+      : null;
 
   // Showcase user wallet: in showcase mode we don't know the live
   // Phantom pubkey; surface `null` and let the card fall back to the
@@ -1194,25 +1206,50 @@ export async function confirmW5hFunding(
   return { kind: "error", httpStatus: res.status, error: errorText };
 }
 
+/// Per-signature call counter so the showcase fixture can simulate
+/// the W5h-lite "backend reports funding_pending for a while, then
+/// flips to budget_reserved" lifecycle. Lifetime is the browser
+/// session; we don't persist across reloads. Bounded by the keys we
+/// actually see — no GC needed.
+const SHOWCASE_W5H_CONFIRM_CALLS = new Map<string, number>();
+
+/// Default number of funding_pending replies the showcase fixture
+/// emits before flipping to budget_reserved when the signature suffix
+/// requests the pending lifecycle. Stays under the frontend's bounded
+/// confirm-poll cap so the demo always resolves.
+const SHOWCASE_PENDING_REPLIES_DEFAULT = 2;
+
 /// Showcase reply for the W5h funding-confirm route. Returns a
 /// `budget_reserved` DTO populated from the request body, so the
 /// chat-card flips into the "watching / ready_to_execute" branch and
 /// surfaces the W5g approval-command panel.
 ///
-/// The fixture honours an opt-out: if `body.funding_signature` ends
-/// in `"fail"` we return `funding_failed` so a demo viewer can
-/// exercise the red branch without a real failure on chain.
+/// Suffix selectors on `body.funding_signature` let demo viewers
+/// preview different backend behaviours without standing up the live
+/// W5h backend:
+///   - …fail               → funding_failed (red branch)
+///   - …pending / …pend01  → funding_pending for the first 2 calls,
+///                           then budget_reserved / ready_to_execute.
+///                           Exercises the frontend's bounded
+///                           confirm-poll loop end-to-end.
+///   - (default)           → immediate budget_reserved (or
+///                           ready_to_execute when APY > threshold)
 function showcaseW5hFundingConfirmReply(
   body: W5hFundingConfirmRequest,
 ): W5hFundingConfirmEnvelope {
-  const wantsFailure = body.funding_signature.toLowerCase().endsWith("fail");
+  const sig = body.funding_signature;
+  const sigLower = sig.toLowerCase();
+  const wantsFailure = sigLower.endsWith("fail");
+  const wantsPendingPoll =
+    sigLower.endsWith("pending") || sigLower.endsWith("pend01");
+
   if (wantsFailure) {
     return {
       kind: "ok",
       response: {
         ...buildW5hShowcaseShared(body),
         status: "funding_failed",
-        funding_signature: body.funding_signature,
+        funding_signature: sig,
         funding_confirmation_slot: null,
         error_code: "funding_signature_not_found",
         error_reason:
@@ -1220,14 +1257,39 @@ function showcaseW5hFundingConfirmReply(
       },
     };
   }
+
+  if (wantsPendingPoll) {
+    const seen = SHOWCASE_W5H_CONFIRM_CALLS.get(sig) ?? 0;
+    SHOWCASE_W5H_CONFIRM_CALLS.set(sig, seen + 1);
+    if (seen < SHOWCASE_PENDING_REPLIES_DEFAULT) {
+      // Still "pending" — the frontend's bounded confirm-poll loop
+      // will keep polling without claiming budget_reserved.
+      return {
+        kind: "ok",
+        response: {
+          ...buildW5hShowcaseShared(body),
+          status: "funding_pending",
+          funding_signature: sig,
+          funding_confirmation_slot: null,
+          current_budget_raw: "0",
+          condition_met: false,
+          error_code: null,
+          error_reason: null,
+        },
+      };
+    }
+    // Counter exhausted — flip to the happy terminal state.
+  }
+
   return {
     kind: "ok",
     response: {
       ...buildW5hShowcaseShared(body),
-      status: W5H_FIXTURE_PINNED.save_display_apy_bps > 100
-        ? "ready_to_execute"
-        : "budget_reserved",
-      funding_signature: body.funding_signature,
+      status:
+        W5H_FIXTURE_PINNED.save_display_apy_bps > 100
+          ? "ready_to_execute"
+          : "budget_reserved",
+      funding_signature: sig,
       funding_confirmation_slot: SHOWCASE_FUNDING_SLOT,
       current_budget_raw: body.amount_raw,
       condition_met: W5H_FIXTURE_PINNED.save_display_apy_bps > 100,
