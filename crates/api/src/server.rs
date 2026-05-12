@@ -60,6 +60,7 @@ use crate::{
         solend_signatures::{get_solend_signature, submit_solend_signature},
         solend_withdraw_jit_signing::prepare_solend_withdraw_signing,
         stage2_chat_execute::post_w5g_execute,
+        stage2_w5h_funding_confirm::post_w5h_funding_confirm,
         wallets::list_wallets,
         wallet_challenges::{create_wallet_challenge, confirm_wallet_challenge},
         wallet_signatures::{bind_wallet, list_wallet_signatures, submit_wallet_signature},
@@ -135,6 +136,19 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         .route(
             "/sessions/:id/stage2/w5g/execute",
             post(post_w5g_execute).layer(DefaultBodyLimit::max(2048)),
+        )
+        // W5h-lite — funding-confirm route. After the user Phantom-signs
+        // a TransferChecked of 0.25 USDC into the controlled wallet's
+        // USDC ATA, the frontend POSTs the signature here so the
+        // backend can authoritatively verify the token-balance delta
+        // (read-only `getTransaction` with `maxSupportedTransactionVersion:0`).
+        // The handler is opt-in via the daemon's W5h substrate wiring;
+        // when not wired the route returns 503. Body limit is 2 KB —
+        // the legitimate payload (rule_id + signature + 4 base58
+        // pubkeys + JSON envelope) is < 500 bytes.
+        .route(
+            "/sessions/:id/stage2/w5h/funding/confirm",
+            post(post_w5h_funding_confirm).layer(DefaultBodyLimit::max(2048)),
         )
         // Wallet ownership proof (challenge-response)
         .route("/sessions/:id/wallet-bind-challenge", post(create_wallet_challenge))

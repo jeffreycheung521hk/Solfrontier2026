@@ -997,6 +997,51 @@ impl GatewayDaemon {
                 .into_handler_ref()
             });
 
+        // W5h-lite — chat-funding-confirm route adapter. Constructed
+        // unconditionally whenever the RPC URL is available; the
+        // route returns a typed `funding_pending` / `funding_invalid`
+        // / `intent_not_found` DTO on a per-request basis and never
+        // sends a transaction (read-only `getTransaction`).
+        //
+        // The W5h funding-intent repo is built here so a single
+        // shared instance is used by both the route adapter and any
+        // future chat-route dispatch that creates intents.
+        let w5h_intent_repo = std::sync::Arc::new(
+            claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository::new(
+                db.pool().clone(),
+            ),
+        );
+        let chat_funding_confirm_ref: Option<
+            claw_api::state::W5hFundingConfirmHandlerRef,
+        > = {
+            let rpc_url = std::env::var("HELIUS_RPC_URL")
+                .or_else(|_| std::env::var("CLAW_RPC_URL"))
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            let handler = crate::runtime::stage2_w5h_funding_confirm_wiring::build_w5h_funding_confirm_handler(
+                rpc_url.as_deref(),
+                w5h_intent_repo.clone(),
+            );
+            if handler.is_some() {
+                info!(
+                    "W5h funding-confirm route WIRED \u{2014} \
+                     POST /sessions/:id/stage2/w5h/funding/confirm \
+                     will verify Phantom-signed funding txs with \
+                     maxSupportedTransactionVersion:0 + accountIndex \
+                     \u{2192} pubkey resolution; no sleep, no send, \
+                     no keypair."
+                );
+            } else {
+                info!(
+                    "W5h funding-confirm route NOT wired (RPC URL missing or \
+                     LiveTxFetcher rejected it); \
+                     POST /sessions/:id/stage2/w5h/funding/confirm will \
+                     return 503."
+                );
+            }
+            handler
+        };
+
         // Phase 6B Window 2 — JIT prepare handler. Bridges the API
         // trait (`SolendJitPrepareHandler`) to the gateway-internal
         // dependencies (approval store, external wallet, jit-ready
@@ -1114,12 +1159,12 @@ impl GatewayDaemon {
             demo_seeder:       demo_seeder_ref,
             chat:              chat_handler_ref,
             chat_execute:      chat_execute_ref,
-            // W5h handlers — to be wired in a follow-up daemon pass.
-            // Default None means the routes return 503 until the
-            // wiring lands; the chat-route W5h detector still
-            // dispatches through the bridge below regardless of
-            // these handlers.
-            chat_funding_confirm: None,
+            // W5h-lite — funding-confirm route adapter (wired above).
+            // Refund handler intentionally remains None in this
+            // slice: the W5h-lite scope drops automatic expiry /
+            // refund; manual operator action is the assumed
+            // cancellation path.
+            chat_funding_confirm: chat_funding_confirm_ref,
             chat_refund:          None,
         };
 

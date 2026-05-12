@@ -46,9 +46,20 @@ pub const USDC_MINT_BS58: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 /// What the verifier needs from `getTransaction`. The shape mirrors
 /// the relevant Solana JSON-RPC response fields (omitting everything
 /// we don't read) so tests can build fixtures by hand.
+///
+/// W5h-lite addendum §2 — `pubkey` is the base58 pubkey resolved from
+/// `account_index` via `transaction.message.accountKeys` AND
+/// `meta.loadedAddresses` (address-table lookups for v0 transactions).
+/// The verifier matches the destination token account by **pubkey
+/// equality** with the persisted `controlled_usdc_ata`, never by
+/// `accountIndex` position. Mint + owner are still verified as
+/// defense-in-depth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedTokenBalance {
     pub account_index: u32,
+    /// Base58 pubkey resolved from the message's `accountKeys` list
+    /// (and `meta.loadedAddresses` for v0 transactions).
+    pub pubkey: String,
     pub mint: String,
     pub owner: String,
     /// `uiTokenAmount.amount` — the RAW integer string. Never use
@@ -77,6 +88,14 @@ pub enum TxFetchOutcome {
     /// Tx confirmed AND finalized; the verifier can run the delta
     /// check now.
     Available(FetchedTx),
+    /// The fetcher saw the tx but cannot safely verify it — e.g. v0
+    /// transactions whose address-table-loaded addresses are not
+    /// resolvable, or an unsupported transaction version surfaced by
+    /// the RPC. Treat as `funding_pending` (NEVER `funding_invalid`):
+    /// returning invalid on a verifier limitation would let a real
+    /// funding tx get rejected for backend-side reasons. Frontend
+    /// retries; an operator can investigate the reason string.
+    VerifierUnsupported(String),
 }
 
 /// Trait the verifier depends on. Production uses a thin
@@ -132,6 +151,12 @@ pub enum W5hFundingConfirmErrorCode {
     IntentNotFound,
     IntentAlreadyTerminal,
     RepoFailed,
+    /// W5h-lite addendum §1/§2: verifier can't safely process this
+    /// transaction (e.g. address-table-lookups not resolvable, or RPC
+    /// returned `Transaction version unsupported` because the request
+    /// omitted `maxSupportedTransactionVersion`). Returned alongside
+    /// `FundingPending` — never `FundingInvalid`.
+    VerifierUnsupported,
 }
 
 /// Rich orchestrator outcome. The route adapter collapses this into
@@ -147,6 +172,14 @@ pub struct W5hFundingConfirmOutcome {
     pub threshold_bps: u32,
     pub save_display_apy_bps: Option<u32>,
     pub native_onchain_apr_bps: Option<u32>,
+    /// W5h-lite addendum — surfaced verbatim from the persisted
+    /// intent so the adapter can fill the wire DTO without a repo
+    /// round-trip.
+    pub amount_raw: u64,
+    pub user_wallet: String,
+    pub user_usdc_ata: String,
+    pub controlled_wallet: String,
+    pub controlled_usdc_ata: String,
     pub error: Option<W5hFundingConfirmErrorCode>,
     pub error_reason: Option<String>,
 }
@@ -184,50 +217,50 @@ pub fn verify_funding_delta(
         ));
     }
 
-    // Find the controlled-ATA entry in BOTH pre and post. The same
-    // ATA must appear at the same `account_index` in both lists; the
-    // mint MUST be USDC; the owner MUST match the controlled wallet.
-    let find_balance = |list: &[FetchedTokenBalance]| -> Option<FetchedTokenBalance> {
-        list.iter()
-            .find(|b| {
-                b.mint == USDC_MINT_BS58
-                    && b.owner == controlled_wallet
-                    // Note: Solana doesn't put the account pubkey here;
-                    // the verifier's identity proof is (mint, owner)
-                    // tuple. The caller's `controlled_usdc_ata`
-                    // hint is used for downstream display but not for
-                    // identity matching at this layer.
-            })
-            .cloned()
-    };
+    // W5h-lite addendum §2 — match the destination token account by
+    // EXACT pubkey equality. We do NOT trust `accountIndex` ordering
+    // and we do NOT trust `(mint, owner)` alone (an attacker can mint
+    // a different USDC ATA owned by the controlled wallet and credit
+    // it). Mint + owner are still checked as defense-in-depth once
+    // the pubkey row is found.
+    let find_balance_by_pubkey =
+        |list: &[FetchedTokenBalance]| -> Option<FetchedTokenBalance> {
+            list.iter().find(|b| b.pubkey == controlled_usdc_ata).cloned()
+        };
 
-    let pre = find_balance(&tx.pre_token_balances);
-    let post = find_balance(&tx.post_token_balances);
+    let pre = find_balance_by_pubkey(&tx.pre_token_balances);
+    let post = find_balance_by_pubkey(&tx.post_token_balances);
 
     let pre_raw = match pre.as_ref() {
-        Some(b) => parse_raw_amount(&b.amount_raw_str).map_err(|e| {
-            (
-                W5hFundingConfirmErrorCode::AmountDeltaMismatch,
-                format!("pre amount_raw_str parse: {e}"),
-            )
-        })?,
+        Some(b) => {
+            assert_balance_identity(b, controlled_wallet)?;
+            parse_raw_amount(&b.amount_raw_str).map_err(|e| {
+                (
+                    W5hFundingConfirmErrorCode::AmountDeltaMismatch,
+                    format!("pre amount_raw_str parse: {e}"),
+                )
+            })?
+        }
         // Brand-new ATA: pre balance may be missing (the account
         // didn't exist before the tx). Treat as 0.
         None => 0,
     };
     let post_raw = match post.as_ref() {
-        Some(b) => parse_raw_amount(&b.amount_raw_str).map_err(|e| {
-            (
-                W5hFundingConfirmErrorCode::AmountDeltaMismatch,
-                format!("post amount_raw_str parse: {e}"),
-            )
-        })?,
+        Some(b) => {
+            assert_balance_identity(b, controlled_wallet)?;
+            parse_raw_amount(&b.amount_raw_str).map_err(|e| {
+                (
+                    W5hFundingConfirmErrorCode::AmountDeltaMismatch,
+                    format!("post amount_raw_str parse: {e}"),
+                )
+            })?
+        }
         None => {
             return Err((
                 W5hFundingConfirmErrorCode::DestinationNotControlledUsdcAta,
                 format!(
-                    "post tx has no USDC token balance for owner {controlled_wallet} \
-                     (expected delta destination = {controlled_usdc_ata})"
+                    "post tx has no token-balance row for pubkey {controlled_usdc_ata} \
+                     (resolved via message.accountKeys + meta.loadedAddresses)"
                 ),
             ));
         }
@@ -254,6 +287,34 @@ pub fn verify_funding_delta(
     }
 
     Ok(tx.slot)
+}
+
+/// Defense-in-depth: even though we matched by pubkey, assert the
+/// token-balance row is in fact USDC and owned by the controlled
+/// wallet. Mismatch → typed funding_invalid.
+fn assert_balance_identity(
+    b: &FetchedTokenBalance,
+    controlled_wallet: &str,
+) -> Result<(), (W5hFundingConfirmErrorCode, String)> {
+    if b.mint != USDC_MINT_BS58 {
+        return Err((
+            W5hFundingConfirmErrorCode::WrongMint,
+            format!(
+                "token-balance row mint {} ≠ USDC mint {}",
+                b.mint, USDC_MINT_BS58
+            ),
+        ));
+    }
+    if b.owner != controlled_wallet {
+        return Err((
+            W5hFundingConfirmErrorCode::DestinationNotControlledUsdcAta,
+            format!(
+                "token-balance row owner {} ≠ controlled wallet {}",
+                b.owner, controlled_wallet
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_raw_amount(s: &str) -> Result<u64, std::num::ParseIntError> {
@@ -313,6 +374,11 @@ impl Stage2W5hFundingConfirmExecutor {
                     threshold_bps: 0,
                     save_display_apy_bps: None,
                     native_onchain_apr_bps: None,
+                    amount_raw: request.amount_raw,
+                    user_wallet: request.user_wallet,
+                    user_usdc_ata: request.user_usdc_ata,
+                    controlled_wallet: request.controlled_wallet,
+                    controlled_usdc_ata: request.controlled_usdc_ata,
                     error: Some(W5hFundingConfirmErrorCode::IntentNotFound),
                     error_reason: Some(format!(
                         "rule_id {rid} not found in W5h funding intent repo"
@@ -322,7 +388,7 @@ impl Stage2W5hFundingConfirmExecutor {
             Err(e) => {
                 return W5hFundingConfirmOutcome {
                     status: W5hFundingConfirmStatus::RepoFailed,
-                    rule_id_hex: request.rule_id_hex,
+                    rule_id_hex: request.rule_id_hex.clone(),
                     canonical_rule_hash_hex: String::new(),
                     funding_signature: request.funding_signature,
                     funding_finalized_slot: None,
@@ -330,6 +396,11 @@ impl Stage2W5hFundingConfirmExecutor {
                     threshold_bps: 0,
                     save_display_apy_bps: None,
                     native_onchain_apr_bps: None,
+                    amount_raw: request.amount_raw,
+                    user_wallet: request.user_wallet,
+                    user_usdc_ata: request.user_usdc_ata,
+                    controlled_wallet: request.controlled_wallet,
+                    controlled_usdc_ata: request.controlled_usdc_ata,
                     error: Some(W5hFundingConfirmErrorCode::RepoFailed),
                     error_reason: Some(format!("repo.get failed: {e}")),
                 };
@@ -448,6 +519,19 @@ impl Stage2W5hFundingConfirmExecutor {
                     Some(W5hFundingConfirmErrorCode::TxNotYetAvailable),
                 ).await;
             }
+            Ok(TxFetchOutcome::VerifierUnsupported(reason)) => {
+                // Backend-side verifier limitation (unsupported tx
+                // version, unresolved address-table lookups). Treat
+                // as funding_pending so a real funding tx is not
+                // marked invalid because of a configuration gap.
+                return self.success_outcome_with_status(
+                    &stored,
+                    request.funding_signature,
+                    W5hFundingConfirmStatus::FundingPending,
+                    Some(W5hFundingConfirmErrorCode::VerifierUnsupported),
+                ).await
+                    .with_reason(format!("verifier_unsupported: {reason}"));
+            }
             Ok(TxFetchOutcome::Available(t)) => t,
             Err(e) => {
                 // RPC transport error — frontend retries.
@@ -529,14 +613,19 @@ impl Stage2W5hFundingConfirmExecutor {
                         }
                         _ => W5hFundingConfirmStatus::FundingPending,
                     },
-                    rule_id_hex: refreshed.rule_id_hex,
-                    canonical_rule_hash_hex: refreshed.canonical_rule_hash_hex,
+                    rule_id_hex: refreshed.rule_id_hex.clone(),
+                    canonical_rule_hash_hex: refreshed.canonical_rule_hash_hex.clone(),
                     funding_signature: request.funding_signature,
                     funding_finalized_slot: Some(finalized_slot),
                     expires_at_ms: refreshed.expires_at_ms,
                     threshold_bps: refreshed.threshold_bps,
                     save_display_apy_bps: live.0,
                     native_onchain_apr_bps: live.1,
+                    amount_raw: refreshed.amount_raw,
+                    user_wallet: refreshed.user_wallet.clone(),
+                    user_usdc_ata: refreshed.user_usdc_ata.clone(),
+                    controlled_wallet: refreshed.controlled_wallet.clone(),
+                    controlled_usdc_ata: refreshed.controlled_usdc_ata.clone(),
                     error: None,
                     error_reason: None,
                 }
@@ -586,6 +675,11 @@ impl Stage2W5hFundingConfirmExecutor {
             threshold_bps: stored.threshold_bps,
             save_display_apy_bps: live.0,
             native_onchain_apr_bps: live.1,
+            amount_raw: stored.amount_raw,
+            user_wallet: stored.user_wallet.clone(),
+            user_usdc_ata: stored.user_usdc_ata.clone(),
+            controlled_wallet: stored.controlled_wallet.clone(),
+            controlled_usdc_ata: stored.controlled_usdc_ata.clone(),
             error,
             error_reason: None,
         }
@@ -610,6 +704,11 @@ impl Stage2W5hFundingConfirmExecutor {
             threshold_bps: stored.threshold_bps,
             save_display_apy_bps: live.0,
             native_onchain_apr_bps: live.1,
+            amount_raw: stored.amount_raw,
+            user_wallet: stored.user_wallet.clone(),
+            user_usdc_ata: stored.user_usdc_ata.clone(),
+            controlled_wallet: stored.controlled_wallet.clone(),
+            controlled_usdc_ata: stored.controlled_usdc_ata.clone(),
             error: Some(code),
             error_reason: Some(reason),
         }
@@ -622,6 +721,308 @@ impl W5hFundingConfirmOutcome {
         self.error_reason = Some(r);
         self
     }
+}
+
+// ── Live tx fetcher (production JSON-RPC implementation) ─────────────────
+//
+// `LiveTxFetcher` wraps Solana JSON-RPC `getTransaction` for the W5h
+// funding-confirm route. It is read-only — no signing, no
+// `sendTransaction`, no keypair.
+//
+// W5h-lite addendum §1 requirements baked in:
+//
+//   - `maxSupportedTransactionVersion: 0` is ALWAYS sent so v0
+//     transactions (which Phantom can submit) are returned by the
+//     RPC instead of rejected as "Transaction version unsupported".
+//
+//   - If the RPC surfaces an unsupported-version error anyway, we map
+//     it to `VerifierUnsupported` (NOT `funding_invalid`) — a real
+//     funding tx must never be rejected because of a verifier-side
+//     gap.
+//
+// W5h-lite addendum §2 requirements:
+//
+//   - We build the full account-key list from
+//     `transaction.message.accountKeys` AND, for v0 transactions,
+//     `meta.loadedAddresses.writable` followed by
+//     `meta.loadedAddresses.readonly`.
+//
+//   - Every `meta.preTokenBalances` / `meta.postTokenBalances` entry
+//     is resolved to its pubkey via the merged key list. The verifier
+//     then matches the destination ATA by pubkey equality, never by
+//     `accountIndex` ordering.
+//
+//   - If a token-balance entry references an `accountIndex` we
+//     cannot resolve (the merged key list is shorter than the
+//     index — typical when a node returns loaded addresses in a
+//     format we did not parse), the fetcher emits
+//     `VerifierUnsupported(...)` so the orchestrator returns
+//     `funding_pending` rather than silently mismatching.
+//
+// W5h-lite addendum §3 — polling ownership:
+//
+//   - This fetcher performs a SINGLE `getTransaction` call. It does
+//     NOT sleep, poll, or hold the HTTP request open. If the tx is
+//     not yet visible, we return `NotYetAvailable`. The frontend
+//     owns the retry loop.
+
+use reqwest::Client as ReqwestClient;
+use serde_json::{json, Value as JsonValue};
+use std::time::Duration as StdDuration;
+
+const LIVE_TX_FETCHER_TIMEOUT_MS: u64 = 4_000;
+
+#[derive(Clone)]
+pub struct LiveTxFetcher {
+    rpc_url: String,
+    http: ReqwestClient,
+}
+
+impl std::fmt::Debug for LiveTxFetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveTxFetcher")
+            .field("rpc_url", &"<redacted>")
+            .finish()
+    }
+}
+
+impl LiveTxFetcher {
+    /// Build a fetcher with the given RPC URL. Returns `None` if the
+    /// URL is empty/blank or if reqwest fails to construct a client
+    /// (timeout misconfig, native TLS init failure, etc).
+    pub fn new(rpc_url: impl Into<String>) -> Option<Self> {
+        let rpc_url = rpc_url.into();
+        if rpc_url.trim().is_empty() {
+            return None;
+        }
+        let http = ReqwestClient::builder()
+            .timeout(StdDuration::from_millis(LIVE_TX_FETCHER_TIMEOUT_MS))
+            .build()
+            .ok()?;
+        Some(Self { rpc_url, http })
+    }
+}
+
+/// Build the `getTransaction` JSON-RPC request body. Kept pub(crate)
+/// so tests can prove the wire shape contains
+/// `maxSupportedTransactionVersion: 0`.
+pub(crate) fn build_get_transaction_request_body(signature: &str) -> JsonValue {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [
+            signature,
+            {
+                "encoding": "json",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0,
+            }
+        ]
+    })
+}
+
+#[async_trait]
+impl TxFetcher for LiveTxFetcher {
+    async fn fetch(&self, signature: &str) -> Result<TxFetchOutcome, String> {
+        let body = build_get_transaction_request_body(signature);
+        let resp = self
+            .http
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("transport: {e}"))?;
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            return Err(format!("http {status}"));
+        }
+        let v: JsonValue = resp
+            .json()
+            .await
+            .map_err(|e| format!("body decode: {e}"))?;
+
+        // Typed RPC error path. We MUST distinguish
+        // "unsupported tx version" from other errors and route the
+        // former to VerifierUnsupported (NOT funding_invalid).
+        if let Some(err) = v.get("error") {
+            let msg = serde_json::to_string(err).unwrap_or_else(|_| "{}".to_string());
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("version") && lower.contains("unsupported") {
+                return Ok(TxFetchOutcome::VerifierUnsupported(format!(
+                    "rpc rejected as unsupported version: {msg}"
+                )));
+            }
+            return Err(format!("rpc error: {msg}"));
+        }
+
+        let result = v.get("result").cloned().unwrap_or(JsonValue::Null);
+        if result.is_null() {
+            return Ok(TxFetchOutcome::NotYetAvailable);
+        }
+        match parse_get_transaction_result(&result) {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => Err(format!("getTransaction parse: {e}")),
+        }
+    }
+}
+
+/// Parse a `result` object from `getTransaction` into a typed
+/// `TxFetchOutcome`. Kept pub(crate) so tests can run fixture JSON
+/// through this function without spinning up an HTTP server.
+pub(crate) fn parse_get_transaction_result(
+    result: &JsonValue,
+) -> Result<TxFetchOutcome, String> {
+    let slot = result
+        .get("slot")
+        .and_then(|s| s.as_u64())
+        .ok_or_else(|| "missing/non-u64 slot".to_string())?;
+
+    let meta = result
+        .get("meta")
+        .ok_or_else(|| "missing meta".to_string())?;
+    let err = meta
+        .get("err")
+        .and_then(|e| {
+            if e.is_null() {
+                None
+            } else {
+                Some(serde_json::to_string(e).unwrap_or_else(|_| "<unserializable>".to_string()))
+            }
+        });
+
+    // ── Resolve the full account-key list ──────────────────────────────
+    //
+    // For v0 transactions, the JSON-RPC `json` encoding returns the
+    // message-level static accountKeys plus, separately,
+    // `meta.loadedAddresses.{writable, readonly}` arrays. We MUST
+    // concatenate them in this order to match how the runtime
+    // interprets `accountIndex`:
+    //
+    //   [ message.accountKeys ... ] ++
+    //   [ meta.loadedAddresses.writable ... ] ++
+    //   [ meta.loadedAddresses.readonly ... ]
+    //
+    // Reference: Solana JSON-RPC docs for `getTransaction`,
+    // `encoding=json` + `maxSupportedTransactionVersion=0`. Other
+    // encodings (`jsonParsed`, `base64`, etc) have different layouts;
+    // we hold the format invariant by always requesting `json`.
+    let mut keys: Vec<String> = Vec::new();
+    let mut alt_present = false;
+    if let Some(arr) = result
+        .get("transaction")
+        .and_then(|t| t.get("message"))
+        .and_then(|m| m.get("accountKeys"))
+        .and_then(|a| a.as_array())
+    {
+        for k in arr {
+            if let Some(s) = k.as_str() {
+                keys.push(s.to_string());
+            }
+        }
+    }
+    if let Some(loaded) = meta.get("loadedAddresses") {
+        for field in ["writable", "readonly"] {
+            if let Some(arr) = loaded.get(field).and_then(|a| a.as_array()) {
+                if !arr.is_empty() {
+                    alt_present = true;
+                }
+                for k in arr {
+                    if let Some(s) = k.as_str() {
+                        keys.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Helper: resolve an `accountIndex` → pubkey. If the merged list
+    // is shorter than the index we have NO safe way to identify the
+    // destination ATA, so we surface `VerifierUnsupported`. Returning
+    // an "unknown" pubkey here would let the verifier silently miss
+    // the controlled-ATA row.
+    let resolve = |idx: u64| -> Option<&str> {
+        keys.get(idx as usize).map(|s| s.as_str())
+    };
+
+    let pre_token_balances = match parse_token_balance_array(meta.get("preTokenBalances"), &keys) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(TxFetchOutcome::VerifierUnsupported(format!(
+                "unresolved preTokenBalances (alt_present={alt_present}): {e}"
+            )))
+        }
+    };
+    let post_token_balances = match parse_token_balance_array(meta.get("postTokenBalances"), &keys) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(TxFetchOutcome::VerifierUnsupported(format!(
+                "unresolved postTokenBalances (alt_present={alt_present}): {e}"
+            )))
+        }
+    };
+
+    // `resolve` is kept above for future per-entry lookups; current
+    // call sites use `keys` directly via `parse_token_balance_array`.
+    let _ = resolve;
+
+    Ok(TxFetchOutcome::Available(FetchedTx {
+        slot,
+        err,
+        pre_token_balances,
+        post_token_balances,
+    }))
+}
+
+fn parse_token_balance_array(
+    arr: Option<&JsonValue>,
+    keys: &[String],
+) -> Result<Vec<FetchedTokenBalance>, String> {
+    let arr = match arr.and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let account_index = entry
+            .get("accountIndex")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| "tokenBalance entry missing accountIndex".to_string())?;
+        let pubkey = keys
+            .get(account_index as usize)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "accountIndex {account_index} out of resolved-keys range (len={}); \
+                     unresolved address-table-lookup entry",
+                    keys.len()
+                )
+            })?;
+        let mint = entry
+            .get("mint")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "tokenBalance entry missing mint".to_string())?
+            .to_string();
+        let owner = entry
+            .get("owner")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "tokenBalance entry missing owner".to_string())?
+            .to_string();
+        let amount_raw_str = entry
+            .get("uiTokenAmount")
+            .and_then(|u| u.get("amount"))
+            .and_then(|a| a.as_str())
+            .ok_or_else(|| "tokenBalance entry missing uiTokenAmount.amount".to_string())?
+            .to_string();
+        out.push(FetchedTokenBalance {
+            account_index: account_index as u32,
+            pubkey,
+            mint,
+            owner,
+            amount_raw_str,
+        });
+    }
+    Ok(out)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -695,12 +1096,14 @@ mod tests {
             err: None,
             pre_token_balances: vec![FetchedTokenBalance {
                 account_index: 2,
+                pubkey: CONTROLLED_USDC_ATA.to_string(),
                 mint: mint.to_string(),
                 owner: owner.to_string(),
                 amount_raw_str: pre_raw.to_string(),
             }],
             post_token_balances: vec![FetchedTokenBalance {
                 account_index: 2,
+                pubkey: CONTROLLED_USDC_ATA.to_string(),
                 mint: mint.to_string(),
                 owner: owner.to_string(),
                 amount_raw_str: post_raw.to_string(),
@@ -733,8 +1136,8 @@ mod tests {
             250_000,
         )
         .unwrap_err();
-        // Owner-on-USDC-mint not found → DestinationNotControlledUsdcAta.
-        assert_eq!(err.0, W5hFundingConfirmErrorCode::DestinationNotControlledUsdcAta);
+        // Pubkey matched but mint identity check fails → WrongMint.
+        assert_eq!(err.0, W5hFundingConfirmErrorCode::WrongMint);
     }
 
     #[test]
@@ -796,6 +1199,7 @@ mod tests {
             pre_token_balances: vec![], // no pre entry
             post_token_balances: vec![FetchedTokenBalance {
                 account_index: 2,
+                pubkey: CONTROLLED_USDC_ATA.to_string(),
                 mint: USDC_MINT_BS58.to_string(),
                 owner: CONTROLLED_WALLET.to_string(),
                 amount_raw_str: "250000".to_string(),
@@ -811,7 +1215,125 @@ mod tests {
         assert_eq!(slot, 1);
     }
 
+    // ── W5h-lite addendum §2: accountIndex → pubkey resolution ────────
+
+    #[test]
+    fn verifier_accepts_destination_at_non_zero_account_index() {
+        // post_token_balances has the controlled ATA at accountIndex 7;
+        // other token rows (e.g. user's source ATA) sit at lower
+        // indices. The verifier MUST match by pubkey, not by index.
+        let tx = FetchedTx {
+            slot: 419_201_111,
+            err: None,
+            pre_token_balances: vec![
+                FetchedTokenBalance {
+                    account_index: 3,
+                    pubkey: "UserUsdcAtaPubkey11111111111111111111111111".to_string(),
+                    mint: USDC_MINT_BS58.to_string(),
+                    owner: "UserWallet1111111111111111111111111111111111".to_string(),
+                    amount_raw_str: "5_000_000".replace('_', ""),
+                },
+                FetchedTokenBalance {
+                    account_index: 7,
+                    pubkey: CONTROLLED_USDC_ATA.to_string(),
+                    mint: USDC_MINT_BS58.to_string(),
+                    owner: CONTROLLED_WALLET.to_string(),
+                    amount_raw_str: "0".to_string(),
+                },
+            ],
+            post_token_balances: vec![
+                FetchedTokenBalance {
+                    account_index: 7,
+                    pubkey: CONTROLLED_USDC_ATA.to_string(),
+                    mint: USDC_MINT_BS58.to_string(),
+                    owner: CONTROLLED_WALLET.to_string(),
+                    amount_raw_str: "250000".to_string(),
+                },
+                FetchedTokenBalance {
+                    account_index: 3,
+                    pubkey: "UserUsdcAtaPubkey11111111111111111111111111".to_string(),
+                    mint: USDC_MINT_BS58.to_string(),
+                    owner: "UserWallet1111111111111111111111111111111111".to_string(),
+                    amount_raw_str: "4750000".to_string(),
+                },
+            ],
+        };
+        let slot = verify_funding_delta(
+            &tx,
+            CONTROLLED_USDC_ATA,
+            CONTROLLED_WALLET,
+            250_000,
+        )
+        .unwrap();
+        assert_eq!(slot, 419_201_111);
+    }
+
+    #[test]
+    fn verifier_rejects_wrong_pubkey_even_when_mint_and_amount_match() {
+        // Attacker scenario: an ATA that's NOT the controlled USDC
+        // ATA but still has USDC mint and the same +250 000 delta.
+        // Strict pubkey equality MUST reject this.
+        let tx = FetchedTx {
+            slot: 419_300_000,
+            err: None,
+            pre_token_balances: vec![FetchedTokenBalance {
+                account_index: 1,
+                pubkey: "DifferentUsdcAta111111111111111111111111111".to_string(),
+                mint: USDC_MINT_BS58.to_string(),
+                owner: CONTROLLED_WALLET.to_string(),
+                amount_raw_str: "0".to_string(),
+            }],
+            post_token_balances: vec![FetchedTokenBalance {
+                account_index: 1,
+                pubkey: "DifferentUsdcAta111111111111111111111111111".to_string(),
+                mint: USDC_MINT_BS58.to_string(),
+                owner: CONTROLLED_WALLET.to_string(),
+                amount_raw_str: "250000".to_string(),
+            }],
+        };
+        let err = verify_funding_delta(
+            &tx,
+            CONTROLLED_USDC_ATA,
+            CONTROLLED_WALLET,
+            250_000,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.0,
+            W5hFundingConfirmErrorCode::DestinationNotControlledUsdcAta
+        );
+    }
+
     // ── Orchestrator paths ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn verifier_unsupported_returns_funding_pending_not_invalid() {
+        // W5h-lite addendum §1/§2: fetcher signals a verifier
+        // limitation (e.g. unsupported tx version, unresolved ALT).
+        // Intent must NOT regress to funding_invalid — that would
+        // mark a real funding tx as failed because of a backend
+        // verifier gap. Status stays funding_pending; frontend
+        // retries; operator investigates the reason.
+        let (_db, repo) = fixture().await;
+        let exec = Stage2W5hFundingConfirmExecutor::new(
+            repo.clone(),
+            Arc::new(StubFetcher {
+                outcome: Ok(TxFetchOutcome::VerifierUnsupported(
+                    "Transaction version (0) is not supported".to_string(),
+                )),
+            }),
+            None,
+            None,
+        );
+        let o = exec.execute(good_request("Sig1")).await;
+        assert_eq!(o.status, W5hFundingConfirmStatus::FundingPending);
+        assert_eq!(
+            o.error,
+            Some(W5hFundingConfirmErrorCode::VerifierUnsupported)
+        );
+        let stored = repo.get(RULE_ID).await.unwrap().unwrap();
+        assert_eq!(stored.status, W5hIntentStatus::FundingSubmitted);
+    }
 
     #[tokio::test]
     async fn rpc_delay_returns_funding_pending() {
@@ -934,6 +1456,196 @@ mod tests {
         let o = exec.execute(req).await;
         assert_eq!(o.status, W5hFundingConfirmStatus::RequestMismatch);
         assert_eq!(o.error, Some(W5hFundingConfirmErrorCode::RequestMismatch));
+    }
+
+    // ── LiveTxFetcher fixtures (addendum §1/§2) ──────────────────────
+
+    #[test]
+    fn get_transaction_request_body_includes_max_supported_transaction_version_0() {
+        // W5h-lite addendum §1: Phantom may submit a v0 transaction.
+        // The request body MUST include
+        // `maxSupportedTransactionVersion: 0` or Solana JSON-RPC
+        // returns "Transaction version unsupported" even when the tx
+        // exists.
+        let body = super::build_get_transaction_request_body(
+            "4M4ezLgmAbcDefGhiJkLMnoPqRstUvWxYz0123456789Py3y",
+        );
+        assert_eq!(body["method"], "getTransaction");
+        let cfg = &body["params"][1];
+        assert_eq!(cfg["encoding"], "json");
+        let commitment = cfg["commitment"].as_str().unwrap_or("");
+        assert!(
+            commitment == "confirmed" || commitment == "finalized",
+            "commitment must be confirmed or finalized; got {commitment:?}"
+        );
+        assert_eq!(
+            cfg["maxSupportedTransactionVersion"].as_i64(),
+            Some(0),
+            "request MUST set maxSupportedTransactionVersion:0 for v0 txs",
+        );
+    }
+
+    #[test]
+    fn parse_get_transaction_resolves_destination_at_non_zero_account_index() {
+        // accountKeys: [user_wallet, mint, controlled_usdc_ata, user_usdc_ata]
+        // postTokenBalances entry at accountIndex=2 must resolve to
+        // controlled_usdc_ata pubkey.
+        let result = serde_json::json!({
+            "slot": 419_201_000u64,
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        "UserWalletPubkey111111111111111111111111111",
+                        USDC_MINT_BS58,
+                        CONTROLLED_USDC_ATA,
+                        "UserUsdcAtaPubkey11111111111111111111111111",
+                    ],
+                },
+            },
+            "meta": {
+                "err": null,
+                "preTokenBalances": [
+                    {
+                        "accountIndex": 3,
+                        "mint": USDC_MINT_BS58,
+                        "owner": "UserWalletPubkey111111111111111111111111111",
+                        "uiTokenAmount": { "amount": "5000000", "decimals": 6 },
+                    },
+                ],
+                "postTokenBalances": [
+                    {
+                        "accountIndex": 2,
+                        "mint": USDC_MINT_BS58,
+                        "owner": CONTROLLED_WALLET,
+                        "uiTokenAmount": { "amount": "250000", "decimals": 6 },
+                    },
+                    {
+                        "accountIndex": 3,
+                        "mint": USDC_MINT_BS58,
+                        "owner": "UserWalletPubkey111111111111111111111111111",
+                        "uiTokenAmount": { "amount": "4750000", "decimals": 6 },
+                    },
+                ],
+            },
+        });
+        let outcome = super::parse_get_transaction_result(&result).unwrap();
+        let tx = match outcome {
+            TxFetchOutcome::Available(t) => t,
+            other => panic!("expected Available, got {other:?}"),
+        };
+        let post = tx
+            .post_token_balances
+            .iter()
+            .find(|b| b.pubkey == CONTROLLED_USDC_ATA)
+            .expect("must resolve controlled ATA pubkey from accountIndex=2");
+        assert_eq!(post.account_index, 2);
+        assert_eq!(post.mint, USDC_MINT_BS58);
+        assert_eq!(post.owner, CONTROLLED_WALLET);
+        assert_eq!(post.amount_raw_str, "250000");
+
+        // Run the full verifier on the parsed tx.
+        let slot = verify_funding_delta(
+            &tx,
+            CONTROLLED_USDC_ATA,
+            CONTROLLED_WALLET,
+            250_000,
+        )
+        .unwrap();
+        assert_eq!(slot, 419_201_000);
+    }
+
+    #[test]
+    fn parse_get_transaction_includes_loaded_addresses_for_v0() {
+        // v0 transaction: static accountKeys is shorter than the
+        // controlled ATA's index because the controlled ATA appears
+        // in meta.loadedAddresses.writable. Global index 4 = 2 static
+        // keys + index 2 in the writable list.
+        let result = serde_json::json!({
+            "slot": 419_202_500u64,
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        "UserWalletPubkey111111111111111111111111111",
+                        "SystemProgram111111111111111111111111111111",
+                    ],
+                },
+            },
+            "meta": {
+                "err": null,
+                "loadedAddresses": {
+                    "writable": [
+                        USDC_MINT_BS58,
+                        "UserUsdcAtaPubkey11111111111111111111111111",
+                        CONTROLLED_USDC_ATA,
+                    ],
+                    "readonly": [],
+                },
+                "preTokenBalances": [],
+                "postTokenBalances": [
+                    {
+                        "accountIndex": 4,
+                        "mint": USDC_MINT_BS58,
+                        "owner": CONTROLLED_WALLET,
+                        "uiTokenAmount": { "amount": "250000", "decimals": 6 },
+                    },
+                ],
+            },
+        });
+        let outcome = super::parse_get_transaction_result(&result).unwrap();
+        let tx = match outcome {
+            TxFetchOutcome::Available(t) => t,
+            other => panic!("expected Available, got {other:?}"),
+        };
+        let post = tx
+            .post_token_balances
+            .iter()
+            .find(|b| b.pubkey == CONTROLLED_USDC_ATA)
+            .expect("ALT-loaded controlled ATA must be resolvable");
+        assert_eq!(post.account_index, 4);
+    }
+
+    #[test]
+    fn parse_get_transaction_unresolved_account_index_returns_verifier_unsupported() {
+        // accountIndex 9 references something we cannot resolve (the
+        // merged keys list has only 2 entries). The fetcher MUST emit
+        // VerifierUnsupported, NOT a "found at fake pubkey" entry.
+        let result = serde_json::json!({
+            "slot": 419_203_000u64,
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        "AccountKey0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "AccountKey1BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                    ],
+                },
+            },
+            "meta": {
+                "err": null,
+                "preTokenBalances": [],
+                "postTokenBalances": [
+                    {
+                        "accountIndex": 9,
+                        "mint": USDC_MINT_BS58,
+                        "owner": CONTROLLED_WALLET,
+                        "uiTokenAmount": { "amount": "250000", "decimals": 6 },
+                    },
+                ],
+            },
+        });
+        let outcome = super::parse_get_transaction_result(&result).unwrap();
+        match outcome {
+            TxFetchOutcome::VerifierUnsupported(reason) => {
+                assert!(reason.contains("accountIndex"));
+                assert!(reason.contains("9"));
+            }
+            other => panic!("expected VerifierUnsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_tx_fetcher_rejects_empty_url() {
+        assert!(super::LiveTxFetcher::new("").is_none());
+        assert!(super::LiveTxFetcher::new("   ").is_none());
     }
 
     #[tokio::test]

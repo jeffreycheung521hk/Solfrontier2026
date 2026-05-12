@@ -85,21 +85,38 @@ impl std::fmt::Display for W5hParseError {
 /// *worth* trying to parse against the W5h grammar. The strict
 /// parser then accepts or rejects.
 ///
-/// The discriminator that distinguishes W5h from W5d/W5e/W5f is the
-/// explicit *expiry phrase*: `expires in N minute(s)` (English) or
-/// `有效期 N 分鐘` / `有效期 N 分钟` (traditional / simplified).
+/// W5h-lite (2026-05-12) — accepts BOTH the verbose form with the
+/// explicit expiry phrase (`expires in 3 minutes` / `有效期 3 分鐘`)
+/// AND the simplified demo form without expiry. The discriminator
+/// against W5d/W5e/W5f is no longer the expiry phrase alone; instead
+/// we require the W5h-specific `from my wallet` qualifier (English),
+/// the literal Chinese 如果 ... USDC head, OR the explicit expiry
+/// phrase. W5d's grammar uses `from my bounded executor wallet` and
+/// is rejected by the `from my wallet` check.
 pub fn looks_like_w5h_chat_command(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let pool_named = lower.contains("save")
-        || lower.contains("solend")
-        || text.contains("solend")  // already lowercased above; defensive
-        || text.contains("Save");
+        || lower.contains("solend");
     let amount_named =
         lower.contains("0.25 usdc") || lower.contains("0.25usdc") || lower.contains("250000");
     let expires_named = lower.contains("expires in")
         || lower.contains("有效期")
         || lower.contains("expiry");
-    pool_named && amount_named && expires_named
+    // W5h-lite simplified-form discriminators (no expiry needed).
+    // Reject W5d's "from my bounded executor wallet" form by hand.
+    let bounded_executor_form = lower.contains("from my bounded executor wallet")
+        || lower.contains("into solend.");
+    let w5h_lite_english_marker =
+        lower.contains("from my wallet") && !bounded_executor_form;
+    // Chinese 如果 ... deposit 0.25 USDC head — never used by W5d/W5e/W5f.
+    let w5h_lite_chinese_marker = text.contains("如果");
+    if !pool_named || !amount_named {
+        return false;
+    }
+    if bounded_executor_form {
+        return false;
+    }
+    expires_named || w5h_lite_english_marker || w5h_lite_chinese_marker
 }
 
 /// Strict parser. Returns a `W5hParsed` on success; a typed error
@@ -137,20 +154,26 @@ pub fn parse_w5h_chat_command(text: &str) -> Result<W5hParsed, W5hParseError> {
         }
     }
 
-    // ── Expiry ───────────────────────────────────────────────────────
-    let expiry_ok = matches_three_minute_expiry(&normalized) || matches_three_minute_expiry(text);
-    if !expiry_ok {
-        // Surface a useful detail. If we see ANY "expires in N
-        // minute(s)" or "有效期 N 分鐘", echo N; otherwise say the
-        // marker is missing.
+    // ── Expiry (W5h-lite: optional) ──────────────────────────────────
+    //
+    // The original W5h grammar required `expires in 3 minutes` (or
+    // 有效期 3 分鐘); under W5h-lite the simplified demo command
+    // omits the expiry clause and inherits the default 180 s window.
+    // The parser:
+    //   - silently accepts ZERO mention of expiry (lite form);
+    //   - accepts the canonical `3 minutes` / `3 分鐘` form;
+    //   - REJECTS any explicit OTHER expiry (e.g. `5 minutes`),
+    //     because that's a user-typed mismatch that should fail loud.
+    let saw_expiry_phrase =
+        find_expiry_minutes(&normalized).is_some() || find_expiry_minutes(text).is_some();
+    let expiry_ok =
+        matches_three_minute_expiry(&normalized) || matches_three_minute_expiry(text);
+    if saw_expiry_phrase && !expiry_ok {
         if let Some(n) = find_expiry_minutes(&normalized).or_else(|| find_expiry_minutes(text)) {
             return Err(W5hParseError::UnsupportedExpiry {
                 detail: format!("expiry {n} minutes is not supported (only 3 minutes)"),
             });
         }
-        return Err(W5hParseError::MissingMarker {
-            what: "'expires in 3 minutes' or '有效期 3 分鐘'".to_string(),
-        });
     }
 
     // ── Threshold percent ────────────────────────────────────────────
@@ -439,10 +462,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_expiry_marker() {
+    fn w5h_lite_simplified_english_accepted() {
+        // W5h-lite: no expiry clause → parser accepts and defaults
+        // to 180 s.
         let s = "If Save APY > 1%, deposit 0.25 USDC";
-        let err = parse_w5h_chat_command(s).unwrap_err();
-        assert!(matches!(err, W5hParseError::MissingMarker { .. }));
+        let p = parse_w5h_chat_command(s).unwrap();
+        assert_eq!(p.threshold_bps, 100);
+        assert_eq!(p.amount_raw, 250_000);
+        assert_eq!(p.expires_seconds, 180);
+    }
+
+    #[test]
+    fn w5h_lite_simplified_chinese_accepted() {
+        // W5h-lite 簡化 form, no 有效期 clause.
+        let s = "如果 Save APY > 1%，deposit 0.25 USDC";
+        let p = parse_w5h_chat_command(s).unwrap();
+        assert_eq!(p.threshold_bps, 100);
+        assert_eq!(p.amount_raw, 250_000);
+        assert_eq!(p.expires_seconds, 180);
+        assert!(looks_like_w5h_chat_command(s));
+    }
+
+    #[test]
+    fn w5h_lite_detector_accepts_simplified_english() {
+        let s = "If Save APY > 1%, deposit 0.25 USDC from my wallet";
+        assert!(looks_like_w5h_chat_command(s));
     }
 
     #[test]

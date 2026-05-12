@@ -1186,6 +1186,13 @@ pub struct W5hFundingConfirmRequestDto {
 /// intent's current status. `status="funding_pending"` is the
 /// RPC-delay path: the frontend retries the POST after a short
 /// backoff.
+///
+/// W5h-lite addendum (2026-05-12) — extends the original narrow shape
+/// with the full set of wallet/ATA / amount / budget_status fields the
+/// frontend needs to re-render the conditional-order card without a
+/// separate fetch. `tx_signature` is always `None` here (the
+/// funding-confirm route NEVER triggers the Solend deposit; that
+/// happens later via W5g).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct W5hFundingConfirmResultDto {
     /// Status: `funding_pending` (tx not yet visible / finalized) |
@@ -1198,8 +1205,12 @@ pub struct W5hFundingConfirmResultDto {
     pub canonical_rule_hash_hex: String,
 
     pub funding_signature: String,
+    /// Renamed from `funding_finalized_slot` — the W5h-lite confirm
+    /// route returns `confirmed` (not `finalized`) so the slot is the
+    /// CONFIRMATION slot, not the finalized slot. The semantic is the
+    /// same on the frontend.
     #[serde(default, with = "crate::serde_str::opt_u64_string")]
-    pub funding_finalized_slot: Option<u64>,
+    pub funding_confirmation_slot: Option<u64>,
     #[serde(with = "crate::serde_str::i64_string")]
     pub expires_at_ms: i64,
 
@@ -1209,6 +1220,25 @@ pub struct W5hFundingConfirmResultDto {
     pub save_display_apy_bps: Option<u32>,
     pub native_onchain_apr_bps: Option<u32>,
     pub threshold_bps: u32,
+
+    // ── W5h-lite addendum: full identity payload ─────────────────────
+    /// Required amount in raw USDC (always `"250000"`).
+    #[serde(with = "crate::serde_str::u64_string")]
+    pub amount_raw: u64,
+    pub user_wallet: String,
+    pub user_usdc_ata: String,
+    pub controlled_wallet: String,
+    pub controlled_usdc_ata: String,
+    /// `"reserved"` when status is `budget_reserved`,
+    /// `"needs_funding"` while `funding_pending` /
+    /// `funding_required` / `funding_invalid`, etc. Frontend
+    /// renders this as the budget-card chip label.
+    pub budget_status: String,
+    /// Always `None` from this route — the W5h-lite funding-confirm
+    /// path NEVER executes the Solend deposit. Reserved so the
+    /// frontend can render a single result-card shape across the
+    /// funding-confirm AND the eventual W5g-execution responses.
+    pub tx_signature: Option<String>,
 
     pub error_code: Option<String>,
     pub error_reason: Option<String>,

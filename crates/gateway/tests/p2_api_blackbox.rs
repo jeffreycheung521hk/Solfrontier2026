@@ -34,6 +34,9 @@ use claw_api::{
         AuditReader, AuditReaderRef, AuditRowDto,
         DemoSeeder, DemoSeederRef, DemoSeedReport,
         PolicyReader, PolicyReaderRef,
+        W5hFundingConfirmHandler, W5hFundingConfirmHandlerRef,
+        W5hFundingConfirmRequestDto, W5hFundingConfirmResultDto,
+        W5hFundingConfirmRouteOutcome,
         WalletDirectory, WalletDirectoryRef, WalletSummaryDto,
     },
 };
@@ -278,6 +281,10 @@ struct HarnessOptions {
     seeder_enabled:  bool,
     wallet_pubkey:   Option<String>,
     operator_roles:  Vec<(String, Vec<String>)>, // (token, roles)
+    /// W5h-lite — when `Some`, wires the funding-confirm handler so
+    /// `POST /sessions/:id/stage2/w5h/funding/confirm` returns 200 +
+    /// typed DTO. When `None`, the route returns 503. Default: None.
+    chat_funding_confirm: Option<W5hFundingConfirmHandlerRef>,
 }
 
 async fn build_harness(opts: HarnessOptions) -> Harness {
@@ -348,7 +355,7 @@ async fn build_harness(opts: HarnessOptions) -> Harness {
         demo_seeder,
         chat:              None,
         chat_execute:      None,
-        chat_funding_confirm: None,
+        chat_funding_confirm: opts.chat_funding_confirm,
         chat_refund:       None,
     };
 
@@ -863,4 +870,175 @@ async fn approve_route_with_wrong_token_returns_401() {
         status, StatusCode::UNAUTHORIZED,
         "/approve must reject requests whose bearer token does not match auth_token",
     );
+}
+
+// ── W5h-lite: funding-confirm route 503 / 200 contract ─────────────────────
+
+/// Mock that returns a deterministic typed DTO. Used to prove the
+/// route plumbs through to `chat_funding_confirm` correctly and that
+/// the typed DTO survives the HTTP/JSON boundary.
+struct MockW5hFundingConfirmHandler {
+    response: W5hFundingConfirmResultDto,
+}
+
+impl W5hFundingConfirmHandler for MockW5hFundingConfirmHandler {
+    fn execute(
+        &self,
+        _session_id: &SessionId,
+        _request: W5hFundingConfirmRequestDto,
+    ) -> Pin<
+        Box<dyn Future<Output = W5hFundingConfirmRouteOutcome> + Send + '_>,
+    > {
+        let resp = self.response.clone();
+        Box::pin(async move { W5hFundingConfirmRouteOutcome::Ok(resp) })
+    }
+}
+
+fn w5h_confirm_request_body(session_id: &SessionId) -> Value {
+    let _ = session_id;
+    json!({
+        "rule_id_hex": "6400000090d00300000000009a62dace",
+        "funding_signature": "4M4ezLgmAbcDefGhiJkLMnoPqRstUvWxYz0123456789Py3y",
+        "user_wallet": "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW",
+        "user_usdc_ata": "TestUserUsdcAta1111111111111111111111111111",
+        "controlled_wallet": "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+        "controlled_usdc_ata": "7LFdKcSV7JQYi3or5y9phHVPjhGigu5DDjUakAFbBmk3",
+        "amount_raw": "250000"
+    })
+}
+
+#[tokio::test]
+async fn w5h_funding_confirm_returns_503_when_handler_not_wired() {
+    // Default harness has `chat_funding_confirm: None` → route must
+    // return 503. This is the daemon's default behavior when the W5h
+    // substrate isn't wired (no RPC URL etc).
+    let h = build_harness(HarnessOptions::default()).await;
+    let path = format!(
+        "/sessions/{}/stage2/w5h/funding/confirm",
+        h.session_id.to_string()
+    );
+    let req = post_json(&path, TOKEN, w5h_confirm_request_body(&h.session_id));
+    let (status, body) = call_json(&h.router, req).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("W5h funding-confirm"),
+        "503 body must explain why; got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn w5h_funding_confirm_returns_200_with_typed_dto_when_handler_wired() {
+    // Wire a mock handler that always returns a budget_reserved DTO.
+    // Route must pass the request through and return 200 + the typed
+    // DTO with all the wire-shape fields populated.
+    let canned = W5hFundingConfirmResultDto {
+        status: "budget_reserved".into(),
+        rule_id_hex: "6400000090d00300000000009a62dace".into(),
+        canonical_rule_hash_hex:
+            "962ae352baa3f4d494d4723f6391d40643271d1fd63b9085968ca892a60df69d".into(),
+        funding_signature:
+            "4M4ezLgmAbcDefGhiJkLMnoPqRstUvWxYz0123456789Py3y".into(),
+        funding_confirmation_slot: Some(419_571_964),
+        expires_at_ms: 1_715_500_000_180,
+        save_display_apy_bps: Some(312),
+        native_onchain_apr_bps: Some(287),
+        threshold_bps: 100,
+        amount_raw: 250_000,
+        user_wallet: "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW".into(),
+        user_usdc_ata: "TestUserUsdcAta1111111111111111111111111111".into(),
+        controlled_wallet: "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L".into(),
+        controlled_usdc_ata: "7LFdKcSV7JQYi3or5y9phHVPjhGigu5DDjUakAFbBmk3".into(),
+        budget_status: "reserved".into(),
+        tx_signature: None,
+        error_code: None,
+        error_reason: None,
+    };
+    let handler = W5hFundingConfirmHandlerRef::new(Arc::new(
+        MockW5hFundingConfirmHandler { response: canned.clone() },
+    ));
+    let h = build_harness(HarnessOptions {
+        chat_funding_confirm: Some(handler),
+        ..Default::default()
+    })
+    .await;
+
+    let path = format!(
+        "/sessions/{}/stage2/w5h/funding/confirm",
+        h.session_id.to_string()
+    );
+    let req = post_json(&path, TOKEN, w5h_confirm_request_body(&h.session_id));
+    let (status, body) = call_json(&h.router, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"].as_str(), Some("budget_reserved"));
+    // amount_raw must arrive as a JSON STRING (integer-safety rule).
+    assert_eq!(body["amount_raw"].as_str(), Some("250000"));
+    // funding_confirmation_slot must also be a JSON string.
+    assert_eq!(body["funding_confirmation_slot"].as_str(), Some("419571964"));
+    // expires_at_ms is a JSON string.
+    assert_eq!(body["expires_at_ms"].as_str(), Some("1715500000180"));
+    // bps fields are JSON numbers.
+    assert_eq!(body["threshold_bps"].as_u64(), Some(100));
+    assert_eq!(body["save_display_apy_bps"].as_u64(), Some(312));
+    // tx_signature is null (the confirm route NEVER ships a Solend
+    // deposit signature — that's W5g's job).
+    assert!(body["tx_signature"].is_null());
+    // budget_status reflects the budget-reserved chip.
+    assert_eq!(body["budget_status"].as_str(), Some("reserved"));
+    // Wallet topology survives the JSON round-trip.
+    assert_eq!(
+        body["controlled_usdc_ata"].as_str(),
+        Some("7LFdKcSV7JQYi3or5y9phHVPjhGigu5DDjUakAFbBmk3")
+    );
+}
+
+#[tokio::test]
+async fn w5h_funding_confirm_returns_400_on_empty_signature() {
+    // Defense-in-depth: even with a wired handler, the route rejects
+    // a malformed body BEFORE delegating.
+    let canned = W5hFundingConfirmResultDto {
+        status: "budget_reserved".into(),
+        rule_id_hex: "x".into(),
+        canonical_rule_hash_hex: "y".into(),
+        funding_signature: "z".into(),
+        funding_confirmation_slot: None,
+        expires_at_ms: 0,
+        save_display_apy_bps: None,
+        native_onchain_apr_bps: None,
+        threshold_bps: 0,
+        amount_raw: 0,
+        user_wallet: "u".into(),
+        user_usdc_ata: "a".into(),
+        controlled_wallet: "c".into(),
+        controlled_usdc_ata: "ca".into(),
+        budget_status: "reserved".into(),
+        tx_signature: None,
+        error_code: None,
+        error_reason: None,
+    };
+    let handler = W5hFundingConfirmHandlerRef::new(Arc::new(
+        MockW5hFundingConfirmHandler { response: canned },
+    ));
+    let h = build_harness(HarnessOptions {
+        chat_funding_confirm: Some(handler),
+        ..Default::default()
+    })
+    .await;
+
+    let path = format!(
+        "/sessions/{}/stage2/w5h/funding/confirm",
+        h.session_id.to_string()
+    );
+    let body = json!({
+        "rule_id_hex": "deadbeef",
+        "funding_signature": "",  // ← empty → 400
+        "user_wallet": "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW",
+        "user_usdc_ata": "TestUserUsdcAta1111111111111111111111111111",
+        "controlled_wallet": "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+        "controlled_usdc_ata": "7LFdKcSV7JQYi3or5y9phHVPjhGigu5DDjUakAFbBmk3",
+        "amount_raw": "250000"
+    });
+    let req = post_json(&path, TOKEN, body);
+    let (status, _) = call_json(&h.router, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
