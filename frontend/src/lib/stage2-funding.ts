@@ -254,6 +254,93 @@ export function buildFundingTransaction(
   return tx;
 }
 
+// ── W5h chat-driven funding-transaction builder ──────────────────────────
+//
+// The /stage2/live-demo page pins amount + destination at module level
+// (`FUNDING_AMOUNT_BASE_UNITS`, `CONTROLLED_WALLET_BASE58`). The W5h
+// chat flow CAN'T do that — both amount and destination ATA come from
+// the backend's `W5hConditionalDepositResult` DTO at chat time, so the
+// builder must be parameterised. This helper is the same primitive
+// pipeline as `buildFundingTransaction` above, just open to any amount
+// and any destination ATA. Hard safety:
+//   - Source ATA stays user-owned (caller's responsibility to derive
+//     it from the user's pubkey).
+//   - Mint stays pinned to USDC (`USDC_MINT_BASE58`) — there's no
+//     parameter to override the mint, by design.
+//   - Decimals stays pinned to 6 (`USDC_DECIMALS`) — TransferChecked
+//     hard-asserts this against the on-chain mint, so even if a
+//     hostile DTO swapped in a non-USDC mint pubkey for `destinationAta`,
+//     the instruction would fail before the tx landed.
+
+/// Args for `buildW5hFundingTransaction`. Same shape as
+/// `BuildFundingTxArgs` plus an explicit `amountBaseUnits` parameter.
+export interface BuildW5hFundingTxArgs {
+  payer: PublicKey;
+  sourceAta: PublicKey;
+  destinationAta: PublicKey;
+  /// `CreateIdempotent` is included unconditionally when true. The
+  /// idempotent variant is a no-op when the ATA already exists, so
+  /// it's safe to always include — costs ~1.5k lamports of rent if
+  /// the account doesn't exist, zero otherwise.
+  includeCreateAta: boolean;
+  /// USDC base units, u64. Validate at the call site that the value
+  /// fits in u64 — the underlying `createTransferCheckedInstruction`
+  /// throws on overflow but does NOT clamp.
+  amountBaseUnits: bigint;
+  /// Controlled wallet pubkey (= owner of `destinationAta`). The
+  /// idempotent CreateAta needs this as the `owner` field. The W5h
+  /// DTO carries `controlled_wallet` so the caller threads it
+  /// through; we never default to `CONTROLLED_WALLET_BASE58` here
+  /// because that would silently mask a backend DTO drift.
+  controlledWallet: PublicKey;
+  recentBlockhash: string;
+}
+
+/// Build a W5h funding transaction (unsigned).
+///
+/// Always:
+///   1. (optional) `CreateIdempotent` ATA for the controlled-wallet
+///      USDC ATA — safe to include unconditionally.
+///   2. `TransferChecked` `amountBaseUnits` USDC from `sourceAta`
+///      → `destinationAta`.
+///
+/// Returns the assembled `Transaction`; the caller signs via Phantom
+/// and submits via JSON-RPC.
+///
+/// NOTE: amount is bigint. The caller MUST parse the DTO's
+/// `amount_raw` (string) into a bigint at the call site, with whatever
+/// guardrails fit the context (e.g. reject negatives, cap at the
+/// pinned demo amount of 250_000).
+export function buildW5hFundingTransaction(
+  args: BuildW5hFundingTxArgs,
+): Transaction {
+  const usdcMint = new PublicKey(USDC_MINT_BASE58);
+  const tx = new Transaction();
+  if (args.includeCreateAta) {
+    tx.add(
+      createIdempotentAtaInstruction({
+        payer: args.payer,
+        ata: args.destinationAta,
+        owner: args.controlledWallet,
+        mint: usdcMint,
+      }),
+    );
+  }
+  tx.add(
+    createTransferCheckedInstruction({
+      source: args.sourceAta,
+      mint: usdcMint,
+      destination: args.destinationAta,
+      owner: args.payer,
+      amount: args.amountBaseUnits,
+      decimals: USDC_DECIMALS,
+    }),
+  );
+  tx.feePayer = args.payer;
+  tx.recentBlockhash = args.recentBlockhash;
+  return tx;
+}
+
 // ── Display helpers ───────────────────────────────────────────────────────
 
 /// Convert base-units bigint to a `"X.YYYYYY USDC"` display string

@@ -24,6 +24,9 @@ import type {
   TransactionProposal,
   Uuid,
   W5gConditionalExecutionResult,
+  W5hConditionalDepositResult,
+  W5hFundingConfirmEnvelope,
+  W5hFundingConfirmRequest,
   WalletSummary,
 } from "@/lib/types";
 import {
@@ -365,6 +368,23 @@ export async function postW5gExecute(
 function showcaseChatReply(message: string): ChatRouteResult {
   const lower = message.toLowerCase();
 
+  // ── W5h chat-driven funding-gated fixture ───────────────────────
+  //
+  // Matches the W5h demo grammar in English OR Traditional Chinese:
+  //   "If Solend Main Pool USDC deposit APY is above X%, deposit
+  //    0.25 USDC from my wallet, expires in N minutes."
+  //   "如果 Save APY > X%，deposit 0.25 USDC，有效期 N 分鐘"
+  //
+  // Returns a `funding_required` card so the demo viewer can see the
+  // Fund-with-Phantom button + countdown without standing up the
+  // live W5h backend. The chat fixture path NEVER produces other
+  // statuses — those flow back from the confirm route fixture below
+  // (`showcaseW5hFundingConfirmReply`).
+  const w5hOrder = parseShowcaseW5hConditional(message);
+  if (w5hOrder !== null) {
+    return { kind: "ok", response: w5hOrder };
+  }
+
   // ── W5d/W5e/W5f conditional-order fixture ───────────────────────
   //
   // Lets a showcase-mode operator see the W5f conditional-order card
@@ -429,6 +449,86 @@ function showcaseChatReply(message: string): ChatRouteResult {
       assistant_text:
         "Showcase mode is rendering a fixture reply. " +
         "Ask me to deposit USDC into Solend to see the LLM tool-call shape.",
+    },
+  };
+}
+
+/// W5h showcase fixture — pinned demo values aligned with the
+/// project memory pointers (controlled wallet BPfDMm…hhs5L, controlled
+/// USDC ATA 7LFdKc…BBmk3 per the W5h prompt, USDC mint EPjFWd…TDt1v).
+const W5H_FIXTURE_PINNED = {
+  rule_id_hex: "deadbeefcafef00d1234567890abcdef",
+  canonical_rule_hash_hex:
+    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+  amount_raw: "250000",
+  controlled_wallet: "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+  controlled_usdc_ata: "7LFdKcSV7JQYi3or5y9phHVPjhGigu5DDjUakAFbBmk3",
+  save_display_apy_bps: 312,
+  native_onchain_apr_bps: 287,
+  native_onchain_apr_source: "b_o1_reserve_math",
+  decision_source: "save_display_apy",
+} as const;
+
+/// Parse the W5h chat command in either English or 繁體中文 grammar.
+/// Returns a `funding_required` W5h DTO showcase fixture, or `null`
+/// when the message doesn't match. Strict regex so legacy W5d/W5g
+/// chatter doesn't get hijacked.
+function parseShowcaseW5hConditional(
+  message: string,
+): ChatResponse | null {
+  const trimmed = message.trim();
+
+  // English grammar:
+  //   If Solend Main Pool USDC deposit APY is above X%, deposit 0.25 USDC
+  //   from my wallet, expires in N minutes[.]
+  const en = trimmed.match(
+    /^If Solend Main Pool USDC deposit APY is above\s+(\d+(?:\.\d+)?)%,\s+deposit\s+0\.25\s+USDC\s+from my wallet,\s+expires in\s+(\d+)\s+minutes?\.?\s*$/i,
+  );
+  // 繁中 grammar:
+  //   如果 Save APY > X%，deposit 0.25 USDC，有效期 N 分鐘
+  // (allow optional spaces, half/full-width comma, optional 0 leading)
+  const zh = trimmed.match(
+    /^如果\s*Save\s*APY\s*>\s*(\d+(?:\.\d+)?)%[，,]\s*deposit\s*0\.25\s*USDC[，,]\s*有效期\s*(\d+)\s*分鐘\s*$/i,
+  );
+  const m = en ?? zh;
+  if (m === null) return null;
+
+  const thresholdPctLabel = m[1];
+  const expireMinutes = Math.max(1, Math.min(60, parseInt(m[2], 10) || 3));
+  const thresholdBps = Math.round(parseFloat(thresholdPctLabel) * 100);
+  const expiresAtMs = (Date.now() + expireMinutes * 60_000).toString();
+
+  // Showcase user wallet: in showcase mode we don't know the live
+  // Phantom pubkey; surface `null` and let the card fall back to the
+  // connected-wallet pubkey, deriving the source ATA at click time.
+  return {
+    status: "w5h_conditional_order",
+    result: {
+      input_text: trimmed,
+      status: "funding_required",
+      rule_id_hex: W5H_FIXTURE_PINNED.rule_id_hex,
+      canonical_rule_hash_hex: W5H_FIXTURE_PINNED.canonical_rule_hash_hex,
+      amount_raw: W5H_FIXTURE_PINNED.amount_raw,
+      current_budget_raw: "0",
+      user_wallet: null,
+      user_usdc_ata: null,
+      controlled_wallet: W5H_FIXTURE_PINNED.controlled_wallet,
+      controlled_usdc_ata: W5H_FIXTURE_PINNED.controlled_usdc_ata,
+      expires_at_ms: expiresAtMs,
+      last_checked_slot: "418961171",
+      threshold_bps: thresholdBps,
+      threshold_pct_label: thresholdPctLabel,
+      condition_met:
+        W5H_FIXTURE_PINNED.save_display_apy_bps > thresholdBps,
+      save_display_apy_bps: W5H_FIXTURE_PINNED.save_display_apy_bps,
+      native_onchain_apr_bps: W5H_FIXTURE_PINNED.native_onchain_apr_bps,
+      native_onchain_apr_source: W5H_FIXTURE_PINNED.native_onchain_apr_source,
+      decision_source: W5H_FIXTURE_PINNED.decision_source,
+      funding_signature: null,
+      funding_confirmation_slot: null,
+      refund_signature: null,
+      error_reason: null,
+      error_code: null,
     },
   };
 }
@@ -1040,4 +1140,128 @@ export async function decideApproval(
     errorText = (await res.text().catch(() => "")) || res.statusText;
   }
   return { ok: false, httpStatus: res.status, error: errorText };
+}
+
+// ── W5h funding-confirm route ───────────────────────────────────────────────
+//
+// `POST /sessions/:id/stage2/w5h/funding/confirm` — frontend tells the
+// backend that a USDC TransferChecked was broadcast from the user's
+// USDC ATA to the controlled-wallet USDC ATA. Backend authoritatively
+// re-verifies on-chain (signature exists, transfer instruction match,
+// finality) and re-emits the `W5hConditionalDepositResult` with an
+// updated `status` — typically `budget_reserved` on the happy path.
+//
+// As of 2026-05-12 Agent D has NOT shipped this route yet. The
+// showcase fixture path below stands in so the manual UI walkthrough
+// works end-to-end without a live backend. In live mode the function
+// returns a 503 envelope ("route not wired") until Agent D lands it.
+
+const SHOWCASE_FUNDING_SLOT = "419010000";
+
+export async function confirmW5hFunding(
+  sessionId: SessionId,
+  body: W5hFundingConfirmRequest,
+): Promise<W5hFundingConfirmEnvelope> {
+  if (IS_SHOWCASE) {
+    return showcaseW5hFundingConfirmReply(body);
+  }
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+
+  const res = await fetch(
+    `${GATEWAY_URL}/sessions/${sessionId}/stage2/w5h/funding/confirm`,
+    {
+      method: "POST",
+      headers,
+      cache: "no-store",
+      body: JSON.stringify(body),
+    },
+  );
+
+  if (res.status === 200) {
+    const data = (await res.json()) as W5hConditionalDepositResult;
+    return { kind: "ok", response: data };
+  }
+
+  let errorText = "";
+  try {
+    const errBody = (await res.json()) as { error?: string };
+    errorText = errBody.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+  return { kind: "error", httpStatus: res.status, error: errorText };
+}
+
+/// Showcase reply for the W5h funding-confirm route. Returns a
+/// `budget_reserved` DTO populated from the request body, so the
+/// chat-card flips into the "watching / ready_to_execute" branch and
+/// surfaces the W5g approval-command panel.
+///
+/// The fixture honours an opt-out: if `body.funding_signature` ends
+/// in `"fail"` we return `funding_failed` so a demo viewer can
+/// exercise the red branch without a real failure on chain.
+function showcaseW5hFundingConfirmReply(
+  body: W5hFundingConfirmRequest,
+): W5hFundingConfirmEnvelope {
+  const wantsFailure = body.funding_signature.toLowerCase().endsWith("fail");
+  if (wantsFailure) {
+    return {
+      kind: "ok",
+      response: {
+        ...buildW5hShowcaseShared(body),
+        status: "funding_failed",
+        funding_signature: body.funding_signature,
+        funding_confirmation_slot: null,
+        error_code: "funding_signature_not_found",
+        error_reason:
+          "Showcase fixture: signature suffix '…fail' triggers the funding_failed branch.",
+      },
+    };
+  }
+  return {
+    kind: "ok",
+    response: {
+      ...buildW5hShowcaseShared(body),
+      status: W5H_FIXTURE_PINNED.save_display_apy_bps > 100
+        ? "ready_to_execute"
+        : "budget_reserved",
+      funding_signature: body.funding_signature,
+      funding_confirmation_slot: SHOWCASE_FUNDING_SLOT,
+      current_budget_raw: body.amount_raw,
+      condition_met: W5H_FIXTURE_PINNED.save_display_apy_bps > 100,
+      error_code: null,
+      error_reason: null,
+    },
+  };
+}
+
+/// Build the constant prefix shared by the success + failure W5h
+/// confirm fixtures. Honours the request body for rule_id /
+/// canonical_hash so the round-trip is internally consistent.
+function buildW5hShowcaseShared(body: W5hFundingConfirmRequest) {
+  return {
+    input_text:
+      "(showcase confirm fixture — original chat input not re-echoed)",
+    rule_id_hex: body.rule_id_hex,
+    canonical_rule_hash_hex:
+      body.rule_id_hex === W5H_FIXTURE_PINNED.rule_id_hex
+        ? W5H_FIXTURE_PINNED.canonical_rule_hash_hex
+        : W5H_FIXTURE_PINNED.canonical_rule_hash_hex,
+    amount_raw: body.amount_raw,
+    user_wallet: body.user_wallet,
+    user_usdc_ata: body.user_usdc_ata,
+    controlled_wallet: body.controlled_wallet,
+    controlled_usdc_ata: body.controlled_usdc_ata,
+    expires_at_ms: (Date.now() + 3 * 60_000).toString(),
+    last_checked_slot: SHOWCASE_FUNDING_SLOT,
+    threshold_bps: 100,
+    threshold_pct_label: "1",
+    save_display_apy_bps: W5H_FIXTURE_PINNED.save_display_apy_bps,
+    native_onchain_apr_bps: W5H_FIXTURE_PINNED.native_onchain_apr_bps,
+    native_onchain_apr_source: W5H_FIXTURE_PINNED.native_onchain_apr_source,
+    decision_source: W5H_FIXTURE_PINNED.decision_source,
+    refund_signature: null,
+  };
 }

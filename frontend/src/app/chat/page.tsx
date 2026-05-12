@@ -12,7 +12,10 @@
 // yet have polished UX. Phantom signing and live balance display are
 // Day 2+.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { Connection, PublicKey } from "@solana/web3.js";
+import type { Transaction } from "@solana/web3.js";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -21,13 +24,25 @@ import { Button } from "@/components/ui/button";
 import { ToolResultCard } from "@/components/tool-cards";
 import { WalletConnect } from "@/components/wallet-connect";
 import {
+  confirmW5hFunding,
   confirmWalletBindChallenge,
   createWalletBindChallenge,
   getOrCreateSession,
   postChat,
 } from "@/lib/api";
 import { IS_SHOWCASE, MODE } from "@/lib/mode";
-import { signMessage } from "@/lib/phantom";
+import { getPhantomProvider, signMessage } from "@/lib/phantom";
+import {
+  CONTROLLED_WALLET_BASE58,
+  MAX_POLL_ATTEMPTS_DEFAULT,
+  POLL_INTERVAL_MS_DEFAULT,
+  SignatureStatusNetworkError,
+  USDC_MINT_BASE58,
+  buildW5hFundingTransaction,
+  deriveAtaPubkey,
+  pollSignatureStatus,
+  solscanTxUrl,
+} from "@/lib/stage2-funding";
 import type {
   ChatMessage,
   ChatResponse,
@@ -35,7 +50,16 @@ import type {
   SessionId,
   W5dConditionalDepositResult,
   W5gConditionalExecutionResult,
+  W5hConditionalDepositResult,
 } from "@/lib/types";
+
+/// Public RPC endpoint. Operator can override to a Helius / Triton
+/// URL via `NEXT_PUBLIC_SOLANA_RPC_URL`. Any value set here is
+/// browser-visible so DO NOT include an API key the operator wouldn't
+/// already accept exposing.
+const SOLANA_RPC_URL =
+  process.env.NEXT_PUBLIC_SOLANA_RPC_URL ??
+  "https://api.mainnet-beta.solana.com";
 
 /// Approval phrase the chat-route requires inside the user's W5g
 /// execute command. Hard-coded copy — the frontend never inspects it
@@ -64,6 +88,56 @@ function buildW5gExecuteCommand(
 /// detect the operator's intent without parsing the full grammar.
 function looksLikeW5gExecuteCommand(text: string): boolean {
   return /^Execute W5g conditional deposit\s+\S/.test(text.trim());
+}
+
+/// Loose detector for the W5h chat command in either English or 繁中.
+/// Used by the network-error catch path so a thrown `postChat` on a
+/// W5h prompt renders a typed safe-error card (not a generic system
+/// notice). The card preserves the user's chat text — they don't have
+/// to re-type a 50-character bilingual conditional order.
+function looksLikeW5hChatCommand(text: string): boolean {
+  const t = text.trim();
+  if (
+    /^If Solend Main Pool USDC deposit APY is above\s+\d/i.test(t) &&
+    /deposit\s+0\.25\s+USDC\s+from my wallet/i.test(t)
+  ) {
+    return true;
+  }
+  if (/^如果\s*Save\s*APY/i.test(t) && /deposit\s*0\.25\s*USDC/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+/// 250 000 USDC base units = 0.25 USDC, the W5h pinned demo amount.
+/// Hard-coded as a bigint so the funding-tx builder gets a guaranteed
+/// u64-safe value even if a hostile DTO returns a giant `amount_raw`.
+const W5H_DEMO_AMOUNT_BASE_UNITS = BigInt(250_000);
+
+/// Hard upper bound on the parsed `amount_raw` from a W5h DTO. The
+/// chat-route in the canonical W5h grammar only proposes 0.25 USDC;
+/// any DTO that asks for more than 1 USDC (= 1_000_000 raw) is
+/// treated as a wire-shape drift and we fall back to the demo amount.
+/// This is defence-in-depth: the demo budget is pinned in the rule,
+/// not in the DTO field.
+const W5H_AMOUNT_SAFETY_CAP_BASE_UNITS = BigInt(1_000_000);
+
+/// Parse a string `amount_raw` from a W5h DTO into a bigint. Defensive
+/// — rejects negative / non-numeric / above-cap values, and falls back
+/// to the pinned demo amount in any unhappy case.
+function safeParseW5hAmount(raw: string | null | undefined): bigint {
+  if (typeof raw !== "string" || !/^\d+$/.test(raw)) {
+    return W5H_DEMO_AMOUNT_BASE_UNITS;
+  }
+  try {
+    const n = BigInt(raw);
+    if (n < BigInt(0) || n > W5H_AMOUNT_SAFETY_CAP_BASE_UNITS) {
+      return W5H_DEMO_AMOUNT_BASE_UNITS;
+    }
+    return n;
+  } catch {
+    return W5H_DEMO_AMOUNT_BASE_UNITS;
+  }
 }
 
 // Live-mode wallet bind state. The Phantom popup for signMessage is
@@ -225,6 +299,15 @@ export default function ChatPage() {
           at: new Date().toISOString(),
         };
         setMessages((prev) => [...prev, localError]);
+      } else if (looksLikeW5hChatCommand(text)) {
+        const localError: ChatMessage = {
+          id: `local-w5h-err-${Date.now()}`,
+          kind: "local_w5h_safe_error",
+          userText: text,
+          networkError: errText,
+          at: new Date().toISOString(),
+        };
+        setMessages((prev) => [...prev, localError]);
       } else {
         const sysMessage: ChatMessage = {
           id: `sys-${Date.now()}`,
@@ -291,10 +374,22 @@ export default function ChatPage() {
             {messages.map((m) => (
               <li key={m.id}>
                 {m.kind === "user" && <UserBubble text={m.text} />}
-                {m.kind === "assistant" && <AssistantBubble result={m.result} />}
+                {m.kind === "assistant" && (
+                  <AssistantBubble
+                    result={m.result}
+                    sessionId={sessionId}
+                    walletPubkey={walletPubkey}
+                  />
+                )}
                 {m.kind === "system" && <SystemNotice text={m.text} />}
                 {m.kind === "local_w5g_safe_error" && (
                   <LocalW5gSafeErrorCard
+                    userText={m.userText}
+                    networkError={m.networkError}
+                  />
+                )}
+                {m.kind === "local_w5h_safe_error" && (
+                  <LocalW5hSafeErrorCard
                     userText={m.userText}
                     networkError={m.networkError}
                   />
@@ -532,7 +627,21 @@ function UserBubble({ text }: { text: string }) {
   );
 }
 
-function AssistantBubble({ result }: { result: ChatRouteResult }) {
+function AssistantBubble({
+  result,
+  sessionId,
+  walletPubkey,
+}: {
+  result: ChatRouteResult;
+  /// Session id for backend calls the bubble's nested cards might
+  /// make (W5h funding-confirm). `null` while the page is still
+  /// opening the session — disables in-bubble actions until ready.
+  sessionId: SessionId | null;
+  /// Currently-connected Phantom pubkey. The W5h card uses this to
+  /// gate the Fund button (refuses when no wallet, or when the
+  /// connected pubkey ≠ the DTO's `user_wallet`).
+  walletPubkey: string | null;
+}) {
   // ── HTTP-envelope-level branches first ───────────────────────────────
   if (result.kind === "disabled") {
     return (
@@ -575,10 +684,24 @@ function AssistantBubble({ result }: { result: ChatRouteResult }) {
   }
 
   // ── 200 OK domain variants ───────────────────────────────────────────
-  return <ChatResponseCard response={result.response} />;
+  return (
+    <ChatResponseCard
+      response={result.response}
+      sessionId={sessionId}
+      walletPubkey={walletPubkey}
+    />
+  );
 }
 
-function ChatResponseCard({ response }: { response: ChatResponse }) {
+function ChatResponseCard({
+  response,
+  sessionId,
+  walletPubkey,
+}: {
+  response: ChatResponse;
+  sessionId: SessionId | null;
+  walletPubkey: string | null;
+}) {
   switch (response.status) {
     case "assistant_text":
       return (
@@ -650,6 +773,21 @@ function ChatResponseCard({ response }: { response: ChatResponse }) {
       // W5d demo-bridge: deterministic-parser + B-O1 on-chain APR.
       // Render a typed card — never a raw JSON blob.
       return <W5dConditionalDepositCard result={response.result} />;
+
+    case "w5h_conditional_order":
+      // W5h chat-driven funding-gated conditional order. Card owns
+      // the Phantom-funding flow state machine internally so each
+      // chat message preserves its own progress; sessionId +
+      // walletPubkey are threaded in so the Fund click can build
+      // and submit a USDC TransferChecked and then call the
+      // backend confirm route.
+      return (
+        <W5hConditionalOrderCard
+          initial={response.result}
+          sessionId={sessionId}
+          walletPubkey={walletPubkey}
+        />
+      );
 
     case "w5g_conditional_execution":
       // W5g chat-first execution result. The user's second chat
@@ -1021,6 +1159,865 @@ function W5dConditionalDepositCard({
 ///     user's second chat message — keeping the demo provably
 ///     chat-driven.
 ///
+// ── W5h chat-driven funding-gated conditional order ─────────────────
+//
+// Renders the user-facing card for the W5h chat command:
+//
+//   "If Solend Main Pool USDC deposit APY is above X%, deposit 0.25
+//    USDC from my wallet, expires in N minutes."
+//   "如果 Save APY > X%，deposit 0.25 USDC，有效期 N 分鐘"
+//
+// Lifecycle (server status → client funding-flow):
+//
+//   funding_required        → Fund button enabled (when wallet matches)
+//   funding_required + idle → "Fund 0.25 USDC with Phantom" CTA
+//   client.preparing        → "Preparing transaction…"
+//   client.awaiting_signature → "Awaiting Phantom signature…"
+//   client.broadcasting     → "Broadcasting funding tx…"
+//   client.submitted        → "Submitted; polling chain status"
+//   client.polling_chain    → "Confirming on Mainnet… N/M"
+//   client.confirming_backend → "Backend verifying budget reservation…"
+//   budget_reserved         → green banner, hand off to W5g panel
+//   watching                → blue/amber: condition false but rule live
+//   ready_to_execute        → emerald: condition met, W5g panel rendered
+//   expired                 → amber: countdown done, refund prompt
+//   refunded                → muted: budget returned
+//   funding_failed          → red: typed error_reason
+//
+// Allowed buttons: exactly ONE — "Fund 0.25 USDC with Phantom".
+// Plus three copy controls (Copy wallet, Copy USDC ATA, Copy execute
+// command — the last one only after budget_reserved & condition_met).
+//
+// FORBIDDEN here: Execute / Approve / Send Solend Deposit / Confirm
+// Deposit. Solend execution stays chat-first via the W5g approval
+// command, which is rendered via the existing
+// `ReadyToExecuteCommandPanel` below.
+//
+// Safety invariants enforced inside this component:
+//   1. `signTransaction` only fires inside the `handleFund` user
+//      gesture path. NEVER from an effect.
+//   2. `sendRawTransaction` fires at most ONCE per Fund click. The
+//      Fund button disables for the rest of the flow.
+//   3. No private-key handling. No `Keypair` import. The destination
+//      ATA is read from the DTO (`controlled_usdc_ata`) and used
+//      verbatim — no controlled-wallet keypair is loaded to derive it.
+//   4. Mint stays pinned to USDC. The transfer instruction asserts
+//      decimals via TransferChecked, so a hostile DTO that injected
+//      a non-USDC ATA pubkey would fail on-chain before settling.
+//   5. Amount is parsed via `safeParseW5hAmount` with a cap at 1 USDC
+//      so a wire-shape drift cannot escalate the spend.
+//   6. The funding amount + destination are displayed in the card
+//      BEFORE the Fund button is enabled, so the user reads them
+//      pre-Phantom-popup.
+//   7. Phantom-rejected signatures map to a typed `error` flow
+//      state — they never claim a finalised budget.
+
+/// In-flight state the W5h card owns locally. Sits ON TOP of the
+/// server-side `status` in `W5hConditionalDepositResult.status` — the
+/// server status drives the display BRANCH (funding_required vs
+/// budget_reserved vs expired etc.) and the local flow drives the
+/// LOADING UX inside the funding_required branch.
+type W5hFundingFlow =
+  | { kind: "idle" }
+  | { kind: "preparing" }
+  | { kind: "awaiting_signature" }
+  | { kind: "broadcasting" }
+  /// sendRawTransaction returned. Signature is on the wire.
+  | { kind: "submitted"; signature: string }
+  /// Polling `getSignatureStatuses` for finalization.
+  | { kind: "polling_chain"; signature: string; attempts: number }
+  /// Backend confirm POST in flight. Signature is finalised.
+  | { kind: "confirming_backend"; signature: string }
+  /// Backend confirm POST 4xx/5xx. Signature MAY have landed; we
+  /// keep it so the operator can verify on Solscan.
+  | { kind: "error"; reason: string; signature?: string };
+
+function W5hConditionalOrderCard({
+  initial,
+  sessionId,
+  walletPubkey,
+}: {
+  initial: W5hConditionalDepositResult;
+  sessionId: SessionId | null;
+  walletPubkey: string | null;
+}) {
+  const [result, setResult] = useState<W5hConditionalDepositResult>(initial);
+  const [flow, setFlow] = useState<W5hFundingFlow>({ kind: "idle" });
+
+  const connection = useMemo(
+    () => new Connection(SOLANA_RPC_URL, "confirmed"),
+    [],
+  );
+
+  // ── Countdown ─────────────────────────────────────────────────────
+  // A single 1s ticker drives the "expires in" label. We round down
+  // and clamp to zero — never negative.
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const expiresAtMs = useMemo(() => {
+    const raw = result.expires_at_ms;
+    if (!/^\d+$/.test(raw)) return null;
+    const n = Number(raw);
+    return Number.isSafeInteger(n) ? n : null;
+  }, [result.expires_at_ms]);
+  const remainingMs =
+    expiresAtMs === null ? null : Math.max(0, expiresAtMs - nowMs);
+  const countdownDone =
+    remainingMs !== null && remainingMs === 0;
+  // Display countdown only while the order is still gathering / live.
+  // After budget_reserved / ready_to_execute / expired the count is
+  // either superseded by an execution prompt or by the expired card.
+  const showCountdown =
+    result.status === "funding_required" ||
+    result.status === "watching" ||
+    result.status === "budget_reserved" ||
+    result.status === "ready_to_execute";
+
+  // ── Wallet gating ─────────────────────────────────────────────────
+  const expectedUserWallet = result.user_wallet ?? null;
+  const walletConnected = walletPubkey !== null;
+  const walletMatchesExpected =
+    expectedUserWallet === null
+      ? true
+      : walletPubkey === expectedUserWallet;
+  const walletOk = walletConnected && walletMatchesExpected;
+  const walletMismatch =
+    walletConnected &&
+    expectedUserWallet !== null &&
+    walletPubkey !== expectedUserWallet;
+
+  // ── Fund button gate ──────────────────────────────────────────────
+  const fundInFlight =
+    flow.kind === "preparing" ||
+    flow.kind === "awaiting_signature" ||
+    flow.kind === "broadcasting" ||
+    flow.kind === "submitted" ||
+    flow.kind === "polling_chain" ||
+    flow.kind === "confirming_backend";
+  const canFund =
+    result.status === "funding_required" &&
+    !fundInFlight &&
+    walletOk &&
+    sessionId !== null &&
+    !countdownDone;
+
+  const handleFund = useCallback(async () => {
+    if (!canFund) return;
+    if (walletPubkey === null || sessionId === null) return;
+
+    setFlow({ kind: "preparing" });
+
+    // 1. Derive the source ATA from the connected wallet (the DTO
+    //    can carry `user_usdc_ata` but we derive defensively — the
+    //    derivation is pure and the backend will reject mismatches).
+    let payer: PublicKey;
+    let sourceAta: PublicKey;
+    let destinationAta: PublicKey;
+    let controlledWallet: PublicKey;
+    try {
+      payer = new PublicKey(walletPubkey);
+      const usdcMint = new PublicKey(USDC_MINT_BASE58);
+      sourceAta = result.user_usdc_ata
+        ? new PublicKey(result.user_usdc_ata)
+        : deriveAtaPubkey(payer, usdcMint);
+      destinationAta = new PublicKey(result.controlled_usdc_ata);
+      controlledWallet = new PublicKey(
+        result.controlled_wallet || CONTROLLED_WALLET_BASE58,
+      );
+    } catch (err) {
+      setFlow({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `pubkey parse failed: ${err.message}`
+            : "pubkey parse failed",
+      });
+      return;
+    }
+
+    // 2. Fresh blockhash.
+    let blockhash: string;
+    try {
+      const { blockhash: bh } =
+        await connection.getLatestBlockhash("confirmed");
+      blockhash = bh;
+    } catch (err) {
+      setFlow({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `RPC blockhash fetch failed: ${err.message}`
+            : "RPC blockhash fetch failed",
+      });
+      return;
+    }
+
+    // 3. Build the W5h transfer tx (TransferChecked + idempotent
+    //    CreateAta). Amount is parsed via the defensive helper.
+    let tx: Transaction;
+    try {
+      tx = buildW5hFundingTransaction({
+        payer,
+        sourceAta,
+        destinationAta,
+        includeCreateAta: true,
+        amountBaseUnits: safeParseW5hAmount(result.amount_raw),
+        controlledWallet,
+        recentBlockhash: blockhash,
+      });
+    } catch (err) {
+      setFlow({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `tx build failed: ${err.message}`
+            : "tx build failed",
+      });
+      return;
+    }
+
+    // 4. Phantom signs (popup). The user APPROVED this by clicking
+    //    Fund and seeing the amount + destination above; signing
+    //    happens here and only here.
+    const provider = getPhantomProvider();
+    if (!provider) {
+      setFlow({
+        kind: "error",
+        reason: "Phantom provider not detected — please connect first.",
+      });
+      return;
+    }
+    setFlow({ kind: "awaiting_signature" });
+    let signedTx: Transaction;
+    try {
+      signedTx = await provider.signTransaction(tx);
+    } catch (err) {
+      setFlow({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `Phantom rejected / signing failed: ${err.message}`
+            : "Phantom rejected / signing failed",
+      });
+      return;
+    }
+
+    // 5. Broadcast signed bytes — ONCE. No retry on failure to
+    //    preserve "exactly one sendRawTransaction per Fund click".
+    setFlow({ kind: "broadcasting" });
+    let signature: string;
+    try {
+      const raw = signedTx.serialize();
+      signature = await connection.sendRawTransaction(raw, {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+      });
+    } catch (err) {
+      setFlow({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `RPC send failed: ${err.message}`
+            : "RPC send failed",
+      });
+      return;
+    }
+
+    setFlow({ kind: "submitted", signature });
+
+    // 6. Poll on-chain finality. Replaces the old
+    //    `confirmTransaction({ blockhash, lastValidBlockHeight: 0 }, ...)`
+    //    path that gave up at block-height-exceeded BEFORE late-
+    //    landing txs finalized.
+    try {
+      const pollResult = await pollSignatureStatus(connection, signature, {
+        maxAttempts: MAX_POLL_ATTEMPTS_DEFAULT,
+        intervalMs: POLL_INTERVAL_MS_DEFAULT,
+        onAttempt: (n) => {
+          setFlow({ kind: "polling_chain", signature, attempts: n });
+        },
+      });
+      if (pollResult.kind === "failed_on_chain") {
+        setFlow({
+          kind: "error",
+          reason: `Transaction failed on chain: ${JSON.stringify(
+            pollResult.err,
+          )}`,
+          signature,
+        });
+        return;
+      }
+      if (pollResult.kind === "timeout") {
+        setFlow({
+          kind: "error",
+          reason:
+            "Confirmation timeout — the tx may still land. Verify on Solscan.",
+          signature,
+        });
+        return;
+      }
+      // pollResult.kind === "finalized" — proceed to backend confirm.
+    } catch (err) {
+      if (err instanceof SignatureStatusNetworkError) {
+        setFlow({
+          kind: "error",
+          reason: "Network error polling status; verify on Solscan.",
+          signature,
+        });
+        return;
+      }
+      throw err;
+    }
+
+    // 7. Tell the backend so it re-reads on-chain authoritatively
+    //    and flips the W5h state to budget_reserved / watching /
+    //    ready_to_execute / funding_failed.
+    setFlow({ kind: "confirming_backend", signature });
+    try {
+      const env = await confirmW5hFunding(sessionId, {
+        rule_id_hex: result.rule_id_hex,
+        funding_signature: signature,
+        user_wallet: walletPubkey,
+        user_usdc_ata: sourceAta.toBase58(),
+        controlled_wallet: result.controlled_wallet,
+        controlled_usdc_ata: result.controlled_usdc_ata,
+        amount_raw: result.amount_raw,
+      });
+      if (env.kind === "ok") {
+        setResult(env.response);
+        setFlow({ kind: "idle" });
+      } else {
+        setFlow({
+          kind: "error",
+          reason: `Backend confirm failed (${env.httpStatus}): ${env.error || "no error body"}`,
+          signature,
+        });
+      }
+    } catch (err) {
+      setFlow({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `Backend confirm threw: ${err.message}`
+            : "Backend confirm threw",
+        signature,
+      });
+    }
+  }, [canFund, connection, result, sessionId, walletPubkey]);
+
+  // ── Banner copy ──────────────────────────────────────────────────
+  const banner = w5hBanner(result.status, flow, walletMismatch);
+  const showW5gPanel =
+    (result.status === "budget_reserved" ||
+      result.status === "ready_to_execute") &&
+    result.rule_id_hex.length > 0 &&
+    result.canonical_rule_hash_hex.length > 0;
+  // Active funding signature — either an in-flight one (flow.signature)
+  // or one preserved on the result (post-confirm).
+  const liveFundingSig =
+    flow.kind === "submitted" ||
+    flow.kind === "polling_chain" ||
+    flow.kind === "confirming_backend" ||
+    flow.kind === "error"
+      ? (flow as { signature?: string }).signature ?? null
+      : result.funding_signature ?? null;
+
+  return (
+    <div className="flex justify-start">
+      <div
+        data-testid="w5h-conditional-order-card"
+        data-status={result.status}
+        className="max-w-[85%] rounded-2xl rounded-bl-sm bg-card border px-4 py-3 text-sm space-y-2"
+      >
+        <div className="font-medium">W5h conditional order (funding-gated)</div>
+        <div className="text-xs text-muted-foreground italic break-words">
+          &ldquo;{result.input_text}&rdquo;
+        </div>
+
+        <div
+          data-testid="w5h-status-banner"
+          data-status={result.status}
+          data-flow-kind={flow.kind}
+          className={`mt-2 inline-block rounded border px-2 py-1 text-xs ${banner.tone}`}
+        >
+          {banner.text}
+        </div>
+
+        {/* ── Funding parameters ────────────────────────────────── */}
+        <div className="mt-3">
+          <div className="text-xs font-medium text-foreground/80">
+            Funding parameters
+          </div>
+          <dl className="mt-1 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
+            <dt className="text-muted-foreground">amount</dt>
+            <dd className="font-mono" data-testid="w5h-amount">
+              <span className="text-foreground">
+                {formatRawUsdcDisplay(result.amount_raw)}
+              </span>
+              <span className="ml-2 text-muted-foreground">
+                ({result.amount_raw} raw)
+              </span>
+            </dd>
+
+            <dt className="text-muted-foreground">USDC mint</dt>
+            <dd className="font-mono break-all">{USDC_MINT_BASE58}</dd>
+
+            <dt className="text-muted-foreground">controlled wallet</dt>
+            <dd className="font-mono break-all flex items-start">
+              <span
+                className="break-all"
+                data-testid="w5h-controlled-wallet"
+              >
+                {result.controlled_wallet}
+              </span>
+              <CopyButton
+                value={result.controlled_wallet}
+                label="controlled wallet"
+              />
+            </dd>
+
+            <dt className="text-muted-foreground">controlled USDC ATA</dt>
+            <dd className="font-mono break-all flex items-start">
+              <span
+                className="break-all"
+                data-testid="w5h-controlled-usdc-ata"
+              >
+                {result.controlled_usdc_ata}
+              </span>
+              <CopyButton
+                value={result.controlled_usdc_ata}
+                label="controlled USDC ATA"
+              />
+            </dd>
+
+            {showCountdown && (
+              <>
+                <dt className="text-muted-foreground">expires in</dt>
+                <dd
+                  className="font-mono"
+                  data-testid="w5h-countdown"
+                  data-expired={countdownDone ? "true" : "false"}
+                >
+                  {remainingMs === null
+                    ? "—"
+                    : formatRemaining(remainingMs)}
+                </dd>
+              </>
+            )}
+          </dl>
+        </div>
+
+        {/* ── Decision metrics ──────────────────────────────────── */}
+        {(result.save_display_apy_bps !== undefined ||
+          result.native_onchain_apr_bps !== undefined) && (
+          <div className="mt-3">
+            <div className="text-xs font-medium text-foreground/80">
+              Decision metrics
+            </div>
+            <dl className="mt-1 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
+              {result.save_display_apy_bps !== undefined &&
+                result.save_display_apy_bps !== null && (
+                  <>
+                    <dt className="text-muted-foreground">
+                      Save display APY
+                    </dt>
+                    <dd data-testid="w5h-save-display-apy">
+                      {result.save_display_apy_bps} bps (
+                      {bpsToPctLabel(result.save_display_apy_bps)})
+                    </dd>
+                  </>
+                )}
+              {result.native_onchain_apr_bps !== undefined &&
+                result.native_onchain_apr_bps !== null && (
+                  <>
+                    <dt className="text-muted-foreground">
+                      native on-chain APR (audit)
+                    </dt>
+                    <dd data-testid="w5h-native-onchain-apr">
+                      {result.native_onchain_apr_bps} bps (
+                      {bpsToPctLabel(result.native_onchain_apr_bps)})
+                    </dd>
+                  </>
+                )}
+              <dt className="text-muted-foreground">threshold</dt>
+              <dd>
+                {result.threshold_bps} bps (
+                {bpsToPctLabel(result.threshold_bps)})
+              </dd>
+              {result.condition_met !== undefined && (
+                <>
+                  <dt className="text-muted-foreground">condition_met</dt>
+                  <dd className="font-mono">
+                    {result.condition_met ? "true" : "false"}
+                  </dd>
+                </>
+              )}
+            </dl>
+          </div>
+        )}
+
+        {/* ── Wallet-bind hint (when no Phantom yet) ───────────── */}
+        {result.status === "funding_required" && !walletConnected && (
+          <div className="mt-3 rounded border border-amber-300 bg-amber-50/70 p-3 text-xs text-amber-900">
+            Connect Phantom in the header to enable funding.
+          </div>
+        )}
+        {walletMismatch && (
+          <div
+            className="mt-3 rounded border border-rose-300 bg-rose-50/70 p-3 text-xs text-rose-900 break-words"
+            data-testid="w5h-wallet-mismatch"
+          >
+            Connected wallet does NOT match the expected user wallet
+            for this order. Fund button is disabled — switch Phantom
+            accounts to{" "}
+            <code className="font-mono">{expectedUserWallet}</code>.
+          </div>
+        )}
+
+        {/* ── Fund button — the SINGLE allowed action button ──── */}
+        {result.status === "funding_required" && !countdownDone && (
+          <div className="mt-3 flex items-center gap-3 flex-wrap">
+            <Button
+              size="sm"
+              onClick={() => void handleFund()}
+              disabled={!canFund}
+              data-testid="w5h-fund-button"
+            >
+              {fundButtonLabel(flow, result.amount_raw)}
+            </Button>
+            <span className="text-[11px] text-muted-foreground italic">
+              Phantom will pop up only on this click. One signature; one
+              broadcast.
+            </span>
+          </div>
+        )}
+        {countdownDone && result.status === "funding_required" && (
+          <div
+            className="mt-3 rounded border border-rose-300 bg-rose-50/70 p-3 text-xs text-rose-900"
+            data-testid="w5h-countdown-expired"
+          >
+            Countdown expired before funding. This order is now invalid —
+            type a fresh W5h conditional-order command to retry.
+          </div>
+        )}
+
+        {/* ── Funding signature display ─────────────────────────── */}
+        {liveFundingSig && (
+          <div className="mt-3">
+            <div className="text-xs font-medium text-foreground/80">
+              Funding tx
+            </div>
+            <dl className="mt-1 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
+              <dt className="text-muted-foreground">signature</dt>
+              <dd
+                className="font-mono break-all"
+                data-testid="w5h-funding-signature"
+              >
+                {liveFundingSig}
+              </dd>
+              <dt className="text-muted-foreground">solscan</dt>
+              <dd>
+                <a
+                  href={solscanTxUrl(liveFundingSig)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-mono underline hover:no-underline break-all"
+                  data-testid="w5h-solscan-link"
+                >
+                  {solscanTxUrl(liveFundingSig)}
+                </a>
+              </dd>
+              {result.funding_confirmation_slot && (
+                <>
+                  <dt className="text-muted-foreground">
+                    confirmation slot
+                  </dt>
+                  <dd className="font-mono break-all">
+                    {result.funding_confirmation_slot}
+                  </dd>
+                </>
+              )}
+            </dl>
+          </div>
+        )}
+
+        {/* ── Hand-off: W5g approval-command panel ─────────────── */}
+        {showW5gPanel && (
+          <ReadyToExecuteCommandPanel
+            ruleIdHex={result.rule_id_hex}
+            canonicalRuleHashHex={result.canonical_rule_hash_hex}
+          />
+        )}
+
+        {/* ── Expired branch ──────────────────────────────────── */}
+        {result.status === "expired" && (
+          <div
+            className="mt-3 rounded border border-amber-300 bg-amber-50/70 p-3 text-xs text-amber-900"
+            data-testid="w5h-expired-card"
+          >
+            <div className="font-medium">
+              Expired — budget can be refunded
+            </div>
+            <p className="mt-1">
+              The conditional order window passed without execution.
+              Refund flows are a backend-operator action — the frontend
+              never auto-refunds. If the backend later returns a refund
+              signature it will appear below.
+            </p>
+            {result.refund_signature && (
+              <div className="mt-2 font-mono break-all">
+                refund:{" "}
+                <a
+                  href={solscanTxUrl(result.refund_signature)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:no-underline"
+                >
+                  {result.refund_signature}
+                </a>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Refunded branch ─────────────────────────────────── */}
+        {result.status === "refunded" && (
+          <div
+            className="mt-3 rounded border border-muted-foreground/30 bg-muted/40 p-3 text-xs text-muted-foreground"
+            data-testid="w5h-refunded-card"
+          >
+            Refunded — budget returned to user wallet.
+            {result.refund_signature && (
+              <div className="mt-1 font-mono break-all">
+                refund:{" "}
+                <a
+                  href={solscanTxUrl(result.refund_signature)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:no-underline"
+                >
+                  {result.refund_signature}
+                </a>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Funding-failed branch ──────────────────────────── */}
+        {result.status === "funding_failed" && (
+          <div
+            className="mt-3 rounded border border-rose-300 bg-rose-50/70 p-3 text-xs text-rose-900 space-y-1 break-words"
+            data-testid="w5h-funding-failed-card"
+          >
+            <div className="font-medium">Funding failed</div>
+            {result.error_code && (
+              <div className="font-mono">
+                code: <code>{result.error_code}</code>
+              </div>
+            )}
+            {result.error_reason && (
+              <div>{result.error_reason}</div>
+            )}
+          </div>
+        )}
+
+        {/* ── Client-side flow error (signing / broadcast / poll) */}
+        {flow.kind === "error" && (
+          <div
+            className="mt-3 rounded border border-rose-300 bg-rose-50/70 p-3 text-xs text-rose-900 space-y-1 break-words"
+            data-testid="w5h-flow-error"
+          >
+            <div className="font-medium">Funding flow error</div>
+            <div>{flow.reason}</div>
+            {flow.signature && (
+              <div className="font-mono break-all">
+                tx broadcasted:{" "}
+                <a
+                  href={solscanTxUrl(flow.signature)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:no-underline"
+                >
+                  {flow.signature}
+                </a>
+                <span className="ml-1 italic">
+                  — verify on Solscan; no completed claim made
+                  client-side.
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── No-overclaim footer ────────────────────────────── */}
+        <div className="mt-2 text-[10px] text-muted-foreground leading-snug">
+          <p>
+            W5h funding goes from your wallet to the controlled wallet
+            via a single SPL TransferChecked. No Solend / Jupiter
+            execution is triggered from this page. The W5g approval
+            command above (when shown) is the only path to the live
+            Solend deposit, and it is a chat message — not a button.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function fundButtonLabel(
+  flow: W5hFundingFlow,
+  amountRaw: string,
+): string {
+  switch (flow.kind) {
+    case "idle":
+      return `Fund ${formatRawUsdcDisplay(amountRaw)} with Phantom`;
+    case "preparing":
+      return "Preparing…";
+    case "awaiting_signature":
+      return "Awaiting Phantom…";
+    case "broadcasting":
+      return "Broadcasting…";
+    case "submitted":
+      return "Submitted, confirming…";
+    case "polling_chain":
+      return `Confirming… (${flow.attempts}/${MAX_POLL_ATTEMPTS_DEFAULT})`;
+    case "confirming_backend":
+      return "Backend confirming…";
+    case "error":
+      return "Funding failed";
+    default: {
+      const exhaustive: never = flow;
+      return String(exhaustive);
+    }
+  }
+}
+
+/// "0.25 USDC" display for a base-units string. Uses safe-integer
+/// guarded math; falls back to "—" when the raw value is outside
+/// safe-integer range (defensive — shouldn't happen for realistic
+/// amounts, but we never crash on a weird DTO).
+function formatRawUsdcDisplay(raw: string | null | undefined): string {
+  if (typeof raw !== "string" || !/^\d+$/.test(raw)) return "—";
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n)) return "—";
+  return `${(n / 1_000_000).toFixed(6)} USDC`;
+}
+
+/// Render `mm:ss` from a millisecond remainder.
+function formatRemaining(remainingMs: number): string {
+  const totalSec = Math.floor(remainingMs / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+/// Per-(server-status, client-flow) banner copy + tone. Server status
+/// has primacy — once the backend says `budget_reserved` we render
+/// the green banner regardless of any stale client-flow state.
+function w5hBanner(
+  status: W5hConditionalDepositResult["status"],
+  flow: W5hFundingFlow,
+  walletMismatch: boolean,
+): { tone: string; text: string } {
+  // Terminal server-side states come first.
+  switch (status) {
+    case "budget_reserved":
+      return {
+        tone: "bg-emerald-50 text-emerald-900 border-emerald-200",
+        text: "Budget reserved — controlled wallet holds the 0.25 USDC. Watching the condition.",
+      };
+    case "ready_to_execute":
+      return {
+        tone: "bg-emerald-50 text-emerald-900 border-emerald-200",
+        text: "Ready to execute — APY threshold met. Copy the W5g approval command below to authorise the live deposit.",
+      };
+    case "watching":
+      return {
+        tone: "bg-sky-50 text-sky-900 border-sky-200",
+        text: "Watching — budget reserved; waiting for APY threshold to be met.",
+      };
+    case "expired":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Expired — order window closed.",
+      };
+    case "refunded":
+      return {
+        tone: "bg-muted text-muted-foreground border-muted",
+        text: "Refunded — budget returned to user wallet.",
+      };
+    case "funding_failed":
+      return {
+        tone: "bg-rose-50 text-rose-900 border-rose-200",
+        text: "Funding failed — see error details below.",
+      };
+    case "funding_required":
+      // Fall through to flow-dependent copy below.
+      break;
+    default: {
+      const exhaustive: never = status;
+      return { tone: "", text: String(exhaustive) };
+    }
+  }
+
+  if (walletMismatch) {
+    return {
+      tone: "bg-rose-50 text-rose-900 border-rose-200",
+      text: "Wallet mismatch — connected pubkey is not the expected user wallet.",
+    };
+  }
+
+  switch (flow.kind) {
+    case "idle":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Funding required — click Fund to send 0.25 USDC into the controlled wallet.",
+      };
+    case "preparing":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Preparing funding transaction…",
+      };
+    case "awaiting_signature":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Awaiting Phantom signature… approve in the popup.",
+      };
+    case "broadcasting":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Broadcasting signed funding tx…",
+      };
+    case "submitted":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Submitted — waiting for chain finalization.",
+      };
+    case "polling_chain":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: `Confirming on Mainnet… attempt ${flow.attempts} of ${MAX_POLL_ATTEMPTS_DEFAULT}.`,
+      };
+    case "confirming_backend":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Backend verifying budget reservation…",
+      };
+    case "error":
+      return {
+        tone: "bg-rose-50 text-rose-900 border-rose-200",
+        text: "Funding interrupted — see details below.",
+      };
+    default: {
+      const exhaustive: never = flow;
+      return { tone: "", text: String(exhaustive) };
+    }
+  }
+}
+
 /// The `data-testid` hooks let smoke tests assert "no Execute button
 /// rendered on ready_to_execute" by grepping for absence of
 /// `data-testid="w5g-execute-button"` (no such hook exists in this
@@ -1600,6 +2597,54 @@ function LocalW5gSafeErrorCard({
         <p className="text-[10px] italic">
           No completed badge — the frontend never claims finalization on
           a thrown HTTP request.
+        </p>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
+/// Safe-error card for a thrown `postChat` on a W5h chat command. The
+/// chat-route hadn't returned a body, so no W5h order exists yet —
+/// nothing to render in the funding flow. The card preserves the
+/// user's command text so they can re-submit without re-typing the
+/// bilingual conditional-order grammar.
+function LocalW5hSafeErrorCard({
+  userText,
+  networkError,
+}: {
+  userText: string;
+  networkError: string;
+}) {
+  return (
+    <Alert
+      className="border-amber-500/40"
+      data-testid="w5h-local-safe-error-card"
+    >
+      <AlertTitle>W5h order request — status unknown</AlertTitle>
+      <AlertDescription className="space-y-2 text-xs">
+        <p>
+          The chat request failed before a W5h order card could be
+          rendered. No funding tx has been built or signed — Phantom
+          stays closed until you re-submit and click Fund.
+        </p>
+        <details className="text-muted-foreground">
+          <summary className="cursor-pointer hover:text-foreground">
+            chat command sent
+          </summary>
+          <pre className="mt-2 overflow-x-auto rounded bg-muted px-3 py-2 text-[11px] leading-snug whitespace-pre-wrap break-all">
+            {userText}
+          </pre>
+        </details>
+        <details className="text-muted-foreground">
+          <summary className="cursor-pointer hover:text-foreground">
+            transport error
+          </summary>
+          <pre className="mt-2 overflow-x-auto rounded bg-muted px-3 py-2 text-[11px] leading-snug whitespace-pre-wrap break-words">
+            {networkError}
+          </pre>
+        </details>
+        <p className="text-[10px] italic">
+          No funding has happened — re-send the W5h command to retry.
         </p>
       </AlertDescription>
     </Alert>

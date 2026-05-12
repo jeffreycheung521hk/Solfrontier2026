@@ -345,6 +345,156 @@ export interface W5dConditionalDepositResult {
   native_onchain_apr_source: string;
 }
 
+/// Wire DTO for the W5h conditional-order result.
+///
+/// Produced by the chat handler's W5h interceptor when the user types
+/// the W5h funding-gated demo grammar (English or 繁中):
+///
+/// > "If Solend Main Pool USDC deposit APY is above X%, deposit
+/// >  0.25 USDC from my wallet, expires in N minutes."
+/// > "如果 Save APY > X%，deposit 0.25 USDC，有效期 N 分鐘"
+///
+/// W5h differs from W5d/W5e/W5f in that the budget is sourced from
+/// the USER's wallet (not the pre-funded controlled wallet). The
+/// chat-route returns `status: "funding_required"`; the frontend
+/// renders a card with a "Fund 0.25 USDC with Phantom" button that
+/// drives an SPL TransferChecked from the user's USDC ATA to the
+/// pinned controlled-wallet USDC ATA. After broadcast the frontend
+/// POSTs to `/sessions/:id/stage2/w5h/funding/confirm` and the
+/// backend re-emits a `W5hConditionalDepositResult` with an updated
+/// `status` (budget_reserved / watching / ready_to_execute / etc.).
+///
+/// ── COORDINATION NOTE ─────────────────────────────────────────────
+/// As of 2026-05-12 Agent D has NOT yet committed a W5h DTO — this
+/// type is the frontend's first-draft contract derived from the W5h
+/// prompt. Field names use the same conventions as Agent D's W5g
+/// `ChatExecuteResultDto` (snake_case, `used_*_bps` for echoed
+/// metrics, u64 → JSON string for raw integers). If Agent D ships a
+/// different shape, the integration step adjusts this interface and
+/// the `w5h_conditional_order` ChatResponse tag.
+///
+/// ── INTEGER SAFETY ────────────────────────────────────────────────
+/// Raw u64 fields are STRINGS (`amount_raw`, `current_budget_raw`,
+/// balance deltas). bps fields stay as numbers. `expires_at_ms` is
+/// modelled as `string` to dodge JS Number precision on a wall-clock
+/// millisecond timestamp far enough in the future; the countdown
+/// component clamps to Number after a safe-integer guard.
+export interface W5hConditionalDepositResult {
+  /// Echo of the user's chat command. Rendered verbatim in the
+  /// card's italic header so the demo viewer sees the round-trip.
+  input_text: string;
+
+  /// Server-side lifecycle status. See module doc for the full
+  /// transition graph. The frontend's local in-flight states
+  /// (signing / submitted / pending) sit on top of these.
+  status:
+    | "funding_required"
+    | "budget_reserved"
+    | "watching"
+    | "ready_to_execute"
+    | "expired"
+    | "refunded"
+    | "funding_failed";
+
+  /// 32-char hex of the deterministic rule id. Survives across the
+  /// funding lifecycle so the W5g approval command can reference it
+  /// once budget_reserved.
+  rule_id_hex: string;
+  /// 64-char hex of the canonical Borsh-encoded rule hash. Required
+  /// by the W5g approval command body.
+  canonical_rule_hash_hex: string;
+
+  /// Required budget in raw USDC units (1 USDC = 1_000_000).
+  /// Constant `"250000"` for the W5h 0.25 USDC demo grammar. u64 →
+  /// string per the integer-safety rule.
+  amount_raw: string;
+  /// Live USDC balance at the controlled-wallet USDC ATA, raw units.
+  /// Optional — populated after backend re-reads on confirm.
+  current_budget_raw?: string | null;
+
+  /// User's wallet pubkey, base58. The chat-route either binds this
+  /// from the session-wallet binding OR echoes the user-supplied
+  /// pubkey; the frontend uses it to gate the Fund button (refuse
+  /// if connected Phantom pubkey ≠ this value).
+  user_wallet?: string | null;
+  /// User's USDC ATA derived from `(user_wallet, USDC_MINT)`, base58.
+  /// Optional — frontend can derive this from `user_wallet` if the
+  /// backend omits it.
+  user_usdc_ata?: string | null;
+
+  /// Controlled (bounded-executor) wallet pubkey, base58. Always
+  /// the project-pinned `BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L`.
+  controlled_wallet: string;
+  /// Controlled-wallet USDC ATA, base58. The funding-tx destination.
+  controlled_usdc_ata: string;
+
+  /// Wall-clock expiry as Unix milliseconds. STRING because some
+  /// chat commands could land us > 2^53 ms in the future
+  /// hypothetically; defensive against any future expiry math.
+  expires_at_ms: string;
+  /// Solana slot at which the reserve + balance were read. Liveness
+  /// anchor.
+  last_checked_slot?: string | null;
+
+  /// Echo of the threshold the user typed, in basis points.
+  threshold_bps: number;
+  /// Echo of the percent label the user typed (e.g. `"1"` or
+  /// `"2.5"`).
+  threshold_pct_label: string;
+  /// `true` when `save_display_apy_bps > threshold_bps`. Only
+  /// meaningful for `watching` / `ready_to_execute`.
+  condition_met?: boolean;
+
+  /// Save UI display APY at last check, in basis points. Primary
+  /// decision metric.
+  save_display_apy_bps?: number | null;
+  /// Native on-chain supply APR at last check, in basis points.
+  /// Audit-only — Save APY drives the decision.
+  native_onchain_apr_bps?: number | null;
+  /// Provenance for the native APR — typically `"b_o1_reserve_math"`.
+  native_onchain_apr_source?: string | null;
+  /// Which metric drove the decision. Always `"save_display_apy"`
+  /// on the W5h happy path.
+  decision_source?: string | null;
+
+  /// Once a funding tx exists, its base58 signature. Survives across
+  /// confirm round-trips so the card can keep the Solscan link.
+  funding_signature?: string | null;
+  /// Slot at which the funding tx confirmed. u64 → string.
+  funding_confirmation_slot?: string | null;
+
+  /// If the backend supports refund (status === "expired" or
+  /// "refunded"), this carries the refund tx signature.
+  refund_signature?: string | null;
+
+  /// Human-readable failure reason for `funding_failed`. Sent
+  /// through verbatim; never inspected for structural meaning.
+  error_reason?: string | null;
+  /// Snake-case error variant. Optional.
+  error_code?: string | null;
+}
+
+/// Wire request body for `POST /sessions/:id/stage2/w5h/funding/confirm`.
+/// The frontend POSTs this immediately after a successful
+/// `sendRawTransaction` so the backend can authoritatively verify the
+/// funding move and re-emit an updated `W5hConditionalDepositResult`.
+export interface W5hFundingConfirmRequest {
+  rule_id_hex: string;
+  funding_signature: string;
+  user_wallet: string;
+  user_usdc_ata: string;
+  controlled_wallet: string;
+  controlled_usdc_ata: string;
+  amount_raw: string;
+}
+
+/// Response envelope for the confirm route. On 200, the body IS the
+/// updated `W5hConditionalDepositResult` (same shape; new status).
+/// 4xx/5xx surface as `{ kind: "error", httpStatus, error }`.
+export type W5hFundingConfirmEnvelope =
+  | { kind: "ok"; response: W5hConditionalDepositResult }
+  | { kind: "error"; httpStatus: number; error: string };
+
 /// Wire DTO for the W5g chat-first execution result.
 ///
 /// Field names + status values mirror Agent D's
@@ -498,6 +648,14 @@ export type ChatResponse =
   | { status: "tool_error"; tool_name: string; message: string }
   | { status: "pending_action_exists"; reason: string }
   | { status: "w5d_conditional_deposit"; result: W5dConditionalDepositResult }
+  /// W5h chat-first funding-gated conditional order. Tag string is
+  /// the frontend's first-draft contract (Agent D hadn't shipped a
+  /// W5h DTO as of 2026-05-12); integration step adjusts if Agent D
+  /// chooses a different name.
+  | {
+      status: "w5h_conditional_order";
+      result: W5hConditionalDepositResult;
+    }
   /// W5g chat-first execution result. Tag string aligns with the Rust
   /// enum's `#[serde(rename_all = "snake_case")]` projection of the
   /// variant `W5gConditionalExecution { result }`. Agent D may rename
@@ -541,6 +699,19 @@ export type ChatMessage =
       /// The thrown error's message string. Rendered in a small detail
       /// region so the operator can see the underlying transport
       /// failure — never used to decide whether the tx succeeded.
+      networkError: string;
+      at: IsoDate;
+    }
+  /// Client-side safe-error card for the W5h CHAT path. Emitted when
+  /// `postChat` itself throws while the user's last message looked
+  /// like a W5h conditional-order command. Distinct from a Phantom
+  /// signing rejection (which surfaces inside the W5h card's own
+  /// flow state) — this covers the case where the chat request never
+  /// returned a response body at all.
+  | {
+      id: string;
+      kind: "local_w5h_safe_error";
+      userText: string;
       networkError: string;
       at: IsoDate;
     };
