@@ -1317,36 +1317,55 @@ function W5hConditionalOrderCard({
 
   // ── W5i auto-execution status polling ─────────────────────────────
   //
-  // Once the order is `budget_reserved` or `ready_to_execute` and the
-  // backend gives us a `rule_id_hex`, poll the status route every 5 s
-  // so the demo viewer sees the W5i watcher → executing → completed
-  // transition in real time. Stops on terminal auto-execution states
-  // (completed / failed / broadcasted_timeout) and on network errors
-  // (we keep the last result and surface a small "status refresh
-  // delayed" notice — never overwriting good state with a bad one).
+  // Once the order has a `rule_id_hex` AND the server status is in the
+  // "active lifecycle" set (`budget_reserved | ready_to_execute |
+  // executing | funding_pending`), poll `/sessions/:id/stage2/w5h/order
+  // /:rule_id_hex` every 3 s. Stop when the server reports a TERMINAL
+  // status (`completed | failed | broadcasted_timeout | expired |
+  // refunded | funding_invalid`) or when we hit the bounded 5-minute
+  // ceiling.
   //
-  // READ-ONLY: the polling effect performs ONLY a GET. It never signs,
-  // never broadcasts, never constructs a Solend instruction.
+  // Critical: the poller keeps running THROUGH `executing` — that
+  // server-side state is the ONLY way the frontend learns the watcher
+  // promoted the order from `budget_reserved` to mid-broadcast, and it
+  // needs to keep checking until the executor lands `completed`.
+  //
+  // Read-only: pure GET. Never signs, never broadcasts, never
+  // constructs a Solend instruction. On a transient envelope error we
+  // KEEP the last good `result` and surface a small "status refresh
+  // delayed" notice — never overwriting confirmed state with a bad
+  // poll.
+  const W5I_STATUS_POLL_INTERVAL_MS = 3_000;
+  const W5I_STATUS_POLL_MAX_ATTEMPTS = 100; // ≈ 5 minute ceiling
+
   const [statusPollError, setStatusPollError] = useState<string | null>(
     null,
   );
   const ruleIdForPoll = result.rule_id_hex;
-  const autoExecStatus = result.auto_execution_status ?? null;
-  const autoExecTerminal =
-    autoExecStatus === "completed" ||
-    autoExecStatus === "failed" ||
-    autoExecStatus === "broadcasted_timeout";
+  const TERMINAL_STATUSES = new Set<W5hConditionalDepositResult["status"]>([
+    "completed",
+    "failed",
+    "funding_failed",
+    "broadcasted_timeout",
+    "expired",
+    "refunded",
+    "funding_invalid",
+  ]);
+  const ACTIVE_POLL_STATUSES = new Set<W5hConditionalDepositResult["status"]>([
+    "budget_reserved",
+    "ready_to_execute",
+    "executing",
+    "funding_pending",
+    "funding_submitted",
+    "watching",
+    "refunding",
+  ]);
   const shouldPollOrderStatus =
     sessionId !== null &&
     typeof ruleIdForPoll === "string" &&
     ruleIdForPoll.length > 0 &&
-    (result.status === "budget_reserved" ||
-      result.status === "ready_to_execute") &&
-    !autoExecTerminal;
-  // 5 s ticker — bounded by `shouldPollOrderStatus` flipping to false
-  // (terminal state reached, or order moved out of the watching
-  // window). No artificial attempt cap; the upstream lifecycle is the
-  // natural exit.
+    ACTIVE_POLL_STATUSES.has(result.status) &&
+    !TERMINAL_STATUSES.has(result.status);
   useEffect(() => {
     if (!shouldPollOrderStatus) return;
     if (sessionId === null) return;
@@ -1354,14 +1373,32 @@ function W5hConditionalOrderCard({
       return;
     }
     let cancelled = false;
+    let attempts = 0;
+    let intervalId: number | null = null;
+    const stop = () => {
+      cancelled = true;
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+        intervalId = null;
+      }
+    };
     const pollOnce = async () => {
       if (cancelled) return;
+      attempts += 1;
       try {
         const env = await getW5hOrderStatus(sessionId, ruleIdForPoll);
         if (cancelled) return;
         if (env.kind === "ok") {
           setResult(env.response);
           setStatusPollError(null);
+          // If the backend just reported a terminal status, stop the
+          // ticker explicitly — the `useEffect` cleanup will also do
+          // this when `shouldPollOrderStatus` flips false on the next
+          // render, but stopping eagerly avoids a stray late poll.
+          if (TERMINAL_STATUSES.has(env.response.status)) {
+            stop();
+            return;
+          }
         } else {
           // Backend transient — keep last good state visible.
           setStatusPollError(`status refresh delayed (${env.httpStatus})`);
@@ -1370,17 +1407,27 @@ function W5hConditionalOrderCard({
         if (cancelled) return;
         setStatusPollError("status refresh delayed (network)");
       }
+      if (attempts >= W5I_STATUS_POLL_MAX_ATTEMPTS) {
+        // Bounded ceiling reached. The order may still flip on its own
+        // server-side; the operator just stops getting auto-updates.
+        // Keep the last `result` and last `statusPollError` visible.
+        stop();
+      }
     };
-    // First poll immediately so the demo viewer doesn't wait 5 s
-    // for the very first transition.
+    // First poll immediately so the demo viewer doesn't wait 3 s for
+    // the first transition.
     void pollOnce();
-    const id = window.setInterval(() => {
+    intervalId = window.setInterval(() => {
       void pollOnce();
-    }, 5_000);
+    }, W5I_STATUS_POLL_INTERVAL_MS);
     return () => {
-      cancelled = true;
-      window.clearInterval(id);
+      stop();
     };
+    // TERMINAL_STATUSES / ACTIVE_POLL_STATUSES are module-stable Sets
+    // built inside the component; including them in deps would force
+    // an effect restart on every render. `shouldPollOrderStatus`
+    // already captures the relevant boolean.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shouldPollOrderStatus, sessionId, ruleIdForPoll]);
 
   // ── Wallet gating ─────────────────────────────────────────────────
@@ -1915,9 +1962,23 @@ function W5hConditionalOrderCard({
           </div>
         )}
 
-        {/* ── W5i auto-execution status section ────────────────── */}
+        {/* ── W5i auto-execution status section ──────────────────
+            Renders whenever the order has reached or passed
+            `budget_reserved`, including the terminal `completed` /
+            `failed` / `broadcasted_timeout` / `expired` / `refunded`
+            / `funding_invalid` states. Polling stops inside the
+            section's hosting effect on terminal states; the rendered
+            content shows the last known DTO. */}
         {(result.status === "budget_reserved" ||
-          result.status === "ready_to_execute") && (
+          result.status === "ready_to_execute" ||
+          result.status === "executing" ||
+          result.status === "completed" ||
+          result.status === "failed" ||
+          result.status === "broadcasted_timeout" ||
+          result.status === "expired" ||
+          result.status === "refunding" ||
+          result.status === "refunded" ||
+          result.status === "funding_invalid") && (
           <W5iAutoExecutionSection
             result={result}
             statusPollError={statusPollError}
@@ -1925,34 +1986,40 @@ function W5hConditionalOrderCard({
         )}
 
         {/* ── Hand-off: W5g approval-command panel ───────────────
-            When the backend reports `auto_execution_enabled === true`
-            the demo is fully autonomous — the manual W5g chat command
-            collapses under a "Manual fallback" toggle so the demo
-            audience sees the autopilot path. When `false` / undefined
-            (e.g. W5h-lite mode without auto-watcher), the panel stays
-            visible as the primary execution affordance. */}
-        {showW5gPanel && (
-          result.auto_execution_enabled === true ? (
-            <details
-              className="mt-3"
-              data-testid="w5g-manual-fallback-details"
+            UX gate per the W5i bug-fix scope:
+              - auto_execution_enabled === true:
+                  Hide the manual W5g command outright. Replace with a
+                  single-line "watcher is monitoring" line — no copy
+                  affordance, no chat-command pasting needed.
+              - auto_execution_enabled === false / undefined:
+                  Keep the panel visible inline (manual demo path).
+
+            When the order has already reached a terminal state the
+            panel is suppressed regardless — there's no point pasting
+            a chat command after `completed` / `failed`. */}
+        {showW5gPanel &&
+          !TERMINAL_STATUSES.has(result.status) &&
+          (result.auto_execution_enabled === true ? (
+            <div
+              className="mt-3 rounded border border-emerald-300 bg-emerald-50/70 p-3 text-xs text-emerald-900"
+              data-testid="w5i-auto-watcher-note"
             >
-              <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">
-                Manual fallback command (backup path — auto-execution is
-                enabled)
-              </summary>
-              <ReadyToExecuteCommandPanel
-                ruleIdHex={result.rule_id_hex}
-                canonicalRuleHashHex={result.canonical_rule_hash_hex}
-              />
-            </details>
+              <div className="font-medium">
+                Watcher is monitoring — no manual action required.
+              </div>
+              <p className="mt-1 leading-snug">
+                When the Save APY crosses the threshold, the backend
+                executor will build, sign, and broadcast the Solend
+                deposit on its own (typically within ~30 s). The
+                W5g approval chat command is NOT needed in auto mode.
+              </p>
+            </div>
           ) : (
             <ReadyToExecuteCommandPanel
               ruleIdHex={result.rule_id_hex}
               canonicalRuleHashHex={result.canonical_rule_hash_hex}
             />
-          )
-        )}
+          ))}
 
         {/* ── Expired branch (W5h-lite: no refund promise) ─────── */}
         {result.status === "expired" && (
@@ -2139,35 +2206,63 @@ function W5iAutoExecutionSection({
   result: W5hConditionalDepositResult;
   statusPollError: string | null;
 }) {
-  // No backend signal at all → render nothing. Keeps the card clean
-  // when running against a backend version that pre-dates W5i.
+  // Render when ANY W5i signal is present: backend auto-flag, server
+  // status that lives in the post-funding lifecycle, OR a populated
+  // execution_signature. Keeps the card clean against a pre-W5i
+  // backend that omits everything.
+  const inPostFundingLifecycle =
+    result.status === "budget_reserved" ||
+    result.status === "ready_to_execute" ||
+    result.status === "executing" ||
+    result.status === "completed" ||
+    result.status === "failed" ||
+    result.status === "broadcasted_timeout" ||
+    result.status === "expired" ||
+    result.status === "refunding" ||
+    result.status === "refunded" ||
+    result.status === "funding_invalid";
   if (
     result.auto_execution_enabled === undefined &&
-    result.auto_execution_status === undefined
+    result.auto_execution_status === undefined &&
+    !result.execution_signature &&
+    !inPostFundingLifecycle
   ) {
     return null;
   }
 
   const autoOn = result.auto_execution_enabled === true;
-  const autoStatus = result.auto_execution_status ?? null;
-  const banner = w5iAutoBanner(autoOn, autoStatus);
+  // Prefer the server-side `status` flow (the canonical Agent D
+  // contract). Fall back to the legacy `auto_execution_status` only
+  // when the canonical field is absent (back-compat with showcase
+  // fixtures + the W5i prototype).
+  const banner = w5iServerStatusBanner(result.status, autoOn);
 
-  // Resolve Solscan URL — backend-supplied one wins; otherwise build
-  // from the signature.
-  const sig = result.auto_tx_signature ?? null;
+  // Prefer the canonical top-level fields the live backend returns
+  // (`execution_signature`, `solscan_url`). Fall back to the legacy
+  // `auto_*` aliases used by the showcase fixture.
+  const execSig =
+    result.execution_signature ?? result.auto_tx_signature ?? null;
   const solscan =
-    result.auto_solscan_url ?? (sig ? solscanTxUrl(sig) : null);
+    result.solscan_url ??
+    result.auto_solscan_url ??
+    (execSig ? solscanTxUrl(execSig) : null);
 
   // Last-check timestamp display — a relative "Ns ago" string. Uses
   // safe-int guard against absurd payloads.
   const lastCheckedLabel = formatRelativeMsAgo(result.auto_last_checked_at_ms);
+
+  // Error rendering — prefer the canonical `last_error` field over
+  // the W5h-lite `auto_error_*` aliases.
+  const errCode = result.auto_error_code ?? null;
+  const errReason =
+    result.last_error ?? result.auto_error_reason ?? null;
 
   return (
     <div
       className="mt-3"
       data-testid="w5i-auto-execution-section"
       data-auto-enabled={autoOn ? "true" : "false"}
-      data-auto-status={autoStatus ?? "(none)"}
+      data-server-status={result.status}
     >
       <div
         data-testid="w5i-auto-banner"
@@ -2181,15 +2276,17 @@ function W5iAutoExecutionSection({
         <dd className="font-mono">
           {autoOn ? "enabled" : "disabled"}
         </dd>
-        {autoStatus !== null && (
+        <dt className="text-muted-foreground">server status</dt>
+        <dd
+          className="font-mono"
+          data-testid="w5i-server-status"
+        >
+          {result.status}
+        </dd>
+        {result.budget_status && (
           <>
-            <dt className="text-muted-foreground">watcher status</dt>
-            <dd
-              className="font-mono"
-              data-testid="w5i-auto-watcher-status"
-            >
-              {autoStatus}
-            </dd>
+            <dt className="text-muted-foreground">budget status</dt>
+            <dd className="font-mono">{result.budget_status}</dd>
           </>
         )}
         {lastCheckedLabel && (
@@ -2198,14 +2295,14 @@ function W5iAutoExecutionSection({
             <dd className="font-mono">{lastCheckedLabel}</dd>
           </>
         )}
-        {sig && (
+        {execSig && (
           <>
-            <dt className="text-muted-foreground">auto tx signature</dt>
+            <dt className="text-muted-foreground">Solend tx signature</dt>
             <dd
               className="font-mono break-all"
-              data-testid="w5i-auto-tx-signature"
+              data-testid="w5i-execution-signature"
             >
-              {sig}
+              {execSig}
             </dd>
           </>
         )}
@@ -2218,7 +2315,7 @@ function W5iAutoExecutionSection({
                 target="_blank"
                 rel="noopener noreferrer"
                 className="font-mono underline hover:no-underline break-all"
-                data-testid="w5i-auto-solscan-link"
+                data-testid="w5i-solscan-link"
               >
                 {solscan}
               </a>
@@ -2263,30 +2360,41 @@ function W5iAutoExecutionSection({
             </dd>
           </>
         )}
-        {(result.auto_error_code || result.auto_error_reason) && (
+        {(errCode || errReason) && (
           <>
-            {result.auto_error_code && (
+            {errCode && (
               <>
                 <dt className="text-muted-foreground">error code</dt>
                 <dd
                   className="font-mono"
                   data-testid="w5i-auto-error-code"
                 >
-                  {result.auto_error_code}
+                  {errCode}
                 </dd>
               </>
             )}
-            {result.auto_error_reason && (
+            {errReason && (
               <>
                 <dt className="text-muted-foreground">error reason</dt>
                 <dd
                   className="break-words whitespace-pre-wrap"
                   data-testid="w5i-auto-error-reason"
                 >
-                  {result.auto_error_reason}
+                  {errReason}
                 </dd>
               </>
             )}
+          </>
+        )}
+        {result.refund_signature && (
+          <>
+            <dt className="text-muted-foreground">refund signature</dt>
+            <dd
+              className="font-mono break-all"
+              data-testid="w5i-refund-signature"
+            >
+              {result.refund_signature}
+            </dd>
           </>
         )}
       </dl>
@@ -2303,26 +2411,26 @@ function W5iAutoExecutionSection({
   );
 }
 
-/// Per-(auto_enabled, auto_status) banner copy + tone. The W5i prompt
-/// pins specific copy for each lifecycle state.
-function w5iAutoBanner(
+/// Banner copy + tone derived from the canonical server `status` enum.
+/// Used by the W5i section to render a status-aware banner without
+/// requiring the optional `auto_execution_status` sub-field. Aligned
+/// with the W5i bug-fix prompt copy verbatim where the user pinned a
+/// specific string.
+function w5iServerStatusBanner(
+  status: W5hConditionalDepositResult["status"],
   autoOn: boolean,
-  autoStatus: W5hConditionalDepositResult["auto_execution_status"] | null,
 ): { tone: string; text: string } {
-  if (!autoOn) {
-    return {
-      tone: "bg-muted text-muted-foreground border-muted",
-      text: "Budget reserved — execution gate is off.",
-    };
-  }
-  switch (autoStatus) {
-    case "watching":
-    case null:
-    case undefined:
-      return {
-        tone: "bg-sky-50 text-sky-900 border-sky-200",
-        text: "Budget reserved — watching Save APY every 30 seconds.",
-      };
+  switch (status) {
+    case "budget_reserved":
+      return autoOn
+        ? {
+            tone: "bg-sky-50 text-sky-900 border-sky-200",
+            text: "Budget reserved — watcher monitoring Save APY every ~30 s.",
+          }
+        : {
+            tone: "bg-muted text-muted-foreground border-muted",
+            text: "Budget reserved — execution gate is off.",
+          };
     case "ready_to_execute":
       return {
         tone: "bg-emerald-50 text-emerald-900 border-emerald-200",
@@ -2339,6 +2447,7 @@ function w5iAutoBanner(
         text: "Completed — Solend deposit finalized.",
       };
     case "failed":
+    case "funding_failed":
       return {
         tone: "bg-rose-50 text-rose-900 border-rose-200",
         text: "Execution failed — no retry was attempted.",
@@ -2348,12 +2457,49 @@ function w5iAutoBanner(
         tone: "bg-amber-50 text-amber-900 border-amber-200",
         text: "Broadcasted but finality timed out — check explorer.",
       };
+    case "funding_invalid":
+      return {
+        tone: "bg-rose-50 text-rose-900 border-rose-200",
+        text: "Funding invalid — on-chain delta did not match.",
+      };
+    case "expired":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Order window closed.",
+      };
+    case "refunding":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Refund in progress…",
+      };
+    case "refunded":
+      return {
+        tone: "bg-muted text-muted-foreground border-muted",
+        text: "Refunded — budget returned to user wallet.",
+      };
+    // Pre-budget statuses — section renders only when one is
+    // surfaced via auto-flags, but cover the cases for safety.
+    case "funding_required":
+    case "funding_submitted":
+    case "funding_pending":
+    case "watching":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Pending — order has not yet reached budget_reserved.",
+      };
     default: {
-      const exhaustive: never = autoStatus;
+      const exhaustive: never = status;
       return { tone: "", text: String(exhaustive) };
     }
   }
 }
+
+// `w5iAutoBanner(autoOn, autoStatus)` was the W5i prototype helper
+// that dispatched on the optional `auto_execution_status` sub-field.
+// It is superseded by `w5iServerStatusBanner` (above), which dispatches
+// on the canonical `status` enum the live backend returns from
+// `GET /sessions/:id/stage2/w5h/order/:rule_id_hex`. Removed in the
+// W5i bug-fix to avoid two banner-copy sources drifting apart.
 
 /// "Ns ago" string from a Unix-millis timestamp. Returns `null` when
 /// the input isn't a parseable safe-int — defensive against backend
@@ -2460,6 +2606,7 @@ function w5hBanner(
         text: "Funding failed — see error details below.",
       };
     case "funding_pending":
+    case "funding_submitted":
       // The backend has the signature but hasn't observed on-chain
       // budget yet. The frontend's bounded confirm-poll loop keeps
       // hitting the confirm route every ~2.5 s while this status
@@ -2468,6 +2615,36 @@ function w5hBanner(
       return {
         tone: "bg-amber-50 text-amber-900 border-amber-200",
         text: "Funding submitted — waiting for chain confirmation.",
+      };
+    case "funding_invalid":
+      return {
+        tone: "bg-rose-50 text-rose-900 border-rose-200",
+        text: "Funding invalid — on-chain delta did not match the expected transfer.",
+      };
+    case "executing":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Executing on mainnet — the W5i auto-watcher is broadcasting the Solend deposit.",
+      };
+    case "completed":
+      return {
+        tone: "bg-emerald-50 text-emerald-900 border-emerald-200",
+        text: "Completed — Solend deposit finalized on mainnet.",
+      };
+    case "failed":
+      return {
+        tone: "bg-rose-50 text-rose-900 border-rose-200",
+        text: "Auto-execution failed — see error details below.",
+      };
+    case "broadcasted_timeout":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Broadcasted but finality timed out — verify on Solscan.",
+      };
+    case "refunding":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Refund in progress — backend is returning the budget to the user wallet.",
       };
     case "funding_required":
       // Fall through to flow-dependent copy below.

@@ -1209,10 +1209,13 @@ export async function confirmW5hFunding(
 
 // ── W5i order-status polling route ──────────────────────────────────────────
 //
-// `GET /sessions/:id/stage2/w5h/orders/:rule_id_hex` — frontend polls
-// this every ~5 s once an order is `budget_reserved` / `ready_to_execute`
-// so the demo viewer sees the W5i auto-watcher → executing → completed
-// transition without any frontend Solend tx work.
+// `GET /sessions/:id/stage2/w5h/order/:rule_id_hex` — frontend polls
+// this every ~3 s once an order is `budget_reserved` (or any earlier
+// non-terminal state) so the demo viewer sees the W5i auto-watcher →
+// executing → completed transition without any frontend Solend tx
+// work. Backend route is the SINGULAR `/order/`; an earlier draft of
+// this client typoed it as `/orders/` and silently 404'd every poll —
+// the card never auto-flipped to `completed`.
 //
 // READ-ONLY: this helper performs only a GET. It NEVER signs, NEVER
 // broadcasts, NEVER constructs a Solend instruction. The auto-executed
@@ -1236,7 +1239,9 @@ export async function getW5hOrderStatus(
   if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
 
   const res = await fetch(
-    `${GATEWAY_URL}/sessions/${sessionId}/stage2/w5h/orders/${ruleIdHex}`,
+    // Backend route is SINGULAR `/order/` — see
+    // crates/api/src/routes/stage2_w5h_order_status.rs:48.
+    `${GATEWAY_URL}/sessions/${sessionId}/stage2/w5h/order/${ruleIdHex}`,
     { method: "GET", headers, cache: "no-store" },
   );
 
@@ -1291,33 +1296,25 @@ function showcaseW5iOrderStatusReply(
   const seen = SHOWCASE_W5I_STATUS_CALLS.get(ruleIdHex) ?? 0;
   SHOWCASE_W5I_STATUS_CALLS.set(ruleIdHex, seen + 1);
 
-  // Phase 1 — watching (server status = budget_reserved + auto = watching)
+  // Phase 1 — budget_reserved (watcher monitoring).
   if (seen < SHOWCASE_W5I_POLLS_PER_PHASE) {
     return {
       kind: "ok",
       response: buildShowcaseW5i(ruleIdHex, {
         status: "budget_reserved",
-        auto_execution_status: "watching",
+        budget_status: "reserved",
       }),
     };
   }
-  // Phase 2 — ready_to_execute (condition met but executor hasn't fired)
+  // Phase 2 — executing (mid-broadcast). Backend status flips to
+  // `executing` once the executor has signed and broadcast the
+  // Solend deposit but hasn't yet seen finality.
   if (seen < SHOWCASE_W5I_POLLS_PER_PHASE * 2) {
     return {
       kind: "ok",
       response: buildShowcaseW5i(ruleIdHex, {
-        status: "ready_to_execute",
-        auto_execution_status: "ready_to_execute",
-      }),
-    };
-  }
-  // Phase 3 — executing
-  if (seen < SHOWCASE_W5I_POLLS_PER_PHASE * 3) {
-    return {
-      kind: "ok",
-      response: buildShowcaseW5i(ruleIdHex, {
-        status: "ready_to_execute",
-        auto_execution_status: "executing",
+        status: "executing",
+        budget_status: "reserved",
       }),
     };
   }
@@ -1326,11 +1323,11 @@ function showcaseW5iOrderStatusReply(
     return {
       kind: "ok",
       response: buildShowcaseW5i(ruleIdHex, {
-        status: "ready_to_execute",
-        auto_execution_status: "failed",
-        auto_error_code: "simulation_failed",
-        auto_error_reason:
+        status: "failed",
+        budget_status: "reserved",
+        last_error:
           "Showcase fixture: rule_id suffix '…execfail' triggers the failed branch.",
+        auto_error_code: "simulation_failed",
       }),
     };
   }
@@ -1338,14 +1335,14 @@ function showcaseW5iOrderStatusReply(
     return {
       kind: "ok",
       response: buildShowcaseW5i(ruleIdHex, {
-        status: "ready_to_execute",
-        auto_execution_status: "broadcasted_timeout",
-        auto_tx_signature:
+        status: "broadcasted_timeout",
+        budget_status: "reserved",
+        execution_signature:
           "4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
-        auto_solscan_url: null,
-        auto_error_code: "confirmation_timeout",
-        auto_error_reason:
+        solscan_url: null,
+        last_error:
           "Showcase fixture: broadcasted but finality not observed within window.",
+        auto_error_code: "confirmation_timeout",
       }),
     };
   }
@@ -1353,11 +1350,11 @@ function showcaseW5iOrderStatusReply(
   return {
     kind: "ok",
     response: buildShowcaseW5i(ruleIdHex, {
-      status: "ready_to_execute",
-      auto_execution_status: "completed",
-      auto_tx_signature:
+      status: "completed",
+      budget_status: "completed",
+      execution_signature:
         "4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
-      auto_solscan_url:
+      solscan_url:
         "https://solscan.io/tx/4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
       auto_confirmation_slot: "419100000",
       auto_usdc_delta_raw: "-250000",

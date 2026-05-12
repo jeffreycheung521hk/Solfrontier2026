@@ -384,28 +384,43 @@ export interface W5hConditionalDepositResult {
   /// card's italic header so the demo viewer sees the round-trip.
   input_text: string;
 
-  /// Server-side lifecycle status. See module doc for the full
-  /// transition graph. The frontend's local in-flight states
-  /// (signing / submitted / chain-polling) sit on top of these.
+  /// Server-side lifecycle status. Aligned with the canonical backend
+  /// enum in `claw_api::state::W5hOrderStatusDto.status`
+  /// (`crates/api/src/state.rs` line ~1318):
   ///
-  /// `funding_pending` is the backend's "I accepted the funding
-  /// signature but haven't yet observed it as on-chain budget" state.
-  /// The frontend polls the confirm route on a bounded loop while
-  /// this status holds and does NOT treat it as failure.
+  ///   funding_required → funding_submitted → funding_pending →
+  ///   funding_invalid (terminal) | budget_reserved → executing →
+  ///   completed (terminal) | failed (terminal) | broadcasted_timeout
+  ///   (terminal) | expired (terminal) | refunding → refunded (terminal)
   ///
-  /// `expired` / `refunded` may still be emitted by the backend, but
-  /// the W5h-lite demo (2026-05-12) no longer promises an automatic
-  /// refund — manual operator action is the assumed cancellation
-  /// path. The frontend renders these informationally only.
+  /// Frontend renders ONE card branch per status. The W5i polling
+  /// loop continues while status ∈ {budget_reserved, ready_to_execute,
+  /// executing, funding_pending} and stops on any terminal state.
+  ///
+  /// Back-compat names kept in the union:
+  ///   - `funding_pending` — emitted by the confirm-route fixture
+  ///     during the bounded re-poll window.
+  ///   - `watching` / `ready_to_execute` — emitted by the legacy
+  ///     W5e/W5f chat-route before the W5i state machine flattened
+  ///     them into `budget_reserved`.
+  ///   - `funding_failed` — pre-W5i name for what the backend now
+  ///     emits as `failed`.
   status:
     | "funding_required"
+    | "funding_submitted"
     | "funding_pending"
+    | "funding_invalid"
     | "budget_reserved"
     | "watching"
     | "ready_to_execute"
+    | "executing"
+    | "completed"
     | "expired"
+    | "refunding"
     | "refunded"
-    | "funding_failed";
+    | "failed"
+    | "funding_failed"
+    | "broadcasted_timeout";
 
   /// 32-char hex of the deterministic rule id. Survives across the
   /// funding lifecycle so the W5g approval command can reference it
@@ -491,6 +506,31 @@ export interface W5hConditionalDepositResult {
   error_reason?: string | null;
   /// Snake-case error variant. Optional.
   error_code?: string | null;
+
+  // ── Canonical W5i order-status fields (backend, top-level) ────────
+  //
+  // These mirror `claw_api::state::W5hOrderStatusDto` field names
+  // exactly. The `auto_*` mirrors below are kept for back-compat with
+  // showcase fixtures and the W5i frontend prototype; the card render
+  // logic now prefers these canonical names and falls back to the
+  // `auto_*` aliases only when the canonical field is absent.
+
+  /// Set when the W5i auto-execution watcher (or manual W5g) completes
+  /// the Solend deposit. Base58 signature, same value the W5g card
+  /// uses for `tx_signature`. This is the field the live backend
+  /// returns from `GET /sessions/:id/stage2/w5h/order/:rule_id_hex`.
+  execution_signature?: string | null;
+  /// Pre-built Solscan URL for `execution_signature` — the frontend
+  /// falls back to `https://solscan.io/tx/<sig>` when omitted.
+  solscan_url?: string | null;
+  /// Lightweight chip label for the card (`"reserved"` while the
+  /// budget is held, `"completed"` after auto-execution, etc.).
+  budget_status?: string | null;
+  /// Backend-set last error string. Populated on `failed` /
+  /// `funding_invalid` / `broadcasted_timeout`. Distinct from
+  /// `error_reason` (which is the frontend's preferred name for the
+  /// chat-route / funding-confirm error path).
+  last_error?: string | null;
 
   // ── W5i — backend auto-watcher / auto-execution status ────────────
   //
