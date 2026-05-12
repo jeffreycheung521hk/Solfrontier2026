@@ -43,26 +43,41 @@ ws_url = "wss://api.devnet.solana.com"
 timeout_ms = 15000
 
 # ── Wallets ────────────────────────────────────────────────────────────────
-# One or more wallets to load at startup.
-# For development you can use a keypair JSON file generated with:
-#   solana-keygen new --outfile ~/.config/solana/devnet.json
+# By default no wallets are configured. The daemon will start, expose its
+# read-only and policy surfaces, and accept proposals — but actions that
+# require a signer will return a typed configuration error until a wallet
+# is added below.
+#
+# For a fresh clone (`cargo run --bin clawd`), this means:
+#   - `cargo check` / `cargo test` work out of the box (no wallet required)
+#   - the daemon starts and binds to 127.0.0.1
+#   - signing actions fail-closed until you uncomment one of the examples
+#     below and provide a real keypair / pubkey
+#
+# Choose ONE of the examples below and uncomment it.
 
-# Example: load from file
-[[wallets]]
-label = "devnet-hot-wallet"
-signer_type = "local_keypair"
-# keypair_path = "~/.config/solana/devnet.json"  # Rust does NOT expand ~; use absolute path
-keypair_path = "data/devnet.json"
+# Example 1: local keypair loaded from a JSON file.
+# Generate one first:
+#   mkdir -p data
+#   solana-keygen new --outfile data/devnet.json
+#   solana airdrop 1 $(solana-keygen pubkey data/devnet.json) --url devnet
+#
+# Rust does NOT expand ~; use an absolute or repo-relative path.
+#
+# [[wallets]]
+# label = "devnet-hot-wallet"
+# signer_type = "local_keypair"
+# keypair_path = "data/devnet.json"
 
-# Example: load from base58 (for testing only — never commit real keys)
+# Example 2: load from base58 (for testing only — never commit real keys).
 # [[wallets]]
 # label = "test-wallet"
 # signer_type = "local_keypair"
 # keypair_base58 = "PASTE_BASE58_KEY_HERE"
 
-# Example: external wallet (e.g., Phantom)
-# Requires only the pubkey — no key material is loaded.
-# Transactions targeting this wallet route to the external signing path.
+# Example 3: external wallet (e.g., Phantom). Requires only the pubkey —
+# no key material is loaded. Transactions targeting this wallet route to
+# the external signing path (e.g., the /chat bind-wallet challenge flow).
 # [[wallets]]
 # label = "phantom-wallet"
 # signer_type = "external"

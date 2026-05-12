@@ -8,8 +8,13 @@
 //! 4. Simulate the transaction
 //! 5. If simulation passes → sign and submit
 //!
-//! ⚠ Requires: devnet keypair with SOL balance at
-//!   C:/Users/jeffr/Downloads/New/testingcrypto2/data/devnet.json
+//! ⚠ Requires a devnet keypair with SOL balance at `data/devnet.json`
+//! (or override with the `CLAW_DEVNET_KEYPAIR` env var). The test is
+//! `#[ignore]` by default — fresh clones see "ignored", not "failed".
+//! Generate a keypair first:
+//!   `solana-keygen new --outfile data/devnet.json`
+//!   `solana airdrop 1 $(solana-keygen pubkey data/devnet.json) --url devnet`
+//! Then run with: `cargo test -p claw-solana-core --test devnet_orca_swap_e2e -- --ignored --nocapture`
 
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSimulateTransactionConfig;
@@ -83,6 +88,7 @@ fn create_ata_idem(funder: &Pubkey, wallet: &Pubkey, mint: &Pubkey) -> Instructi
 }
 
 #[test]
+#[ignore = "requires data/devnet.json keypair; opt in with `cargo test -- --ignored`. See README §A."]
 fn e2e_orca_swap_devnet() {
     // Load real keypair
     let keypair = load_keypair();
