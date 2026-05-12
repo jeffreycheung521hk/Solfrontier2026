@@ -272,8 +272,55 @@ export function buildFundingTransaction(
 //     hostile DTO swapped in a non-USDC mint pubkey for `destinationAta`,
 //     the instruction would fail before the tx landed.
 
+// ── SPL Memo (v2) instruction ────────────────────────────────────────────
+//
+// The canonical on-chain Memo program. Memo v2 takes UTF-8 bytes as the
+// entire instruction data — no varint length prefix, no instruction tag.
+// Optional signer accounts in `keys` co-sign the memo; for the W5h
+// audit-anchor use case we don't co-sign (Phantom already signs the
+// payer slot of the tx as a whole), so `keys` is empty.
+
+/// Canonical SPL Memo v2 program. Pinned to a string + parsed once.
+/// Pubkey shipped with the @solana/web3.js standard library, but we
+/// pin it here so we don't depend on the optional @solana/spl-memo
+/// package.
+export const MEMO_PROGRAM_ID = new PublicKey(
+  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+);
+
+/// Build the W5h on-chain memo string. Canonical format:
+///   `claw:w5h:<rule_id_hex>:<canonical_rule_hash_hex>`
+///
+/// Used in two places — the actual `MemoSq4gqAB…` instruction data,
+/// and the W5h card's "Instruction hash memo" UI row. Keeping both
+/// behind a single helper ensures the value the user sees matches the
+/// bytes Phantom signs.
+///
+/// NEVER includes the natural-language chat command. The two hex
+/// anchors are deterministic and bound to the persisted rule; that's
+/// the audit signal we want on-chain. Free-form text would balloon
+/// the memo size and risk leaking commands.
+export function buildW5hMemoText(
+  ruleIdHex: string,
+  canonicalRuleHashHex: string,
+): string {
+  return `claw:w5h:${ruleIdHex}:${canonicalRuleHashHex}`;
+}
+
+/// Build a single-instruction Memo entry from a UTF-8 string. No
+/// co-signers; the memo is anchored by the outer transaction's
+/// payer signature alone.
+export function createMemoInstruction(memoText: string): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: MEMO_PROGRAM_ID,
+    keys: [],
+    data: Buffer.from(memoText, "utf8"),
+  });
+}
+
 /// Args for `buildW5hFundingTransaction`. Same shape as
-/// `BuildFundingTxArgs` plus an explicit `amountBaseUnits` parameter.
+/// `BuildFundingTxArgs` plus an explicit `amountBaseUnits` parameter
+/// plus the two memo-anchor hex strings.
 export interface BuildW5hFundingTxArgs {
   payer: PublicKey;
   sourceAta: PublicKey;
@@ -293,19 +340,30 @@ export interface BuildW5hFundingTxArgs {
   /// through; we never default to `CONTROLLED_WALLET_BASE58` here
   /// because that would silently mask a backend DTO drift.
   controlledWallet: PublicKey;
+  /// 32-char hex of the persisted `WatchRule.rule_id`. Anchored in
+  /// the on-chain memo as the first half of the audit string.
+  ruleIdHex: string;
+  /// 64-char hex of the rule's canonical Borsh hash. Anchored in
+  /// the on-chain memo as the second half — this is the rule's
+  /// integrity signature, distinct from the rule id.
+  canonicalRuleHashHex: string;
   recentBlockhash: string;
 }
 
 /// Build a W5h funding transaction (unsigned).
 ///
-/// Always:
+/// Always (in this exact order — Memo MUST be index 0):
+///   0. SPL Memo v2 — anchors `claw:w5h:<rule_id_hex>:<hash_hex>`
+///      on-chain so the audit trail of "this signature funded that
+///      rule" is recoverable without backend state.
 ///   1. (optional) `CreateIdempotent` ATA for the controlled-wallet
 ///      USDC ATA — safe to include unconditionally.
 ///   2. `TransferChecked` `amountBaseUnits` USDC from `sourceAta`
 ///      → `destinationAta`.
 ///
 /// Returns the assembled `Transaction`; the caller signs via Phantom
-/// and submits via JSON-RPC.
+/// (ONE signature on the payer slot, NO new co-signers) and submits
+/// via JSON-RPC.
 ///
 /// NOTE: amount is bigint. The caller MUST parse the DTO's
 /// `amount_raw` (string) into a bigint at the call site, with whatever
@@ -316,6 +374,13 @@ export function buildW5hFundingTransaction(
 ): Transaction {
   const usdcMint = new PublicKey(USDC_MINT_BASE58);
   const tx = new Transaction();
+  // Index 0 — Memo (audit anchor). MUST stay first per the W5h-Memo
+  // addendum contract so the on-chain layout is grep-stable.
+  tx.add(
+    createMemoInstruction(
+      buildW5hMemoText(args.ruleIdHex, args.canonicalRuleHashHex),
+    ),
+  );
   if (args.includeCreateAta) {
     tx.add(
       createIdempotentAtaInstruction({

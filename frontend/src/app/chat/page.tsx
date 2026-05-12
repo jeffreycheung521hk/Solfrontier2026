@@ -40,6 +40,7 @@ import {
   SignatureStatusNetworkError,
   USDC_MINT_BASE58,
   buildW5hFundingTransaction,
+  buildW5hMemoText,
   deriveAtaPubkey,
   pollSignatureStatus,
   solscanTxUrl,
@@ -1471,6 +1472,12 @@ function W5hConditionalOrderCard({
         includeCreateAta: true,
         amountBaseUnits: safeParseW5hAmount(result.amount_raw),
         controlledWallet,
+        // Memo anchor — `claw:w5h:<rule_id_hex>:<canonical_rule_hash_hex>`
+        // is inserted as instruction 0. Pass the EXACT DTO values
+        // (no transformation) so the on-chain audit trail matches the
+        // persisted rule byte-for-byte.
+        ruleIdHex: result.rule_id_hex,
+        canonicalRuleHashHex: result.canonical_rule_hash_hex,
         recentBlockhash: blockhash,
       });
     } catch (err) {
@@ -1734,6 +1741,17 @@ function W5hConditionalOrderCard({
               <CopyButton
                 value={result.controlled_usdc_ata}
                 label="controlled USDC ATA"
+              />
+            </dd>
+
+            <dt className="text-muted-foreground">instruction hash memo</dt>
+            <dd
+              className="font-mono break-words"
+              data-testid="w5h-memo-row"
+            >
+              <W5hMemoCell
+                ruleIdHex={result.rule_id_hex}
+                canonicalRuleHashHex={result.canonical_rule_hash_hex}
               />
             </dd>
 
@@ -2046,6 +2064,61 @@ function W5hConditionalOrderCard({
           </p>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── W5h on-chain Memo cell ──────────────────────────────────────────
+//
+// Renders the EXACT UTF-8 bytes the W5h funding tx will anchor in its
+// `MemoSq4gqAB…` instruction. Short form is shown inline; the full
+// value lives behind a <details> toggle with a Copy control. This is
+// PURELY display — the same `buildW5hMemoText` helper is used by the
+// tx builder, so what the operator sees here byte-matches what Phantom
+// will sign.
+function W5hMemoCell({
+  ruleIdHex,
+  canonicalRuleHashHex,
+}: {
+  ruleIdHex: string;
+  canonicalRuleHashHex: string;
+}) {
+  const full = buildW5hMemoText(ruleIdHex, canonicalRuleHashHex);
+  // Truncate-with-ellipsis on the two hex tokens for the inline label.
+  // Hex values are 32 / 64 chars; first 8 + last 4 is enough to be
+  // recognisable while still fitting in a row.
+  const shortHex = (hex: string): string => {
+    if (hex.length <= 14) return hex;
+    return `${hex.slice(0, 8)}…${hex.slice(-4)}`;
+  };
+  const shortMemo = `claw:w5h:${shortHex(ruleIdHex)}:${shortHex(canonicalRuleHashHex)}`;
+  return (
+    <div>
+      <div className="flex items-start gap-2 flex-wrap">
+        <span
+          className="text-foreground"
+          data-testid="w5h-memo-short"
+        >
+          {shortMemo}
+        </span>
+        <CopyButton value={full} label="memo" />
+      </div>
+      <details className="mt-1">
+        <summary className="cursor-pointer text-[10px] text-muted-foreground hover:text-foreground">
+          show full memo bytes
+        </summary>
+        <pre
+          className="mt-1 overflow-x-auto rounded bg-muted px-2 py-1 text-[10px] leading-snug whitespace-pre-wrap break-all"
+          data-testid="w5h-memo-full"
+        >
+          {full}
+        </pre>
+        <p className="mt-1 text-[10px] text-muted-foreground italic">
+          Inserted as instruction 0 of the W5h funding transaction
+          via the SPL Memo program. Anchors the rule identity on-chain
+          alongside the SPL Token TransferChecked.
+        </p>
+      </details>
     </div>
   );
 }
