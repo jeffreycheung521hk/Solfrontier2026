@@ -99,24 +99,17 @@ pub fn looks_like_w5h_chat_command(text: &str) -> bool {
         || lower.contains("solend");
     let amount_named =
         lower.contains("0.25 usdc") || lower.contains("0.25usdc") || lower.contains("250000");
-    let expires_named = lower.contains("expires in")
-        || lower.contains("有效期")
-        || lower.contains("expiry");
-    // W5h-lite simplified-form discriminators (no expiry needed).
-    // Reject W5d's "from my bounded executor wallet" form by hand.
+    // W5d's signature phrase explicitly funds FROM the controlled
+    // wallet and is distinct from W5h's user-funded flow. Excluding
+    // it here keeps the W5h detector from hijacking W5d commands.
     let bounded_executor_form = lower.contains("from my bounded executor wallet")
         || lower.contains("into solend.");
-    let w5h_lite_english_marker =
-        lower.contains("from my wallet") && !bounded_executor_form;
-    // Chinese 如果 ... deposit 0.25 USDC head — never used by W5d/W5e/W5f.
-    let w5h_lite_chinese_marker = text.contains("如果");
-    if !pool_named || !amount_named {
-        return false;
-    }
-    if bounded_executor_form {
-        return false;
-    }
-    expires_named || w5h_lite_english_marker || w5h_lite_chinese_marker
+    // W5h-lite (2026-05-12): accept the bare simplified grammar
+    // (`If Save APY > X%, deposit 0.25 USDC`) and its Chinese twin.
+    // The presence of pool + amount is enough; the "expires in" and
+    // "from my wallet" qualifiers are optional. W5d/W5e/W5f are
+    // ruled out by the `bounded_executor_form` guard above.
+    pool_named && amount_named && !bounded_executor_form
 }
 
 /// Strict parser. Returns a `W5hParsed` on success; a typed error

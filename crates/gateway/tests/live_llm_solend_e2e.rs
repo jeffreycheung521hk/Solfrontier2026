@@ -768,7 +768,7 @@ async fn run_live_llm_solend_e2e() {
     );
 
     // ── Build the chat handler over the same registry ─────────────────────
-    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider, None, None) {
+    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider, None, None, None, None) {
         Ok(Some(c)) => c,
         Ok(None) => panic!(
             "chat provider env gate returned None despite {ENV_LLM_OPT_IN}=1; \

@@ -964,11 +964,30 @@ impl GatewayDaemon {
             build_w5g_executor(cfg, w5e_repo.clone())
         };
 
+        // W5h-lite — chat-route dispatcher needs the funding-intent
+        // repo + a session-bound wallet resolver. The intent repo is
+        // constructed below alongside the funding-confirm route adapter;
+        // hoist the construction up so the chat handler can also see it.
+        let w5h_intent_repo_for_chat = std::sync::Arc::new(
+            claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository::new(
+                db.pool().clone(),
+            ),
+        );
+        // ExternalWalletStore implements SessionBoundWallet via the
+        // jupiter_swap trait — use it for the W5h user-wallet lookup
+        // so the funding intent's `user_wallet` is the operator's
+        // session-bound pubkey, never a placeholder.
+        let session_wallet_lookup_for_chat: std::sync::Arc<
+            dyn crate::tools::jupiter_swap::SessionBoundWallet,
+        > = std::sync::Arc::new(external_wallet.clone());
+
         let chat_handler_ref: Option<ChatHandlerRef> =
             match crate::runtime::chat_wiring::wire_chat_handler_from_std_env(
                 &registry,
                 Some(w5e_repo.clone()),
                 w5g_executor.clone(),
+                Some(w5h_intent_repo_for_chat.clone()),
+                Some(session_wallet_lookup_for_chat.clone()),
             ) {
                 Ok(opt) => {
                     if opt.is_some() {
@@ -1003,14 +1022,10 @@ impl GatewayDaemon {
         // / `intent_not_found` DTO on a per-request basis and never
         // sends a transaction (read-only `getTransaction`).
         //
-        // The W5h funding-intent repo is built here so a single
-        // shared instance is used by both the route adapter and any
-        // future chat-route dispatch that creates intents.
-        let w5h_intent_repo = std::sync::Arc::new(
-            claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository::new(
-                db.pool().clone(),
-            ),
-        );
+        // Reuses the same `w5h_intent_repo_for_chat` Arc as the chat
+        // route so creating an intent via `/chat` and confirming it
+        // via `/funding/confirm` see the same row.
+        let w5h_intent_repo = w5h_intent_repo_for_chat.clone();
         let chat_funding_confirm_ref: Option<
             claw_api::state::W5hFundingConfirmHandlerRef,
         > = {

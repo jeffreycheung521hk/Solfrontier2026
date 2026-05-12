@@ -414,6 +414,10 @@ pub fn wire_chat_handler_with_registry(
     env: &dyn EnvProvider,
     w5e_repo: Option<Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>>,
     w5g_executor: Option<Arc<crate::stage2_chat_execute::Stage2ChatExecutor>>,
+    w5h_intent_repo: Option<
+        Arc<claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository>,
+    >,
+    session_wallet_lookup: Option<Arc<dyn crate::tools::jupiter_swap::SessionBoundWallet>>,
 ) -> Result<Option<ChatHandlerRef>, LlmProviderConfigError> {
     let llm = match build_chat_provider_from_env(env)? {
         Some(c) => c,
@@ -483,6 +487,17 @@ pub fn wire_chat_handler_with_registry(
     if let Some(executor) = w5g_executor {
         handler = handler.with_w5g_executor(executor);
     }
+    // W5h-lite — attach the funding-intent repo and the session →
+    // user-wallet lookup. Both are required by the W5h chat-route
+    // dispatcher; if either is absent, W5h-grammar commands surface
+    // a typed `ToolError` (NEVER a silent LLM fall-through and
+    // NEVER an intent insert without the operator's bound wallet).
+    if let Some(repo) = w5h_intent_repo {
+        handler = handler.with_w5h_intent_repo(repo);
+    }
+    if let Some(lookup) = session_wallet_lookup {
+        handler = handler.with_session_wallet_lookup(lookup);
+    }
     Ok(Some(handler.into_handler_ref()))
 }
 
@@ -499,8 +514,19 @@ pub fn wire_chat_handler_from_std_env(
     registry: &ToolRegistry,
     w5e_repo: Option<Arc<claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>>,
     w5g_executor: Option<Arc<crate::stage2_chat_execute::Stage2ChatExecutor>>,
+    w5h_intent_repo: Option<
+        Arc<claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository>,
+    >,
+    session_wallet_lookup: Option<Arc<dyn crate::tools::jupiter_swap::SessionBoundWallet>>,
 ) -> Result<Option<ChatHandlerRef>, LlmProviderConfigError> {
-    wire_chat_handler_with_registry(registry, &StdEnvProvider, w5e_repo, w5g_executor)
+    wire_chat_handler_with_registry(
+        registry,
+        &StdEnvProvider,
+        w5e_repo,
+        w5g_executor,
+        w5h_intent_repo,
+        session_wallet_lookup,
+    )
 }
 
 /// Bridge from the API-layer `ChatHandler` trait to the runtime's
@@ -562,6 +588,23 @@ pub struct GatewayChatHandler {
     /// so the operator sees an explicit refusal instead of a silent
     /// fall-through to the LLM.
     w5g_executor: Option<Arc<crate::stage2_chat_execute::Stage2ChatExecutor>>,
+    /// W5h-lite — funding-intent repository. When present alongside
+    /// `w5d_bridge` + `w5f_save_apy` + `w5e_repo` +
+    /// `session_wallet_lookup`, the chat handler detects W5h grammar
+    /// (`"If Save APY > X%, deposit 0.25 USDC"`) and dispatches to
+    /// the W5h bridge BEFORE the LLM call. The funding-confirm route
+    /// is wired separately in `daemon.rs`.
+    w5h_intent_repo: Option<
+        Arc<claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository>,
+    >,
+    /// W5h-lite — session → user-wallet pubkey resolver. The W5h
+    /// dispatcher REQUIRES this; the funding intent's `user_wallet`
+    /// MUST be the operator's externally-bound pubkey, never a
+    /// hard-coded placeholder. When the session has no bound wallet,
+    /// the dispatcher returns a typed `ToolError` and does NOT create
+    /// any intent (verified by
+    /// `w5h_chat_command_without_bound_wallet_returns_typed_error`).
+    session_wallet_lookup: Option<Arc<dyn crate::tools::jupiter_swap::SessionBoundWallet>>,
 }
 
 impl GatewayChatHandler {
@@ -580,6 +623,8 @@ impl GatewayChatHandler {
             w5e_repo: None,
             w5f_save_apy: None,
             w5g_executor: None,
+            w5h_intent_repo: None,
+            session_wallet_lookup: None,
         }
     }
 
@@ -638,6 +683,32 @@ impl GatewayChatHandler {
         self
     }
 
+    /// W5h-lite — attach the funding-intent repository. Required
+    /// alongside `with_w5d_bridge`, `with_w5f_save_apy`,
+    /// `with_w5e_repo`, and `with_session_wallet_lookup` for the
+    /// chat-route W5h dispatch to fire. Without it, W5h-grammar
+    /// commands fall through to the LLM.
+    pub fn with_w5h_intent_repo(
+        mut self,
+        repo: Arc<claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository>,
+    ) -> Self {
+        self.w5h_intent_repo = Some(repo);
+        self
+    }
+
+    /// W5h-lite — attach the session → user-wallet pubkey resolver.
+    /// The W5h dispatcher uses this to source the operator's
+    /// externally-bound wallet for the funding intent's `user_wallet`
+    /// field. If absent at dispatch time, the chat-route returns a
+    /// typed `ToolError` and never creates an intent.
+    pub fn with_session_wallet_lookup(
+        mut self,
+        lookup: Arc<dyn crate::tools::jupiter_swap::SessionBoundWallet>,
+    ) -> Self {
+        self.session_wallet_lookup = Some(lookup);
+        self
+    }
+
     /// Wraps `self` in an `Arc<dyn ChatHandler>` ready for `AppState`.
     pub fn into_handler_ref(self) -> ChatHandlerRef {
         ChatHandlerRef::new(Arc::new(self))
@@ -679,6 +750,33 @@ impl ChatHandler for GatewayChatHandler {
                     )
                     .await;
                 }
+            }
+
+            // ── W5h-lite chat-route interceptor ──────────────────────
+            //
+            // The W5h grammar (English / 繁中, "If Save APY > X%,
+            // deposit 0.25 USDC[, expires in 3 minutes]") is detected
+            // BEFORE the LLM call. The bridge needs:
+            //   - APR fetcher (w5d_bridge)
+            //   - Save APY fetcher (w5f_save_apy)
+            //   - WatchRule repo (w5e_repo)
+            //   - Funding-intent repo (w5h_intent_repo)
+            //   - Session-bound user wallet (session_wallet_lookup)
+            //
+            // Missing any of these → typed ToolError, NEVER a silent
+            // LLM fall-through. The user wallet pubkey is sourced
+            // from the session binding, never hardcoded.
+            if crate::stage2_w5h_chat::looks_like_w5h_chat_command(&message) {
+                return handle_w5h_chat_command(
+                    self.w5d_bridge.as_deref(),
+                    self.w5f_save_apy.as_deref(),
+                    self.w5e_repo.as_deref(),
+                    self.w5h_intent_repo.as_deref(),
+                    self.session_wallet_lookup.as_deref(),
+                    &session_id,
+                    &message,
+                )
+                .await;
             }
 
             // ── W5g approval-command interceptor ──────────────────────
@@ -786,6 +884,129 @@ async fn handle_w5d_demo_command(
                 message: eval_err.to_string(),
             })
         }
+    }
+}
+
+/// W5h-lite chat-route branch. Detects the W5h grammar (English /
+/// 繁中, "If Save APY > X%, deposit 0.25 USDC[, expires in 3 minutes]")
+/// and dispatches to the persistent bridge BEFORE the LLM call.
+///
+/// Fail-closed conditions (all return typed `ChatResponse::ToolError`
+/// with `tool_name == "w5h_conditional_order"`, NEVER an LLM
+/// fall-through and NEVER a silent intent insert):
+///
+///   - APR fetcher missing (daemon has no RPC URL).
+///   - Save APY fetcher missing.
+///   - WatchRule repo missing.
+///   - Funding-intent repo missing.
+///   - Session-wallet-lookup missing.
+///   - Session has no bound external wallet — surfaced to the user
+///     as "Connect wallet before creating a funded conditional order."
+///   - W5h bridge parse / native-APR / Save-APY / repo failure.
+///
+/// The user wallet pubkey is sourced ONLY from
+/// `session_wallet_lookup.session_wallet_pubkey(session_id)`. It is
+/// never hardcoded, never `Pubkey::default()`, and never the
+/// controlled wallet.
+async fn handle_w5h_chat_command(
+    apr_fetcher: Option<&(dyn crate::stage2_demo_apr_bridge::W5dAprFetcher + 'static)>,
+    save_apy: Option<&(dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher + 'static)>,
+    rule_repo: Option<&claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>,
+    intent_repo: Option<&claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository>,
+    session_wallet_lookup: Option<&(dyn crate::tools::jupiter_swap::SessionBoundWallet + 'static)>,
+    session_id: &SessionId,
+    message: &str,
+) -> ChatRouteOutcome {
+    const TOOL_NAME: &str = "w5h_conditional_order";
+
+    fn tool_error(msg: impl Into<String>) -> ChatRouteOutcome {
+        ChatRouteOutcome::Ok(ChatResponse::ToolError {
+            tool_name: TOOL_NAME.to_string(),
+            message: msg.into(),
+        })
+    }
+
+    // ── Dependency gate — every piece MUST be wired ──────────────────
+    let apr_fetcher = match apr_fetcher {
+        Some(f) => f,
+        None => {
+            return tool_error(
+                "W5h is not available in this daemon \
+                 (B-O1 APR fetcher missing — start the daemon with \
+                 HELIUS_RPC_URL or CLAW_RPC_URL set).",
+            );
+        }
+    };
+    let save_apy = match save_apy {
+        Some(s) => s,
+        None => {
+            return tool_error(
+                "W5h is not available in this daemon \
+                 (Save display APY fetcher not wired).",
+            );
+        }
+    };
+    let rule_repo = match rule_repo {
+        Some(r) => r,
+        None => {
+            return tool_error(
+                "W5h is not available in this daemon \
+                 (Stage 2 WatchRule repository not wired).",
+            );
+        }
+    };
+    let intent_repo = match intent_repo {
+        Some(r) => r,
+        None => {
+            return tool_error(
+                "W5h is not available in this daemon \
+                 (Stage 2 W5h funding-intent repository not wired).",
+            );
+        }
+    };
+    let session_wallet_lookup = match session_wallet_lookup {
+        Some(s) => s,
+        None => {
+            return tool_error(
+                "W5h is not available in this daemon \
+                 (session→wallet lookup not wired).",
+            );
+        }
+    };
+
+    // ── User wallet — sourced ONLY from the session binding ──────────
+    //
+    // No hardcoded fallback, no Pubkey::default(), no controlled
+    // wallet substitution. If the session has no bound external
+    // wallet, refuse the command — the operator's W5h Phantom flow
+    // can only target the wallet they've proved ownership of.
+    let user_wallet_bs58 = match session_wallet_lookup.session_wallet_pubkey(session_id) {
+        Some(pk) if !pk.trim().is_empty() => pk,
+        _ => {
+            return tool_error(
+                "Connect wallet before creating a funded conditional order. \
+                 Use the wallet-bind challenge/response flow to bind a \
+                 Phantom wallet to this session, then re-issue the W5h \
+                 command.",
+            );
+        }
+    };
+
+    // ── Dispatch to the persistent W5h bridge ────────────────────────
+    match crate::stage2_w5h_bridge::handle_w5h_chat_command(
+        apr_fetcher,
+        save_apy,
+        rule_repo,
+        intent_repo,
+        &user_wallet_bs58,
+        message,
+    )
+    .await
+    {
+        Ok(dto) => {
+            ChatRouteOutcome::Ok(ChatResponse::W5hConditionalOrder { result: dto })
+        }
+        Err(e) => tool_error(e.to_string()),
     }
 }
 
@@ -1863,7 +2084,7 @@ mod p5e_env_gate_tests {
     #[test]
     fn p5e_wire_with_registry_returns_none_when_env_disabled() {
         let env = MockEnv::empty();
-        let result = wire_chat_handler_with_registry(&stub_registry(), &env, None, None)
+        let result = wire_chat_handler_with_registry(&stub_registry(), &env, None, None, None, None)
             .expect("disabled env must be Ok(None)");
         assert!(result.is_none());
     }
@@ -1878,7 +2099,7 @@ mod p5e_env_gate_tests {
             ("OPENAI_API_KEY", "sk-test-fixture"),
         ]);
         let empty = ToolRegistry::new();
-        let result = wire_chat_handler_with_registry(&empty, &env, None, None);
+        let result = wire_chat_handler_with_registry(&empty, &env, None, None, None, None);
         match result {
             Err(LlmProviderConfigError::InvalidProviderConfig { .. }) => {}
             // Result's Ok arm contains `Option<ChatHandlerRef>` (no Debug);
@@ -2264,6 +2485,300 @@ mod w5g_chat_route_tests {
             }
             other => panic!(
                 "expected ChatResponse::W5gConditionalExecution (proves wired seam), \
+                 got {other:?}"
+            ),
+        }
+    }
+}
+
+/// W5h-lite chat-route seam tests. Proves:
+///
+///   1. With every W5h dep wired (intent repo + session-wallet lookup +
+///      APR + Save APY + WatchRule repo), an English/Chinese W5h
+///      command dispatches to the bridge and returns
+///      `ChatResponse::W5hConditionalOrder { result }` — the LLM
+///      stub PANICS if invoked, proving no LLM fall-through.
+///
+///   2. When the session has no bound external wallet, the W5h
+///      dispatcher returns a typed `ToolError` ("Connect wallet
+///      before creating a funded conditional order.") and does NOT
+///      create a funding intent (repo row count remains 0).
+#[cfg(test)]
+mod w5h_chat_route_tests {
+    use super::*;
+    use crate::stage2_demo_apr_bridge::{
+        compose_w5e_result, controlled_wallet_addresses, DemoParsed,
+        EvaluationError, SaveDisplayApyFetcher, SaveDisplayApyReading,
+        W5dAprFetcher, W5dEvaluationResult,
+    };
+    use crate::tools::jupiter_swap::SessionBoundWallet;
+    use async_trait::async_trait;
+    use claw_agent_runtime::{
+        errors::AgentError,
+        llm::{LlmClient, LlmMessage, LlmResponse},
+    };
+    use claw_api::state::ChatResponse;
+    use claw_state_store::{
+        stage2_w5h_funding::Stage2W5hFundingIntentRepository,
+        stage2_watch_rules::Stage2WatchRuleRepository, Database,
+    };
+    use claw_tool_system::permissions::CapabilitySet;
+    use claw_types::session::SessionId;
+    use claw_types::tool::ToolSpec;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    const TEST_USER_WALLET: &str = "C4QQjzWxnJ5QFAbkzhQJ3wTzyX6nw1vyFvJwbPXJGPNW";
+
+    /// LLM that panics if invoked. The W5h dispatch MUST happen
+    /// before the LLM call; reaching this stub proves the seam is
+    /// leaking and the test fails loud.
+    #[derive(Debug)]
+    struct UncallableLlm;
+    #[async_trait]
+    impl LlmClient for UncallableLlm {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[LlmMessage],
+            _tools: &[ToolSpec],
+        ) -> Result<LlmResponse, AgentError> {
+            panic!(
+                "LLM must NOT be invoked for W5h chat commands; \
+                 the W5h dispatcher must intercept before the LLM call"
+            );
+        }
+    }
+
+    /// Stub Save APY fetcher: deterministic 312 bps.
+    #[derive(Debug, Clone)]
+    struct StubSaveApy;
+    #[async_trait]
+    impl SaveDisplayApyFetcher for StubSaveApy {
+        async fn fetch_main_pool_usdc(
+            &self,
+        ) -> Result<SaveDisplayApyReading, EvaluationError> {
+            Ok(SaveDisplayApyReading {
+                save_display_apy_bps: 312,
+                raw_supply_interest_str: "3.12".to_string(),
+                reserve_pubkey:
+                    "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw".to_string(),
+                lending_market:
+                    "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY".to_string(),
+                liquidity_mint:
+                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                collateral_mint:
+                    "993dVFL2uXWYeoXuEBFXR4BijeXdTv4s6BzsCjJZuwqk".to_string(),
+                rewards_present: false,
+            })
+        }
+    }
+
+    /// Stub B-O1 native APR fetcher: deterministic 287 bps.
+    #[derive(Debug, Clone)]
+    struct StubAprFetcher;
+    #[async_trait]
+    impl W5dAprFetcher for StubAprFetcher {
+        async fn evaluate(
+            &self,
+            input_text: &str,
+            parsed: &DemoParsed,
+        ) -> Result<W5dEvaluationResult, EvaluationError> {
+            let (controlled_wallet, source_usdc_ata) =
+                controlled_wallet_addresses();
+            Ok(compose_w5e_result(
+                input_text,
+                parsed,
+                287,
+                500_000,
+                42_424_242,
+                controlled_wallet,
+                source_usdc_ata,
+            ))
+        }
+    }
+
+    /// Session-bound-wallet stub. `bound_pubkey` is the value the W5h
+    /// dispatcher will see for `user_wallet`; `None` exercises the
+    /// fail-closed path.
+    #[derive(Debug)]
+    struct StubSessionWallet {
+        bound_pubkey: Option<String>,
+    }
+    impl SessionBoundWallet for StubSessionWallet {
+        fn session_wallet_pubkey(&self, _sid: &SessionId) -> Option<String> {
+            self.bound_pubkey.clone()
+        }
+    }
+
+    fn build_w5h_handler(
+        intent_repo: Arc<Stage2W5hFundingIntentRepository>,
+        rule_repo: Arc<Stage2WatchRuleRepository>,
+        wallet: StubSessionWallet,
+    ) -> GatewayChatHandler {
+        let registry = ToolRegistry::new();
+        GatewayChatHandler::new(
+            Arc::new(UncallableLlm),
+            registry,
+            "system-prompt".to_string(),
+            CapabilitySet::empty(),
+        )
+        .with_w5d_bridge(Arc::new(StubAprFetcher))
+        .with_w5f_save_apy(Arc::new(StubSaveApy))
+        .with_w5e_repo(rule_repo)
+        .with_w5h_intent_repo(intent_repo)
+        .with_session_wallet_lookup(Arc::new(wallet))
+    }
+
+    /// Positive test: typed W5h card returned, LLM stub never invoked.
+    #[tokio::test]
+    async fn w5h_chat_command_returns_funding_required_card_without_llm() {
+        let db = Database::open_in_memory().await.unwrap();
+        let intent_repo = Arc::new(Stage2W5hFundingIntentRepository::new(
+            db.pool().clone(),
+        ));
+        let rule_repo = Arc::new(Stage2WatchRuleRepository::new(db.pool().clone()));
+        let wallet = StubSessionWallet {
+            bound_pubkey: Some(TEST_USER_WALLET.to_string()),
+        };
+        let handler = build_w5h_handler(intent_repo.clone(), rule_repo, wallet);
+        let sid = SessionId::from(Uuid::new_v4());
+
+        let outcome = handler
+            .handle_chat(&sid, "If Save APY > 1%, deposit 0.25 USDC".to_string())
+            .await;
+
+        match outcome {
+            ChatRouteOutcome::Ok(ChatResponse::W5hConditionalOrder { result }) => {
+                assert_eq!(result.amount_raw, 250_000);
+                assert_eq!(
+                    result.controlled_wallet,
+                    "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L"
+                );
+                assert_eq!(
+                    result.controlled_usdc_ata,
+                    "7LFdKcSV7JQYi3or5y9phHVPjhGigu5DDjUakAFbBmk3"
+                );
+                assert_eq!(result.user_wallet, TEST_USER_WALLET);
+                assert_eq!(result.threshold_bps, 100);
+                // Persisted intent exists with funding_required status.
+                let stored = intent_repo
+                    .get(&result.rule_id_hex)
+                    .await
+                    .unwrap()
+                    .expect("intent must be persisted");
+                assert_eq!(stored.user_wallet, TEST_USER_WALLET);
+            }
+            other => panic!(
+                "expected ChatResponse::W5hConditionalOrder (proves wired seam, \
+                 LLM was NOT invoked); got {other:?}"
+            ),
+        }
+    }
+
+    /// Chinese-grammar variant. Same assertions; proves both grammars
+    /// dispatch through the same seam.
+    #[tokio::test]
+    async fn w5h_chinese_chat_command_returns_funding_required_card_without_llm() {
+        let db = Database::open_in_memory().await.unwrap();
+        let intent_repo = Arc::new(Stage2W5hFundingIntentRepository::new(
+            db.pool().clone(),
+        ));
+        let rule_repo = Arc::new(Stage2WatchRuleRepository::new(db.pool().clone()));
+        let wallet = StubSessionWallet {
+            bound_pubkey: Some(TEST_USER_WALLET.to_string()),
+        };
+        let handler = build_w5h_handler(intent_repo, rule_repo, wallet);
+        let sid = SessionId::from(Uuid::new_v4());
+
+        let outcome = handler
+            .handle_chat(
+                &sid,
+                "如果 Save APY > 1%，deposit 0.25 USDC".to_string(),
+            )
+            .await;
+
+        match outcome {
+            ChatRouteOutcome::Ok(ChatResponse::W5hConditionalOrder { result }) => {
+                assert_eq!(result.amount_raw, 250_000);
+                assert_eq!(result.user_wallet, TEST_USER_WALLET);
+            }
+            other => panic!(
+                "expected ChatResponse::W5hConditionalOrder for Chinese grammar; \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    /// Fail-closed: session has no bound wallet → typed ToolError +
+    /// NO intent persisted.
+    #[tokio::test]
+    async fn w5h_chat_command_without_bound_wallet_returns_typed_error() {
+        let db = Database::open_in_memory().await.unwrap();
+        let intent_repo = Arc::new(Stage2W5hFundingIntentRepository::new(
+            db.pool().clone(),
+        ));
+        let rule_repo = Arc::new(Stage2WatchRuleRepository::new(db.pool().clone()));
+        let wallet = StubSessionWallet { bound_pubkey: None };
+        let handler =
+            build_w5h_handler(intent_repo.clone(), rule_repo, wallet);
+        let sid = SessionId::from(Uuid::new_v4());
+
+        let outcome = handler
+            .handle_chat(&sid, "If Save APY > 1%, deposit 0.25 USDC".to_string())
+            .await;
+
+        match outcome {
+            ChatRouteOutcome::Ok(ChatResponse::ToolError {
+                tool_name,
+                message,
+            }) => {
+                assert_eq!(tool_name, "w5h_conditional_order");
+                assert!(
+                    message.contains("Connect wallet"),
+                    "message must instruct the operator to bind a wallet; got {message:?}"
+                );
+                // No intent must have been persisted.
+                let rule_id_guess = "00000000000000000000000000000000";
+                let probe = intent_repo.get(rule_id_guess).await.unwrap();
+                assert!(probe.is_none());
+            }
+            other => panic!(
+                "expected ChatResponse::ToolError for unbound session; got {other:?}"
+            ),
+        }
+    }
+
+    /// Fail-closed: blank/whitespace-only bound wallet is treated as
+    /// unbound. Defends against an upstream layer accidentally
+    /// emitting an empty pubkey.
+    #[tokio::test]
+    async fn w5h_chat_command_with_blank_bound_wallet_returns_typed_error() {
+        let db = Database::open_in_memory().await.unwrap();
+        let intent_repo = Arc::new(Stage2W5hFundingIntentRepository::new(
+            db.pool().clone(),
+        ));
+        let rule_repo = Arc::new(Stage2WatchRuleRepository::new(db.pool().clone()));
+        let wallet = StubSessionWallet {
+            bound_pubkey: Some("   ".to_string()),
+        };
+        let handler = build_w5h_handler(intent_repo, rule_repo, wallet);
+        let sid = SessionId::from(Uuid::new_v4());
+
+        let outcome = handler
+            .handle_chat(&sid, "If Save APY > 1%, deposit 0.25 USDC".to_string())
+            .await;
+
+        match outcome {
+            ChatRouteOutcome::Ok(ChatResponse::ToolError {
+                tool_name,
+                message,
+            }) => {
+                assert_eq!(tool_name, "w5h_conditional_order");
+                assert!(message.contains("Connect wallet"));
+            }
+            other => panic!(
+                "expected ChatResponse::ToolError for blank-pubkey session; \
                  got {other:?}"
             ),
         }

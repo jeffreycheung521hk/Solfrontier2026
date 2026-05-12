@@ -266,7 +266,7 @@ async fn run_live_llm_jupiter_e2e() {
     let registry = ToolRegistry::new().with_tool(tool_arc);
 
     // ── Build the chat handler over the same registry ─────────────────────
-    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider, None, None) {
+    let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider, None, None, None, None) {
         Ok(Some(c)) => c,
         Ok(None) => panic!(
             "chat provider env gate returned None despite {ENV_LLM_OPT_IN}=1; \
