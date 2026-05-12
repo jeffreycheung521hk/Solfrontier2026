@@ -28,6 +28,7 @@ import {
   confirmWalletBindChallenge,
   createWalletBindChallenge,
   getOrCreateSession,
+  getW5hOrderStatus,
   postChat,
 } from "@/lib/api";
 import { IS_SHOWCASE, MODE } from "@/lib/mode";
@@ -1313,6 +1314,74 @@ function W5hConditionalOrderCard({
       result.status === "budget_reserved" ||
       result.status === "ready_to_execute");
 
+  // ── W5i auto-execution status polling ─────────────────────────────
+  //
+  // Once the order is `budget_reserved` or `ready_to_execute` and the
+  // backend gives us a `rule_id_hex`, poll the status route every 5 s
+  // so the demo viewer sees the W5i watcher → executing → completed
+  // transition in real time. Stops on terminal auto-execution states
+  // (completed / failed / broadcasted_timeout) and on network errors
+  // (we keep the last result and surface a small "status refresh
+  // delayed" notice — never overwriting good state with a bad one).
+  //
+  // READ-ONLY: the polling effect performs ONLY a GET. It never signs,
+  // never broadcasts, never constructs a Solend instruction.
+  const [statusPollError, setStatusPollError] = useState<string | null>(
+    null,
+  );
+  const ruleIdForPoll = result.rule_id_hex;
+  const autoExecStatus = result.auto_execution_status ?? null;
+  const autoExecTerminal =
+    autoExecStatus === "completed" ||
+    autoExecStatus === "failed" ||
+    autoExecStatus === "broadcasted_timeout";
+  const shouldPollOrderStatus =
+    sessionId !== null &&
+    typeof ruleIdForPoll === "string" &&
+    ruleIdForPoll.length > 0 &&
+    (result.status === "budget_reserved" ||
+      result.status === "ready_to_execute") &&
+    !autoExecTerminal;
+  // 5 s ticker — bounded by `shouldPollOrderStatus` flipping to false
+  // (terminal state reached, or order moved out of the watching
+  // window). No artificial attempt cap; the upstream lifecycle is the
+  // natural exit.
+  useEffect(() => {
+    if (!shouldPollOrderStatus) return;
+    if (sessionId === null) return;
+    if (typeof ruleIdForPoll !== "string" || ruleIdForPoll.length === 0) {
+      return;
+    }
+    let cancelled = false;
+    const pollOnce = async () => {
+      if (cancelled) return;
+      try {
+        const env = await getW5hOrderStatus(sessionId, ruleIdForPoll);
+        if (cancelled) return;
+        if (env.kind === "ok") {
+          setResult(env.response);
+          setStatusPollError(null);
+        } else {
+          // Backend transient — keep last good state visible.
+          setStatusPollError(`status refresh delayed (${env.httpStatus})`);
+        }
+      } catch {
+        if (cancelled) return;
+        setStatusPollError("status refresh delayed (network)");
+      }
+    };
+    // First poll immediately so the demo viewer doesn't wait 5 s
+    // for the very first transition.
+    void pollOnce();
+    const id = window.setInterval(() => {
+      void pollOnce();
+    }, 5_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [shouldPollOrderStatus, sessionId, ruleIdForPoll]);
+
   // ── Wallet gating ─────────────────────────────────────────────────
   const expectedUserWallet = result.user_wallet ?? null;
   const walletConnected = walletPubkey !== null;
@@ -1828,12 +1897,43 @@ function W5hConditionalOrderCard({
           </div>
         )}
 
-        {/* ── Hand-off: W5g approval-command panel ─────────────── */}
-        {showW5gPanel && (
-          <ReadyToExecuteCommandPanel
-            ruleIdHex={result.rule_id_hex}
-            canonicalRuleHashHex={result.canonical_rule_hash_hex}
+        {/* ── W5i auto-execution status section ────────────────── */}
+        {(result.status === "budget_reserved" ||
+          result.status === "ready_to_execute") && (
+          <W5iAutoExecutionSection
+            result={result}
+            statusPollError={statusPollError}
           />
+        )}
+
+        {/* ── Hand-off: W5g approval-command panel ───────────────
+            When the backend reports `auto_execution_enabled === true`
+            the demo is fully autonomous — the manual W5g chat command
+            collapses under a "Manual fallback" toggle so the demo
+            audience sees the autopilot path. When `false` / undefined
+            (e.g. W5h-lite mode without auto-watcher), the panel stays
+            visible as the primary execution affordance. */}
+        {showW5gPanel && (
+          result.auto_execution_enabled === true ? (
+            <details
+              className="mt-3"
+              data-testid="w5g-manual-fallback-details"
+            >
+              <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">
+                Manual fallback command (backup path — auto-execution is
+                enabled)
+              </summary>
+              <ReadyToExecuteCommandPanel
+                ruleIdHex={result.rule_id_hex}
+                canonicalRuleHashHex={result.canonical_rule_hash_hex}
+              />
+            </details>
+          ) : (
+            <ReadyToExecuteCommandPanel
+              ruleIdHex={result.rule_id_hex}
+              canonicalRuleHashHex={result.canonical_rule_hash_hex}
+            />
+          )
         )}
 
         {/* ── Expired branch (W5h-lite: no refund promise) ─────── */}
@@ -1948,6 +2048,255 @@ function W5hConditionalOrderCard({
       </div>
     </div>
   );
+}
+
+// ── W5i auto-execution status sub-section ───────────────────────────
+//
+// Rendered inside the W5h card once the order is `budget_reserved`
+// or `ready_to_execute`. PURELY read-only — surfaces what the
+// backend watcher / executor reported via the order-status poll.
+// Renders NO buttons (Execute, Approve, Send Solend, Confirm Deposit
+// are all forbidden by spec). The Solend deposit signature is
+// SERVER-CONSTRUCTED and SERVER-SIGNED; the frontend mirrors it into
+// the DOM via a Solscan link so the audience can verify off-page.
+function W5iAutoExecutionSection({
+  result,
+  statusPollError,
+}: {
+  result: W5hConditionalDepositResult;
+  statusPollError: string | null;
+}) {
+  // No backend signal at all → render nothing. Keeps the card clean
+  // when running against a backend version that pre-dates W5i.
+  if (
+    result.auto_execution_enabled === undefined &&
+    result.auto_execution_status === undefined
+  ) {
+    return null;
+  }
+
+  const autoOn = result.auto_execution_enabled === true;
+  const autoStatus = result.auto_execution_status ?? null;
+  const banner = w5iAutoBanner(autoOn, autoStatus);
+
+  // Resolve Solscan URL — backend-supplied one wins; otherwise build
+  // from the signature.
+  const sig = result.auto_tx_signature ?? null;
+  const solscan =
+    result.auto_solscan_url ?? (sig ? solscanTxUrl(sig) : null);
+
+  // Last-check timestamp display — a relative "Ns ago" string. Uses
+  // safe-int guard against absurd payloads.
+  const lastCheckedLabel = formatRelativeMsAgo(result.auto_last_checked_at_ms);
+
+  return (
+    <div
+      className="mt-3"
+      data-testid="w5i-auto-execution-section"
+      data-auto-enabled={autoOn ? "true" : "false"}
+      data-auto-status={autoStatus ?? "(none)"}
+    >
+      <div
+        data-testid="w5i-auto-banner"
+        className={`inline-block rounded border px-2 py-1 text-xs ${banner.tone}`}
+      >
+        {banner.text}
+      </div>
+
+      <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
+        <dt className="text-muted-foreground">auto-execution</dt>
+        <dd className="font-mono">
+          {autoOn ? "enabled" : "disabled"}
+        </dd>
+        {autoStatus !== null && (
+          <>
+            <dt className="text-muted-foreground">watcher status</dt>
+            <dd
+              className="font-mono"
+              data-testid="w5i-auto-watcher-status"
+            >
+              {autoStatus}
+            </dd>
+          </>
+        )}
+        {lastCheckedLabel && (
+          <>
+            <dt className="text-muted-foreground">last checked</dt>
+            <dd className="font-mono">{lastCheckedLabel}</dd>
+          </>
+        )}
+        {sig && (
+          <>
+            <dt className="text-muted-foreground">auto tx signature</dt>
+            <dd
+              className="font-mono break-all"
+              data-testid="w5i-auto-tx-signature"
+            >
+              {sig}
+            </dd>
+          </>
+        )}
+        {solscan && (
+          <>
+            <dt className="text-muted-foreground">solscan</dt>
+            <dd>
+              <a
+                href={solscan}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-mono underline hover:no-underline break-all"
+                data-testid="w5i-auto-solscan-link"
+              >
+                {solscan}
+              </a>
+            </dd>
+          </>
+        )}
+        {result.auto_confirmation_slot && (
+          <>
+            <dt className="text-muted-foreground">confirmation slot</dt>
+            <dd className="font-mono break-all">
+              {result.auto_confirmation_slot}
+            </dd>
+          </>
+        )}
+        {result.auto_usdc_delta_raw && (
+          <>
+            <dt className="text-muted-foreground">USDC delta</dt>
+            <dd
+              className="font-mono break-all"
+              data-testid="w5i-auto-usdc-delta"
+            >
+              {result.auto_usdc_delta_raw} raw
+              {(() => {
+                const ui = formatRawUsdcDisplay(result.auto_usdc_delta_raw);
+                return ui === "—" ? null : (
+                  <span className="ml-2 text-muted-foreground">
+                    ({ui})
+                  </span>
+                );
+              })()}
+            </dd>
+          </>
+        )}
+        {result.auto_ctoken_delta_raw && (
+          <>
+            <dt className="text-muted-foreground">cToken delta</dt>
+            <dd
+              className="font-mono break-all"
+              data-testid="w5i-auto-ctoken-delta"
+            >
+              {result.auto_ctoken_delta_raw} raw
+            </dd>
+          </>
+        )}
+        {(result.auto_error_code || result.auto_error_reason) && (
+          <>
+            {result.auto_error_code && (
+              <>
+                <dt className="text-muted-foreground">error code</dt>
+                <dd
+                  className="font-mono"
+                  data-testid="w5i-auto-error-code"
+                >
+                  {result.auto_error_code}
+                </dd>
+              </>
+            )}
+            {result.auto_error_reason && (
+              <>
+                <dt className="text-muted-foreground">error reason</dt>
+                <dd
+                  className="break-words whitespace-pre-wrap"
+                  data-testid="w5i-auto-error-reason"
+                >
+                  {result.auto_error_reason}
+                </dd>
+              </>
+            )}
+          </>
+        )}
+      </dl>
+
+      {statusPollError && (
+        <div
+          className="mt-2 text-[10px] text-amber-700 italic"
+          data-testid="w5i-status-refresh-delayed"
+        >
+          {statusPollError} — last-known state still shown above.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/// Per-(auto_enabled, auto_status) banner copy + tone. The W5i prompt
+/// pins specific copy for each lifecycle state.
+function w5iAutoBanner(
+  autoOn: boolean,
+  autoStatus: W5hConditionalDepositResult["auto_execution_status"] | null,
+): { tone: string; text: string } {
+  if (!autoOn) {
+    return {
+      tone: "bg-muted text-muted-foreground border-muted",
+      text: "Budget reserved — execution gate is off.",
+    };
+  }
+  switch (autoStatus) {
+    case "watching":
+    case null:
+    case undefined:
+      return {
+        tone: "bg-sky-50 text-sky-900 border-sky-200",
+        text: "Budget reserved — watching Save APY every 30 seconds.",
+      };
+    case "ready_to_execute":
+      return {
+        tone: "bg-emerald-50 text-emerald-900 border-emerald-200",
+        text: "Condition met — backend is about to execute.",
+      };
+    case "executing":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Executing on mainnet…",
+      };
+    case "completed":
+      return {
+        tone: "bg-emerald-50 text-emerald-900 border-emerald-200",
+        text: "Completed — Solend deposit finalized.",
+      };
+    case "failed":
+      return {
+        tone: "bg-rose-50 text-rose-900 border-rose-200",
+        text: "Execution failed — no retry was attempted.",
+      };
+    case "broadcasted_timeout":
+      return {
+        tone: "bg-amber-50 text-amber-900 border-amber-200",
+        text: "Broadcasted but finality timed out — check explorer.",
+      };
+    default: {
+      const exhaustive: never = autoStatus;
+      return { tone: "", text: String(exhaustive) };
+    }
+  }
+}
+
+/// "Ns ago" string from a Unix-millis timestamp. Returns `null` when
+/// the input isn't a parseable safe-int — defensive against backend
+/// drift. Bounded to "now" minimum (clamps a stale clock to "0s ago").
+function formatRelativeMsAgo(
+  raw: string | null | undefined,
+): string | null {
+  if (typeof raw !== "string" || !/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n)) return null;
+  const ms = Math.max(0, Date.now() - n);
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}m ${s}s ago`;
 }
 
 function fundButtonLabel(

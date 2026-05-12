@@ -26,6 +26,7 @@ import type {
   W5gConditionalExecutionResult,
   W5hConditionalDepositResult,
   W5hFundingConfirmEnvelope,
+  W5iOrderStatusEnvelope,
   W5hFundingConfirmRequest,
   WalletSummary,
 } from "@/lib/types";
@@ -1204,6 +1205,257 @@ export async function confirmW5hFunding(
     errorText = (await res.text().catch(() => "")) || res.statusText;
   }
   return { kind: "error", httpStatus: res.status, error: errorText };
+}
+
+// ── W5i order-status polling route ──────────────────────────────────────────
+//
+// `GET /sessions/:id/stage2/w5h/orders/:rule_id_hex` — frontend polls
+// this every ~5 s once an order is `budget_reserved` / `ready_to_execute`
+// so the demo viewer sees the W5i auto-watcher → executing → completed
+// transition without any frontend Solend tx work.
+//
+// READ-ONLY: this helper performs only a GET. It NEVER signs, NEVER
+// broadcasts, NEVER constructs a Solend instruction. The auto-executed
+// signature, slot, and deltas are mirrored verbatim from the backend's
+// JSON into the W5hConditionalDepositResult shape.
+//
+// As of 2026-05-12 Agent D has not finalised the exact route path; the
+// fetch URL below is the frontend's first-draft contract. If Agent D
+// chooses a different path, only this string and any header tweak need
+// adjustment — the response shape (a W5hConditionalDepositResult with
+// auto_* fields populated) is already type-aligned.
+export async function getW5hOrderStatus(
+  sessionId: SessionId,
+  ruleIdHex: string,
+): Promise<W5iOrderStatusEnvelope> {
+  if (IS_SHOWCASE) {
+    return showcaseW5iOrderStatusReply(ruleIdHex);
+  }
+
+  const headers: Record<string, string> = {};
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+
+  const res = await fetch(
+    `${GATEWAY_URL}/sessions/${sessionId}/stage2/w5h/orders/${ruleIdHex}`,
+    { method: "GET", headers, cache: "no-store" },
+  );
+
+  if (res.status === 200) {
+    const data = (await res.json()) as W5hConditionalDepositResult;
+    return { kind: "ok", response: data };
+  }
+
+  let errorText = "";
+  try {
+    const errBody = (await res.json()) as { error?: string };
+    errorText = errBody.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+  return { kind: "error", httpStatus: res.status, error: errorText };
+}
+
+/// Per-(rule_id_hex) call counter so the showcase fixture can simulate
+/// the W5i lifecycle (watching → executing → completed) across multiple
+/// poll calls. Lifetime is the browser session; we don't GC.
+const SHOWCASE_W5I_STATUS_CALLS = new Map<string, number>();
+
+/// Default number of polls in each W5i lifecycle phase before flipping
+/// to the next. Tuned so a 5 s poll interval shows each state for
+/// ~10 s, ample for a live-demo audience to read each banner.
+const SHOWCASE_W5I_POLLS_PER_PHASE = 2;
+
+/// Showcase reply for the W5i order-status route. Cycles through a
+/// canonical happy-path lifecycle so the demo viewer can see every
+/// auto-execution banner without standing up the live W5i watcher.
+///
+/// Suffix selectors on `ruleIdHex` let demo viewers preview failure
+/// branches without code edits:
+///   …execfail / …execfailX → enters `failed` after the executing phase
+///   …timeout  / …timeoutX  → enters `broadcasted_timeout` after exec
+///   …offX                  → forces `auto_execution_enabled = false`
+///                            and stays in `budget_reserved` (manual
+///                            W5g approval-command panel remains
+///                            visible, no auto-exec banner)
+function showcaseW5iOrderStatusReply(
+  ruleIdHex: string,
+): W5iOrderStatusEnvelope {
+  const lower = ruleIdHex.toLowerCase();
+  if (lower.includes("off")) {
+    // Watcher disabled — frontend keeps the manual W5g panel visible.
+    return {
+      kind: "ok",
+      response: buildShowcaseW5iAutoOff(ruleIdHex),
+    };
+  }
+  const seen = SHOWCASE_W5I_STATUS_CALLS.get(ruleIdHex) ?? 0;
+  SHOWCASE_W5I_STATUS_CALLS.set(ruleIdHex, seen + 1);
+
+  // Phase 1 — watching (server status = budget_reserved + auto = watching)
+  if (seen < SHOWCASE_W5I_POLLS_PER_PHASE) {
+    return {
+      kind: "ok",
+      response: buildShowcaseW5i(ruleIdHex, {
+        status: "budget_reserved",
+        auto_execution_status: "watching",
+      }),
+    };
+  }
+  // Phase 2 — ready_to_execute (condition met but executor hasn't fired)
+  if (seen < SHOWCASE_W5I_POLLS_PER_PHASE * 2) {
+    return {
+      kind: "ok",
+      response: buildShowcaseW5i(ruleIdHex, {
+        status: "ready_to_execute",
+        auto_execution_status: "ready_to_execute",
+      }),
+    };
+  }
+  // Phase 3 — executing
+  if (seen < SHOWCASE_W5I_POLLS_PER_PHASE * 3) {
+    return {
+      kind: "ok",
+      response: buildShowcaseW5i(ruleIdHex, {
+        status: "ready_to_execute",
+        auto_execution_status: "executing",
+      }),
+    };
+  }
+  // Terminal — branch on suffix.
+  if (lower.endsWith("execfail")) {
+    return {
+      kind: "ok",
+      response: buildShowcaseW5i(ruleIdHex, {
+        status: "ready_to_execute",
+        auto_execution_status: "failed",
+        auto_error_code: "simulation_failed",
+        auto_error_reason:
+          "Showcase fixture: rule_id suffix '…execfail' triggers the failed branch.",
+      }),
+    };
+  }
+  if (lower.endsWith("timeout")) {
+    return {
+      kind: "ok",
+      response: buildShowcaseW5i(ruleIdHex, {
+        status: "ready_to_execute",
+        auto_execution_status: "broadcasted_timeout",
+        auto_tx_signature:
+          "4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
+        auto_solscan_url: null,
+        auto_error_code: "confirmation_timeout",
+        auto_error_reason:
+          "Showcase fixture: broadcasted but finality not observed within window.",
+      }),
+    };
+  }
+  // Default terminal — completed (happy path).
+  return {
+    kind: "ok",
+    response: buildShowcaseW5i(ruleIdHex, {
+      status: "ready_to_execute",
+      auto_execution_status: "completed",
+      auto_tx_signature:
+        "4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
+      auto_solscan_url:
+        "https://solscan.io/tx/4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
+      auto_confirmation_slot: "419100000",
+      auto_usdc_delta_raw: "-250000",
+      auto_ctoken_delta_raw: "240156",
+    }),
+  };
+}
+
+/// Build a showcase W5i DTO with the auto-watcher disabled. Mirrors
+/// the post-funding W5h shape (`budget_reserved`) and leaves the
+/// manual W5g panel visible.
+function buildShowcaseW5iAutoOff(
+  ruleIdHex: string,
+): W5hConditionalDepositResult {
+  return {
+    ...buildShowcaseW5iBase(ruleIdHex),
+    status: "budget_reserved",
+    funding_signature: null,
+    funding_confirmation_slot: SHOWCASE_FUNDING_SLOT,
+    refund_signature: null,
+    error_reason: null,
+    error_code: null,
+    auto_execution_enabled: false,
+    auto_execution_status: undefined,
+    auto_last_checked_at_ms: null,
+    auto_tx_signature: null,
+    auto_solscan_url: null,
+    auto_confirmation_slot: null,
+    auto_usdc_delta_raw: null,
+    auto_ctoken_delta_raw: null,
+    auto_error_code: null,
+    auto_error_reason: null,
+  };
+}
+
+/// Build a showcase W5i DTO with `auto_execution_enabled = true`.
+/// Callers supply only the fields that vary per lifecycle phase; the
+/// rest are pinned constants.
+function buildShowcaseW5i(
+  ruleIdHex: string,
+  overrides: Partial<W5hConditionalDepositResult> & {
+    status: W5hConditionalDepositResult["status"];
+    auto_execution_status?: W5hConditionalDepositResult["auto_execution_status"];
+  },
+): W5hConditionalDepositResult {
+  return {
+    ...buildShowcaseW5iBase(ruleIdHex),
+    funding_signature:
+      "4M4ezLgm1mFpGmUpLJdDAVhfXYwUxjS2ZMkjKprBiWzsfgNudPkhEvBr6GdJbh1zBscKLF6kpUBhZg7tAm3ePy3y",
+    funding_confirmation_slot: SHOWCASE_FUNDING_SLOT,
+    refund_signature: null,
+    error_reason: null,
+    error_code: null,
+    auto_execution_enabled: true,
+    auto_last_checked_at_ms: Date.now().toString(),
+    auto_tx_signature: null,
+    auto_solscan_url: null,
+    auto_confirmation_slot: null,
+    auto_usdc_delta_raw: null,
+    auto_ctoken_delta_raw: null,
+    auto_error_code: null,
+    auto_error_reason: null,
+    ...overrides,
+  };
+}
+
+/// Constant prefix for both showcase auto-on / auto-off W5i DTOs.
+function buildShowcaseW5iBase(
+  ruleIdHex: string,
+): W5hConditionalDepositResult {
+  return {
+    input_text:
+      "(showcase order-status fixture — chat input not re-echoed)",
+    status: "budget_reserved",
+    rule_id_hex: ruleIdHex,
+    canonical_rule_hash_hex:
+      "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    amount_raw: "250000",
+    current_budget_raw: "250000",
+    user_wallet: null,
+    user_usdc_ata: null,
+    controlled_wallet: "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L",
+    controlled_usdc_ata: "7LFdKcSV7JQYi3or5y9phHVPjhGigu5DDjUakAFbBmk3",
+    expires_at_ms: null,
+    last_checked_slot: SHOWCASE_FUNDING_SLOT,
+    threshold_bps: 100,
+    threshold_pct_label: "1",
+    condition_met: true,
+    save_display_apy_bps: 312,
+    native_onchain_apr_bps: 287,
+    native_onchain_apr_source: "b_o1_reserve_math",
+    decision_source: "save_display_apy",
+    funding_signature: null,
+    funding_confirmation_slot: null,
+    refund_signature: null,
+    error_reason: null,
+    error_code: null,
+  };
 }
 
 /// Per-signature call counter so the showcase fixture can simulate

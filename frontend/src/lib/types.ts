@@ -491,7 +491,65 @@ export interface W5hConditionalDepositResult {
   error_reason?: string | null;
   /// Snake-case error variant. Optional.
   error_code?: string | null;
+
+  // ── W5i — backend auto-watcher / auto-execution status ────────────
+  //
+  // After Phantom funding completes and the order is `budget_reserved`,
+  // the W5i backend watcher takes over: re-evaluates the Save APY
+  // condition every ~30 s and, when it crosses the threshold, builds +
+  // signs + broadcasts the Solend deposit using the bounded executor's
+  // keypair (server-side). These fields surface that lifecycle to the
+  // chat card; the frontend POLLS them via the order-status route and
+  // RENDERS only — no signing, no Solend tx construction.
+  //
+  // All raw u64 fields (deltas, slot, last_checked) are STRINGS per
+  // the integer-safety rule.
+
+  /// `true` when the backend has the W5i watcher enabled for this
+  /// rule. When `false` or undefined, the frontend renders the
+  /// existing manual W5g approval-command panel; when `true`, that
+  /// panel is collapsed under a "Manual fallback" toggle so the demo
+  /// reads as fully autonomous.
+  auto_execution_enabled?: boolean;
+  /// Lifecycle of the backend watcher / executor for this rule.
+  /// Distinct from `status` so the demo can show simultaneous facts
+  /// (e.g. order is `budget_reserved` AND watcher is `watching`).
+  auto_execution_status?:
+    | "watching"
+    | "ready_to_execute"
+    | "executing"
+    | "completed"
+    | "failed"
+    | "broadcasted_timeout";
+  /// Unix-millis timestamp of the watcher's most recent condition
+  /// check. Rendered as a relative "checked Ns ago" label.
+  auto_last_checked_at_ms?: string | null;
+  /// Base58 of the auto-executed Solend deposit signature, when one
+  /// exists. Distinct from `funding_signature` (which is the
+  /// user's funding TransferChecked).
+  auto_tx_signature?: string | null;
+  /// Pre-built Solscan URL for `auto_tx_signature`. The frontend
+  /// falls back to `https://solscan.io/tx/<sig>` when omitted.
+  auto_solscan_url?: string | null;
+  /// Slot at which `auto_tx_signature` finalized. u64 → string.
+  auto_confirmation_slot?: string | null;
+  /// Signed delta in USDC raw units. May carry a `-` prefix on the
+  /// controlled wallet's USDC ATA delta. u64/i64 → string.
+  auto_usdc_delta_raw?: string | null;
+  /// Signed delta in cToken raw units. u64/i64 → string.
+  auto_ctoken_delta_raw?: string | null;
+  /// Snake-case error variant for `failed` / `broadcasted_timeout`.
+  auto_error_code?: string | null;
+  /// Human-readable reason — sent through verbatim.
+  auto_error_reason?: string | null;
 }
+
+/// Envelope returned by the W5i order-status helper. Mirrors the
+/// existing `confirmW5hFunding` envelope shape so the polling effect
+/// can branch identically.
+export type W5iOrderStatusEnvelope =
+  | { kind: "ok"; response: W5hConditionalDepositResult }
+  | { kind: "error"; httpStatus: number; error: string };
 
 /// Wire request body for `POST /sessions/:id/stage2/w5h/funding/confirm`.
 /// The frontend POSTs this immediately after a successful
