@@ -23,10 +23,11 @@ The user's Phantom signature event is bounded:
 
 There is no second `signTransaction()` site in the frontend. The
 hackathon prototype enforces this via grep-asserted source tests;
-this scaffold inherits the rule, and the Phase 4 frontend rebuild
-will re-add the assertion fixture. No CI exists yet at Phase 0
-(this scaffold has no CI configured); the rule is documentation
-plus inherited-from-prototype discipline until then.
+this docs branch inherits the rule, and the Phase 4 frontend
+rebuild will re-add the assertion fixture. No CI exists yet
+(this docs branch has no source code to run CI against); the rule
+is documentation plus inherited-from-prototype discipline until
+implementation lands.
 
 ### B2. The controlled wallet's keypair lives only in the daemon process
 
@@ -44,8 +45,9 @@ rebuild adds the equivalent fixture.)
 
 ### B3. The funding verifier is a strict equality check
 
-The verifier (`crates/funding`) refuses to enter `budget_reserved`
-unless **all** of the following hold on the on-chain transaction:
+The funding verifier (planned `crates/funding`, Phase 2) refuses to
+enter `budget_reserved` unless **all** of the following hold on the
+on-chain transaction:
 
 - Memo instruction at any index, program ==
   `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr`, payload == exact
@@ -76,11 +78,12 @@ funded budget.
 
 ### B5. The executor adapter is action-typed
 
-`crates/executor` does not accept arbitrary instructions. It accepts
-an `ActionRequest` keyed by adapter (`SolendDeposit`, planned
-`SolendWithdrawAll`, planned `JupiterSwap`). Each adapter validates
-its own inputs against the pinned demo shape **before** signing. The
-controlled wallet does not sign an opaque blob.
+The executor (planned `crates/executor`, Phase 4) will not accept
+arbitrary instructions. It accepts an `ActionRequest` keyed by
+adapter (`SolendDeposit`, planned `SolendWithdrawAll`, planned
+`JupiterSwap`). Each adapter validates its own inputs against the
+pinned demo shape **before** signing. The controlled wallet does
+not sign an opaque blob.
 
 ### B6. The expiry refund leg is explicitly deferred and gated when it lands
 
@@ -120,7 +123,7 @@ weaknesses.
   wallets (or PDA-derived per-rule signers) is downstream.
 - **Off-chain key rotation policy.** The controlled-wallet keypair
   is loaded from a fixed env path. There is no rotation cadence and
-  no HSM integration in the scaffold.
+  no HSM integration in the design as documented.
 - **Memo anchor uniqueness.** A user could in principle replay an
   identical memo+amount transfer to inflate a single intent's
   budget. The verifier rejects on `funding_signature` re-use, but

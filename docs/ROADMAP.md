@@ -1,21 +1,21 @@
 # Roadmap
 
-This scaffold is **Phase 0**. The phases below name slices, not dates.
-Each slice ships with a live proof (Solscan link + on-chain delta) or
-a typed test artifact.
+This docs branch is **Phase 0**. The phases below name slices, not
+dates. Each slice ships with a live proof (Solscan link + on-chain
+delta) or a typed test artifact.
 
-## Phase 0 — scaffold (this branch, current)
+## Phase 0 — bounded intent docs + evidence (this branch, current)
 
-- [x] Workspace + crate layout
 - [x] Architecture spec
 - [x] Security-boundaries spec
 - [x] Demo-evidence pointer (hackathon proofs)
 - [x] Reviewer quick path
-- [x] Empty `lib.rs` / `main.rs` with module-level docs only
-- [x] Initial `Cargo.toml` declarations (no behaviour yet)
+- [x] Roadmap
 
 No live tx is expected from Phase 0. The deliverable is a
-human-readable architecture and an empty skeleton.
+human-readable architecture spec, the security-boundary spec, the
+mainnet evidence pointer, and the per-phase roadmap. Implementation
+crates and apps land in Phase 1+ on separate branches.
 
 ## Phase 1 — intent-core
 

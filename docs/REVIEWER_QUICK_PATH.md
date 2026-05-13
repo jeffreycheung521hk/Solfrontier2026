@@ -1,6 +1,9 @@
 # Reviewer Quick Path
 
-A five-minute guided walk. Read these in order:
+**This is the docs / evidence branch of Solfrontier 2026** — no source
+code lives here. Implementation crates land in Phase 1+ on separate
+branches (see [`ROADMAP.md`](ROADMAP.md)). A five-minute guided walk
+through this branch — read in order:
 
 1. **[README.md](../README.md)** — the loop in one paragraph, and
    the bullet list of "what this does NOT claim" (the no-overclaim
@@ -13,7 +16,7 @@ A five-minute guided walk. Read these in order:
 4. **[docs/DEMO_EVIDENCE.md](DEMO_EVIDENCE.md)** — hackathon
    mainnet proofs (Solscan links) and the honest qualification on
    W5i (the one operator SQL `UPDATE` that was needed).
-5. **[docs/ROADMAP.md](ROADMAP.md)** — where this scaffold goes
+5. **[docs/ROADMAP.md](ROADMAP.md)** — where this branch goes
    next.
 
 ## What I think is worth your attention
@@ -48,7 +51,7 @@ A five-minute guided walk. Read these in order:
   [`docs/SECURITY_BOUNDARIES.md`](SECURITY_BOUNDARIES.md) has
   either a code-enforcement pointer or a "deferred" tag.
 - The architecture document explicitly tags every aspiration that
-  is **not** implemented in this scaffold.
+  is **not** implemented in the loop today.
 
 If you find a claim in this branch that is not backed by either
 running code (Phase 1+) or a Solscan link (hackathon evidence),

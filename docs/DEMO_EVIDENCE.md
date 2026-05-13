@@ -1,9 +1,11 @@
 # Demo Evidence
 
-This branch (`reset/precise-architecture`) is **scaffolding**. It does
-not yet carry its own mainnet evidence. The runnable demo proof lives
-in the hackathon repository, which is frozen for judging through
-2026-06-23.
+This branch (`reset/precise-docs-only`) is the **docs / evidence
+layer** of the Solfrontier 2026 redesign. It does not yet carry
+mainnet evidence originated from the redesign — those land as
+Phase 4+ ships. The hackathon mainnet evidence, reproduced verbatim
+below, lives authoritatively in the hackathon repository (frozen for
+judging through 2026-06-23).
 
 ## Hackathon evidence (verbatim pointers)
 
@@ -88,7 +90,7 @@ state mutation, is not yet proven on mainnet. Closing it (likely
 by arming the daemon, funding, and triggering the loop within a
 single expiry window) is on the roadmap.
 
-## What this scaffold will prove (planned, not yet executed)
+## What the redesign will prove (planned, not yet executed)
 
 Once the modules land, the redesign will reproduce the W5i loop
 with:

@@ -16,14 +16,14 @@ top of it. Solend is the first adapter; Jupiter is the next; subsequent
 adapters (other lending markets, swap aggregators, perps) follow the
 same template.
 
-> **Status:** scaffolding. This branch (`reset/precise-architecture`)
-> is a ground-up redesign of the runtime prototyped during the Frontier
-> hackathon. The hackathon prototype lives at
+> **Status:** docs and evidence only. This branch
+> (`reset/precise-docs-only`) carries the final Bounded Intent
+> Execution Loop spec, the security-boundary spec, the hackathon
+> mainnet evidence pointer, and the roadmap. **No source code lives
+> on this branch.** Implementation crates and apps land in Phase 1+
+> on separate branches. The hackathon prototype lives at
 > [testingcrypto2](https://github.com/jeffreycheung521hk/testingcrypto2)
-> (frozen for judging through 2026-06-23). Source-grade implementation
-> lands in Phase 1+; what ships in this commit is the architecture
-> spec, the module-boundary skeleton, and the no-overclaim discipline
-> that gates every subsequent commit.
+> (frozen for judging through 2026-06-23).
 
 ## The loop
 
@@ -78,7 +78,7 @@ no-overclaim discipline and this redesign keeps it.
 - **No `clawsol-authority` `ExecuteAction` program signer.** The
   executor signs with a plain controlled-wallet keypair. The
   PDA-authority design (and the `AuthorizationRecord` PDA) is
-  post-Hackathon work, not in this scaffold.
+  post-Hackathon work, not in the initial phases.
 - **No real third-party user delegation.** The "controlled wallet"
   is operator-controlled today. A genuinely user-delegated
   controlled wallet is a separate, later phase.
@@ -101,18 +101,23 @@ no-overclaim discipline and this redesign keeps it.
   path. Adding a new adapter does not modify the watcher, the CAS
   gate, or the executor's signing path.
 
-## Layout
+## Planned module layout (Phase 1+)
 
-| Path | Role |
-|---|---|
-| `crates/intent-core` | typed Intent, canonical hashing, rule lifecycle |
-| `crates/funding` | funding-tx verifier (memo + token delta) |
-| `crates/watcher` | budget-reserved scanner + condition evaluator + CAS gate |
-| `crates/executor` | controlled-wallet signer + adapter dispatcher |
-| `crates/adapters/solend` | Solend reserve interaction |
-| `crates/adapters/jupiter` | Jupiter conditional swap (scaffold) |
-| `apps/gateway` | HTTP surface (REST + chat dispatch) |
-| `frontend/chat-demo` | reviewer-facing chat demo UI |
+Implementation lands on separate branches in subsequent phases. The
+intended module boundaries are:
+
+| Path | Role | Phase |
+|---|---|---|
+| `crates/intent-core` | typed Intent, canonical hashing, rule lifecycle | 1 |
+| `crates/funding` | funding-tx verifier (memo + token delta) | 2 |
+| `crates/watcher` | budget-reserved scanner + condition evaluator + CAS gate | 3 |
+| `crates/executor` | controlled-wallet signer + adapter dispatcher | 4 |
+| `crates/adapters/solend` | Solend reserve interaction (deposit first; withdraw later) | 4 / 7 |
+| `crates/adapters/jupiter` | Jupiter conditional swap | 7 |
+| `apps/gateway` | HTTP surface (REST + chat dispatch) | 4 |
+| `frontend/chat-demo` | reviewer-facing chat demo UI | 4 |
+
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the per-phase plan.
 
 ## Where to start as a reviewer
 

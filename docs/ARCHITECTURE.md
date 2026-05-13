@@ -94,8 +94,9 @@ frontend has no other path to invoke `signTransaction` or `sendRaw*`.
 
 ### 5. Funding verifier
 
-The backend verifier (`crates/funding`) reads the user's funding
-signature via RPC `getTransaction` (with
+The backend funding verifier (planned `crates/funding`, Phase 2)
+will read the user's funding signature via RPC `getTransaction`
+(with
 `maxSupportedTransactionVersion: 0`) and asserts, conjunctively:
 
 - the memo instruction exists, program matches, payload is the
@@ -124,12 +125,14 @@ Only intents in `budget_reserved` are eligible for watcher pickup.
 
 ### 7. Watcher
 
-`crates/watcher` runs a `tokio::time::interval` ticker (30-second
-period in the current scaffold). Each tick:
+The watcher (planned `crates/watcher`, Phase 3) will run a
+`tokio::time::interval` ticker (30-second period initially). Each
+tick:
 
 - lists `budget_reserved` intents;
-- filters by the pinned demo shape (current scaffold accepts the
-  single fixed shape only — `0.25 USDC into Solend Main Pool USDC`);
+- filters by the pinned demo shape (the initial pinned shape is
+  `0.25 USDC into Solend Main Pool USDC` — the same shape the
+  hackathon proved);
 - re-fetches the current condition value (Save APY for the Solend
   USDC reserve);
 - if the condition is met, attempts to claim the execution lease.
@@ -159,12 +162,13 @@ WHERE rule_id = :rule_id
 
 ### 9. Controlled-wallet executor
 
-`crates/executor` holds the controlled-wallet keypair (loaded from
-disk at daemon startup, never embedded in source, never exposed to
-the frontend). On a successful lease claim, the executor:
+The executor (planned `crates/executor`, Phase 4) will hold the
+controlled-wallet keypair (loaded from disk at daemon startup,
+never embedded in source, never exposed to the frontend). On a
+successful lease claim, the executor:
 
 - delegates tx construction to the adapter for the action (Solend
-  deposit, in the current scaffold);
+  deposit is the initial adapter set);
 - signs with the controlled wallet;
 - broadcasts via `sendRawTransaction` against the configured RPC;
 - polls `getSignatureStatuses` for finalization;
@@ -210,13 +214,13 @@ proof artifact.
 
 | Commitment | Where enforced |
 |---|---|
-| User signs once, at funding time only | frontend: exactly one `signTransaction`, one `sendRawTransaction` call site. The hackathon prototype enforces this via grep-asserted source tests; this scaffold inherits the rule, and the Phase 4 frontend rebuild re-adds the fixture (no CI exists at Phase 0) |
-| Funding has an on-chain memo anchor | funding-tx builder; verified by `crates/funding` (Phase 2) |
-| Funding verifier requires exact memo + token-delta match | `crates/funding` test suite (positive + negative cases), Phase 2 |
-| CAS gate shared by manual approval and autonomous watcher | `crates/executor` and `crates/watcher` test suites (Phase 3 / Phase 4) |
-| Controlled-wallet keypair never leaves the daemon process | `crates/executor`; no frontend signing primitives |
-| LLM never reaches watcher / CAS / executor / adapter / broadcast | `crates/watcher` and `crates/executor` accept only `intent-core` types; any LLM output that hasn't been schema-validated cannot construct one |
-| Solend is the first adapter; Jupiter is the next; the loop is adapter-agnostic | `crates/adapters/solend` (deposit; withdraw planned); `crates/adapters/jupiter` (scaffold); subsequent adapters follow the same template |
+| User signs once, at funding time only | frontend: exactly one `signTransaction`, one `sendRawTransaction` call site. The hackathon prototype enforces this via grep-asserted source tests; the Phase 4 frontend rebuild will re-add the fixture |
+| Funding has an on-chain memo anchor | funding-tx builder; verified by the funding crate (Phase 2) |
+| Funding verifier requires exact memo + token-delta match | funding-crate test suite (positive + negative cases), Phase 2 |
+| CAS gate shared by manual approval and autonomous watcher | executor + watcher crate test suites (Phase 3 / Phase 4) |
+| Controlled-wallet keypair never leaves the daemon process | executor crate (Phase 4); no frontend signing primitives |
+| LLM never reaches watcher / CAS / executor / adapter / broadcast | watcher and executor crates accept only `intent-core` types; any LLM output that has not been schema-validated cannot construct one |
+| Solend is the first adapter; Jupiter is the next; the loop is adapter-agnostic | Solend adapter (Phase 4 deposit; Phase 7 withdraw); Jupiter adapter (Phase 7); subsequent adapters follow the same template |
 
 ## Hackathon evidence pointer
 
@@ -232,4 +236,5 @@ Hackathon repo:
 [`testingcrypto2/WEEKLY_UPDATES.md`](https://github.com/jeffreycheung521hk/testingcrypto2/blob/main/docs/WEEKLY_UPDATES.md)
 (frozen for judging through 2026-06-23).
 
-This scaffold rebuilds the same loop with cleaner module boundaries.
+The redesign rebuilds the same loop with cleaner module boundaries;
+see [`ROADMAP.md`](ROADMAP.md) for the per-phase plan.

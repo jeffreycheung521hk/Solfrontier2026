@@ -1,7 +1,0 @@
-[package]
-name = "adapter-solend"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
