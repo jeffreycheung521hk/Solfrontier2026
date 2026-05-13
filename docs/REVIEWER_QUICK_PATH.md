@@ -30,9 +30,15 @@ A five-minute guided walk. Read these in order:
 - **The Memo anchor makes the funding-to-rule binding recoverable
   from the chain without backend state.** That's a deliberate
   redundancy.
-- **The hackathon W5i proof had a one-line operator footnote** (an
-  `UPDATE` to extend an expired intent). The redesign needs to
-  close that gap with a single-sitting end-to-end run.
+- **The hackathon W5i proof required an operator-side SQL override**
+  — a single `UPDATE` that extended the intent's `expires_at_ms`
+  after the original expiry had lapsed during daemon arming. This
+  is not a footnote; it is the load-bearing gap the redesign needs
+  to close. The autonomous loop fail-closed correctly against the
+  original expiry (17 pre-update ticks returned `prechecks_failed`);
+  execution only succeeded after the operator mutated state. A
+  single-sitting end-to-end mainnet run without that override is
+  the next milestone for this branch.
 
 ## How to confirm I'm not overclaiming
 

@@ -21,10 +21,12 @@ The user's Phantom signature event is bounded:
   create-idempotent ATA. No Solend, no Jupiter, no ClawSol program
   is invoked at this step.
 
-There is no second `signTransaction()` site in the frontend; CI must
-fail the build if a second site appears. The hackathon prototype
-already enforced this via grep-asserted tests; the same discipline
-carries over here.
+There is no second `signTransaction()` site in the frontend. The
+hackathon prototype enforces this via grep-asserted source tests;
+this scaffold inherits the rule, and the Phase 4 frontend rebuild
+will re-add the assertion fixture. No CI exists yet at Phase 0
+(this scaffold has no CI configured); the rule is documentation
+plus inherited-from-prototype discipline until then.
 
 ### B2. The controlled wallet's keypair lives only in the daemon process
 
@@ -37,7 +39,8 @@ The frontend has no APIs that touch keypair bytes. There is no
 "import keypair" surface. If a frontend developer adds one, the
 system must fail closed: the controlled wallet refuses to execute
 when a public-facing "import" path exists. (Source-guard tests
-enforce this in the hackathon prototype.)
+enforce this in the hackathon prototype; the Phase 4 frontend
+rebuild adds the equivalent fixture.)
 
 ### B3. The funding verifier is a strict equality check
 
@@ -81,10 +84,14 @@ controlled wallet does not sign an opaque blob.
 
 ### B6. The expiry refund leg is explicitly deferred and gated when it lands
 
-The hackathon prototype shipped funding + autonomous execution but
-**not** automatic expiry refund. A funded budget whose condition
-never triggers stays `budget_reserved` until an operator-initiated
-refund is run.
+**Automatic** expiry refund — the loop closing without operator
+action when a funded condition never triggers — was deliberately
+deferred in the hackathon prototype and remains deferred here.
+**Operator-initiated** refund was proved once on mainnet during
+the hackathon (W6 refund tx `2DybD46v…hNQCd`). The two are
+distinct: a funded budget whose condition never triggers stays
+`budget_reserved` until the operator runs the (gated) refund path
+manually.
 
 When the refund leg lands, it will be a separate gated path:
 

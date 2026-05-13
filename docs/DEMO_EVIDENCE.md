@@ -20,41 +20,73 @@ Frontier hackathon. All are independently verifiable on Solscan.
   native on-chain APR 165 bps, threshold 100 bps (condition
   satisfied).
 
-### W5i — autonomous Solend deposit on mainnet ★
+### W5i — autonomous Solend deposit on mainnet
+
+> **Important caveat — read first.** The hackathon W5i smoke
+> required an **operator-side SQL override** before the autonomous
+> path could complete. The on-chain finalization below is real and
+> Solscan-verifiable, but the **complete watcher-only round-trip
+> without operator intervention has not yet been proven** on
+> mainnet. The exact SQL is inline further down — read it before
+> interpreting the deltas.
+
+**Mainnet finalizations:**
 
 - **Funding tx:** [`AvJFBJ7Z…ganB`](https://solscan.io/tx/AvJFBJ7ZSsQrZjCjxdVBHm5LjYdjMKvCmXbjF6TJSkWjmAAPiW88g8uc5K2TNMQJvXLKBFMNFDpyi9pLEAkganB)
   - slot 419,197,204;
   - memo: `claw:w5h:6400000090d00300000000009a62dace:609a14b2a372b04aabaceadad21cce493bc5197ed21487a6d7adb4a2696f097f`
 - **Auto Solend deposit tx:** [`takmz89b…jTv5`](https://solscan.io/tx/takmz89b5hLHgJ9jHVBbqJogxdvu8xuMdUgZLEpdHhTD7zvRswrrk1UnxfZf7pbsaM4fygqvDFwFbph5YH2jTv5)
   - finalized slot 419,200,198;
-  - 91,893 compute units;
-  - 4 outer instructions;
-  - 2 Solend program invocations;
-  - 0 Jupiter, 0 refund.
+  - 91,893 compute units; 4 outer instructions; 2 Solend program
+    invocations; 0 Jupiter; 0 refund.
 - **Token deltas** (from `meta.preTokenBalances` /
   `meta.postTokenBalances`):
   - Controlled USDC ATA: **−250,000 raw**
   - Solend reserve USDC vault: **+250,000 raw**
   - Solend collateral pool cToken: **+192,819 raw**
   - Controlled wallet cToken ATA: transit-only (0 → 0)
-- **No human signature between funding and execution.** The watcher
-  detected the eligible intent on its 30-second tick, claimed the
-  CAS lease, signed with the controlled wallet, and broadcast the
-  deposit.
+- **No human signature between funding and execution** — but see
+  caveat above; the autonomous path only succeeded after an
+  operator SQL override extended the intent's expiry. The watcher
+  detected the (now-extended) eligible intent on a 30-second tick,
+  claimed the CAS lease, signed with the controlled wallet, and
+  broadcast the deposit.
 
-### Honest qualification on W5i
+#### Operator-side SQL override (the honest part)
 
-The hackathon W5i smoke required a single targeted SQL `UPDATE` to
-extend the intent's `expires_at_ms` after the live gates were armed
-(the earlier expiry had already passed by the time the operator
-finished arming the daemon). The autonomous-execution path itself
-was honest about the original expiry and only succeeded after that
-explicit operator-side extension.
+After the live gates were armed but **before** the watcher could
+pick the intent up, the original `expires_at_ms` had already
+lapsed during the daemon-arming process. The CAS gate behaved
+correctly throughout this interval: 17 pre-update ticks returned
+`prechecks_failed` because `expires_at_ms < now_ms`. The
+autonomous-execution path never bypassed that check.
 
-The complete watcher-only round-trip — natural language → funding →
+To allow the loop to complete in that sitting, the operator ran
+the following targeted SQL **override** against the running
+daemon's intent store:
+
+```sql
+UPDATE stage2_w5h_funding_intents
+SET expires_at_ms = now_ms + 600_000,
+    updated_at_ms = now_ms
+WHERE rule_id_hex = '6400000090d00300000000009a62dace'
+  AND status = 'budget_reserved';
+-- rows_affected = 1
+```
+
+Only the two timestamp columns changed. `rule_id_hex`,
+`canonical_rule_hash_hex`, `amount_raw`, `funding_signature`,
+controlled wallet, and USDC ATA were all unchanged. The CAS gate's
+strictness against expiry is what the 17 pre-update ticks
+demonstrated; the loop's freedom from operator state mutation is
+**not** what the smoke demonstrated.
+
+**This is the gap the redesign needs to close.** A single-sitting
+round-trip — deterministic / structured chat command → funding →
 expiry-fresh trigger → autonomous execution — without any operator
-intervention, **has not yet been proven** on mainnet. Closing that
-gap is on the roadmap for this redesign.
+state mutation, is not yet proven on mainnet. Closing it (likely
+by arming the daemon, funding, and triggering the loop within a
+single expiry window) is on the roadmap.
 
 ## What this scaffold will prove (planned, not yet executed)
 

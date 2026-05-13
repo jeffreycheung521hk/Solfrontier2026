@@ -19,22 +19,36 @@ boundary; no module synthesises behaviour the next module should own.
 
 ### 1. Chat command
 
-The chat surface accepts a small set of deterministic structured
-commands — not free-form natural language. The hackathon prototype
-recognised:
+The chat surface accepts user instructions and produces a typed
+Intent. Two parsers, applied in order:
 
-- English: `If Save APY > <X>%, deposit <Y> USDC`
-- Chinese: `如果 Save APY > <X>%, deposit <Y> USDC`
+1. **Deterministic recogniser** (Phases 0–4). A regex filter matches
+   a small set of structured commands. The hackathon prototype
+   recognised:
 
-The LLM is **not** the parser. The recogniser is a deterministic regex
-filter that runs **before** any LLM call. If the filter matches, the
-chat command is materialised into an Intent. If not, the message falls
-through to the LLM-driven chat surface (for which different rules
-apply, including the no-LLM-in-execution rule below).
+   - English: `If Save APY > <X>%, deposit <Y> USDC`
+   - Chinese: `如果 Save APY > <X>%, deposit <Y> USDC`
 
-This boundary is what makes the loop trustworthy: a deterministic
-recogniser produces a typed Intent, and from that point on no model
-output influences execution.
+   If the regex matches, the message is materialised into an Intent
+   immediately. No LLM call.
+
+2. **LLM-assisted parser** (Phase 5+). For messages the regex
+   doesn't match, an LLM extracts structured fields (`pool`,
+   `threshold`, `amount`, `expiry`, …) from broader natural-language
+   phrasing using constrained output (JSON schema or tool-use mode).
+   The extracted fields are then validated against the typed Intent
+   schema in Rust. Anything that fails schema validation is
+   rejected, not parsed loosely. The LLM's only output that
+   survives validation is the same typed Intent the regex
+   produces.
+
+**The hard boundary.** Regardless of which parser produced the
+Intent, from canonical hash onward no model output influences
+behaviour. The LLM does not read or write persisted state, does not
+call any RPC, does not see the controlled-wallet keypair, does not
+touch the watcher, the CAS gate, the executor, or any adapter.
+**Phase 5 expands what the chat surface *accepts*; it does not
+relax what the runtime *trusts*.**
 
 ### 2. Typed Intent + canonical hash
 
@@ -179,13 +193,13 @@ the evidence in the chat card.
 
 | Aspiration | Status in this scaffold | Status elsewhere |
 |---|---|---|
-| LLM parses arbitrary natural language into Intents | **No** — deterministic recogniser only | LLM-driven product copy in chat surface (pre-Intent) is allowed |
-| LLM in the execution hot path | **No** — watcher/executor are pure Rust | n/a |
+| LLM parses arbitrary NL without schema validation | **No across all phases** — Phase 5+ adds an LLM parser, but every output must validate against the typed Intent schema or be rejected | LLM-driven product copy elsewhere in the chat surface (pre-Intent) is allowed |
+| LLM in the execution hot path (watcher / CAS / executor / adapter / broadcast) | **No across all phases** — pure Rust; no model output reaches these layers | n/a — this is a hard architectural commitment, not a deferral |
 | Production scheduler (durable, distributed) | **No** — single-process `tokio::time::interval` | post-Hackathon work; not yet specified |
 | `clawsol-authority` PDA signer | **No** — controlled wallet is a plain keypair | designed but not implemented |
 | `AuthorizationRecord` PDA-on-chain delegation | **No** — design only | post-Hackathon work |
 | Multi-tenant controlled-wallet management | **No** — single operator wallet | post-Hackathon work |
-| Automatic expiry refund | **No** — operator-initiated only | hackathon-deferred; reuses the same controlled-wallet executor |
+| Automatic expiry refund | **No** — operator-initiated only | hackathon-deferred; operator-initiated refund was proved once on mainnet (W6) |
 
 These are not omissions to be filled in silently. They are the
 boundary of what the loop currently proves. Each future expansion
@@ -196,12 +210,13 @@ proof artifact.
 
 | Commitment | Where enforced |
 |---|---|
-| User signs once, at funding time only | frontend: exactly one `signTransaction`, one `sendRawTransaction` call site (grep-asserted in CI) |
-| Funding has an on-chain memo anchor | funding-tx builder; verified by `crates/funding` |
-| Funding verifier requires exact memo + token-delta match | `crates/funding` test suite (positive + negative cases) |
-| CAS gate shared by manual approval and autonomous watcher | `crates/executor` and `crates/watcher` test suites |
+| User signs once, at funding time only | frontend: exactly one `signTransaction`, one `sendRawTransaction` call site. The hackathon prototype enforces this via grep-asserted source tests; this scaffold inherits the rule, and the Phase 4 frontend rebuild re-adds the fixture (no CI exists at Phase 0) |
+| Funding has an on-chain memo anchor | funding-tx builder; verified by `crates/funding` (Phase 2) |
+| Funding verifier requires exact memo + token-delta match | `crates/funding` test suite (positive + negative cases), Phase 2 |
+| CAS gate shared by manual approval and autonomous watcher | `crates/executor` and `crates/watcher` test suites (Phase 3 / Phase 4) |
 | Controlled-wallet keypair never leaves the daemon process | `crates/executor`; no frontend signing primitives |
-| Solend is the first adapter; Jupiter is the next | `crates/adapters/solend` (deposit; withdraw planned); `crates/adapters/jupiter` (scaffold) |
+| LLM never reaches watcher / CAS / executor / adapter / broadcast | `crates/watcher` and `crates/executor` accept only `intent-core` types; any LLM output that hasn't been schema-validated cannot construct one |
+| Solend is the first adapter; Jupiter is the next; the loop is adapter-agnostic | `crates/adapters/solend` (deposit; withdraw planned); `crates/adapters/jupiter` (scaffold); subsequent adapters follow the same template |
 
 ## Hackathon evidence pointer
 
