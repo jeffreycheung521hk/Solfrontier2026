@@ -1,0 +1,44 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node build artifacts
+node_modules/
+.next/
+out/
+dist/
+build/
+
+# Env / secrets — NEVER commit
+.env
+.env.*
+*.pem
+*.key
+*.p8
+
+# Local wallet / keypair files
+test-wallets/
+keypairs/
+*.keypair.json
+*.json.local
+
+# Local config that may carry secrets
+config/*mainnet*.toml
+config/*-smoke.toml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+data/
+
+# Claude / agent state
+.claude/

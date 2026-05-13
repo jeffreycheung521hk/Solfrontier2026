@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/intent-core",
+    "crates/funding",
+    "crates/watcher",
+    "crates/executor",
+    "crates/adapters/solend",
+    "crates/adapters/jupiter",
+    "apps/gateway",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/jeffreycheung521hk/Solfrontier2026"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
