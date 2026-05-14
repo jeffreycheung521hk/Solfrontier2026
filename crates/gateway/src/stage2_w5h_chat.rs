@@ -104,12 +104,19 @@ pub fn looks_like_w5h_chat_command(text: &str) -> bool {
     // it here keeps the W5h detector from hijacking W5d commands.
     let bounded_executor_form = lower.contains("from my bounded executor wallet")
         || lower.contains("into solend.");
-    // W5h-lite (2026-05-12): accept the bare simplified grammar
-    // (`If Save APY > X%, deposit 0.25 USDC`) and its Chinese twin.
-    // The presence of pool + amount is enough; the "expires in" and
-    // "from my wallet" qualifiers are optional. W5d/W5e/W5f are
-    // ruled out by the `bounded_executor_form` guard above.
-    pool_named && amount_named && !bounded_executor_form
+    // W5h-lite (2026-05-12) + Phase 5 (2026-05-13): accept the bare
+    // simplified grammar (`If Save APY > X%, deposit 0.25 USDC`) and
+    // its Chinese twin. ALSO require an explicit comparison marker
+    // (`above`, `>`) PLUS a `%` — these are the substrings the strict
+    // parser will look for. Paraphrases that have neither marker
+    // (e.g. "put 0.25 USDC in Solend if APY clears 1%") deliberately
+    // fail this detector so the Phase 5 LLM extractor gets a turn at
+    // them, rather than being eagerly captured by the deterministic
+    // path and rejected at strict-parse time.
+    let strict_threshold_marker =
+        (lower.contains("above ") || lower.contains("> ") || lower.contains(">"))
+            && lower.contains('%');
+    pool_named && amount_named && !bounded_executor_form && strict_threshold_marker
 }
 
 /// Strict parser. Returns a `W5hParsed` on success; a typed error

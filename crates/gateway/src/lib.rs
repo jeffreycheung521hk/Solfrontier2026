@@ -70,6 +70,7 @@ pub mod stage2_chat_execute;
 // refund routes, and a CAS-lease gate that protects W5g execution
 // vs. W5h refund as competing terminal paths over the same 0.25
 // USDC budget.
+pub mod stage2_llm_intent_extractor;
 pub mod stage2_w5h_bridge;
 pub mod stage2_w5h_chat;
 pub mod stage2_w5h_funding_confirm;

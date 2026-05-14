@@ -77,7 +77,9 @@ impl std::fmt::Display for W5hBridgeError {
     }
 }
 
-/// Entry point: parse + fetch + persist + return DTO.
+/// Entry point — DETERMINISTIC path. Parses the raw user message with
+/// the strict W5h grammar; on parse-success delegates to
+/// [`handle_w5h_from_parsed`] (the shared-runtime seam).
 ///
 /// `user_wallet_bs58` is the externally-bound wallet pubkey from
 /// the session. For test calls the caller can pass any base58 string.
@@ -90,7 +92,35 @@ pub async fn handle_w5h_chat_command(
     input_text: &str,
 ) -> Result<W5hConditionalOrderResultDto, W5hBridgeError> {
     let parsed = parse_w5h_chat_command(input_text).map_err(W5hBridgeError::Parse)?;
+    handle_w5h_from_parsed(
+        apr_fetcher,
+        save_apy_fetcher,
+        rule_repo,
+        intent_repo,
+        user_wallet_bs58,
+        input_text,
+        &parsed,
+    )
+    .await
+}
 
+/// Shared-runtime seam — accepts a pre-parsed [`W5hParsed`] from
+/// EITHER the deterministic parser OR the Phase 5 LLM intent
+/// extractor and runs the SAME canonical-hash / WatchRule /
+/// FundingIntent pipeline.
+///
+/// This is the single boundary the LLM-assisted extractor crosses
+/// to enter the trusted runtime. From canonical hash onward there
+/// must be no observable difference between the two paths.
+pub async fn handle_w5h_from_parsed(
+    apr_fetcher: &(dyn W5dAprFetcher + 'static),
+    save_apy_fetcher: &(dyn SaveDisplayApyFetcher + 'static),
+    rule_repo: &Stage2WatchRuleRepository,
+    intent_repo: &Stage2W5hFundingIntentRepository,
+    user_wallet_bs58: &str,
+    input_text: &str,
+    parsed: &W5hParsed,
+) -> Result<W5hConditionalOrderResultDto, W5hBridgeError> {
     // Map W5h parser output → W5d/W5e DemoParsed so we can reuse
     // build_w5e_watch_rule (which expects the W5d shape). The
     // amount + threshold survive unchanged; expires is W5h-specific
@@ -164,7 +194,7 @@ pub async fn handle_w5h_chat_command(
     // the persisted intent's current status — the user may have
     // already funded, expired, refunded, etc.
     let intent_now = match intent_repo.insert(&intent).await {
-        Ok(()) => intent_to_response_template(&intent, &parsed),
+        Ok(()) => intent_to_response_template(&intent, parsed),
         Err(_) => match intent_repo.get(&rule_id_hex).await {
             Ok(Some(existing)) => persisted_intent_to_response(&existing),
             Ok(None) => {
@@ -189,7 +219,7 @@ pub async fn handle_w5h_chat_command(
 
         amount_raw: W5H_DEPOSIT_AMOUNT_RAW,
         threshold_bps: parsed.threshold_bps,
-        threshold_pct_label: parsed.threshold_pct_label,
+        threshold_pct_label: parsed.threshold_pct_label.clone(),
         save_display_apy_bps_at_creation: save.save_display_apy_bps,
         native_onchain_apr_bps_at_creation: native.current_apr_bps,
         created_at_ms: intent_now.created_at_ms,
