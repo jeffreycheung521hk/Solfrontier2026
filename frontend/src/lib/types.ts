@@ -507,6 +507,38 @@ export interface W5hConditionalDepositResult {
   /// Snake-case error variant. Optional.
   error_code?: string | null;
 
+  // ── Phase 5c-lite finalize-response extensions ────────────────────
+  //
+  // When this DTO is the response body of the
+  // `POST /sessions/:id/stage2/w5h/intent/finalize` route (user just
+  // confirmed an LLM-drafted intent), the backend ALSO sets these
+  // fields. They are absent on the existing 0.25-regex W5h path.
+  //
+  // `amount_display` / `threshold_display` are PURELY display strings
+  // — the funding tx builder MUST use `amount_raw` for the on-chain
+  // TransferChecked amount (BigInt parsing with safe-integer guard).
+  // `memo_text` is the EXACT UTF-8 bytes the funding tx Memo
+  // instruction must carry; the builder consumes this verbatim
+  // instead of recomputing.
+
+  /// Display-only human-readable amount (e.g. "0.5 USDC"). Never
+  /// parsed back into a number by the frontend.
+  amount_display?: string | null;
+  /// Display-only threshold string (e.g. "0.5%"). Frontend renders
+  /// verbatim; falls back to `threshold_bps / 100 + "%"` only if
+  /// absent.
+  threshold_display?: string | null;
+  /// Memo instruction text the funding tx MUST anchor on-chain. On
+  /// the Phase 5c path this is the backend-controlled canonical
+  /// string; on the legacy 0.25 path it is recomputed locally by
+  /// `buildW5hMemoText(rule_id, canonical_hash)`.
+  memo_text?: string | null;
+
+  /// Optional finalization metadata bag. All sub-fields are optional;
+  /// frontend renders them in a collapsible technical-details section
+  /// and omits the section entirely when this object is absent.
+  finalization?: W5hFinalizationMetadata | null;
+
   // ── Canonical W5i order-status fields (backend, top-level) ────────
   //
   // These mirror `claw_api::state::W5hOrderStatusDto` field names
@@ -589,6 +621,144 @@ export interface W5hConditionalDepositResult {
 /// can branch identically.
 export type W5iOrderStatusEnvelope =
   | { kind: "ok"; response: W5hConditionalDepositResult }
+  | { kind: "error"; httpStatus: number; error: string };
+
+// ── Phase 5c-lite — Draft Intent Review Gate ────────────────────────────────
+//
+// LLM drafts a W5h intent → backend emits `DraftIntentReviewRequiredDto`
+// (wire tag `kind: "draft_intent_review_required"`; api.ts normalises
+// it to a `status`-discriminated ChatResponse variant). Frontend
+// renders the draft as a review card, user clicks Confirm / Reject,
+// frontend POSTs `/sessions/:id/stage2/w5h/intent/finalize`. On
+// confirm-success, the backend re-emits an extended
+// `W5hConditionalDepositResult` (with `memo_text`, `amount_display`,
+// `finalization`) and the frontend renders the existing W5h funding
+// card BELOW the (now-Confirmed) draft card.
+
+/// Per-finalize audit bag carried inside `W5hConditionalDepositResult.
+/// finalization`. Lets the user audit which LLM draft produced the
+/// order they're about to fund.
+export interface W5hFinalizationMetadata {
+  parser_source?: string | null;
+  draft_id?: string | null;
+  draft_hash?: string | null;
+  original_user_message_hash?: string | null;
+  finalized_at_ms?: string | null;
+}
+
+/// Wire DTO for the new chat-route variant. Backend sends the literal
+/// JSON `{ "kind": "draft_intent_review_required", ... }`; api.ts
+/// normalises that to `{ status: "draft_intent_review_required",
+/// result: <DraftIntentReviewRequiredDto> }` so the existing
+/// `ChatResponseCard` switch contract keeps working.
+///
+/// Frontend MUST treat this DTO as opaque from a hash-canonicalisation
+/// standpoint:
+///   - `draft_id` and `draft_hash` are echoed verbatim in the finalize
+///     POST body.
+///   - Frontend never recomputes `draft_hash`.
+///   - `amount_display` / `threshold_display` are display-only.
+///   - `amount_raw` is u64-as-string; the funding-tx builder uses
+///     this AFTER `BigInt` parse with a sanity cap.
+export interface DraftIntentReviewRequiredDto {
+  draft_id: string;
+  draft_hash: string;
+  /// `"llm_extractor"` for the W5h Phase 5b path. Future phases may
+  /// introduce other parser sources; rendered verbatim.
+  parser_source: string;
+  /// 32-byte hex of `sha256(user_message_utf8)`. Audit anchor —
+  /// lets the user see which input produced this draft.
+  original_user_message_hash: string;
+  /// Pinned to `"deposit"` for Phase 5c-lite. Future flows may
+  /// introduce other actions.
+  action: string;
+  /// Pinned to `"solend"` for Phase 5c-lite.
+  protocol: string;
+  /// Pinned to `"USDC"` for Phase 5c-lite.
+  asset: string;
+  /// Pinned to `"save"` (Save UI APY) for Phase 5c-lite.
+  display_source: string;
+  /// Pinned to `"gt"` (strictly greater than) for Phase 5c-lite.
+  comparison: string;
+  threshold_bps: number;
+  /// Display-only string (e.g. `"0.5%"`). Frontend renders verbatim
+  /// — never parses it.
+  threshold_display: string;
+  /// u64-as-string base-unit amount. Source of truth for the funding
+  /// tx — funding builder MUST `BigInt(amount_raw)` with a safe-int
+  /// guard at the call site.
+  amount_raw: string;
+  /// Display-only human amount (e.g. `"0.5 USDC"`).
+  amount_display: string;
+  controlled_wallet: string;
+  controlled_usdc_ata: string;
+  /// Expiry window backend will apply when finalize succeeds. The
+  /// review card surfaces this as "Expires N minutes after
+  /// confirmation." — NOT an absolute timestamp.
+  expiry_seconds_after_finalize: number;
+  /// Optional non-blocking warnings (e.g. "model confidence is
+  /// borderline"). Empty array is the happy path.
+  warnings: string[];
+  /// Localised review-copy string. Rendered verbatim above the
+  /// Confirm / Reject buttons.
+  review_copy: string;
+}
+
+/// Wire body for `POST /sessions/:id/stage2/w5h/intent/finalize`.
+///
+/// Matches Agent D's contract-realignment commit `ade3d6e` on
+/// `develop-phase5c-lite-backend`: the discriminator is the boolean
+/// `user_confirmed`. The earlier `action: "confirm" | "reject"`
+/// string-tag shape from commit `3d30617` has been removed; the
+/// boolean is now the canonical wire shape. Frontend must NOT send
+/// an `action` field.
+export interface FinalizeW5hIntentRequest {
+  draft_id: string;
+  draft_hash: string;
+  /// `true`  → finalize and proceed to funding_required.
+  /// `false` → reject; backend returns `{ status: "rejected" }`.
+  user_confirmed: boolean;
+}
+
+/// Envelope returned by `finalizeW5hIntent`. Discriminates by HTTP
+/// status AND by the typed `error_code` field the backend includes
+/// in the response body (both 409 variants share the HTTP status but
+/// carry distinct `error_code`s).
+///
+/// Variants:
+///   - `funding_required` — confirm success; the response IS the
+///      existing `W5hConditionalDepositResult` extended with
+///      `memo_text` / `amount_display` / `finalization`.
+///   - `rejected` — reject success; backend body
+///      `{ status: "rejected" }`.
+///   - `draft_not_found_or_expired` — 404 with
+///      `error_code: "draft_not_found_or_expired"`. The draft expired
+///      or never existed.
+///   - `draft_hash_mismatch` — 409 with
+///      `error_code: "draft_hash_mismatch"`. The hash the client
+///      sent does not match the canonical hash the backend recomputed
+///      from the persisted draft preimage. The draft is NOT consumed;
+///      a fresh fetch would let the user re-confirm. We surface this
+///      as terminal-stale so the user re-types a clean instruction
+///      (per the Phase 5c-lite prompt copy).
+///   - `draft_already_finalized_or_missing` — 409 with
+///      `error_code: "draft_already_finalized_or_missing"`. The draft
+///      was already confirmed or rejected on a prior round-trip.
+///   - `bad_request` — 400 (malformed body, missing/empty fields,
+///      unknown `action` string). Terminal — frontend bug.
+///   - `disabled` — 503 (no finalize handler wired in this daemon).
+///      Terminal — daemon configuration issue.
+///   - `error` — anything else (parse failure, unexpected status,
+///      etc.). Caller decides whether to retry; the card surfaces a
+///      recoverable transient banner.
+export type FinalizeW5hIntentEnvelope =
+  | { kind: "funding_required"; response: W5hConditionalDepositResult }
+  | { kind: "rejected" }
+  | { kind: "draft_not_found_or_expired"; error: string }
+  | { kind: "draft_hash_mismatch"; error: string }
+  | { kind: "draft_already_finalized_or_missing"; error: string }
+  | { kind: "bad_request"; error: string }
+  | { kind: "disabled"; error: string }
   | { kind: "error"; httpStatus: number; error: string };
 
 /// Wire request body for `POST /sessions/:id/stage2/w5h/funding/confirm`.
@@ -772,6 +942,15 @@ export type ChatResponse =
   | {
       status: "w5h_conditional_order";
       result: W5hConditionalDepositResult;
+    }
+  /// Phase 5c-lite — LLM drafted an intent and is asking the user to
+  /// confirm before any funding flow starts. Backend's wire body is
+  /// `{ "kind": "draft_intent_review_required", … }`; api.ts
+  /// normalises the discriminator from `kind` to `status` so this
+  /// dispatch stays uniform with the rest of the union.
+  | {
+      status: "draft_intent_review_required";
+      result: DraftIntentReviewRequiredDto;
     }
   /// W5g chat-first execution result. Tag string aligns with the Rust
   /// enum's `#[serde(rename_all = "snake_case")]` projection of the

@@ -341,12 +341,24 @@ export interface BuildW5hFundingTxArgs {
   /// because that would silently mask a backend DTO drift.
   controlledWallet: PublicKey;
   /// 32-char hex of the persisted `WatchRule.rule_id`. Anchored in
-  /// the on-chain memo as the first half of the audit string.
+  /// the on-chain memo as the first half of the audit string —
+  /// IGNORED when `memoTextOverride` is set.
   ruleIdHex: string;
   /// 64-char hex of the rule's canonical Borsh hash. Anchored in
   /// the on-chain memo as the second half — this is the rule's
-  /// integrity signature, distinct from the rule id.
+  /// integrity signature, distinct from the rule id. IGNORED when
+  /// `memoTextOverride` is set.
   canonicalRuleHashHex: string;
+  /// Phase 5c-lite path: when the finalize-response carries a
+  /// canonical `memo_text` string, the caller passes it here and
+  /// the builder uses the bytes VERBATIM instead of recomputing via
+  /// `buildW5hMemoText(ruleIdHex, canonicalRuleHashHex)`. This pins
+  /// the audit memo to whatever the backend chose, so display-only
+  /// fields in the UI cannot influence the on-chain bytes.
+  ///
+  /// Legacy 0.25-regex path leaves this undefined and the builder
+  /// falls back to `buildW5hMemoText`.
+  memoTextOverride?: string;
   recentBlockhash: string;
 }
 
@@ -375,12 +387,17 @@ export function buildW5hFundingTransaction(
   const usdcMint = new PublicKey(USDC_MINT_BASE58);
   const tx = new Transaction();
   // Index 0 — Memo (audit anchor). MUST stay first per the W5h-Memo
-  // addendum contract so the on-chain layout is grep-stable.
-  tx.add(
-    createMemoInstruction(
-      buildW5hMemoText(args.ruleIdHex, args.canonicalRuleHashHex),
-    ),
-  );
+  // addendum contract so the on-chain layout is grep-stable. The
+  // Phase 5c-lite finalize-response path passes its canonical
+  // `memo_text` through `memoTextOverride` so the bytes the user
+  // signs are exactly what the backend pinned in the finalized
+  // intent. Legacy path recomputes from rule_id + canonical hash.
+  const memoText =
+    typeof args.memoTextOverride === "string" &&
+    args.memoTextOverride.length > 0
+      ? args.memoTextOverride
+      : buildW5hMemoText(args.ruleIdHex, args.canonicalRuleHashHex);
+  tx.add(createMemoInstruction(memoText));
   if (args.includeCreateAta) {
     tx.add(
       createIdempotentAtaInstruction({

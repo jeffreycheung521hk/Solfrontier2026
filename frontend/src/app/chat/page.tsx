@@ -27,6 +27,7 @@ import {
   confirmW5hFunding,
   confirmWalletBindChallenge,
   createWalletBindChallenge,
+  finalizeW5hIntent,
   getOrCreateSession,
   getW5hOrderStatus,
   postChat,
@@ -49,6 +50,7 @@ import type {
   ChatMessage,
   ChatResponse,
   ChatRouteResult,
+  DraftIntentReviewRequiredDto,
   SessionId,
   W5dConditionalDepositResult,
   W5gConditionalExecutionResult,
@@ -798,6 +800,21 @@ function ChatResponseCard({
         />
       );
 
+    case "draft_intent_review_required":
+      // Phase 5c-lite — LLM drafted an intent and is waiting for
+      // user confirmation BEFORE any funding flow. Card owns its
+      // own confirm/reject in-flight state and, on confirm-success,
+      // renders the existing W5h funding card BELOW the (now-
+      // disabled) draft details so the chat-history transcript
+      // shows what the LLM drafted and what the user did with it.
+      return (
+        <DraftIntentReviewCard
+          draft={response.result}
+          sessionId={sessionId}
+          walletPubkey={walletPubkey}
+        />
+      );
+
     case "w5g_conditional_execution":
       // W5g chat-first execution result. The user's second chat
       // message ("Execute W5g conditional deposit …") drives the
@@ -1523,8 +1540,17 @@ function W5hConditionalOrderCard({
         // is inserted as instruction 0. Pass the EXACT DTO values
         // (no transformation) so the on-chain audit trail matches the
         // persisted rule byte-for-byte.
+        //
+        // Phase 5c-lite finalize path: when the DTO carries a
+        // backend-pinned `memo_text`, pass it through the override so
+        // the on-chain bytes are exactly what the finalized intent
+        // committed to. UI display fields CANNOT influence the memo
+        // bytes — only `result.memo_text` (from the finalize response)
+        // does. Legacy 0.25 regex path leaves `memo_text` undefined
+        // and the builder recomputes locally.
         ruleIdHex: result.rule_id_hex,
         canonicalRuleHashHex: result.canonical_rule_hash_hex,
+        memoTextOverride: result.memo_text ?? undefined,
         recentBlockhash: blockhash,
       });
     } catch (err) {
@@ -2131,6 +2157,495 @@ function W5hConditionalOrderCard({
           </p>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── Phase 5c-lite — Draft Intent Review card ───────────────────────
+//
+// Renders an LLM-drafted W5h intent as a chat-history-resident
+// review card. The user clicks Confirm or Reject. Confirm POSTs to
+// the finalize route; on success, the card stays visible (marked as
+// Confirmed) and APPENDS the existing W5h funding card inline.
+// Reject marks the card as Rejected. 404 / 409 mark it Expired or
+// Stale; the user is asked to re-type the instruction.
+//
+// CRITICAL invariants (per the Phase 5c-lite prompt):
+//   1. NO Fund button is rendered until finalize succeeds. The W5h
+//      funding card (which owns the Fund button) is rendered ONLY
+//      inside the `confirmed` branch.
+//   2. The draft card is NEVER silently removed. Confirmed / rejected
+//      / stale states all keep the original details visible so the
+//      chat log preserves what the LLM drafted and what the user did.
+//   3. `draft_hash` is round-tripped EXACTLY. The frontend never
+//      recomputes it.
+//   4. `amount_display` and `threshold_display` are display-only
+//      strings; the funding tx will use `amount_raw` (via the W5h
+//      card's `safeParseW5hAmount`) regardless of what the display
+//      strings look like.
+//   5. Confirm is user-click-driven only. No effect-rooted finalize.
+//      Double-firing is prevented by disabling both buttons during
+//      in-flight requests AND by gating on the local flow state.
+//   6. Each `DraftIntentReviewCard` owns its own `draft_id` /
+//      `draft_hash`; sibling cards (multiple paraphrased drafts in
+//      the same chat history) do not affect one another.
+
+/// Per-card flow state. `confirmed` carries the finalize-response
+/// W5h DTO so the nested funding card has its `initial` prop.
+type DraftFinalizeFlow =
+  | { kind: "review" }
+  | { kind: "confirming" }
+  | { kind: "rejecting" }
+  | { kind: "confirmed"; funding: W5hConditionalDepositResult }
+  | { kind: "rejected" }
+  /// Terminal: backend said the draft is gone (404) or has been
+  /// replaced (409). Card stops accepting input; user types a fresh
+  /// instruction.
+  | { kind: "stale"; reason: string }
+  /// Recoverable: network / parse / 5xx. Card re-enables buttons.
+  | { kind: "transient_error"; reason: string };
+
+function DraftIntentReviewCard({
+  draft,
+  sessionId,
+  walletPubkey,
+}: {
+  draft: DraftIntentReviewRequiredDto;
+  sessionId: SessionId | null;
+  walletPubkey: string | null;
+}) {
+  const [flow, setFlow] = useState<DraftFinalizeFlow>({ kind: "review" });
+
+  // Buttons disabled during in-flight requests AND during terminal
+  // confirmed/rejected/stale states. transient_error returns to
+  // re-enabled per the prompt.
+  const inFlight = flow.kind === "confirming" || flow.kind === "rejecting";
+  const terminalDisabled =
+    flow.kind === "confirmed" ||
+    flow.kind === "rejected" ||
+    flow.kind === "stale";
+  const sessionReady = sessionId !== null;
+  const disabled = inFlight || terminalDisabled || !sessionReady;
+
+  // Header chip per terminal state — surfaces "Confirmed" / "Rejected"
+  // / "Expired" in the card title while keeping the body visible.
+  const headerChip = (() => {
+    switch (flow.kind) {
+      case "confirmed":
+        return { text: "Confirmed", tone: "bg-emerald-500/15 text-emerald-700 border-emerald-500/40" };
+      case "rejected":
+        return { text: "Rejected", tone: "bg-rose-500/15 text-rose-700 border-rose-500/40" };
+      case "stale":
+        return { text: "Expired", tone: "bg-amber-500/15 text-amber-700 border-amber-500/40" };
+      default:
+        return null;
+    }
+  })();
+
+  const fallbackThresholdDisplay =
+    draft.threshold_display && draft.threshold_display.length > 0
+      ? draft.threshold_display
+      : `${(draft.threshold_bps / 100).toFixed(2)}%`;
+
+  // Per-error_code stale copy. Matches the exact strings spec'd in
+  // the Phase 5c-lite prompt so smoke tests can grep for them.
+  const STALE_NOT_FOUND =
+    "Draft expired or is no longer available. Please type the instruction again.";
+  const STALE_HASH_MISMATCH =
+    "Draft changed before confirmation. Please type the instruction again.";
+  const STALE_ALREADY_FINALIZED =
+    "This intent has already been finalized or is no longer available. Please type a new instruction if needed.";
+
+  // Confirm handler — POSTs finalize with `user_confirmed: true`. Per
+  // the prompt, this MUST be user-click-rooted (button onClick), not
+  // effect-rooted, so it never fires twice from the same click. The
+  // request body matches Agent D's contract-realignment commit
+  // `ade3d6e` (replacing the earlier `action` string-tag from 3d30617):
+  // `{ draft_id, draft_hash, user_confirmed }`.
+  const onConfirm = useCallback(async () => {
+    if (disabled) return;
+    if (sessionId === null) return;
+    setFlow({ kind: "confirming" });
+    try {
+      const env = await finalizeW5hIntent(sessionId, {
+        draft_id: draft.draft_id,
+        // `draft_hash` is round-tripped EXACTLY. We never recompute.
+        draft_hash: draft.draft_hash,
+        user_confirmed: true,
+      });
+      switch (env.kind) {
+        case "funding_required":
+          setFlow({ kind: "confirmed", funding: env.response });
+          return;
+        case "rejected":
+          // Shouldn't happen for `user_confirmed: true` — defensive recovery.
+          setFlow({
+            kind: "transient_error",
+            reason:
+              "Backend returned a rejected envelope on a confirm POST. Retry.",
+          });
+          return;
+        case "draft_not_found_or_expired":
+          setFlow({ kind: "stale", reason: STALE_NOT_FOUND });
+          return;
+        case "draft_hash_mismatch":
+          setFlow({ kind: "stale", reason: STALE_HASH_MISMATCH });
+          return;
+        case "draft_already_finalized_or_missing":
+          setFlow({ kind: "stale", reason: STALE_ALREADY_FINALIZED });
+          return;
+        case "bad_request":
+          // Terminal — the request body itself is wrong. This is a
+          // frontend bug if it ever fires in production, but we surface
+          // the backend's reason so it's actionable.
+          setFlow({
+            kind: "stale",
+            reason:
+              "Confirm request was rejected as malformed by the backend. " +
+              "Please reload the page and try again. (" +
+              (env.error || "no error body") +
+              ")",
+          });
+          return;
+        case "disabled":
+          // Terminal — daemon is not configured for the finalize flow.
+          setFlow({
+            kind: "stale",
+            reason:
+              "The finalize handler is not enabled on this daemon. " +
+              "Ask the operator to start the gateway with the chat / " +
+              "LLM extractor providers configured.",
+          });
+          return;
+        case "error":
+        default:
+          setFlow({
+            kind: "transient_error",
+            reason: `Finalize failed (${
+              env.kind === "error" ? env.httpStatus : "unknown"
+            }): ${env.kind === "error" ? env.error : "unexpected envelope"}`,
+          });
+          return;
+      }
+    } catch (err) {
+      setFlow({
+        kind: "transient_error",
+        reason:
+          err instanceof Error
+            ? `Network error: ${err.message}. Retry when ready.`
+            : "Network error. Retry when ready.",
+      });
+    }
+  }, [disabled, sessionId, draft.draft_id, draft.draft_hash]);
+
+  // Reject handler — POSTs finalize with `user_confirmed: false`. The
+  // backend's reject body is `{ status: "rejected" }`; our envelope
+  // surfaces that as `kind: "rejected"`.
+  const onReject = useCallback(async () => {
+    if (disabled) return;
+    if (sessionId === null) return;
+    setFlow({ kind: "rejecting" });
+    try {
+      const env = await finalizeW5hIntent(sessionId, {
+        draft_id: draft.draft_id,
+        draft_hash: draft.draft_hash,
+        user_confirmed: false,
+      });
+      switch (env.kind) {
+        case "rejected":
+          setFlow({ kind: "rejected" });
+          return;
+        case "funding_required":
+          // Shouldn't happen for `user_confirmed: false` — defensive recovery.
+          setFlow({
+            kind: "transient_error",
+            reason:
+              "Backend returned funding_required on a reject POST. Retry.",
+          });
+          return;
+        case "draft_not_found_or_expired":
+          setFlow({ kind: "stale", reason: STALE_NOT_FOUND });
+          return;
+        case "draft_hash_mismatch":
+          setFlow({ kind: "stale", reason: STALE_HASH_MISMATCH });
+          return;
+        case "draft_already_finalized_or_missing":
+          setFlow({ kind: "stale", reason: STALE_ALREADY_FINALIZED });
+          return;
+        case "bad_request":
+          setFlow({
+            kind: "stale",
+            reason:
+              "Reject request was rejected as malformed by the backend. " +
+              "Please reload the page and try again. (" +
+              (env.error || "no error body") +
+              ")",
+          });
+          return;
+        case "disabled":
+          setFlow({
+            kind: "stale",
+            reason:
+              "The finalize handler is not enabled on this daemon.",
+          });
+          return;
+        case "error":
+        default:
+          setFlow({
+            kind: "transient_error",
+            reason: `Reject failed (${
+              env.kind === "error" ? env.httpStatus : "unknown"
+            }): ${env.kind === "error" ? env.error : "unexpected envelope"}`,
+          });
+          return;
+      }
+    } catch (err) {
+      setFlow({
+        kind: "transient_error",
+        reason:
+          err instanceof Error
+            ? `Network error: ${err.message}. Retry when ready.`
+            : "Network error. Retry when ready.",
+      });
+    }
+  }, [disabled, sessionId, draft.draft_id, draft.draft_hash]);
+
+  return (
+    <div className="flex justify-start">
+      <div
+        data-testid="draft-intent-review-card"
+        data-draft-id={draft.draft_id}
+        data-flow-kind={flow.kind}
+        className="max-w-[85%] rounded-2xl rounded-bl-sm bg-card border px-4 py-3 text-sm space-y-2"
+      >
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-medium">Review interpreted intent</span>
+          <Badge
+            variant="outline"
+            className="border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+            data-testid="draft-llm-badge"
+          >
+            LLM-drafted
+          </Badge>
+          {headerChip !== null && (
+            <Badge
+              variant="outline"
+              className={headerChip.tone}
+              data-testid="draft-flow-badge"
+            >
+              {headerChip.text}
+            </Badge>
+          )}
+        </div>
+
+        <p
+          className="text-xs text-muted-foreground italic"
+          data-testid="draft-review-copy"
+        >
+          {draft.review_copy}
+        </p>
+
+        <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
+          <dt className="text-muted-foreground">Action</dt>
+          <dd className="font-mono">{draft.action}</dd>
+
+          <dt className="text-muted-foreground">Protocol</dt>
+          <dd className="font-mono">{draft.protocol}</dd>
+
+          <dt className="text-muted-foreground">Asset</dt>
+          <dd className="font-mono">{draft.asset}</dd>
+
+          <dt className="text-muted-foreground">Amount</dt>
+          <dd data-testid="draft-amount">
+            <span className="font-mono text-foreground">
+              {draft.amount_display}
+            </span>
+            <span className="ml-2 text-muted-foreground">
+              ({draft.amount_raw} raw)
+            </span>
+          </dd>
+
+          <dt className="text-muted-foreground">Condition</dt>
+          <dd data-testid="draft-condition">
+            Save APY {draft.comparison === "gt" ? ">" : draft.comparison}{" "}
+            <span className="font-mono">{fallbackThresholdDisplay}</span>
+          </dd>
+
+          <dt className="text-muted-foreground">Controlled wallet</dt>
+          <dd className="font-mono break-all flex items-start">
+            <span
+              className="break-all"
+              data-testid="draft-controlled-wallet"
+            >
+              {draft.controlled_wallet}
+            </span>
+            <CopyButton
+              value={draft.controlled_wallet}
+              label="controlled wallet"
+            />
+          </dd>
+
+          <dt className="text-muted-foreground">Controlled USDC ATA</dt>
+          <dd className="font-mono break-all flex items-start">
+            <span
+              className="break-all"
+              data-testid="draft-controlled-usdc-ata"
+            >
+              {draft.controlled_usdc_ata}
+            </span>
+            <CopyButton
+              value={draft.controlled_usdc_ata}
+              label="controlled USDC ATA"
+            />
+          </dd>
+
+          <dt className="text-muted-foreground">Expiry</dt>
+          <dd
+            className="text-foreground"
+            data-testid="draft-expiry"
+          >
+            Expires {Math.max(1, Math.round(
+              draft.expiry_seconds_after_finalize / 60,
+            ))} minutes after confirmation.
+          </dd>
+
+          <dt className="text-muted-foreground">Parser source</dt>
+          <dd className="font-mono">{draft.parser_source}</dd>
+        </dl>
+
+        {draft.warnings.length > 0 && (
+          <Alert className="border-amber-500/40">
+            <AlertTitle className="text-xs">Warnings</AlertTitle>
+            <AlertDescription className="text-xs space-y-1">
+              {draft.warnings.map((w, i) => (
+                <div key={i} className="break-words">
+                  {w}
+                </div>
+              ))}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        <details className="mt-2">
+          <summary className="cursor-pointer text-[10px] text-muted-foreground hover:text-foreground">
+            technical details
+          </summary>
+          <dl className="mt-1 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-[10px]">
+            <dt className="text-muted-foreground">draft_id</dt>
+            <dd
+              className="font-mono break-all"
+              data-testid="draft-id"
+            >
+              {draft.draft_id}
+            </dd>
+            <dt className="text-muted-foreground">draft_hash</dt>
+            <dd
+              className="font-mono break-all"
+              data-testid="draft-hash"
+            >
+              {draft.draft_hash}
+            </dd>
+            <dt className="text-muted-foreground">user message hash</dt>
+            <dd className="font-mono break-all">
+              {draft.original_user_message_hash}
+            </dd>
+            <dt className="text-muted-foreground">display source</dt>
+            <dd className="font-mono">{draft.display_source}</dd>
+            <dt className="text-muted-foreground">threshold (bps)</dt>
+            <dd className="font-mono">{draft.threshold_bps}</dd>
+          </dl>
+        </details>
+
+        {/* ── Action buttons ─────────────────────────────────── */}
+        {!terminalDisabled && (
+          <div className="mt-3 flex items-center gap-2 flex-wrap">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void onReject()}
+              disabled={disabled}
+              data-testid="draft-reject-button"
+            >
+              {flow.kind === "rejecting" ? "Rejecting…" : "Reject"}
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => void onConfirm()}
+              disabled={disabled}
+              data-testid="draft-confirm-button"
+            >
+              {flow.kind === "confirming" ? "Confirming…" : "Confirm intent"}
+            </Button>
+            {!sessionReady && (
+              <span className="text-[10px] text-muted-foreground italic">
+                opening session…
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* ── Transient error (network / 5xx) — recoverable ─── */}
+        {flow.kind === "transient_error" && (
+          <Alert
+            className="border-amber-500/40"
+            data-testid="draft-transient-error"
+          >
+            <AlertTitle className="text-xs">Couldn&apos;t finalize</AlertTitle>
+            <AlertDescription className="text-xs break-words">
+              {flow.reason}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* ── Stale terminal — re-type prompt ────────────────── */}
+        {flow.kind === "stale" && (
+          <Alert
+            className="border-amber-500/40"
+            data-testid="draft-stale-notice"
+          >
+            <AlertTitle className="text-xs">Draft no longer valid</AlertTitle>
+            <AlertDescription className="text-xs break-words">
+              {flow.reason}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* ── Rejected terminal — just sit visible ───────────── */}
+        {flow.kind === "rejected" && (
+          <p
+            className="text-[11px] text-muted-foreground italic"
+            data-testid="draft-rejected-note"
+          >
+            You rejected this draft. No funding has happened. Type a
+            new instruction to try again.
+          </p>
+        )}
+
+        {/* ── No-overclaim footer ────────────────────────────── */}
+        <div className="mt-2 text-[10px] text-muted-foreground leading-snug">
+          <p>
+            LLM drafts. User finalises. The chain anchors the
+            finalised canonical intent. No funding, no Solend deposit
+            happens until you click Confirm and then Fund on the
+            funding card that appears below.
+          </p>
+        </div>
+      </div>
+
+      {/* ── Confirmed branch — append the W5h funding card BELOW
+            the draft details (same chat-message DOM scope, but
+            visually a separate card). The draft card above remains
+            visible with the "Confirmed" chip so the chat-history
+            transcript preserves what the LLM drafted. */}
+      {flow.kind === "confirmed" && (
+        <div className="mt-3 ml-1 w-[85%]">
+          <W5hConditionalOrderCard
+            initial={flow.funding}
+            sessionId={sessionId}
+            walletPubkey={walletPubkey}
+          />
+        </div>
+      )}
     </div>
   );
 }
