@@ -706,17 +706,18 @@ export interface DraftIntentReviewRequiredDto {
 
 /// Wire body for `POST /sessions/:id/stage2/w5h/intent/finalize`.
 ///
-/// Matches the shipped backend DTO `claw_api::state::
-/// W5hIntentFinalizeRequestDto` (Agent D commit `3d30617`): the
-/// discriminator field is `action: "confirm" | "reject"` — NOT
-/// `user_confirmed: boolean`. The route rejects unknown action
-/// strings with a typed 400.
+/// Matches Agent D's contract-realignment commit `ade3d6e` on
+/// `develop-phase5c-lite-backend`: the discriminator is the boolean
+/// `user_confirmed`. The earlier `action: "confirm" | "reject"`
+/// string-tag shape from commit `3d30617` has been removed; the
+/// boolean is now the canonical wire shape. Frontend must NOT send
+/// an `action` field.
 export interface FinalizeW5hIntentRequest {
   draft_id: string;
   draft_hash: string;
-  /// `"confirm"` → finalize and proceed to funding_required.
-  /// `"reject"`  → reject; backend returns `{ status: "rejected" }`.
-  action: "confirm" | "reject";
+  /// `true`  → finalize and proceed to funding_required.
+  /// `false` → reject; backend returns `{ status: "rejected" }`.
+  user_confirmed: boolean;
 }
 
 /// Envelope returned by `finalizeW5hIntent`. Discriminates by HTTP

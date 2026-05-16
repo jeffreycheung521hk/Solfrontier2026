@@ -1729,10 +1729,10 @@ export async function finalizeW5hIntent(
   return { kind: "error", httpStatus: res.status, error: errorText };
 }
 
-/// Showcase reply for the finalize route. Honours the `action`
-/// field — `"confirm"` produces a `funding_required` DTO populated
-/// with the Phase 5c-lite fields the card expects (`amount_display`,
-/// `memo_text`, `finalization`); `"reject"` returns
+/// Showcase reply for the finalize route. Honours the
+/// `user_confirmed` boolean — `true` produces a `funding_required`
+/// DTO populated with the Phase 5c-lite fields the card expects
+/// (`amount_display`, `memo_text`, `finalization`); `false` returns
 /// `{ kind: "rejected" }`.
 ///
 /// Per-draft_id suffix selectors let the fixture exercise every
@@ -1778,7 +1778,7 @@ function showcaseFinalizeW5hIntentReply(
       error: "showcase fixture: forced bad_request (suffix '…bad')",
     };
   }
-  if (body.action === "reject") {
+  if (body.user_confirmed === false) {
     return { kind: "rejected" };
   }
   const memoText = `claw:w5h:${SHOWCASE_FINALIZE_RULE_ID}:${SHOWCASE_FINALIZE_CANONICAL_HASH}`;

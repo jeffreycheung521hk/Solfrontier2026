@@ -100,31 +100,38 @@ ok("DraftIntentReviewRequiredDto: draft_hash is a 64-char hex string", /^[0-9a-f
 ok("DraftIntentReviewRequiredDto: draft_id is non-empty", draft.draft_id.length > 0);
 ok("DraftIntentReviewRequiredDto: warnings is an array", Array.isArray(draft.warnings));
 
-// ── Invariant 1b — FinalizeW5hIntentRequest uses action: confirm/reject ──
+// ── Invariant 1b — FinalizeW5hIntentRequest uses user_confirmed: bool ──
 //
-// Per Agent D's shipped backend (commit 3d30617), the request body
-// MUST use `action: "confirm" | "reject"` — NOT `user_confirmed:
-// boolean`. The TS type itself enforces this; the assertions below
-// are runtime smoke checks against accidentally constructing the
-// legacy shape.
+// Per Agent D's contract-realignment commit `ade3d6e` on
+// `develop-phase5c-lite-backend`, the request body MUST use
+// `user_confirmed: boolean` — NOT the earlier `action: "confirm" |
+// "reject"` string-tag from commit `3d30617`. The TS type itself
+// enforces this; the runtime assertions below catch fixtures that
+// accidentally re-introduce an `action` field.
 const confirmReq: FinalizeW5hIntentRequest = {
   draft_id: draft.draft_id,
   draft_hash: draft.draft_hash,
-  action: "confirm",
+  user_confirmed: true,
 };
 const rejectReq: FinalizeW5hIntentRequest = {
   draft_id: draft.draft_id,
   draft_hash: draft.draft_hash,
-  action: "reject",
+  user_confirmed: false,
 };
-ok("FinalizeW5hIntentRequest: action='confirm' accepted", confirmReq.action === "confirm");
-ok("FinalizeW5hIntentRequest: action='reject' accepted", rejectReq.action === "reject");
 ok(
-  "FinalizeW5hIntentRequest: 'user_confirmed' is NOT a field on the type",
-  // Compile-time enforced by the type system; runtime check below
-  // verifies a constructed request has no such property leaking
-  // through (would mean a stale fixture).
-  !("user_confirmed" in confirmReq) && !("user_confirmed" in rejectReq),
+  "FinalizeW5hIntentRequest: user_confirmed=true accepted",
+  confirmReq.user_confirmed === true,
+);
+ok(
+  "FinalizeW5hIntentRequest: user_confirmed=false accepted",
+  rejectReq.user_confirmed === false,
+);
+ok(
+  "FinalizeW5hIntentRequest: 'action' is NOT a field on the type",
+  // Compile-time enforced by the type system; runtime check
+  // verifies a constructed request never sets the legacy `action`
+  // field (would mean a stale fixture re-introduced it).
+  !("action" in confirmReq) && !("action" in rejectReq),
 );
 
 // ── Invariant 2 — memo_text override drives the memo bytes ───────────

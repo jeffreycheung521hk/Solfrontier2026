@@ -2256,11 +2256,12 @@ function DraftIntentReviewCard({
   const STALE_ALREADY_FINALIZED =
     "This intent has already been finalized or is no longer available. Please type a new instruction if needed.";
 
-  // Confirm handler — POSTs finalize with action="confirm". Per the
-  // prompt, this MUST be user-click-rooted (button onClick), not
+  // Confirm handler — POSTs finalize with `user_confirmed: true`. Per
+  // the prompt, this MUST be user-click-rooted (button onClick), not
   // effect-rooted, so it never fires twice from the same click. The
-  // request body matches Agent D's shipped `W5hIntentFinalizeRequestDto`
-  // (commit 3d30617): `{ draft_id, draft_hash, action }`.
+  // request body matches Agent D's contract-realignment commit
+  // `ade3d6e` (replacing the earlier `action` string-tag from 3d30617):
+  // `{ draft_id, draft_hash, user_confirmed }`.
   const onConfirm = useCallback(async () => {
     if (disabled) return;
     if (sessionId === null) return;
@@ -2270,14 +2271,14 @@ function DraftIntentReviewCard({
         draft_id: draft.draft_id,
         // `draft_hash` is round-tripped EXACTLY. We never recompute.
         draft_hash: draft.draft_hash,
-        action: "confirm",
+        user_confirmed: true,
       });
       switch (env.kind) {
         case "funding_required":
           setFlow({ kind: "confirmed", funding: env.response });
           return;
         case "rejected":
-          // Shouldn't happen for action="confirm" — defensive recovery.
+          // Shouldn't happen for `user_confirmed: true` — defensive recovery.
           setFlow({
             kind: "transient_error",
             reason:
@@ -2337,7 +2338,7 @@ function DraftIntentReviewCard({
     }
   }, [disabled, sessionId, draft.draft_id, draft.draft_hash]);
 
-  // Reject handler — POSTs finalize with action="reject". The
+  // Reject handler — POSTs finalize with `user_confirmed: false`. The
   // backend's reject body is `{ status: "rejected" }`; our envelope
   // surfaces that as `kind: "rejected"`.
   const onReject = useCallback(async () => {
@@ -2348,14 +2349,14 @@ function DraftIntentReviewCard({
       const env = await finalizeW5hIntent(sessionId, {
         draft_id: draft.draft_id,
         draft_hash: draft.draft_hash,
-        action: "reject",
+        user_confirmed: false,
       });
       switch (env.kind) {
         case "rejected":
           setFlow({ kind: "rejected" });
           return;
         case "funding_required":
-          // Shouldn't happen for action="reject" — defensive recovery.
+          // Shouldn't happen for `user_confirmed: false` — defensive recovery.
           setFlow({
             kind: "transient_error",
             reason:
