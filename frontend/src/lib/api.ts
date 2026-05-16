@@ -259,6 +259,7 @@ export async function getOrCreateSession(role: "execution" = "execution"): Promi
 function normalizeChatResponseWireShape(raw: unknown): ChatResponse {
   if (raw !== null && typeof raw === "object") {
     const obj = raw as Record<string, unknown>;
+    // Shape A (legacy expectation): { kind, ...spread_at_top }.
     if (
       typeof obj.status !== "string" &&
       typeof obj.kind === "string" &&
@@ -273,6 +274,19 @@ function normalizeChatResponseWireShape(raw: unknown): ChatResponse {
       return {
         status: "draft_intent_review_required",
         result: rest as unknown as DraftIntentReviewRequiredDto,
+      };
+    }
+    // Shape B (Agent D ade3d6e ships): { status, draft: { ...nested } }.
+    // Re-pack the nested `draft` body into `result` so the downstream
+    // dispatch + `DraftIntentReviewCard` see a single uniform envelope.
+    if (
+      obj.status === "draft_intent_review_required" &&
+      obj.draft !== null &&
+      typeof obj.draft === "object"
+    ) {
+      return {
+        status: "draft_intent_review_required",
+        result: obj.draft as DraftIntentReviewRequiredDto,
       };
     }
   }
@@ -1668,17 +1682,28 @@ export async function finalizeW5hIntent(
   );
 
   if (res.status === 200) {
-    // Body is either { status: "funding_required", ...W5hConditionalDepositResult }
-    // or { status: "rejected" }. Discriminate on status.
+    // Backend ships W5hIntentFinalizeResultDto:
+    //   { status: "funding_required" | "rejected",
+    //     funding: W5hConditionalOrderResultDto | null,
+    //     finalization: W5hIntentFinalizationAuditDto }
+    // (crates/api/src/state.rs:1497-1507). The W5h fields live INSIDE
+    // `funding`, not spread at the top level. Discriminate on status,
+    // then unwrap `funding` for the `funding_required` case so the
+    // downstream `W5hConditionalOrderCard` sees the same shape it has
+    // always consumed.
     const parsed = (await res.json()) as
-      | (W5hConditionalDepositResult & { status: string })
+      | {
+          status: "funding_required";
+          funding: W5hConditionalDepositResult;
+          finalization?: unknown;
+        }
       | { status: "rejected" };
     if (parsed.status === "rejected") {
       return { kind: "rejected" };
     }
     return {
       kind: "funding_required",
-      response: parsed as W5hConditionalDepositResult,
+      response: parsed.funding,
     };
   }
 
