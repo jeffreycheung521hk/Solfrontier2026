@@ -267,11 +267,13 @@ async fn run_live_llm_jupiter_e2e() {
 
     // ── Build the chat handler over the same registry ─────────────────────
     let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &StdEnvProvider, None, None, None, None) {
-        Ok(Some(c)) => c,
-        Ok(None) => panic!(
-            "chat provider env gate returned None despite {ENV_LLM_OPT_IN}=1; \
-             ensure CLAW_CHAT_PROVIDER and the matching API key are set"
-        ),
+        Ok(out) => match out.chat_handler {
+            Some(c) => c,
+            None => panic!(
+                "chat provider env gate returned None despite {ENV_LLM_OPT_IN}=1; \
+                 ensure CLAW_CHAT_PROVIDER and the matching API key are set"
+            ),
+        },
         Err(e) => panic!("chat handler construction failed: {e}"),
     };
 
@@ -350,6 +352,11 @@ async fn run_live_llm_jupiter_e2e() {
             "Jupiter live LLM test must dispatch submit_jupiter_swap, \
              but the W5h chat-route interceptor matched (status={}); result={result:?}",
             result.status,
+        ),
+        ChatRouteOutcome::Ok(ChatResponse::DraftIntentReviewRequired { draft }) => panic!(
+            "Jupiter live LLM test must dispatch submit_jupiter_swap, \
+             but the Phase 5c-lite LLM draft path matched (draft_id={}); draft={draft:?}",
+            draft.draft_id,
         ),
     };
 

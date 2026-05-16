@@ -236,6 +236,7 @@ fn build_router(chat_ref: ChatHandlerRef, sid: &SessionId) -> axum::Router {
         chat_funding_confirm: None,
         chat_refund:       None,
         chat_order_status:       None,
+        chat_intent_finalize:    None,
     };
     claw_api::create_router(state, HealthRegistry::new())
 }
@@ -378,10 +379,12 @@ async fn live_chat_provider_dry_run() {
     // ── Build chat handler against the real provider ────────────────────
     let registry = stub_registry();
     let chat_ref = match chat_wiring::wire_chat_handler_with_registry(&registry, &env, None, None, None, None) {
-        Ok(Some(c)) => c,
-        Ok(None) => {
-            panic!("provider config gate returned None despite explicit opt-in");
-        }
+        Ok(out) => match out.chat_handler {
+            Some(c) => c,
+            None => panic!(
+                "provider config gate returned None chat_handler despite explicit opt-in"
+            ),
+        },
         Err(e) => panic!("chat handler construction failed: {e}"),
     };
 

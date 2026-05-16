@@ -61,6 +61,7 @@ use crate::{
         solend_withdraw_jit_signing::prepare_solend_withdraw_signing,
         stage2_chat_execute::post_w5g_execute,
         stage2_w5h_funding_confirm::post_w5h_funding_confirm,
+        stage2_w5h_intent_finalize::post_w5h_intent_finalize,
         stage2_w5h_order_status::get_w5h_order_status,
         wallets::list_wallets,
         wallet_challenges::{create_wallet_challenge, confirm_wallet_challenge},
@@ -150,6 +151,16 @@ pub fn create_router(state: AppState, health: HealthRegistry) -> Router {
         .route(
             "/sessions/:id/stage2/w5h/funding/confirm",
             post(post_w5h_funding_confirm).layer(DefaultBodyLimit::max(2048)),
+        )
+        // Phase 5c-lite — LLM draft intent finalize. The frontend
+        // POSTs `{draft_id, draft_hash, action}` here after the user
+        // reviews the LLM-produced draft card. Confirm mints the W5h
+        // funding-required row (the existing deterministic pipeline);
+        // reject drops the draft. Body limit is 2 KB — payload is
+        // < 200 bytes. 503 when the daemon didn't wire the handler.
+        .route(
+            "/sessions/:id/stage2/w5h/intent/finalize",
+            post(post_w5h_intent_finalize).layer(DefaultBodyLimit::max(2048)),
         )
         // W5i — read-only order-status endpoint. Frontend polls this
         // after `budget_reserved` to detect the watcher's terminal

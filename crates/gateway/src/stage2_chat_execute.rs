@@ -748,16 +748,33 @@ impl Stage2ChatExecutor {
                 )
             }
         };
-        if rule.max_input_amount_raw != W5G_DEPOSIT_AMOUNT_RAW {
-            return precheck_failure(
-                &request,
-                ChatExecuteErrorCode::AmountMismatch,
-                format!(
-                    "rule.max_input_amount_raw {} != {} (W5g is single-amount)",
-                    rule.max_input_amount_raw, W5G_DEPOSIT_AMOUNT_RAW
-                ),
-            );
+        // Phase 5c-lite — accept any rule whose `max_input_amount_raw`
+        // is in the Phase 5c-lite band. The deterministic regex path
+        // still pins 0.25 USDC; the LLM-finalize path persists any
+        // band value into the rule. Outside the band → typed precheck
+        // failure (defense-in-depth; the bridge enforces the band on
+        // insertion).
+        {
+            use crate::stage2_phase5c_draft::{
+                PHASE5C_MAX_AMOUNT_RAW, PHASE5C_MIN_AMOUNT_RAW,
+            };
+            if !(PHASE5C_MIN_AMOUNT_RAW..=PHASE5C_MAX_AMOUNT_RAW)
+                .contains(&rule.max_input_amount_raw)
+            {
+                return precheck_failure(
+                    &request,
+                    ChatExecuteErrorCode::AmountMismatch,
+                    format!(
+                        "rule.max_input_amount_raw {} outside Phase 5c-lite \
+                         band [{}, {}]",
+                        rule.max_input_amount_raw,
+                        PHASE5C_MIN_AMOUNT_RAW,
+                        PHASE5C_MAX_AMOUNT_RAW,
+                    ),
+                );
+            }
         }
+        let amount_raw = rule.max_input_amount_raw;
         let controlled_wallet =
             Pubkey::new_from_array(rule.delegated_wallet.0);
         let reserve_pubkey = Pubkey::from_str(DEMO_RESERVE_BS58)
@@ -794,7 +811,7 @@ impl Stage2ChatExecutor {
         let parsed = crate::stage2_demo_apr_bridge::DemoParsed {
             threshold_bps,
             threshold_pct_label: bps_to_pct_label(threshold_bps),
-            amount_raw: W5G_DEPOSIT_AMOUNT_RAW,
+            amount_raw,
         };
         let native = match self
             .apr_fetcher
@@ -810,13 +827,13 @@ impl Stage2ChatExecutor {
                 )
             }
         };
-        if native.current_budget_raw < W5G_DEPOSIT_AMOUNT_RAW {
+        if native.current_budget_raw < amount_raw {
             return precheck_failure(
                 &request,
                 ChatExecuteErrorCode::BudgetInsufficient,
                 format!(
                     "controlled wallet USDC balance {} raw < required {} raw",
-                    native.current_budget_raw, W5G_DEPOSIT_AMOUNT_RAW
+                    native.current_budget_raw, amount_raw
                 ),
             );
         }
@@ -858,7 +875,7 @@ impl Stage2ChatExecutor {
         // 11b. Hand to the sender.
         let send_request = ChatExecuteSendRequest {
             controlled_wallet,
-            amount_raw: W5G_DEPOSIT_AMOUNT_RAW,
+            amount_raw,
             target_obligation,
             reserve_pubkey,
         };
@@ -911,11 +928,7 @@ impl Stage2ChatExecutor {
                 // signature column).
                 let repo_marked = self
                     .repo
-                    .mark_completed(
-                        &rule_id,
-                        W5G_DEPOSIT_AMOUNT_RAW,
-                        confirmation_slot,
-                    )
+                    .mark_completed(&rule_id, amount_raw, confirmation_slot)
                     .await
                     .map(|n| n == 1)
                     .unwrap_or(false);
@@ -1256,13 +1269,22 @@ impl Stage2ChatExecuteSender for LiveStage2ChatExecuteSender {
                 ),
             };
         }
-        if request.amount_raw != W5G_DEPOSIT_AMOUNT_RAW {
-            return ChatExecuteSendOutcome::TxBuildFailed {
-                reason: format!(
-                    "amount {} != W5g single-amount {}",
-                    request.amount_raw, W5G_DEPOSIT_AMOUNT_RAW
-                ),
+        {
+            use crate::stage2_phase5c_draft::{
+                PHASE5C_MAX_AMOUNT_RAW, PHASE5C_MIN_AMOUNT_RAW,
             };
+            if !(PHASE5C_MIN_AMOUNT_RAW..=PHASE5C_MAX_AMOUNT_RAW)
+                .contains(&request.amount_raw)
+            {
+                return ChatExecuteSendOutcome::TxBuildFailed {
+                    reason: format!(
+                        "amount {} outside Phase 5c-lite band [{}, {}]",
+                        request.amount_raw,
+                        PHASE5C_MIN_AMOUNT_RAW,
+                        PHASE5C_MAX_AMOUNT_RAW,
+                    ),
+                };
+            }
         }
 
         // ── Live reserve + obligation read ───────────────────────────

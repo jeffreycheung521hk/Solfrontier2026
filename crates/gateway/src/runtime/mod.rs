@@ -27,5 +27,6 @@ pub mod solend_wiring;
 pub mod solend_withdraw_jit_prepare_wiring;
 pub mod stage2_chat_execute_wiring;
 pub mod stage2_w5h_funding_confirm_wiring;
+pub mod stage2_w5h_intent_finalize_wiring;
 pub mod stage2_w5h_order_status_wiring;
 pub mod tool_output_explainer;

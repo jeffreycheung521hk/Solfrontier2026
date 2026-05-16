@@ -71,6 +71,12 @@ pub mod stage2_chat_execute;
 // vs. W5h refund as competing terminal paths over the same 0.25
 // USDC budget.
 pub mod stage2_llm_intent_extractor;
+// Stage 2 Phase 5c-lite — LLM draft intent + user finalization gate.
+// Canonical draft_hash helper, decimal-safe amount converter,
+// DraftIntent shape, and the in-process / session-scoped /
+// TTL-bounded draft store. Pre-finalize zero-DB-write invariant
+// lives here. See module docs for the full trust-boundary model.
+pub mod stage2_phase5c_draft;
 pub mod stage2_w5h_bridge;
 pub mod stage2_w5h_chat;
 pub mod stage2_w5h_funding_confirm;

@@ -172,6 +172,7 @@ async fn setup(rules: Vec<PolicyRule>) -> Ctx {
         chat_funding_confirm: None,
         chat_refund:       None,
         chat_order_status:       None,
+        chat_intent_finalize:    None,
     };
     let router = claw_api::create_router(state, HealthRegistry::new());
     Ctx { router, store, sid }
