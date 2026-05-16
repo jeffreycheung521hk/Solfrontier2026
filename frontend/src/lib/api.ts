@@ -1682,32 +1682,65 @@ export async function finalizeW5hIntent(
     };
   }
 
+  // 4xx / 5xx — Agent D's route attaches a typed `error_code` field
+  // to the body for the 404 + the two 409 variants. Both 409s share
+  // the HTTP status, so we MUST read `error_code` to disambiguate
+  // `draft_hash_mismatch` vs `draft_already_finalized_or_missing`.
   let errorText = "";
+  let errorCode: string | null = null;
   try {
-    const errBody = (await res.json()) as { error?: string };
+    const errBody = (await res.json()) as {
+      error?: string;
+      error_code?: string;
+    };
     errorText = errBody.error ?? "";
+    errorCode =
+      typeof errBody.error_code === "string" ? errBody.error_code : null;
   } catch {
     errorText = (await res.text().catch(() => "")) || res.statusText;
   }
 
+  if (res.status === 400) {
+    return { kind: "bad_request", error: errorText };
+  }
   if (res.status === 404) {
-    return { kind: "draft_not_found", error: errorText };
+    // Either the typed `draft_not_found_or_expired` body OR the
+    // session-not-active 404 the route emits without an error_code.
+    // Both surface as the same terminal-stale state to the user.
+    return { kind: "draft_not_found_or_expired", error: errorText };
   }
   if (res.status === 409) {
+    if (errorCode === "draft_already_finalized_or_missing") {
+      return {
+        kind: "draft_already_finalized_or_missing",
+        error: errorText,
+      };
+    }
+    // Default 409 is draft_hash_mismatch (the only other 409 the
+    // route emits, per the shipped backend at commit 3d30617). The
+    // body also includes `provided_draft_hash` / `backend_draft_hash`
+    // fields we ignore — the card already shows the client-side
+    // draft_hash in its technical-details bag.
     return { kind: "draft_hash_mismatch", error: errorText };
+  }
+  if (res.status === 503) {
+    return { kind: "disabled", error: errorText };
   }
   return { kind: "error", httpStatus: res.status, error: errorText };
 }
 
-/// Showcase reply for the finalize route. Honours the user_confirmed
-/// flag — confirm produces a `funding_required` DTO populated with
-/// the Phase 5c-lite fields the card expects (`amount_display`,
-/// `memo_text`, `finalization`). Reject returns `{ kind: "rejected" }`.
+/// Showcase reply for the finalize route. Honours the `action`
+/// field — `"confirm"` produces a `funding_required` DTO populated
+/// with the Phase 5c-lite fields the card expects (`amount_display`,
+/// `memo_text`, `finalization`); `"reject"` returns
+/// `{ kind: "rejected" }`.
 ///
-/// Per-draft_id call counter lets the fixture exercise the 409
-/// `draft_hash_mismatch` branch by replaying the same draft_id with
-/// a mismatched hash (suffix `…stale` on the draft_id), or the 404
-/// `draft_not_found` branch (suffix `…expired`).
+/// Per-draft_id suffix selectors let the fixture exercise every
+/// terminal-error branch the live backend can emit:
+///   - draft_id ends with "expired" → 404 draft_not_found_or_expired
+///   - draft_id ends with "stale"   → 409 draft_hash_mismatch
+///   - draft_id ends with "final"   → 409 draft_already_finalized_or_missing
+///   - draft_id ends with "bad"     → 400 bad_request
 const SHOWCASE_FINALIZE_AMOUNT_RAW = "500000";
 const SHOWCASE_FINALIZE_AMOUNT_DISPLAY = "0.5 USDC";
 const SHOWCASE_FINALIZE_THRESHOLD_BPS = 50;
@@ -1722,17 +1755,30 @@ function showcaseFinalizeW5hIntentReply(
   const idLower = body.draft_id.toLowerCase();
   if (idLower.endsWith("expired")) {
     return {
-      kind: "draft_not_found",
-      error: "draft_not_found_or_expired",
+      kind: "draft_not_found_or_expired",
+      error: "draft not found or expired",
     };
   }
   if (idLower.endsWith("stale")) {
     return {
       kind: "draft_hash_mismatch",
-      error: "draft_hash_mismatch",
+      error:
+        "draft_hash does not match the canonical hash for the persisted draft",
     };
   }
-  if (!body.user_confirmed) {
+  if (idLower.endsWith("final")) {
+    return {
+      kind: "draft_already_finalized_or_missing",
+      error: "draft already finalized or never existed",
+    };
+  }
+  if (idLower.endsWith("bad")) {
+    return {
+      kind: "bad_request",
+      error: "showcase fixture: forced bad_request (suffix '…bad')",
+    };
+  }
+  if (body.action === "reject") {
     return { kind: "rejected" };
   }
   const memoText = `claw:w5h:${SHOWCASE_FINALIZE_RULE_ID}:${SHOWCASE_FINALIZE_CANONICAL_HASH}`;

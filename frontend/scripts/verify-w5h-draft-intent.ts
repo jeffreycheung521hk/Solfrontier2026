@@ -32,6 +32,7 @@ import {
 } from "../src/lib/stage2-funding.ts";
 import type {
   DraftIntentReviewRequiredDto,
+  FinalizeW5hIntentRequest,
   W5hConditionalDepositResult,
 } from "../src/lib/types.ts";
 
@@ -98,6 +99,33 @@ ok("DraftIntentReviewRequiredDto: threshold_display is a string", typeof draft.t
 ok("DraftIntentReviewRequiredDto: draft_hash is a 64-char hex string", /^[0-9a-fA-F]{64}$/.test(draft.draft_hash));
 ok("DraftIntentReviewRequiredDto: draft_id is non-empty", draft.draft_id.length > 0);
 ok("DraftIntentReviewRequiredDto: warnings is an array", Array.isArray(draft.warnings));
+
+// ── Invariant 1b — FinalizeW5hIntentRequest uses action: confirm/reject ──
+//
+// Per Agent D's shipped backend (commit 3d30617), the request body
+// MUST use `action: "confirm" | "reject"` — NOT `user_confirmed:
+// boolean`. The TS type itself enforces this; the assertions below
+// are runtime smoke checks against accidentally constructing the
+// legacy shape.
+const confirmReq: FinalizeW5hIntentRequest = {
+  draft_id: draft.draft_id,
+  draft_hash: draft.draft_hash,
+  action: "confirm",
+};
+const rejectReq: FinalizeW5hIntentRequest = {
+  draft_id: draft.draft_id,
+  draft_hash: draft.draft_hash,
+  action: "reject",
+};
+ok("FinalizeW5hIntentRequest: action='confirm' accepted", confirmReq.action === "confirm");
+ok("FinalizeW5hIntentRequest: action='reject' accepted", rejectReq.action === "reject");
+ok(
+  "FinalizeW5hIntentRequest: 'user_confirmed' is NOT a field on the type",
+  // Compile-time enforced by the type system; runtime check below
+  // verifies a constructed request has no such property leaking
+  // through (would mean a stale fixture).
+  !("user_confirmed" in confirmReq) && !("user_confirmed" in rejectReq),
+);
 
 // ── Invariant 2 — memo_text override drives the memo bytes ───────────
 //

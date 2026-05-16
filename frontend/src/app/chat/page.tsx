@@ -2247,9 +2247,20 @@ function DraftIntentReviewCard({
       ? draft.threshold_display
       : `${(draft.threshold_bps / 100).toFixed(2)}%`;
 
-  // Confirm handler — POSTs finalize with user_confirmed=true. Per
-  // the prompt, this MUST be user-click-rooted (button onClick), not
-  // effect-rooted, so it never fires twice from the same click.
+  // Per-error_code stale copy. Matches the exact strings spec'd in
+  // the Phase 5c-lite prompt so smoke tests can grep for them.
+  const STALE_NOT_FOUND =
+    "Draft expired or is no longer available. Please type the instruction again.";
+  const STALE_HASH_MISMATCH =
+    "Draft changed before confirmation. Please type the instruction again.";
+  const STALE_ALREADY_FINALIZED =
+    "This intent has already been finalized or is no longer available. Please type a new instruction if needed.";
+
+  // Confirm handler — POSTs finalize with action="confirm". Per the
+  // prompt, this MUST be user-click-rooted (button onClick), not
+  // effect-rooted, so it never fires twice from the same click. The
+  // request body matches Agent D's shipped `W5hIntentFinalizeRequestDto`
+  // (commit 3d30617): `{ draft_id, draft_hash, action }`.
   const onConfirm = useCallback(async () => {
     if (disabled) return;
     if (sessionId === null) return;
@@ -2259,33 +2270,50 @@ function DraftIntentReviewCard({
         draft_id: draft.draft_id,
         // `draft_hash` is round-tripped EXACTLY. We never recompute.
         draft_hash: draft.draft_hash,
-        user_confirmed: true,
+        action: "confirm",
       });
       switch (env.kind) {
         case "funding_required":
           setFlow({ kind: "confirmed", funding: env.response });
           return;
         case "rejected":
-          // Shouldn't happen for user_confirmed=true, but defensive:
-          // treat as transient so user can retry.
+          // Shouldn't happen for action="confirm" — defensive recovery.
           setFlow({
             kind: "transient_error",
             reason:
               "Backend returned a rejected envelope on a confirm POST. Retry.",
           });
           return;
-        case "draft_not_found":
-          setFlow({
-            kind: "stale",
-            reason:
-              "Draft expired. Please type the instruction again.",
-          });
+        case "draft_not_found_or_expired":
+          setFlow({ kind: "stale", reason: STALE_NOT_FOUND });
           return;
         case "draft_hash_mismatch":
+          setFlow({ kind: "stale", reason: STALE_HASH_MISMATCH });
+          return;
+        case "draft_already_finalized_or_missing":
+          setFlow({ kind: "stale", reason: STALE_ALREADY_FINALIZED });
+          return;
+        case "bad_request":
+          // Terminal — the request body itself is wrong. This is a
+          // frontend bug if it ever fires in production, but we surface
+          // the backend's reason so it's actionable.
           setFlow({
             kind: "stale",
             reason:
-              "Draft changed or expired. Please type the instruction again.",
+              "Confirm request was rejected as malformed by the backend. " +
+              "Please reload the page and try again. (" +
+              (env.error || "no error body") +
+              ")",
+          });
+          return;
+        case "disabled":
+          // Terminal — daemon is not configured for the finalize flow.
+          setFlow({
+            kind: "stale",
+            reason:
+              "The finalize handler is not enabled on this daemon. " +
+              "Ask the operator to start the gateway with the chat / " +
+              "LLM extractor providers configured.",
           });
           return;
         case "error":
@@ -2309,7 +2337,7 @@ function DraftIntentReviewCard({
     }
   }, [disabled, sessionId, draft.draft_id, draft.draft_hash]);
 
-  // Reject handler — POSTs finalize with user_confirmed=false. The
+  // Reject handler — POSTs finalize with action="reject". The
   // backend's reject body is `{ status: "rejected" }`; our envelope
   // surfaces that as `kind: "rejected"`.
   const onReject = useCallback(async () => {
@@ -2320,29 +2348,44 @@ function DraftIntentReviewCard({
       const env = await finalizeW5hIntent(sessionId, {
         draft_id: draft.draft_id,
         draft_hash: draft.draft_hash,
-        user_confirmed: false,
+        action: "reject",
       });
       switch (env.kind) {
         case "rejected":
           setFlow({ kind: "rejected" });
           return;
         case "funding_required":
-          // Shouldn't happen for user_confirmed=false.
+          // Shouldn't happen for action="reject" — defensive recovery.
           setFlow({
             kind: "transient_error",
             reason:
               "Backend returned funding_required on a reject POST. Retry.",
           });
           return;
-        case "draft_not_found":
+        case "draft_not_found_or_expired":
+          setFlow({ kind: "stale", reason: STALE_NOT_FOUND });
+          return;
         case "draft_hash_mismatch":
-          // The draft is already gone — that's effectively "rejected"
-          // from the user's perspective. Mark stale so the message is
-          // explicit.
+          setFlow({ kind: "stale", reason: STALE_HASH_MISMATCH });
+          return;
+        case "draft_already_finalized_or_missing":
+          setFlow({ kind: "stale", reason: STALE_ALREADY_FINALIZED });
+          return;
+        case "bad_request":
           setFlow({
             kind: "stale",
             reason:
-              "Draft expired. Please type the instruction again.",
+              "Reject request was rejected as malformed by the backend. " +
+              "Please reload the page and try again. (" +
+              (env.error || "no error body") +
+              ")",
+          });
+          return;
+        case "disabled":
+          setFlow({
+            kind: "stale",
+            reason:
+              "The finalize handler is not enabled on this daemon.",
           });
           return;
         case "error":

@@ -705,16 +705,24 @@ export interface DraftIntentReviewRequiredDto {
 }
 
 /// Wire body for `POST /sessions/:id/stage2/w5h/intent/finalize`.
+///
+/// Matches the shipped backend DTO `claw_api::state::
+/// W5hIntentFinalizeRequestDto` (Agent D commit `3d30617`): the
+/// discriminator field is `action: "confirm" | "reject"` — NOT
+/// `user_confirmed: boolean`. The route rejects unknown action
+/// strings with a typed 400.
 export interface FinalizeW5hIntentRequest {
   draft_id: string;
   draft_hash: string;
-  /// `true` → finalize and proceed to funding_required.
-  /// `false` → reject; backend returns `{ status: "rejected" }`.
-  user_confirmed: boolean;
+  /// `"confirm"` → finalize and proceed to funding_required.
+  /// `"reject"`  → reject; backend returns `{ status: "rejected" }`.
+  action: "confirm" | "reject";
 }
 
-/// Envelope returned by `finalizeW5hIntent`. Mirrors the typed-result
-/// shape of the rest of the api client.
+/// Envelope returned by `finalizeW5hIntent`. Discriminates by HTTP
+/// status AND by the typed `error_code` field the backend includes
+/// in the response body (both 409 variants share the HTTP status but
+/// carry distinct `error_code`s).
 ///
 /// Variants:
 ///   - `funding_required` — confirm success; the response IS the
@@ -722,17 +730,34 @@ export interface FinalizeW5hIntentRequest {
 ///      `memo_text` / `amount_display` / `finalization`.
 ///   - `rejected` — reject success; backend body
 ///      `{ status: "rejected" }`.
-///   - `draft_not_found` — 404; the draft expired before the user
-///      confirmed.
-///   - `draft_hash_mismatch` — 409; the draft was replaced or the
-///      hash on the client doesn't match the server's view.
-///   - `error` — anything else (400 / 5xx / parse failure). Network
-///      throws bubble up as exceptions, NOT as this variant.
+///   - `draft_not_found_or_expired` — 404 with
+///      `error_code: "draft_not_found_or_expired"`. The draft expired
+///      or never existed.
+///   - `draft_hash_mismatch` — 409 with
+///      `error_code: "draft_hash_mismatch"`. The hash the client
+///      sent does not match the canonical hash the backend recomputed
+///      from the persisted draft preimage. The draft is NOT consumed;
+///      a fresh fetch would let the user re-confirm. We surface this
+///      as terminal-stale so the user re-types a clean instruction
+///      (per the Phase 5c-lite prompt copy).
+///   - `draft_already_finalized_or_missing` — 409 with
+///      `error_code: "draft_already_finalized_or_missing"`. The draft
+///      was already confirmed or rejected on a prior round-trip.
+///   - `bad_request` — 400 (malformed body, missing/empty fields,
+///      unknown `action` string). Terminal — frontend bug.
+///   - `disabled` — 503 (no finalize handler wired in this daemon).
+///      Terminal — daemon configuration issue.
+///   - `error` — anything else (parse failure, unexpected status,
+///      etc.). Caller decides whether to retry; the card surfaces a
+///      recoverable transient banner.
 export type FinalizeW5hIntentEnvelope =
   | { kind: "funding_required"; response: W5hConditionalDepositResult }
   | { kind: "rejected" }
-  | { kind: "draft_not_found"; error: string }
+  | { kind: "draft_not_found_or_expired"; error: string }
   | { kind: "draft_hash_mismatch"; error: string }
+  | { kind: "draft_already_finalized_or_missing"; error: string }
+  | { kind: "bad_request"; error: string }
+  | { kind: "disabled"; error: string }
   | { kind: "error"; httpStatus: number; error: string };
 
 /// Wire request body for `POST /sessions/:id/stage2/w5h/funding/confirm`.
