@@ -415,7 +415,7 @@ pub struct DraftIntentStore {
 
 #[derive(Debug, Default)]
 struct DraftIntentStoreInner {
-    by_key: std::collections::HashMap<DraftKey, StoredDraft>,
+    by_key: std::collections::HashMap<DraftKey, StoredEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -424,20 +424,51 @@ struct DraftKey {
     draft_id: String,
 }
 
+/// One slot in [`DraftIntentStoreInner`] — either an active draft
+/// awaiting finalize, or a tombstone marking a draft that has been
+/// finalized + consumed already (so a concurrent / retried confirm
+/// can distinguish "you already finalized this" from "never minted").
+#[derive(Debug, Clone)]
+enum StoredEntry {
+    Active(StoredDraft),
+    Tombstone(Tombstone),
+}
+
 #[derive(Debug, Clone)]
 struct StoredDraft {
     draft: DraftIntent,
     expires_at_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+struct Tombstone {
+    /// Wall-clock at which the tombstone may be lazily removed. Equal
+    /// to `consumed_at_ms + tombstone_ttl_ms`, where
+    /// `tombstone_ttl_ms = draft_ttl_ms + 60_000`. Past this point
+    /// repeated finalize attempts revert to `NotFoundOrExpired`,
+    /// which is acceptable because the user has long since moved on.
+    expires_at_ms: i64,
+    /// When the draft was consumed. Surfaced to logs only; never
+    /// returned over the wire. Audit-grade — does NOT leak any raw
+    /// user text.
+    #[allow(dead_code)]
+    consumed_at_ms: i64,
+}
+
 /// Outcome of [`DraftIntentStore::consume_if_match`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DraftConsumeOutcome {
-    /// Draft existed, hash matched, entry consumed.
+    /// Draft existed, hash matched, entry consumed (and replaced
+    /// with a tombstone).
     Ok(DraftIntent),
-    /// Draft id not present (never minted, or already consumed /
-    /// dropped / expired).
+    /// Draft id not present and no tombstone for it (never minted,
+    /// dropped, or both draft + tombstone expired).
     NotFoundOrExpired,
+    /// Draft id WAS minted and has already been consumed by a prior
+    /// confirm. Distinguished from `NotFoundOrExpired` so the finalize
+    /// route can surface HTTP 409 `draft_already_finalized_or_missing`
+    /// (rather than the 404 used for never-existed drafts).
+    AlreadyConsumed,
     /// Draft id present but its computed hash does NOT match the
     /// one the caller supplied. The entry is left in place
     /// (NOT consumed) so the user can retry within the TTL.
@@ -448,6 +479,12 @@ pub enum DraftConsumeOutcome {
         backend: String,
     },
 }
+
+/// Tombstone extra-life past the draft TTL — the Phase 5c-lite
+/// brief pins this at `+60 s`. So if the draft TTL is 15 min, a
+/// consumed draft leaves a tombstone for ~16 min, after which the
+/// slot lazy-recycles to `NotFoundOrExpired`.
+pub const TOMBSTONE_TTL_EXTRA_SECONDS: u64 = 60;
 
 impl DraftIntentStore {
     /// Construct a store with the given TTL (in seconds). The brief
@@ -464,6 +501,17 @@ impl DraftIntentStore {
         }
     }
 
+    /// Draft TTL (seconds) this store was constructed with. Tombstone
+    /// TTL derives from this: `ttl_seconds + TOMBSTONE_TTL_EXTRA_SECONDS`.
+    pub fn ttl_seconds(&self) -> u64 {
+        self.ttl_seconds
+    }
+
+    /// Tombstone TTL (seconds): draft TTL + 60 s, per brief.
+    pub fn tombstone_ttl_seconds(&self) -> u64 {
+        self.ttl_seconds + TOMBSTONE_TTL_EXTRA_SECONDS
+    }
+
     /// Insert a freshly-minted draft. Returns the draft id (echo).
     pub fn insert(&self, draft: DraftIntent) -> String {
         let now_ms = Utc::now().timestamp_millis();
@@ -476,16 +524,19 @@ impl DraftIntentStore {
         let mut g = self.inner.lock();
         g.by_key.insert(
             key,
-            StoredDraft {
+            StoredEntry::Active(StoredDraft {
                 draft,
                 expires_at_ms,
-            },
+            }),
         );
         id
     }
 
     /// Look up a draft, transparently expiring any entry whose TTL
-    /// has elapsed. Returns `None` for not-found AND expired entries.
+    /// has elapsed. Returns `None` for not-found, expired, AND
+    /// tombstoned entries. (`get` is the lookup-only path for the
+    /// reject flow; the consume path uses `consume_if_match` to
+    /// distinguish tombstones.)
     pub fn get(&self, session_id_hex: &str, draft_id: &str) -> Option<DraftIntent> {
         let now_ms = Utc::now().timestamp_millis();
         let key = DraftKey {
@@ -493,11 +544,20 @@ impl DraftIntentStore {
             draft_id: draft_id.to_string(),
         };
         let mut g = self.inner.lock();
-        let stored = g.by_key.get(&key).cloned();
-        match stored {
-            Some(s) if s.expires_at_ms > now_ms => Some(s.draft),
-            Some(_) => {
-                // Expired — lazy-remove and report not-found.
+        match g.by_key.get(&key).cloned() {
+            Some(StoredEntry::Active(s)) if s.expires_at_ms > now_ms => Some(s.draft),
+            Some(StoredEntry::Active(_)) => {
+                // Expired active draft — lazy-remove and report not-found.
+                g.by_key.remove(&key);
+                None
+            }
+            Some(StoredEntry::Tombstone(t)) if t.expires_at_ms > now_ms => {
+                // Active tombstone — `get` does NOT distinguish; it is
+                // the consume-path that surfaces AlreadyConsumed.
+                None
+            }
+            Some(StoredEntry::Tombstone(_)) => {
+                // Expired tombstone — lazy-remove.
                 g.by_key.remove(&key);
                 None
             }
@@ -505,10 +565,14 @@ impl DraftIntentStore {
         }
     }
 
-    /// Consume a draft IF the supplied `expected_hash` matches the
-    /// backend-computed hash. Atomic: either we remove and return
-    /// the draft, OR we leave the entry alone and report mismatch /
-    /// not-found.
+    /// Atomically consume a draft IF the supplied `expected_hash`
+    /// matches the backend-computed hash. On success, the active
+    /// draft is REPLACED with a tombstone (NOT a plain removal), so
+    /// a concurrent / retried confirm with the same `draft_id`
+    /// observes [`DraftConsumeOutcome::AlreadyConsumed`] rather than
+    /// `NotFoundOrExpired`. The mutex is held across the read +
+    /// compare + state-swap so the entire transition is atomic from
+    /// the perspective of any other caller.
     pub fn consume_if_match(
         &self,
         session_id_hex: &str,
@@ -521,27 +585,52 @@ impl DraftIntentStore {
             draft_id: draft_id.to_string(),
         };
         let mut g = self.inner.lock();
-        let stored = match g.by_key.get(&key) {
-            Some(s) => s.clone(),
+        let entry = match g.by_key.get(&key) {
+            Some(e) => e.clone(),
             None => return DraftConsumeOutcome::NotFoundOrExpired,
         };
-        if stored.expires_at_ms <= now_ms {
-            g.by_key.remove(&key);
-            return DraftConsumeOutcome::NotFoundOrExpired;
+        match entry {
+            StoredEntry::Tombstone(t) => {
+                if t.expires_at_ms > now_ms {
+                    DraftConsumeOutcome::AlreadyConsumed
+                } else {
+                    // Tombstone expired in flight — same as never minted.
+                    g.by_key.remove(&key);
+                    DraftConsumeOutcome::NotFoundOrExpired
+                }
+            }
+            StoredEntry::Active(stored) => {
+                if stored.expires_at_ms <= now_ms {
+                    // Draft TTL expired before consume — lazy-clean.
+                    g.by_key.remove(&key);
+                    return DraftConsumeOutcome::NotFoundOrExpired;
+                }
+                let backend = stored.draft.compute_hash();
+                if backend != expected_hash {
+                    return DraftConsumeOutcome::HashMismatch {
+                        provided: expected_hash.to_string(),
+                        backend,
+                    };
+                }
+                // Atomic swap: install tombstone in the same slot
+                // before releasing the lock. Subsequent confirm calls
+                // with the same draft_id observe AlreadyConsumed.
+                let tombstone_expires =
+                    now_ms + (self.tombstone_ttl_seconds() as i64) * 1000;
+                g.by_key.insert(
+                    key,
+                    StoredEntry::Tombstone(Tombstone {
+                        expires_at_ms: tombstone_expires,
+                        consumed_at_ms: now_ms,
+                    }),
+                );
+                DraftConsumeOutcome::Ok(stored.draft)
+            }
         }
-        let backend = stored.draft.compute_hash();
-        if backend != expected_hash {
-            return DraftConsumeOutcome::HashMismatch {
-                provided: expected_hash.to_string(),
-                backend,
-            };
-        }
-        g.by_key.remove(&key);
-        DraftConsumeOutcome::Ok(stored.draft)
     }
 
-    /// Unconditionally remove a draft entry. Used by the reject path
-    /// and tests. Idempotent.
+    /// Unconditionally remove a draft entry (and any tombstone for
+    /// it). Used by the reject path and tests. Idempotent.
     pub fn drop_draft(&self, session_id_hex: &str, draft_id: &str) {
         let key = DraftKey {
             session_id_hex: session_id_hex.to_string(),
@@ -551,10 +640,40 @@ impl DraftIntentStore {
         g.by_key.remove(&key);
     }
 
-    /// Number of currently-stored entries (including possibly
-    /// expired ones — lazy cleanup happens on access). Test-only.
+    /// Number of currently-stored slots (active drafts + tombstones,
+    /// some possibly expired — lazy cleanup happens on access).
+    /// Test-only.
     pub fn len(&self) -> usize {
         self.inner.lock().by_key.len()
+    }
+
+    /// Number of currently-active drafts (excluding tombstones and
+    /// expired slots). Test-only.
+    pub fn active_len(&self) -> usize {
+        let now_ms = Utc::now().timestamp_millis();
+        self.inner
+            .lock()
+            .by_key
+            .values()
+            .filter(|e| match e {
+                StoredEntry::Active(s) => s.expires_at_ms > now_ms,
+                StoredEntry::Tombstone(_) => false,
+            })
+            .count()
+    }
+
+    /// Number of currently-active tombstones. Test-only.
+    pub fn tombstone_len(&self) -> usize {
+        let now_ms = Utc::now().timestamp_millis();
+        self.inner
+            .lock()
+            .by_key
+            .values()
+            .filter(|e| match e {
+                StoredEntry::Tombstone(t) => t.expires_at_ms > now_ms,
+                StoredEntry::Active(_) => false,
+            })
+            .count()
     }
 
     /// True when there are no entries. Test-only.
@@ -844,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn store_consume_if_match_happy_path_removes() {
+    fn store_consume_if_match_happy_path_installs_tombstone() {
         let store = DraftIntentStore::new(DEFAULT_DRAFT_TTL_SECONDS);
         let d = fixture_draft();
         let id = d.draft_id.clone();
@@ -855,11 +974,21 @@ mod tests {
             DraftConsumeOutcome::Ok(out) => assert_eq!(out.draft_id, id),
             other => panic!("expected Ok, got {other:?}"),
         }
-        assert!(store.is_empty(), "consume must remove the entry");
+        // Phase 5c-lite contract-alignment: consume installs a
+        // tombstone in the same slot (not a plain removal). The slot
+        // still exists; the active-draft count is zero.
+        assert_eq!(store.active_len(), 0, "active draft was consumed");
+        assert_eq!(store.tombstone_len(), 1, "tombstone installed for 409 path");
+        assert_eq!(store.len(), 1, "slot is still occupied (by the tombstone)");
     }
 
     #[test]
-    fn store_consume_idempotency_retry_after_consume_is_not_found() {
+    fn store_consume_idempotency_second_call_returns_already_consumed() {
+        // Phase 5c-lite contract-alignment: consume installs a
+        // tombstone so a SECOND confirm with the same draft_id
+        // surfaces `AlreadyConsumed` (the route maps this to
+        // HTTP 409 `draft_already_finalized_or_missing`) rather than
+        // the 404 used for never-existed drafts.
         let store = DraftIntentStore::new(DEFAULT_DRAFT_TTL_SECONDS);
         let d = fixture_draft();
         let id = d.draft_id.clone();
@@ -870,11 +999,72 @@ mod tests {
             store.consume_if_match(&sid, &id, &h),
             DraftConsumeOutcome::Ok(_)
         ));
-        // Second call: NotFoundOrExpired (not a duplicate Ok).
+        // Second call: AlreadyConsumed (NOT NotFoundOrExpired, NOT
+        // a duplicate Ok).
         assert!(matches!(
             store.consume_if_match(&sid, &id, &h),
-            DraftConsumeOutcome::NotFoundOrExpired
+            DraftConsumeOutcome::AlreadyConsumed
         ));
+        // Active drafts: zero. Tombstone slot: one.
+        assert_eq!(store.active_len(), 0);
+        assert_eq!(store.tombstone_len(), 1);
+    }
+
+    #[test]
+    fn store_never_minted_draft_returns_not_found_or_expired() {
+        // The 404 path: a confirm targeting a draft_id that was
+        // NEVER minted observes NotFoundOrExpired (NOT
+        // AlreadyConsumed — there's no tombstone to hit).
+        let store = DraftIntentStore::new(DEFAULT_DRAFT_TTL_SECONDS);
+        let outcome = store.consume_if_match(
+            "any-session",
+            "ff".repeat(16).as_str(),
+            "0".repeat(64).as_str(),
+        );
+        assert!(matches!(outcome, DraftConsumeOutcome::NotFoundOrExpired));
+    }
+
+    #[test]
+    fn store_tombstone_ttl_is_draft_ttl_plus_sixty_seconds() {
+        let store = DraftIntentStore::new(DEFAULT_DRAFT_TTL_SECONDS);
+        assert_eq!(store.ttl_seconds(), DEFAULT_DRAFT_TTL_SECONDS);
+        assert_eq!(
+            store.tombstone_ttl_seconds(),
+            DEFAULT_DRAFT_TTL_SECONDS + TOMBSTONE_TTL_EXTRA_SECONDS
+        );
+        assert_eq!(TOMBSTONE_TTL_EXTRA_SECONDS, 60);
+    }
+
+    #[test]
+    fn store_get_returns_none_when_slot_holds_a_tombstone() {
+        // After consume, `get` for the same draft_id must return
+        // None (the tombstone is opaque to the lookup path).
+        let store = DraftIntentStore::new(DEFAULT_DRAFT_TTL_SECONDS);
+        let d = fixture_draft();
+        let id = d.draft_id.clone();
+        let sid = d.session_id_hex.clone();
+        let h = d.compute_hash();
+        store.insert(d);
+        let _ = store.consume_if_match(&sid, &id, &h);
+        assert!(store.get(&sid, &id).is_none());
+    }
+
+    #[test]
+    fn store_drop_draft_clears_tombstone_too() {
+        // drop_draft must remove EITHER an active draft OR a
+        // tombstone — the reject path may run after consume and
+        // we don't want stranded tombstones polluting len().
+        let store = DraftIntentStore::new(DEFAULT_DRAFT_TTL_SECONDS);
+        let d = fixture_draft();
+        let id = d.draft_id.clone();
+        let sid = d.session_id_hex.clone();
+        let h = d.compute_hash();
+        store.insert(d);
+        let _ = store.consume_if_match(&sid, &id, &h);
+        assert_eq!(store.tombstone_len(), 1);
+        store.drop_draft(&sid, &id);
+        assert_eq!(store.tombstone_len(), 0);
+        assert_eq!(store.len(), 0);
     }
 
     #[test]

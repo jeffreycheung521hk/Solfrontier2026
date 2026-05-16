@@ -99,12 +99,10 @@ impl Phase5cIntentFinalizeAdapter {
         session_id: &SessionId,
         request: W5hIntentFinalizeRequestDto,
     ) -> W5hIntentFinalizeRouteOutcome {
-        match request.action.as_str() {
-            "confirm" => self.run_confirm(session_id, &request).await,
-            "reject" => self.run_reject(session_id, &request).await,
-            other => W5hIntentFinalizeRouteOutcome::BadRequest(format!(
-                "unknown finalize action {other:?}"
-            )),
+        if request.user_confirmed {
+            self.run_confirm(session_id, &request).await
+        } else {
+            self.run_reject(session_id, &request).await
         }
     }
 
@@ -115,16 +113,15 @@ impl Phase5cIntentFinalizeAdapter {
     ) -> W5hIntentFinalizeRouteOutcome {
         let sid_hex = session_id_hex(session_id);
 
-        // Atomic consume-on-match. Hash mismatch leaves the entry in
-        // place so the user can retry. NotFoundOrExpired covers both
-        // "never minted" and "already finalized" — the route returns
-        // 404 for the former and 409 for the latter, but the in-process
-        // store cannot distinguish them by design (consume-on-success
-        // is the only state transition). We surface NotFoundOrExpired
-        // here and let the route emit the 404 variant; the 409
-        // `AlreadyFinalizedOrMissing` variant is reserved for a future
-        // refinement (e.g. tombstoning consumed drafts) and the
-        // current adapter never emits it.
+        // Atomic consume-or-tombstone-hit. The store distinguishes:
+        //   - `Ok` → first confirm wins; entry is replaced with a
+        //     tombstone in the same critical section.
+        //   - `AlreadyConsumed` → a tombstone is present; this is
+        //     either a retried confirm or the concurrent loser. Map
+        //     to HTTP 409 `draft_already_finalized_or_missing`.
+        //   - `NotFoundOrExpired` → never minted or both the draft
+        //     and its tombstone aged out. Map to HTTP 404.
+        //   - `HashMismatch` → draft preserved; user can retry.
         let draft = match self.draft_store.consume_if_match(
             &sid_hex,
             &request.draft_id,
@@ -139,6 +136,15 @@ impl Phase5cIntentFinalizeAdapter {
                     "phase5c-lite finalize: draft not found or expired"
                 );
                 return W5hIntentFinalizeRouteOutcome::NotFoundOrExpired;
+            }
+            DraftConsumeOutcome::AlreadyConsumed => {
+                tracing::info!(
+                    parser_source = "llm_extractor",
+                    finalize_result = "already_finalized_or_missing",
+                    draft_id = %request.draft_id,
+                    "phase5c-lite finalize: draft already finalized (tombstone hit)"
+                );
+                return W5hIntentFinalizeRouteOutcome::AlreadyFinalizedOrMissing;
             }
             DraftConsumeOutcome::HashMismatch { provided, backend } => {
                 tracing::warn!(
@@ -292,36 +298,45 @@ fn audit_envelope(
 }
 
 /// Map a [`W5hBridgeError`] surfaced from
-/// [`handle_w5h_from_finalized_intent`] into a finalize outcome. The
-/// confirm path already consumed the draft by the time we reach this,
-/// so we cannot put it back — the user retries by re-issuing the
-/// chat command (which mints a fresh draft).
+/// [`handle_w5h_from_finalized_intent`] into a finalize outcome.
+///
+/// The confirm path already consumed the draft (and installed a
+/// tombstone) by the time we reach this, so we cannot put it back —
+/// the user retries by re-issuing the chat command (which mints a
+/// fresh draft).
+///
+/// Phase 5c-lite contract: bridge / infrastructure failures **must
+/// not** be returned as `Ok(status="bridge_error:...")`. That shape
+/// causes the frontend to render a misleading funding card. Instead
+/// the adapter emits the typed [`W5hIntentFinalizeRouteOutcome::BridgeFailed`]
+/// variant which the HTTP route maps to a 500 with
+/// `error_code = "bridge_failed"` so the frontend renders a typed
+/// error card (and never a fake funding-required card).
+///
+/// The only client-attributable bridge failure
+/// (`UserWalletInvalid` — the session has a bound wallet that
+/// fails base58 parse, very unlikely past the bind challenge /
+/// response handshake) is still surfaced as `BadRequest` so the
+/// client gets a 4xx rather than a 5xx — but the frontend MUST
+/// still not render a funding card on that path.
 fn finalize_bridge_error_to_outcome(
     err: W5hBridgeError,
-    draft: &DraftIntent,
-    request: &W5hIntentFinalizeRequestDto,
-    finalize_unix_ms: i64,
+    _draft: &DraftIntent,
+    _request: &W5hIntentFinalizeRequestDto,
+    _finalize_unix_ms: i64,
 ) -> W5hIntentFinalizeRouteOutcome {
-    let finalization = audit_envelope(draft, request, finalize_unix_ms);
     match err {
-        // User-recoverable: the operator's bound wallet pubkey is
-        // invalid (very unlikely past the bind challenge/response).
         W5hBridgeError::UserWalletInvalid(reason) => {
             W5hIntentFinalizeRouteOutcome::BadRequest(format!(
                 "user wallet invalid: {reason}"
             ))
         }
-        // Infrastructure errors: surface a typed `Ok` with status
-        // = error code so the frontend renders an error card without
-        // needing a separate HTTP 5xx code path. The draft was
-        // consumed — the operator retries by re-typing the order.
-        other => {
-            W5hIntentFinalizeRouteOutcome::Ok(W5hIntentFinalizeResultDto {
-                status: format!("bridge_error:{other}"),
-                funding: None,
-                finalization,
-            })
-        }
+        // Every other variant is an infrastructure / persistence
+        // failure that the user cannot fix by retyping. Surface as
+        // typed 500.
+        other => W5hIntentFinalizeRouteOutcome::BridgeFailed {
+            reason: other.to_string(),
+        },
     }
 }
 
@@ -533,7 +548,7 @@ mod tests {
                 W5hIntentFinalizeRequestDto {
                     draft_id: draft_id.clone(),
                     draft_hash: draft_hash.clone(),
-                    action: "confirm".to_string(),
+                    user_confirmed: true,
                 },
             )
             .await;
@@ -560,8 +575,9 @@ mod tests {
             dto.finalization.original_user_message_hash,
             draft.original_user_message_hash
         );
-        // Draft has been consumed.
-        assert!(store.is_empty(), "draft must be consumed on confirm-success");
+        // Draft has been consumed (tombstone installed; no active draft).
+        assert_eq!(store.active_len(), 0, "draft must be consumed on confirm-success");
+        assert_eq!(store.tombstone_len(), 1, "consume installs a tombstone");
         // DB row exists.
         let stored = intent_repo.get(&funding.rule_id_hex).await.unwrap().unwrap();
         assert_eq!(stored.status, W5hIntentStatus::FundingRequired);
@@ -584,7 +600,7 @@ mod tests {
                 W5hIntentFinalizeRequestDto {
                     draft_id: draft_id.clone(),
                     draft_hash,
-                    action: "reject".to_string(),
+                    user_confirmed: false,
                 },
             )
             .await;
@@ -605,14 +621,20 @@ mod tests {
     // ── Idempotency / not found / hash mismatch ─────────────────────────
 
     #[tokio::test]
-    async fn confirm_idempotency_second_attempt_returns_not_found_or_expired() {
-        let (adapter, store, _intent_repo, _db) =
+    async fn confirm_idempotency_second_attempt_returns_already_finalized_or_missing() {
+        // Phase 5c-lite contract-alignment: the SECOND confirm with
+        // the same draft_id MUST hit the tombstone and return the
+        // typed `AlreadyFinalizedOrMissing` outcome (HTTP 409). The
+        // FIRST confirm wrote one rule + one funding-intent row; the
+        // second must NOT create duplicates.
+        let (adapter, store, intent_repo, db) =
             fixture_adapter(Some(TEST_USER_WALLET.to_string()), 10 * 60).await;
         let session = fixture_session();
         let draft = fixture_draft_for(&session, "msg");
         let draft_hash = draft.compute_hash();
         let draft_id = draft.draft_id.clone();
         store.insert(draft);
+
         // First confirm: succeeds.
         let first = adapter
             .run(
@@ -620,26 +642,154 @@ mod tests {
                 W5hIntentFinalizeRequestDto {
                     draft_id: draft_id.clone(),
                     draft_hash: draft_hash.clone(),
-                    action: "confirm".to_string(),
+                    user_confirmed: true,
                 },
             )
             .await;
         assert!(matches!(first, W5hIntentFinalizeRouteOutcome::Ok(_)));
-        // Second confirm with the same draft_id: NotFoundOrExpired.
+
+        // Snapshot DB row counts after the first confirm.
+        let rules_after_first = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM stage2_watch_rules",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let intents_after_first = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM stage2_w5h_funding_intents",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(rules_after_first, 1);
+        assert_eq!(intents_after_first, 1);
+
+        // Second confirm with the same draft_id: AlreadyFinalizedOrMissing.
         let second = adapter
             .run(
                 &session,
                 W5hIntentFinalizeRequestDto {
                     draft_id,
                     draft_hash,
-                    action: "confirm".to_string(),
+                    user_confirmed: true,
                 },
             )
             .await;
         assert!(matches!(
             second,
-            W5hIntentFinalizeRouteOutcome::NotFoundOrExpired
+            W5hIntentFinalizeRouteOutcome::AlreadyFinalizedOrMissing
         ));
+
+        // DB row counts MUST be unchanged.
+        let rules_after_second = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM stage2_watch_rules",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let intents_after_second = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM stage2_w5h_funding_intents",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(rules_after_second, rules_after_first);
+        assert_eq!(intents_after_second, intents_after_first);
+
+        // Tombstone is the only thing left in the in-process store.
+        assert_eq!(store.active_len(), 0);
+        assert_eq!(store.tombstone_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_double_confirm_exactly_one_winner() {
+        // Spawn two concurrent confirms targeting the same draft_id +
+        // draft_hash. Exactly ONE must observe `Ok`; the other must
+        // observe `AlreadyFinalizedOrMissing`. Asserts there is no
+        // race window where both consume.
+        let (adapter, store, intent_repo, db) =
+            fixture_adapter(Some(TEST_USER_WALLET.to_string()), 10 * 60).await;
+        let session = fixture_session();
+        let draft = fixture_draft_for(&session, "race");
+        let draft_hash = draft.compute_hash();
+        let draft_id = draft.draft_id.clone();
+        store.insert(draft);
+
+        let adapter_a = adapter.clone();
+        let adapter_b = adapter.clone();
+        let session_a = session.clone();
+        let session_b = session.clone();
+        let did_a = draft_id.clone();
+        let did_b = draft_id.clone();
+        let dh_a = draft_hash.clone();
+        let dh_b = draft_hash.clone();
+
+        let (a, b) = tokio::join!(
+            tokio::spawn(async move {
+                adapter_a
+                    .run(
+                        &session_a,
+                        W5hIntentFinalizeRequestDto {
+                            draft_id: did_a,
+                            draft_hash: dh_a,
+                            user_confirmed: true,
+                        },
+                    )
+                    .await
+            }),
+            tokio::spawn(async move {
+                adapter_b
+                    .run(
+                        &session_b,
+                        W5hIntentFinalizeRequestDto {
+                            draft_id: did_b,
+                            draft_hash: dh_b,
+                            user_confirmed: true,
+                        },
+                    )
+                    .await
+            }),
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+
+        // Exactly one Ok + exactly one AlreadyFinalizedOrMissing —
+        // never two Oks (would imply two DB rows), never two losers.
+        let ok_count = [&a, &b]
+            .iter()
+            .filter(|o| matches!(o, W5hIntentFinalizeRouteOutcome::Ok(_)))
+            .count();
+        let already_count = [&a, &b]
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    W5hIntentFinalizeRouteOutcome::AlreadyFinalizedOrMissing
+                )
+            })
+            .count();
+        assert_eq!(
+            ok_count, 1,
+            "exactly ONE confirm must observe Ok; got a={a:?}, b={b:?}"
+        );
+        assert_eq!(
+            already_count, 1,
+            "the LOSER must observe AlreadyFinalizedOrMissing; got a={a:?}, b={b:?}"
+        );
+
+        // Single row in each table.
+        let rules: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stage2_watch_rules")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let intents: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM stage2_w5h_funding_intents")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rules, 1);
+        assert_eq!(intents, 1);
+        let _ = intent_repo; // keep alive
     }
 
     #[tokio::test]
@@ -657,7 +807,7 @@ mod tests {
                 W5hIntentFinalizeRequestDto {
                     draft_id: draft_id.clone(),
                     draft_hash: "f".repeat(64),
-                    action: "confirm".to_string(),
+                    user_confirmed: true,
                 },
             )
             .await;
@@ -681,12 +831,15 @@ mod tests {
                 W5hIntentFinalizeRequestDto {
                     draft_id,
                     draft_hash: draft.compute_hash(),
-                    action: "confirm".to_string(),
+                    user_confirmed: true,
                 },
             )
             .await;
         assert!(matches!(retry, W5hIntentFinalizeRouteOutcome::Ok(_)));
-        assert!(store.is_empty());
+        // Retry consumed the draft → tombstone slot present, no
+        // active drafts.
+        assert_eq!(store.active_len(), 0);
+        assert_eq!(store.tombstone_len(), 1);
     }
 
     #[tokio::test]
@@ -700,7 +853,7 @@ mod tests {
                 W5hIntentFinalizeRequestDto {
                     draft_id: "never-existed".to_string(),
                     draft_hash: "0".repeat(64),
-                    action: "confirm".to_string(),
+                    user_confirmed: true,
                 },
             )
             .await;
@@ -728,7 +881,7 @@ mod tests {
                 W5hIntentFinalizeRequestDto {
                     draft_id,
                     draft_hash,
-                    action: "confirm".to_string(),
+                    user_confirmed: true,
                 },
             )
             .await;
@@ -738,32 +891,21 @@ mod tests {
         ));
         // Per the implementation comment: draft is consumed before
         // wallet-binding is checked (the consume is atomic). User
-        // retries by re-issuing the chat command.
-        assert!(store.is_empty());
+        // retries by re-issuing the chat command. Slot now holds a
+        // tombstone, not an active draft.
+        assert_eq!(store.active_len(), 0);
+        assert_eq!(store.tombstone_len(), 1);
     }
 
-    // ── Unknown action / reject without prior draft ─────────────────────
-
-    #[tokio::test]
-    async fn unknown_action_returns_bad_request() {
-        let (adapter, _store, _intent_repo, _db) =
-            fixture_adapter(Some(TEST_USER_WALLET.to_string()), 10 * 60).await;
-        let session = fixture_session();
-        let outcome = adapter
-            .run(
-                &session,
-                W5hIntentFinalizeRequestDto {
-                    draft_id: "any".to_string(),
-                    draft_hash: "0".repeat(64),
-                    action: "approve".to_string(), // not "confirm" / "reject"
-                },
-            )
-            .await;
-        assert!(matches!(
-            outcome,
-            W5hIntentFinalizeRouteOutcome::BadRequest(_)
-        ));
-    }
+    // ── Reject without prior draft ───────────────────────────────────────
+    //
+    // Phase 5c-lite contract: `user_confirmed` is a strongly-typed
+    // `bool` field on the request DTO, so there is no "unknown
+    // action" case at the wire layer. The earlier
+    // `unknown_action_returns_bad_request` test (which exercised an
+    // `action: "approve"` value) no longer applies and was removed
+    // when the DTO was renamed from `action: String` to
+    // `user_confirmed: bool`.
 
     #[tokio::test]
     async fn reject_unknown_draft_is_idempotent_no_op() {
@@ -776,7 +918,7 @@ mod tests {
                 W5hIntentFinalizeRequestDto {
                     draft_id: "never-existed".to_string(),
                     draft_hash: "0".repeat(64),
-                    action: "reject".to_string(),
+                    user_confirmed: false,
                 },
             )
             .await;
@@ -788,6 +930,92 @@ mod tests {
             }
             other => panic!("expected Ok(rejected), got {other:?}"),
         }
+    }
+
+    // ── Issue 3 — typed BridgeFailed outcome ───────────────────────────
+    //
+    // Phase 5c-lite contract-alignment: when the post-consume W5h
+    // bridge pipeline raises an internal error, the adapter MUST
+    // surface a typed `BridgeFailed { reason }` outcome (which the
+    // HTTP route maps to a 500 with `error_code = "bridge_failed"`).
+    // It MUST NOT emit a successful funding-shaped DTO with status
+    // `"bridge_error:..."` — that would cause the frontend to render
+    // a misleading funding-required card.
+
+    #[derive(Debug)]
+    struct FailingAprFetcher;
+    #[async_trait]
+    impl W5dAprFetcher for FailingAprFetcher {
+        async fn evaluate(
+            &self,
+            _input_text: &str,
+            _parsed: &DemoParsed,
+        ) -> Result<W5dEvaluationResult, EvaluationError> {
+            Err(EvaluationError::RpcFetchFailed {
+                detail: "simulated RPC outage".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_failure_returns_typed_bridge_failed_outcome_no_funding_dto() {
+        // Build an adapter whose APR fetcher is failing. Everything
+        // else is wired normally; the failure surfaces at the bridge
+        // call after the draft is consumed.
+        let db = Database::open_in_memory().await.unwrap();
+        let rule_repo = Arc::new(Stage2WatchRuleRepository::new(db.pool().clone()));
+        let intent_repo = Arc::new(Stage2W5hFundingIntentRepository::new(db.pool().clone()));
+        let store = Arc::new(DraftIntentStore::new(10 * 60));
+        let adapter = Phase5cIntentFinalizeAdapter::new(
+            store.clone(),
+            Arc::new(FailingAprFetcher),
+            Arc::new(StubSaveFetcher { bps: 210 }),
+            rule_repo,
+            intent_repo.clone(),
+            Arc::new(StubSessionWalletLookup {
+                pubkey: Some(TEST_USER_WALLET.to_string()),
+            }),
+        );
+        let session = fixture_session();
+        let draft = fixture_draft_for(&session, "bridge-fail msg");
+        let draft_hash = draft.compute_hash();
+        let draft_id = draft.draft_id.clone();
+        store.insert(draft);
+
+        let outcome = adapter
+            .run(
+                &session,
+                W5hIntentFinalizeRequestDto {
+                    draft_id,
+                    draft_hash,
+                    user_confirmed: true,
+                },
+            )
+            .await;
+
+        // MUST be BridgeFailed, NOT Ok-with-bridge-error-status.
+        match outcome {
+            W5hIntentFinalizeRouteOutcome::BridgeFailed { reason } => {
+                assert!(
+                    reason.to_lowercase().contains("rpc")
+                        || reason.to_lowercase().contains("apr")
+                        || reason.to_lowercase().contains("simulated")
+                        || reason.to_lowercase().contains("native"),
+                    "bridge failure reason should surface infrastructure detail; got {reason:?}"
+                );
+            }
+            W5hIntentFinalizeRouteOutcome::Ok(dto) => panic!(
+                "bridge failure must NOT return Ok; got status={:?}, funding={:?}",
+                dto.status, dto.funding
+            ),
+            other => panic!("expected BridgeFailed, got {other:?}"),
+        }
+        // No funding-intent row was persisted.
+        let any = intent_repo.list_budget_reserved(10).await.unwrap();
+        assert!(any.is_empty());
+        // Draft was consumed → tombstone present, no active drafts.
+        assert_eq!(store.active_len(), 0);
+        assert_eq!(store.tombstone_len(), 1);
     }
 
     // ── Source guards ──────────────────────────────────────────────────

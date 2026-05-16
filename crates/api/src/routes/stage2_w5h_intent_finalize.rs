@@ -8,12 +8,12 @@
 //!     route runs),
 //!   - recomputes the canonical hash from the persisted preimage and
 //!     compares it byte-for-byte to the `draft_hash` the client sent,
-//!   - on confirm + match: consumes the draft AND persists the
-//!     `WatchRule` + `W5hFundingIntent` (the existing
+//!   - on `user_confirmed=true` + match: consumes the draft AND
+//!     persists the `WatchRule` + `W5hFundingIntent` (the existing
 //!     deterministic-path pipeline), returning the standard
 //!     `funding_required` payload wrapped in a finalize-audit
 //!     envelope,
-//!   - on reject: drops the draft and returns
+//!   - on `user_confirmed=false`: drops the draft and returns
 //!     `status="rejected"` (no DB row written),
 //!   - on hash mismatch: does NOT consume the draft and returns 409
 //!     with a typed error code; the user can retry the confirm from
@@ -21,14 +21,21 @@
 //!   - on not-found / expired / already-finalized: returns the
 //!     appropriate typed 404/409.
 //!
+//! # Request body
+//!
+//! ```json
+//! { "draft_id": "...", "draft_hash": "...", "user_confirmed": true }
+//! ```
+//!
 //! # Status mapping
 //!
 //! | HTTP | When |
 //! |------|------|
 //! | 200 OK | `W5hIntentFinalizeRouteOutcome::Ok(_)` (confirm + persist OR explicit reject) |
-//! | 400 Bad Request | invalid session id, malformed body, missing/empty fields, unknown action |
+//! | 400 Bad Request | invalid session id, malformed body, missing/empty fields |
 //! | 404 Not Found | session not active OR `draft_not_found_or_expired` |
 //! | 409 Conflict | `draft_hash_mismatch` (do not retry without re-fetch) OR `draft_already_finalized_or_missing` |
+//! | 500 Internal Server Error | `bridge_failed` (post-consume W5h bridge / persistence error; frontend MUST NOT render a funding card) |
 //! | 503 Service Unavailable | no `W5hIntentFinalizeHandler` wired (daemon not configured with the chat / extractor) |
 
 use axum::{
@@ -99,18 +106,9 @@ pub async fn post_w5h_intent_finalize(
     if body.draft_hash.chars().count() > MAX_DRAFT_HASH_CHARS {
         return bad_request("draft_hash too long");
     }
-    // Action is one of {confirm, reject}. The gateway-side handler
-    // also re-checks (defense in depth), but rejecting unknown
-    // strings here gives the operator a 400 with a clear reason
-    // instead of a generic backend rejection.
-    match body.action.as_str() {
-        "confirm" | "reject" => {}
-        other => {
-            return bad_request(format!(
-                "unknown finalize action {other:?} (expected \"confirm\" or \"reject\")"
-            ));
-        }
-    }
+    // `user_confirmed` is a bool — serde deserialization already
+    // rejects garbage at the body-parse layer, so no extra
+    // validation needed here beyond hex/string field-length checks.
 
     if !state.session_mgr.is_active(&session_id) {
         return (
@@ -157,6 +155,16 @@ pub async fn post_w5h_intent_finalize(
             Json(json!({
                 "error_code": "draft_already_finalized_or_missing",
                 "error": "draft already finalized or never existed",
+            })),
+        )
+            .into_response(),
+        W5hIntentFinalizeRouteOutcome::BridgeFailed { reason } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error_code": "bridge_failed",
+                "error": "W5h bridge / persistence failed after draft consumption; \
+                         the draft has been consumed and the user must retype the order",
+                "reason": reason,
             })),
         )
             .into_response(),

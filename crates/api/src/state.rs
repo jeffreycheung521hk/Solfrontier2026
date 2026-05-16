@@ -1467,6 +1467,10 @@ pub struct DraftIntentReviewDto {
 }
 
 /// Wire body for `POST /sessions/:id/stage2/w5h/intent/finalize`.
+///
+/// Canonical Phase 5c-lite shape uses a boolean operator-decision
+/// field. The legacy `action: "confirm"|"reject"` shape is not
+/// accepted on this DTO; clients must send `user_confirmed: bool`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct W5hIntentFinalizeRequestDto {
     pub draft_id: String,
@@ -1475,10 +1479,10 @@ pub struct W5hIntentFinalizeRequestDto {
     /// the draft is NOT consumed (the user may retry from the same
     /// card within the TTL).
     pub draft_hash: String,
-    /// Operator decision: `"confirm"` mints the W5h funding-intent
-    /// row; `"reject"` drops the draft and returns 200 + the
-    /// `rejected` outcome.
-    pub action: String,
+    /// Operator decision. `true` mints the W5h funding-intent row;
+    /// `false` drops the draft and returns 200 with the `rejected`
+    /// outcome (no DB write).
+    pub user_confirmed: bool,
 }
 
 /// Wire DTO returned by `POST /sessions/:id/stage2/w5h/intent/finalize`.
@@ -1525,8 +1529,10 @@ pub struct W5hIntentFinalizationAuditDto {
 /// Domain-level outcome from the finalize handler. The HTTP layer
 /// maps these to status codes:
 /// - `Ok` (status=funding_required / rejected / idempotent-persisted) → 200
-/// - `NotFoundOrExpired` → 404
-/// - `HashMismatch` / `AlreadyFinalized` → 409 (with typed body)
+/// - `NotFoundOrExpired` → 404 (`error_code=draft_not_found_or_expired`)
+/// - `HashMismatch` → 409 (`error_code=draft_hash_mismatch`)
+/// - `AlreadyFinalizedOrMissing` → 409 (`error_code=draft_already_finalized_or_missing`)
+/// - `BridgeFailed` → 500 (`error_code=bridge_failed`)
 /// - `BadRequest` → 400, `SessionNotActive` → 404,
 ///   `Disabled` → 503.
 #[derive(Debug, Clone)]
@@ -1540,11 +1546,21 @@ pub enum W5hIntentFinalizeRouteOutcome {
     /// draft on this path — the user may retype the confirm.
     HashMismatch { provided: String, backend: String },
     /// 409 — typed payload uses `error_code =
-    /// "draft_already_finalized_or_missing"`. Distinct from
-    /// NotFoundOrExpired because a successful prior finalize and a
-    /// never-existed draft are indistinguishable at the store level
-    /// (consume-on-success is the only state-transition).
+    /// "draft_already_finalized_or_missing"`. Emitted when the
+    /// draft was previously consumed (a tombstone is present in
+    /// the in-process store) — distinct from `NotFoundOrExpired`
+    /// (the never-minted / fully-expired case). Distinguishing
+    /// these two cases is the whole purpose of the tombstone.
     AlreadyFinalizedOrMissing,
+    /// 500 — typed payload uses `error_code = "bridge_failed"`. The
+    /// draft was consumed but the post-finalize W5h bridge pipeline
+    /// (APR fetch / Save fetch / WatchRule persist / FundingIntent
+    /// persist) raised an internal error. The frontend MUST NOT
+    /// render a funding card on this outcome — the failure is
+    /// non-trivial and the user has to retype the order to mint a
+    /// fresh draft. The `reason` is a non-leaking, audit-grade
+    /// summary suitable for surface logs.
+    BridgeFailed { reason: String },
     BadRequest(String),
     SessionNotActive,
     Disabled(String),
