@@ -13,6 +13,9 @@ import type {
   ChatResponse,
   ChatRouteResult,
   DashboardSnapshot,
+  DraftIntentReviewRequiredDto,
+  FinalizeW5hIntentEnvelope,
+  FinalizeW5hIntentRequest,
   OpenSessionRequest,
   OpenSessionResponse,
   PolicyRule,
@@ -240,6 +243,42 @@ export async function getOrCreateSession(role: "execution" = "execution"): Promi
   return _liveSessionPromise;
 }
 
+/// Normalise the chat-route's JSON body into the frontend's
+/// status-discriminated `ChatResponse` union.
+///
+/// Most variants are emitted with `status: "<variant>"` on the wire
+/// and pass through verbatim. Phase 5c-lite introduces a single
+/// variant whose backend wire shape uses `kind` as the discriminator
+/// instead — `{ "kind": "draft_intent_review_required", "draft_id":
+/// ..., "draft_hash": ..., ... }`. We re-pack that body into the
+/// uniform `{ status, result }` shape so `ChatResponseCard`'s
+/// status-switch stays the single dispatch surface.
+///
+/// Unknown shapes pass through untouched so TypeScript exhaustiveness
+/// catches them at the consumer.
+function normalizeChatResponseWireShape(raw: unknown): ChatResponse {
+  if (raw !== null && typeof raw === "object") {
+    const obj = raw as Record<string, unknown>;
+    if (
+      typeof obj.status !== "string" &&
+      typeof obj.kind === "string" &&
+      obj.kind === "draft_intent_review_required"
+    ) {
+      // Re-pack: { kind, ...rest } → { status, result: { ...rest } }.
+      // Discriminator becomes `status` for uniform downstream dispatch;
+      // the original `kind` is dropped from the result body (no
+      // consumer reads it).
+      const { kind: _kind, ...rest } = obj;
+      void _kind;
+      return {
+        status: "draft_intent_review_required",
+        result: rest as unknown as DraftIntentReviewRequiredDto,
+      };
+    }
+  }
+  return raw as ChatResponse;
+}
+
 /// POST /sessions/:id/chat — strict one-turn LLM dispatch.
 /// Returns a `ChatRouteResult` envelope. Does NOT throw on domain
 /// failures; only network-level / parse failures bubble up.
@@ -264,13 +303,17 @@ export async function postChat(
 
   // 200 OK — body is `ChatResponse`
   if (res.ok) {
-    const parsed = (await res.json()) as ChatResponse;
+    const parsed = normalizeChatResponseWireShape(
+      (await res.json()) as unknown,
+    );
     return { kind: "ok", response: parsed };
   }
 
   // 409 — body is `ChatResponse` with status "pending_action_exists"
   if (res.status === 409) {
-    const parsed = (await res.json()) as ChatResponse;
+    const parsed = normalizeChatResponseWireShape(
+      (await res.json()) as unknown,
+    );
     if (parsed.status === "pending_action_exists") {
       return { kind: "conflict", response: parsed };
     }
@@ -368,6 +411,20 @@ export async function postW5gExecute(
 /// backend would take. No network call.
 function showcaseChatReply(message: string): ChatRouteResult {
   const lower = message.toLowerCase();
+
+  // ── Phase 5c-lite — paraphrased draft-intent review fixture ─────
+  //
+  // Detects paraphrased English / 繁中 W5h-style intents that the
+  // deterministic regex would NOT have matched. Returns a
+  // `draft_intent_review_required` ChatResponse so the
+  // `DraftIntentReviewCard` renders, exactly as the live LLM
+  // extractor would. This is intentionally checked BEFORE the
+  // deterministic 0.25 regex (which still wins for the exact
+  // canonical phrasing).
+  const draftReview = parseShowcaseDraftIntentReview(message);
+  if (draftReview !== null) {
+    return { kind: "ok", response: draftReview };
+  }
 
   // ── W5h chat-driven funding-gated fixture ───────────────────────
   //
@@ -1575,4 +1632,224 @@ function buildW5hShowcaseShared(body: W5hFundingConfirmRequest) {
     decision_source: W5H_FIXTURE_PINNED.decision_source,
     refund_signature: null,
   };
+}
+
+// ── Phase 5c-lite — finalize-intent route ───────────────────────────────────
+//
+// `POST /sessions/:id/stage2/w5h/intent/finalize` — frontend tells
+// the backend the user reviewed an LLM-drafted intent and either
+// confirmed (→ proceed to `funding_required`) or rejected
+// (→ backend body `{ status: "rejected" }`). Backend route is
+// expected to ship in Agent D's Phase 5c-lite backend slice.
+//
+// READ-MODIFIES-ONE-RECORD: this is a state-changing POST but it
+// does NOT broadcast or sign any tx on-chain. The frontend never
+// touches Phantom for this call.
+
+export async function finalizeW5hIntent(
+  sessionId: SessionId,
+  body: FinalizeW5hIntentRequest,
+): Promise<FinalizeW5hIntentEnvelope> {
+  if (IS_SHOWCASE) {
+    return showcaseFinalizeW5hIntentReply(body);
+  }
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (GATEWAY_TOKEN) headers["authorization"] = `Bearer ${GATEWAY_TOKEN}`;
+
+  const res = await fetch(
+    `${GATEWAY_URL}/sessions/${sessionId}/stage2/w5h/intent/finalize`,
+    {
+      method: "POST",
+      headers,
+      cache: "no-store",
+      body: JSON.stringify(body),
+    },
+  );
+
+  if (res.status === 200) {
+    // Body is either { status: "funding_required", ...W5hConditionalDepositResult }
+    // or { status: "rejected" }. Discriminate on status.
+    const parsed = (await res.json()) as
+      | (W5hConditionalDepositResult & { status: string })
+      | { status: "rejected" };
+    if (parsed.status === "rejected") {
+      return { kind: "rejected" };
+    }
+    return {
+      kind: "funding_required",
+      response: parsed as W5hConditionalDepositResult,
+    };
+  }
+
+  let errorText = "";
+  try {
+    const errBody = (await res.json()) as { error?: string };
+    errorText = errBody.error ?? "";
+  } catch {
+    errorText = (await res.text().catch(() => "")) || res.statusText;
+  }
+
+  if (res.status === 404) {
+    return { kind: "draft_not_found", error: errorText };
+  }
+  if (res.status === 409) {
+    return { kind: "draft_hash_mismatch", error: errorText };
+  }
+  return { kind: "error", httpStatus: res.status, error: errorText };
+}
+
+/// Showcase reply for the finalize route. Honours the user_confirmed
+/// flag — confirm produces a `funding_required` DTO populated with
+/// the Phase 5c-lite fields the card expects (`amount_display`,
+/// `memo_text`, `finalization`). Reject returns `{ kind: "rejected" }`.
+///
+/// Per-draft_id call counter lets the fixture exercise the 409
+/// `draft_hash_mismatch` branch by replaying the same draft_id with
+/// a mismatched hash (suffix `…stale` on the draft_id), or the 404
+/// `draft_not_found` branch (suffix `…expired`).
+const SHOWCASE_FINALIZE_AMOUNT_RAW = "500000";
+const SHOWCASE_FINALIZE_AMOUNT_DISPLAY = "0.5 USDC";
+const SHOWCASE_FINALIZE_THRESHOLD_BPS = 50;
+const SHOWCASE_FINALIZE_RULE_ID =
+  "cafef00ddeadbeefcafef00d1234abcd";
+const SHOWCASE_FINALIZE_CANONICAL_HASH =
+  "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+function showcaseFinalizeW5hIntentReply(
+  body: FinalizeW5hIntentRequest,
+): FinalizeW5hIntentEnvelope {
+  const idLower = body.draft_id.toLowerCase();
+  if (idLower.endsWith("expired")) {
+    return {
+      kind: "draft_not_found",
+      error: "draft_not_found_or_expired",
+    };
+  }
+  if (idLower.endsWith("stale")) {
+    return {
+      kind: "draft_hash_mismatch",
+      error: "draft_hash_mismatch",
+    };
+  }
+  if (!body.user_confirmed) {
+    return { kind: "rejected" };
+  }
+  const memoText = `claw:w5h:${SHOWCASE_FINALIZE_RULE_ID}:${SHOWCASE_FINALIZE_CANONICAL_HASH}`;
+  const nowMs = Date.now();
+  const response: W5hConditionalDepositResult = {
+    input_text: "(showcase finalize fixture — paraphrase confirmed)",
+    status: "funding_required",
+    rule_id_hex: SHOWCASE_FINALIZE_RULE_ID,
+    canonical_rule_hash_hex: SHOWCASE_FINALIZE_CANONICAL_HASH,
+    amount_raw: SHOWCASE_FINALIZE_AMOUNT_RAW,
+    amount_display: SHOWCASE_FINALIZE_AMOUNT_DISPLAY,
+    current_budget_raw: "0",
+    user_wallet: null,
+    user_usdc_ata: null,
+    controlled_wallet: W5H_FIXTURE_PINNED.controlled_wallet,
+    controlled_usdc_ata: W5H_FIXTURE_PINNED.controlled_usdc_ata,
+    expires_at_ms: (nowMs + 3 * 60_000).toString(),
+    last_checked_slot: "418961171",
+    threshold_bps: SHOWCASE_FINALIZE_THRESHOLD_BPS,
+    threshold_pct_label: "0.5",
+    threshold_display: "0.5%",
+    condition_met:
+      W5H_FIXTURE_PINNED.save_display_apy_bps > SHOWCASE_FINALIZE_THRESHOLD_BPS,
+    save_display_apy_bps: W5H_FIXTURE_PINNED.save_display_apy_bps,
+    native_onchain_apr_bps: W5H_FIXTURE_PINNED.native_onchain_apr_bps,
+    native_onchain_apr_source: W5H_FIXTURE_PINNED.native_onchain_apr_source,
+    decision_source: W5H_FIXTURE_PINNED.decision_source,
+    funding_signature: null,
+    funding_confirmation_slot: null,
+    refund_signature: null,
+    error_reason: null,
+    error_code: null,
+    memo_text: memoText,
+    finalization: {
+      parser_source: "llm_extractor",
+      draft_id: body.draft_id,
+      draft_hash: body.draft_hash,
+      original_user_message_hash:
+        "0000000000000000000000000000000000000000000000000000000000000000",
+      finalized_at_ms: nowMs.toString(),
+    },
+  };
+  return { kind: "funding_required", response };
+}
+
+/// Parse paraphrased English / 繁中 "put 0.X USDC in Solend if APY > Y%"
+/// style commands into a showcase `DraftIntentReviewRequiredDto`.
+/// Intentionally lenient — covers the smoke prompts from the Phase 5b
+/// browser smoke (e.g. "put 0.25 USDC in Solend if APY clears 1%",
+/// "Move a quarter USDC to Solend whenever the USDC yield is over 1%",
+/// "当 Save USDC APY 高于 1% 时，存入 0.25 USDC"). Pinned amount /
+/// threshold are 0.5 USDC / 0.5% so the demo viewer can see a
+/// non-canonical pair that the deterministic regex would NOT have
+/// matched.
+function parseShowcaseDraftIntentReview(
+  message: string,
+): ChatResponse | null {
+  const t = message.trim();
+  if (t.length === 0) return null;
+  // Hard guard: skip canonical deterministic phrasings so the
+  // existing W5h fixture wins for those.
+  if (/^If Solend Main Pool USDC deposit APY is above/i.test(t)) {
+    return null;
+  }
+  if (/^如果\s*Save\s*APY\s*>\s*\d/i.test(t) && /有效期\s*\d+\s*分鐘/u.test(t)) {
+    return null;
+  }
+  const looksParaphrased =
+    /\b(usdc|usdt|solend|save)\b/i.test(t) &&
+    /\b(apy|yield)\b/i.test(t) &&
+    /(deposit|put|move|stash|park|allocate|存入|放入|deposit)/iu.test(t);
+  const isChinese = /[一-鿿]/.test(t);
+  const isInjection =
+    /ignore previous|forget previous|override|developer mode/i.test(t);
+  if (isInjection) {
+    // Showcase: surface as a typed ToolError, mirroring the live
+    // extractor's `IntentRejectionCode::*` path.
+    return {
+      status: "tool_error",
+      tool_name: "stage2_llm_intent_extractor",
+      message:
+        "Showcase fixture: prompt-injection detected; the live LLM extractor would reject with IntentRejectionCode::LowConfidence.",
+    };
+  }
+  if (!looksParaphrased && !isChinese) {
+    return null;
+  }
+
+  // Canonical fixture: 0.5 USDC, threshold 0.5% — distinct from the
+  // 0.25 / 1% deterministic-regex defaults so the demo can show that
+  // the finalized funding card honours the LLM-drafted amount.
+  const draftId = `draft-${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+  const draftHash =
+    "ffeeddccbbaa9988776655443322110000112233445566778899aabbccddeeff";
+  const draft: DraftIntentReviewRequiredDto = {
+    draft_id: draftId,
+    draft_hash: draftHash,
+    parser_source: "llm_extractor",
+    original_user_message_hash:
+      "1111111111111111111111111111111111111111111111111111111111111111",
+    action: "deposit",
+    protocol: "solend",
+    asset: "USDC",
+    display_source: "save",
+    comparison: "gt",
+    threshold_bps: SHOWCASE_FINALIZE_THRESHOLD_BPS,
+    threshold_display: "0.5%",
+    amount_raw: SHOWCASE_FINALIZE_AMOUNT_RAW,
+    amount_display: SHOWCASE_FINALIZE_AMOUNT_DISPLAY,
+    controlled_wallet: W5H_FIXTURE_PINNED.controlled_wallet,
+    controlled_usdc_ata: W5H_FIXTURE_PINNED.controlled_usdc_ata,
+    expiry_seconds_after_finalize: 180,
+    warnings: [],
+    review_copy:
+      "LLM drafted this intent. Nothing is funded or executed until you confirm.",
+  };
+  return { status: "draft_intent_review_required", result: draft };
 }
