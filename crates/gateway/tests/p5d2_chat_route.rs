@@ -373,6 +373,7 @@ async fn build_ctx_with_registry(
         chat_funding_confirm: None,
         chat_refund:       None,
         chat_order_status:       None,
+        chat_intent_finalize:    None,
     };
     let router = claw_api::create_router(state, HealthRegistry::new());
     Ctx { router, sid, scripted }

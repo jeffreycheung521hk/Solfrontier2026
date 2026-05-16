@@ -988,31 +988,37 @@ impl GatewayDaemon {
             dyn crate::tools::jupiter_swap::SessionBoundWallet,
         > = std::sync::Arc::new(external_wallet.clone());
 
-        let chat_handler_ref: Option<ChatHandlerRef> =
-            match crate::runtime::chat_wiring::wire_chat_handler_from_std_env(
-                &registry,
-                Some(w5e_repo.clone()),
-                w5g_executor.clone(),
-                Some(w5h_intent_repo_for_chat.clone()),
-                Some(session_wallet_lookup_for_chat.clone()),
-            ) {
-                Ok(opt) => {
-                    if opt.is_some() {
-                        info!("chat route enabled with explicit provider opt-in");
-                    } else {
-                        info!(
-                            "chat route disabled (CLAW_CHAT_PROVIDER unset); \
-                             POST /sessions/:id/chat will return 503"
-                        );
-                    }
-                    opt
+        let (chat_handler_ref, phase5c_draft_store): (
+            Option<ChatHandlerRef>,
+            Option<std::sync::Arc<crate::stage2_phase5c_draft::DraftIntentStore>>,
+        ) = match crate::runtime::chat_wiring::wire_chat_handler_from_std_env(
+            &registry,
+            Some(w5e_repo.clone()),
+            w5g_executor.clone(),
+            Some(w5h_intent_repo_for_chat.clone()),
+            Some(session_wallet_lookup_for_chat.clone()),
+        ) {
+            Ok(out) => {
+                if out.chat_handler.is_some() {
+                    info!(
+                        "chat route enabled with explicit provider opt-in \
+                         (phase 5c-lite draft store wired={})",
+                        out.draft_store.is_some()
+                    );
+                } else {
+                    info!(
+                        "chat route disabled (CLAW_CHAT_PROVIDER unset); \
+                         POST /sessions/:id/chat will return 503"
+                    );
                 }
-                Err(e) => {
-                    return Err(GatewayError::Startup(format!(
-                        "chat handler config invalid: {e}"
-                    )));
-                }
-            };
+                (out.chat_handler, out.draft_store)
+            }
+            Err(e) => {
+                return Err(GatewayError::Startup(format!(
+                    "chat handler config invalid: {e}"
+                )));
+            }
+        };
 
         // W5g dedicated-route adapter — wraps the same shared executor.
         let chat_execute_ref: Option<claw_api::state::ChatExecuteHandlerRef> =
@@ -1127,6 +1133,64 @@ impl GatewayDaemon {
             )
             .into_handler_ref(),
         );
+
+        // Phase 5c-lite — finalize-route adapter. Wired only when the
+        // chat route minted a draft store (i.e. the LLM extractor is
+        // active) AND the full W5h substrate is available (APR
+        // fetcher + Save fetcher + rule repo + intent repo + session
+        // wallet lookup). If any dep is missing, the finalize route
+        // returns 503 — same fail-closed contract as the rest of the
+        // W5h surface.
+        let chat_intent_finalize_ref: Option<
+            claw_api::state::W5hIntentFinalizeHandlerRef,
+        > = {
+            let rpc_url = std::env::var("HELIUS_RPC_URL")
+                .or_else(|_| std::env::var("CLAW_RPC_URL"))
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            let apr_fetcher: Option<
+                std::sync::Arc<dyn crate::stage2_demo_apr_bridge::W5dAprFetcher>,
+            > = rpc_url.as_deref().and_then(|u| {
+                crate::stage2_demo_apr_bridge::LiveW5dAprFetcher::new(u.to_string())
+                    .map(|f| {
+                        let f: std::sync::Arc<
+                            dyn crate::stage2_demo_apr_bridge::W5dAprFetcher,
+                        > = std::sync::Arc::new(f);
+                        f
+                    })
+            });
+            let save_apy_fetcher: std::sync::Arc<
+                dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher,
+            > = std::sync::Arc::new(
+                crate::stage2_demo_apr_bridge::LiveSaveDisplayApyFetcher::with_default_base_url(),
+            );
+            let handler = crate::runtime::stage2_w5h_intent_finalize_wiring::build_phase5c_intent_finalize_handler(
+                phase5c_draft_store.clone(),
+                apr_fetcher,
+                Some(save_apy_fetcher),
+                Some(w5e_repo.clone()),
+                Some(w5h_intent_repo_for_chat.clone()),
+                Some(session_wallet_lookup_for_chat.clone()),
+            );
+            if handler.is_some() {
+                info!(
+                    "Phase 5c-lite intent-finalize route WIRED \u{2014} \
+                     POST /sessions/:id/stage2/w5h/intent/finalize \
+                     will consume drafts from the in-process store and \
+                     mint W5h funding_required rows via the existing \
+                     bridge pipeline; TTL clock rooted at finalize \
+                     instant."
+                );
+            } else {
+                info!(
+                    "Phase 5c-lite intent-finalize route NOT wired \
+                     (chat draft store unavailable or W5h substrate \
+                     missing); POST /sessions/:id/stage2/w5h/intent/finalize \
+                     will return 503."
+                );
+            }
+            handler
+        };
 
         // Phase 6B Window 2 — JIT prepare handler. Bridges the API
         // trait (`SolendJitPrepareHandler`) to the gateway-internal
@@ -1253,6 +1317,10 @@ impl GatewayDaemon {
             chat_funding_confirm: chat_funding_confirm_ref,
             chat_refund:          None,
             chat_order_status:    chat_order_status_ref,
+            // Phase 5c-lite — finalize-route adapter wired above; None
+            // when the chat route's draft store is absent (i.e. chat
+            // route disabled or LLM extractor not configured).
+            chat_intent_finalize: chat_intent_finalize_ref,
         };
 
         let api_handle = claw_api::start(

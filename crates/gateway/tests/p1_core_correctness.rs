@@ -512,6 +512,7 @@ fn build_state(
         chat_funding_confirm: None,
         chat_refund:       None,
         chat_order_status:       None,
+        chat_intent_finalize:    None,
     }
 }
 

@@ -46,8 +46,7 @@ use crate::stage2_demo_apr_bridge::{
     SaveDisplayApyFetcher, W5dAprFetcher, CONTROLLED_WALLET_BS58,
 };
 use crate::stage2_w5h_chat::{
-    parse_w5h_chat_command, W5hParseError, W5hParsed, W5H_DEPOSIT_AMOUNT_RAW,
-    W5H_EXPIRY_SECONDS,
+    parse_w5h_chat_command, W5hParseError, W5hParsed, W5H_EXPIRY_SECONDS,
 };
 
 /// USDC mint (mainnet-beta).
@@ -182,7 +181,10 @@ pub async fn handle_w5h_from_parsed(
         user_usdc_ata: user_usdc_ata.to_string(),
         controlled_wallet: controlled_wallet.clone(),
         controlled_usdc_ata: controlled_usdc_ata.clone(),
-        amount_raw: W5H_DEPOSIT_AMOUNT_RAW,
+        // Phase 5c-lite: thread the variable amount from the parsed
+        // shape (deterministic regex still pins 0.25 USDC; LLM-draft
+        // path supplies any amount in 0.1–1.0 USDC).
+        amount_raw: parsed.amount_raw,
         threshold_bps: parsed.threshold_bps,
         save_display_apy_bps_at_creation: save.save_display_apy_bps,
         native_onchain_apr_bps_at_creation: native.current_apr_bps,
@@ -217,7 +219,11 @@ pub async fn handle_w5h_from_parsed(
         controlled_wallet: CONTROLLED_WALLET_BS58.to_string(),
         controlled_usdc_ata,
 
-        amount_raw: W5H_DEPOSIT_AMOUNT_RAW,
+        // Phase 5c-lite: surface the variable amount from the parsed
+        // shape (mirrors the persisted intent and the rule's
+        // max_input_amount_raw — single source of truth is the parsed
+        // shape).
+        amount_raw: parsed.amount_raw,
         threshold_bps: parsed.threshold_bps,
         threshold_pct_label: parsed.threshold_pct_label.clone(),
         save_display_apy_bps_at_creation: save.save_display_apy_bps,
@@ -229,6 +235,61 @@ pub async fn handle_w5h_from_parsed(
         refund_signature: intent_now.refund_signature,
         last_error: intent_now.last_error,
     })
+}
+
+/// Phase 5c-lite seam — accepts a `DraftIntent` that has just passed
+/// user finalization and crosses the SAME runtime pipeline used by
+/// the deterministic regex path and the (now obsolete) direct Phase 5
+/// LLM dispatch.
+///
+/// The TTL clock for the 3-minute funding window starts at the
+/// `finalize_unix_ms` instant supplied by the caller — NOT at draft
+/// creation time. The user may take several minutes reviewing the
+/// LLM-drafted order card; the funding deadline accrues only from
+/// the moment they attest.
+pub async fn handle_w5h_from_finalized_intent(
+    apr_fetcher: &(dyn W5dAprFetcher + 'static),
+    save_apy_fetcher: &(dyn SaveDisplayApyFetcher + 'static),
+    rule_repo: &Stage2WatchRuleRepository,
+    intent_repo: &Stage2W5hFundingIntentRepository,
+    user_wallet_bs58: &str,
+    finalize_unix_ms: i64,
+    draft: &crate::stage2_phase5c_draft::DraftIntent,
+) -> Result<W5hConditionalOrderResultDto, W5hBridgeError> {
+    // The draft already passed schema validation upstream; we project
+    // it back into the `W5hParsed` shape the shared seam expects.
+    let parsed = W5hParsed {
+        threshold_bps: draft.threshold_bps,
+        threshold_pct_label:
+            crate::stage2_phase5c_draft::format_threshold_pct_label(
+                draft.threshold_bps,
+            ),
+        amount_raw: draft.amount_raw,
+        expires_seconds: draft.expiry_seconds_after_finalize,
+    };
+    // `input_text` is the draft's review copy — the canonical
+    // server-side rendering of what the user attested to. We do NOT
+    // pass the raw user message (which is unbounded prose).
+    let mut dto = handle_w5h_from_parsed(
+        apr_fetcher,
+        save_apy_fetcher,
+        rule_repo,
+        intent_repo,
+        user_wallet_bs58,
+        &draft.review_copy,
+        &parsed,
+    )
+    .await?;
+    // The shared seam stamps `created_at_ms = now_ms` and
+    // `expires_at_ms = now_ms + 180_000`. Phase 5c-lite overrides both
+    // with the explicit finalize instant so the TTL clock is rooted
+    // there (not implicitly at the moment the bridge happened to run
+    // — which is the same for a chat-route immediate dispatch but
+    // differs for stalled / queued finalizes).
+    dto.created_at_ms = finalize_unix_ms;
+    dto.expires_at_ms = finalize_unix_ms
+        + (draft.expiry_seconds_after_finalize as i64) * 1000;
+    Ok(dto)
 }
 
 /// Tiny carrier for the response-time intent shape — same fields as

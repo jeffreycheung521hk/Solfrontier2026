@@ -1102,6 +1102,19 @@ pub enum ChatResponse {
     /// `funding_required` on a fresh intent, or the persisted state
     /// for an idempotent re-type.
     W5hConditionalOrder { result: W5hConditionalOrderResultDto },
+    /// Phase 5c-lite — LLM produced a `DraftIntent` that the user must
+    /// review and confirm before the runtime touches any DB row or
+    /// chain state. Emitted in place of `W5hConditionalOrder` when
+    /// the chat handler reached the W5h shape via the LLM extractor
+    /// (deterministic regex path still goes straight to
+    /// `W5hConditionalOrder`, preserving the pre-Phase-5c behaviour
+    /// for the pinned `0.25 USDC` grammar).
+    ///
+    /// The frontend renders the draft as a review card; on confirm,
+    /// it POSTs `draft_id` + `draft_hash` to
+    /// `/sessions/:id/stage2/w5h/intent/finalize` to mint the W5h
+    /// funding-intent row.
+    DraftIntentReviewRequired { draft: DraftIntentReviewDto },
 }
 
 // ── W5h DTOs ───────────────────────────────────────────────────────────────
@@ -1393,6 +1406,192 @@ pub enum W5hRefundRouteOutcome {
     Disabled(String),
 }
 
+// ── Phase 5c-lite — DraftIntent review + finalization DTOs ───────────
+
+/// Wire DTO carrying a Phase 5c-lite LLM-produced draft intent for
+/// frontend review. NO DB row has been written when this is emitted —
+/// the runtime is waiting for the user to attest to the draft via
+/// `/sessions/:id/stage2/w5h/intent/finalize`.
+///
+/// `draft_hash` is the lowercase-hex SHA-256 of the canonicalized
+/// preimage object (see `claw_gateway::stage2_phase5c_draft`). The
+/// frontend MUST echo it verbatim on finalize; the backend re-computes
+/// the hash from the persisted draft and rejects on mismatch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DraftIntentReviewDto {
+    /// Server-issued opaque draft id (UUID-v4 hex).
+    pub draft_id: String,
+    /// Echoed verbatim by the frontend on finalize. Match required.
+    pub draft_hash: String,
+    /// Always `"llm_extractor"` in this phase. Surfaced to the user
+    /// so the review card can label the draft's provenance.
+    pub parser_source: String,
+
+    // ── Canonicalized fields the user is being asked to attest ──────
+    pub action: String,
+    pub protocol: String,
+    pub asset: String,
+    pub display_source: String,
+    pub comparison: String,
+    pub threshold_bps: u32,
+    pub threshold_pct_label: String,
+    #[serde(with = "crate::serde_str::u64_string")]
+    pub amount_raw: u64,
+    /// Human-friendly amount label, e.g. `"0.5"` for `500000` raw.
+    pub amount_usdc_label: String,
+    pub expiry_seconds_after_finalize: u64,
+    pub controlled_wallet: String,
+    pub controlled_usdc_ata: String,
+
+    // ── Identity / audit fields (NOT in the canonical hash) ─────────
+    /// SHA-256 hex of the raw user message bytes — for the frontend
+    /// to display a "you typed X, the model heard Y" diff if it
+    /// wishes. Same value goes into the canonical preimage.
+    pub original_user_message_hash: String,
+    /// Server clock at draft creation.
+    #[serde(with = "crate::serde_str::i64_string")]
+    pub created_at_ms: i64,
+    /// Server clock at draft expiry — the moment beyond which finalize
+    /// will return `draft_not_found_or_expired`. Frontend may render
+    /// a countdown.
+    #[serde(with = "crate::serde_str::i64_string")]
+    pub expires_at_ms: i64,
+
+    /// Non-fatal advisories the runtime wants to show next to the
+    /// review (model said low confidence; we kept the high-band
+    /// suggestion anyway; etc.). Empty by default.
+    pub warnings: Vec<String>,
+    /// Pre-rendered, server-side, plain-text summary of the order the
+    /// frontend may use as a fallback. **NOT** in the canonical hash.
+    pub review_copy: String,
+}
+
+/// Wire body for `POST /sessions/:id/stage2/w5h/intent/finalize`.
+///
+/// Canonical Phase 5c-lite shape uses a boolean operator-decision
+/// field. The legacy `action: "confirm"|"reject"` shape is not
+/// accepted on this DTO; clients must send `user_confirmed: bool`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct W5hIntentFinalizeRequestDto {
+    pub draft_id: String,
+    /// MUST equal the `draft_hash` the backend emitted in the
+    /// matching `DraftIntentReviewDto`. Mismatch is fail-closed and
+    /// the draft is NOT consumed (the user may retry from the same
+    /// card within the TTL).
+    pub draft_hash: String,
+    /// Operator decision. `true` mints the W5h funding-intent row;
+    /// `false` drops the draft and returns 200 with the `rejected`
+    /// outcome (no DB write).
+    pub user_confirmed: bool,
+}
+
+/// Wire DTO returned by `POST /sessions/:id/stage2/w5h/intent/finalize`.
+///
+/// On the happy path the body is structurally identical to
+/// `W5hConditionalOrderResultDto` (same `funding_required` shape that
+/// the deterministic regex path already emits), wrapped in this
+/// envelope so the frontend gets the finalize-time audit fields
+/// (`parser_source`, `original_user_message_hash`, `draft_id`,
+/// `draft_hash`, `finalized_at_ms`) for free.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct W5hIntentFinalizeResultDto {
+    /// `"funding_required"` (and any persisted-status the existing
+    /// W5h pipeline may surface on idempotent re-finalize attempts:
+    /// `"budget_reserved"`, `"completed"`, etc.) on a confirm hit,
+    /// or `"rejected"` when the user explicitly rejected the draft.
+    pub status: String,
+    /// Nested funding-intent payload. Present on `confirm`; `None`
+    /// when `status == "rejected"`.
+    pub funding: Option<W5hConditionalOrderResultDto>,
+    /// Audit envelope — populated for both `confirm` and `reject`.
+    pub finalization: W5hIntentFinalizationAuditDto,
+}
+
+/// Audit-only fields the finalize route surfaces alongside the
+/// W5h funding-intent body so the frontend / logs can trace which
+/// LLM draft minted which on-chain artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct W5hIntentFinalizationAuditDto {
+    /// Always `"llm_extractor"` for Phase 5c-lite (the deterministic
+    /// regex path does NOT go through finalize and therefore does
+    /// NOT emit this envelope).
+    pub parser_source: String,
+    /// SHA-256 hex of the raw user message that minted the draft.
+    pub original_user_message_hash: String,
+    pub draft_id: String,
+    pub draft_hash: String,
+    /// Server clock at finalize. The 3-minute funding-window TTL
+    /// is computed from this instant — NOT from draft creation.
+    #[serde(with = "crate::serde_str::i64_string")]
+    pub finalized_at_ms: i64,
+}
+
+/// Domain-level outcome from the finalize handler. The HTTP layer
+/// maps these to status codes:
+/// - `Ok` (status=funding_required / rejected / idempotent-persisted) → 200
+/// - `NotFoundOrExpired` → 404 (`error_code=draft_not_found_or_expired`)
+/// - `HashMismatch` → 409 (`error_code=draft_hash_mismatch`)
+/// - `AlreadyFinalizedOrMissing` → 409 (`error_code=draft_already_finalized_or_missing`)
+/// - `BridgeFailed` → 500 (`error_code=bridge_failed`)
+/// - `BadRequest` → 400, `SessionNotActive` → 404,
+///   `Disabled` → 503.
+#[derive(Debug, Clone)]
+pub enum W5hIntentFinalizeRouteOutcome {
+    Ok(W5hIntentFinalizeResultDto),
+    /// 404 — typed payload uses `error_code = "draft_not_found_or_expired"`.
+    NotFoundOrExpired,
+    /// 409 — typed payload uses `error_code = "draft_hash_mismatch"`.
+    /// `provided` is what the client sent, `backend` is what we
+    /// computed from the persisted draft. We do NOT consume the
+    /// draft on this path — the user may retype the confirm.
+    HashMismatch { provided: String, backend: String },
+    /// 409 — typed payload uses `error_code =
+    /// "draft_already_finalized_or_missing"`. Emitted when the
+    /// draft was previously consumed (a tombstone is present in
+    /// the in-process store) — distinct from `NotFoundOrExpired`
+    /// (the never-minted / fully-expired case). Distinguishing
+    /// these two cases is the whole purpose of the tombstone.
+    AlreadyFinalizedOrMissing,
+    /// 500 — typed payload uses `error_code = "bridge_failed"`. The
+    /// draft was consumed but the post-finalize W5h bridge pipeline
+    /// (APR fetch / Save fetch / WatchRule persist / FundingIntent
+    /// persist) raised an internal error. The frontend MUST NOT
+    /// render a funding card on this outcome — the failure is
+    /// non-trivial and the user has to retype the order to mint a
+    /// fresh draft. The `reason` is a non-leaking, audit-grade
+    /// summary suitable for surface logs.
+    BridgeFailed { reason: String },
+    BadRequest(String),
+    SessionNotActive,
+    Disabled(String),
+}
+
+/// Backend seam — gateway adapter implements this. The api crate
+/// stays free of any gateway reference.
+pub trait W5hIntentFinalizeHandler: Send + Sync + 'static {
+    fn execute(
+        &self,
+        session_id: &SessionId,
+        request: W5hIntentFinalizeRequestDto,
+    ) -> Pin<Box<dyn Future<Output = W5hIntentFinalizeRouteOutcome> + Send + '_>>;
+}
+
+#[derive(Clone)]
+pub struct W5hIntentFinalizeHandlerRef(pub Arc<dyn W5hIntentFinalizeHandler>);
+
+impl W5hIntentFinalizeHandlerRef {
+    pub fn new(inner: Arc<dyn W5hIntentFinalizeHandler>) -> Self {
+        Self(inner)
+    }
+    pub async fn execute(
+        &self,
+        session_id: &SessionId,
+        request: W5hIntentFinalizeRequestDto,
+    ) -> W5hIntentFinalizeRouteOutcome {
+        self.0.execute(session_id, request).await
+    }
+}
+
 /// Backend seam — gateway adapter implements this.
 pub trait W5hFundingConfirmHandler: Send + Sync + 'static {
     fn execute(
@@ -1650,6 +1849,12 @@ pub struct AppState {
     /// Frontend polls this to detect the watcher's terminal status
     /// after `budget_reserved`. `None` makes the route return 503.
     pub chat_order_status: Option<W5hOrderStatusHandlerRef>,
+    /// Phase 5c-lite — backend seam for
+    /// `POST /sessions/:id/stage2/w5h/intent/finalize`. `None` when
+    /// the daemon was started without the chat handler / LLM
+    /// extractor (in which case the chat surface never produces
+    /// drafts, and finalize requests are 503).
+    pub chat_intent_finalize: Option<W5hIntentFinalizeHandlerRef>,
 }
 
 /// W5g — wire DTO mirroring `claw_gateway::stage2_chat_execute::

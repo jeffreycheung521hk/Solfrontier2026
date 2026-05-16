@@ -71,6 +71,12 @@ use crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher;
 
 // ── Pinned demo identifiers ──────────────────────────────────────────────
 
+/// Deterministic regex / W5h path canonical amount. The watcher used
+/// to require equality; Phase 5c-lite relaxes that to a band check
+/// (any amount in [PHASE5C_MIN_AMOUNT_RAW, PHASE5C_MAX_AMOUNT_RAW] is
+/// considered a valid funded W5h intent). The constant is kept for
+/// test fixtures so the W5h-lite deterministic path remains
+/// indistinguishable from its pre-Phase-5c shape.
 const PINNED_AMOUNT_RAW: u64 = 250_000;
 const PINNED_CONTROLLED_WALLET: &str =
     "BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L";
@@ -389,8 +395,21 @@ impl Stage2W5iAutoExecuteWatcher {
 
 /// Pinned demo shape predicate. Anything that doesn't match is
 /// silently skipped by the watcher.
+///
+/// Phase 5c-lite: the amount check is now a BAND check rather than
+/// strict equality with `PINNED_AMOUNT_RAW`. The intent's
+/// `amount_raw` was written into the DB by the bridge from a
+/// schema-validated source (either the deterministic 0.25 USDC regex
+/// or the Phase 5c-lite LLM extractor whose schema bounds the value
+/// to `[PHASE5C_MIN_AMOUNT_RAW, PHASE5C_MAX_AMOUNT_RAW]`). Any value
+/// outside that band must have been written by a path we don't
+/// recognise — silently skip it (the watcher is defense-in-depth;
+/// the bridge enforces the band at insertion time).
 fn is_pinned_demo_shape(intent: &W5hFundingIntent) -> bool {
-    intent.amount_raw == PINNED_AMOUNT_RAW
+    use crate::stage2_phase5c_draft::{
+        PHASE5C_MAX_AMOUNT_RAW, PHASE5C_MIN_AMOUNT_RAW,
+    };
+    (PHASE5C_MIN_AMOUNT_RAW..=PHASE5C_MAX_AMOUNT_RAW).contains(&intent.amount_raw)
         && intent.controlled_wallet == PINNED_CONTROLLED_WALLET
         && intent.controlled_usdc_ata == PINNED_CONTROLLED_USDC_ATA
 }
@@ -894,11 +913,16 @@ mod tests {
 
     #[tokio::test]
     async fn non_pinned_amount_is_skipped() {
+        // Phase 5c-lite: the watcher's amount check is a BAND check
+        // (PHASE5C_MIN_AMOUNT_RAW..=PHASE5C_MAX_AMOUNT_RAW) rather
+        // than strict equality with the pre-Phase-5c pinned constant.
+        // We use an amount clearly OUTSIDE that band (5 USDC = 5M raw)
+        // to prove the watcher still skips non-recognised shapes.
         let db = Database::open_in_memory().await.unwrap();
         let repo = Arc::new(Stage2W5hFundingIntentRepository::new(db.pool().clone()));
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut wrong = pinned_intent(&"a".repeat(32), 100, now_ms);
-        wrong.amount_raw = 100_000; // not the pinned 250_000
+        wrong.amount_raw = 5_000_000; // above the Phase 5c-lite band
         repo.insert(&wrong).await.unwrap();
         repo.mark_funding_submitted_if_required(&wrong.intent_id, "Sig")
             .await

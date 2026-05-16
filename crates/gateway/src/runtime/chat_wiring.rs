@@ -46,7 +46,7 @@ use claw_agent_runtime::{
 };
 use claw_api::state::{
     ChatHandler, ChatHandlerRef, ChatResponse, ChatRouteOutcome,
-    W5dConditionalDepositResultDto,
+    DraftIntentReviewDto, W5dConditionalDepositResultDto,
 };
 use claw_tool_system::{
     dispatch::ToolDispatcher,
@@ -395,6 +395,24 @@ pub fn wire_chat_handler() -> Option<ChatHandlerRef> {
     None
 }
 
+/// Phase 5c-lite — output of [`wire_chat_handler_with_registry`].
+///
+/// Carries both the chat handler ref AND the Phase 5c-lite draft
+/// store Arc the chat route built. Daemon-side wiring uses the shared
+/// `draft_store` Arc to construct the finalize-route adapter so a
+/// draft minted by `/chat` can be consumed by
+/// `/stage2/w5h/intent/finalize`.
+///
+/// On the env-not-set path (`chat_handler = None`) the draft store is
+/// also `None` — there is no LLM extractor, therefore no drafts can
+/// ever be created, therefore the finalize handler is also disabled
+/// (returns 503) at the daemon layer.
+#[derive(Default, Clone)]
+pub struct ChatWiringOutput {
+    pub chat_handler: Option<ChatHandlerRef>,
+    pub draft_store: Option<Arc<crate::stage2_phase5c_draft::DraftIntentStore>>,
+}
+
 /// Phase 5E — opt-in chat handler construction.
 ///
 /// Returns `Some(ChatHandlerRef)` only when **all** of:
@@ -418,10 +436,10 @@ pub fn wire_chat_handler_with_registry(
         Arc<claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository>,
     >,
     session_wallet_lookup: Option<Arc<dyn crate::tools::jupiter_swap::SessionBoundWallet>>,
-) -> Result<Option<ChatHandlerRef>, LlmProviderConfigError> {
+) -> Result<ChatWiringOutput, LlmProviderConfigError> {
     let llm = match build_chat_provider_from_env(env)? {
         Some(c) => c,
-        None => return Ok(None),
+        None => return Ok(ChatWiringOutput::default()),
     };
 
     // Phase 5b — capture provider/model identity for the LLM intent
@@ -555,7 +573,29 @@ pub fn wire_chat_handler_with_registry(
          W5h grammar continues to short-circuit ahead of the LLM."
     );
 
-    Ok(Some(handler.into_handler_ref()))
+    // Phase 5c-lite — attach the in-process draft store the
+    // LLM-assisted path needs to honour the pre-finalize zero-DB-write
+    // invariant. The handler clones the Arc so the finalize route's
+    // adapter (constructed alongside in `daemon.rs`) sees the SAME
+    // store and can consume drafts the chat route minted.
+    let draft_store = Arc::new(
+        crate::stage2_phase5c_draft::DraftIntentStore::new(
+            crate::stage2_phase5c_draft::DEFAULT_DRAFT_TTL_SECONDS,
+        ),
+    );
+    handler = handler.with_draft_store(draft_store.clone());
+    tracing::info!(
+        ttl_seconds =
+            crate::stage2_phase5c_draft::DEFAULT_DRAFT_TTL_SECONDS,
+        "phase5c-lite draft store wired into chat handler — LLM-assisted \
+         path will mint DraftIntent + return review card, never \
+         dispatch directly to the W5h bridge"
+    );
+
+    Ok(ChatWiringOutput {
+        chat_handler: Some(handler.into_handler_ref()),
+        draft_store: Some(draft_store),
+    })
 }
 
 /// Convenience: read from the real process env. Used by the daemon at
@@ -575,7 +615,7 @@ pub fn wire_chat_handler_from_std_env(
         Arc<claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository>,
     >,
     session_wallet_lookup: Option<Arc<dyn crate::tools::jupiter_swap::SessionBoundWallet>>,
-) -> Result<Option<ChatHandlerRef>, LlmProviderConfigError> {
+) -> Result<ChatWiringOutput, LlmProviderConfigError> {
     wire_chat_handler_with_registry(
         registry,
         &StdEnvProvider,
@@ -673,6 +713,18 @@ pub struct GatewayChatHandler {
     llm_intent_extractor: Option<
         Arc<dyn crate::stage2_llm_intent_extractor::LlmIntentExtractor>,
     >,
+    /// Phase 5c-lite — in-process draft store. When the LLM extractor
+    /// accepts a paraphrase, the validated intent is converted into a
+    /// `DraftIntent` and inserted into this store; the chat route
+    /// returns a `DraftIntentReviewRequired` variant carrying the
+    /// draft id + canonical hash. The finalize route consumes the
+    /// store entry on user confirmation.
+    ///
+    /// When `None`, the LLM-assisted path returns a typed
+    /// `ToolError` ("draft store not wired") rather than silently
+    /// reverting to the Phase 5 / 5b direct-dispatch behaviour —
+    /// guarantees the pre-finalize zero-DB-write invariant.
+    draft_store: Option<Arc<crate::stage2_phase5c_draft::DraftIntentStore>>,
 }
 
 impl GatewayChatHandler {
@@ -694,7 +746,22 @@ impl GatewayChatHandler {
             w5h_intent_repo: None,
             session_wallet_lookup: None,
             llm_intent_extractor: None,
+            draft_store: None,
         }
+    }
+
+    /// Phase 5c-lite — attach the in-process draft store. Required
+    /// alongside the LLM intent extractor: a chat handler that has
+    /// the extractor wired but NOT the draft store will surface a
+    /// typed `ToolError` for finance-shaped paraphrases (instead of
+    /// silently regressing to pre-Phase-5c direct dispatch). The
+    /// finalize route's adapter shares this same `Arc<DraftIntentStore>`.
+    pub fn with_draft_store(
+        mut self,
+        store: Arc<crate::stage2_phase5c_draft::DraftIntentStore>,
+    ) -> Self {
+        self.draft_store = Some(store);
+        self
     }
 
     /// Variant constructor that attaches a W5d APR-bridge fetcher.
@@ -883,11 +950,7 @@ impl ChatHandler for GatewayChatHandler {
                 ) {
                     return handle_llm_assisted_w5h_command(
                         extractor.as_ref(),
-                        self.w5d_bridge.as_deref(),
-                        self.w5f_save_apy.as_deref(),
-                        self.w5e_repo.as_deref(),
-                        self.w5h_intent_repo.as_deref(),
-                        self.session_wallet_lookup.as_deref(),
+                        self.draft_store.as_deref(),
                         &session_id,
                         &message,
                     )
@@ -1126,7 +1189,7 @@ async fn handle_w5h_chat_command(
     }
 }
 
-/// Phase 5 chat-route branch — LLM-assisted W5h intent extractor.
+/// Phase 5c-lite chat-route branch — LLM-assisted W5h DRAFT intent.
 ///
 /// Runs ONLY when the deterministic W5h parser did NOT match AND
 /// [`crate::stage2_llm_intent_extractor::looks_like_finance_intent`]
@@ -1134,28 +1197,20 @@ async fn handle_w5h_chat_command(
 ///
 /// Resolves to ONE of three outcomes — NEVER a fallthrough:
 ///
-///   1. **Accepted**: extractor returns a [`ValidatedW5hIntent`] →
-///      converted to [`crate::stage2_w5h_chat::W5hParsed`] →
-///      [`crate::stage2_w5h_bridge::handle_w5h_from_parsed`] (the
-///      SAME runtime seam the deterministic parser uses).
+///   1. **Accepted**: extractor returns a `ValidatedW5hIntent` (variable
+///      amount in the Phase 5c-lite band) → converted to a
+///      `DraftIntent` and inserted into the in-process draft store.
+///      Returns `ChatResponse::DraftIntentReviewRequired` carrying the
+///      `draft_id` + canonical `draft_hash`. **NO DB row** is written
+///      at this stage — pre-finalize zero-DB-write invariant.
 ///   2. **Rejected**: extractor returns a typed
-///      [`crate::stage2_llm_intent_extractor::IntentRejection`] →
-///      `ChatResponse::ToolError` with the rejection's display.
-///   3. **Daemon misconfigured**: any required dep (APR fetcher,
-///      Save APY fetcher, rule repo, intent repo, session-wallet
-///      lookup) is missing → `ChatResponse::ToolError`.
-///
-/// User wallet pubkey is sourced ONLY from the session binding (same
-/// rule as the deterministic path). Missing bound wallet → typed
-/// `ToolError`, no intent persisted.
-#[allow(clippy::too_many_arguments)]
+///      `IntentRejection` → `ChatResponse::ToolError` with a friendly
+///      human-readable display of the rejection code.
+///   3. **Daemon misconfigured**: draft store not wired →
+///      `ChatResponse::ToolError`.
 async fn handle_llm_assisted_w5h_command(
     extractor: &(dyn crate::stage2_llm_intent_extractor::LlmIntentExtractor + 'static),
-    apr_fetcher: Option<&(dyn crate::stage2_demo_apr_bridge::W5dAprFetcher + 'static)>,
-    save_apy: Option<&(dyn crate::stage2_demo_apr_bridge::SaveDisplayApyFetcher + 'static)>,
-    rule_repo: Option<&claw_state_store::stage2_watch_rules::Stage2WatchRuleRepository>,
-    intent_repo: Option<&claw_state_store::stage2_w5h_funding::Stage2W5hFundingIntentRepository>,
-    session_wallet_lookup: Option<&(dyn crate::tools::jupiter_swap::SessionBoundWallet + 'static)>,
+    draft_store: Option<&crate::stage2_phase5c_draft::DraftIntentStore>,
     session_id: &SessionId,
     message: &str,
 ) -> ChatRouteOutcome {
@@ -1186,7 +1241,8 @@ async fn handle_llm_assisted_w5h_command(
                 validation_result = "accepted",
                 model = extractor.model_label(),
                 threshold_bps = v.threshold_bps,
-                "phase5 llm intent extractor accepted"
+                amount_raw = v.amount_raw,
+                "phase5c-lite llm intent extractor accepted — minting draft"
             );
             v
         }
@@ -1196,13 +1252,14 @@ async fn handle_llm_assisted_w5h_command(
                 validation_result = "rejected",
                 rejection_code = ?rejection.code,
                 model = extractor.model_label(),
-                "phase5 llm intent extractor rejected"
+                "phase5c-lite llm intent extractor rejected"
             );
             let human_msg = match rejection.code {
                 IntentRejectionCode::Timeout => {
                     "LLM intent extractor timed out. Please retype the order \
-                     with a concrete threshold (e.g. \"If Save APY > 1%, deposit \
-                     0.25 USDC\").".to_string()
+                     with a concrete threshold (e.g. \"If Save APY > 1%, \
+                     deposit 0.5 USDC\")."
+                        .to_string()
                 }
                 IntentRejectionCode::LlmError => format!(
                     "LLM intent extractor backend error: {}",
@@ -1211,30 +1268,36 @@ async fn handle_llm_assisted_w5h_command(
                 IntentRejectionCode::AmbiguousRequest
                 | IntentRejectionCode::NoToolCall => {
                     "Couldn't classify that as a supported conditional order. \
-                     Please state a concrete APY threshold (e.g. \"If Save APY \
-                     > 1%, deposit 0.25 USDC\") with no other actions.".to_string()
+                     Please state a concrete APY threshold AND amount \
+                     (e.g. \"If Save APY > 1%, deposit 0.5 USDC\")."
+                        .to_string()
                 }
                 IntentRejectionCode::UnsupportedAmount => {
-                    "Only 0.25 USDC is supported in this slice. Please retry \
-                     with that exact amount.".to_string()
+                    "Amount must be between 0.1 USDC and 1.0 USDC in this \
+                     slice. Please retry with an amount in that band."
+                        .to_string()
                 }
                 IntentRejectionCode::UnsupportedProtocol => {
                     "Only Solend is supported in this slice. Please retry \
-                     with Solend.".to_string()
+                     with Solend."
+                        .to_string()
                 }
                 IntentRejectionCode::UnsupportedComparison => {
                     "Only \"greater than\" comparisons are supported in this \
                      slice (no \"below\", \"drops\", etc.). Please retry \
-                     with `> N%`.".to_string()
+                     with `> N%`."
+                        .to_string()
                 }
                 IntentRejectionCode::UnsupportedAction => {
                     "Only deposit actions are supported in this slice (no \
                      withdraw / transfer / swap). Please retry with a deposit \
-                     command.".to_string()
+                     command."
+                        .to_string()
                 }
                 IntentRejectionCode::UnsupportedExpiry => {
-                    "Only a 3-minute expiry is supported in this slice. \
-                     Please omit any custom expiry or set it to 3 minutes."
+                    "Only a 3-minute funding window is supported in this \
+                     slice. Please omit any custom expiry or set it to \
+                     3 minutes."
                         .to_string()
                 }
                 IntentRejectionCode::ThresholdOutOfRange => {
@@ -1250,12 +1313,14 @@ async fn handle_llm_assisted_w5h_command(
                 IntentRejectionCode::ContextDependent => {
                     "References to prior turns (\"do it again\", \"same as \
                      before\") aren't supported. Please state the full order \
-                     in one message.".to_string()
+                     in one message."
+                        .to_string()
                 }
                 IntentRejectionCode::PromptInjectionDetected => {
                     "Refused: instruction-override / policy-bypass attempts \
                      are not honoured. The supported shape is the only \
-                     accepted shape.".to_string()
+                     accepted shape."
+                        .to_string()
                 }
                 IntentRejectionCode::MalformedJson
                 | IntentRejectionCode::MissingField
@@ -1271,74 +1336,128 @@ async fn handle_llm_assisted_w5h_command(
         }
     };
 
-    // ── Step 2: Dep gates — same shape as deterministic path ─────────
-    let apr_fetcher = match apr_fetcher {
-        Some(f) => f,
-        None => return tool_error(
-            "LLM-assisted W5h path requires the B-O1 APR fetcher; \
-             start the daemon with HELIUS_RPC_URL or CLAW_RPC_URL set.",
-        ),
-    };
-    let save_apy = match save_apy {
-        Some(s) => s,
-        None => return tool_error(
-            "LLM-assisted W5h path requires the Save APY fetcher.",
-        ),
-    };
-    let rule_repo = match rule_repo {
-        Some(r) => r,
-        None => return tool_error(
-            "LLM-assisted W5h path requires the Stage 2 WatchRule repository.",
-        ),
-    };
-    let intent_repo = match intent_repo {
-        Some(r) => r,
-        None => return tool_error(
-            "LLM-assisted W5h path requires the Stage 2 W5h funding-intent \
-             repository.",
-        ),
-    };
-    let session_wallet_lookup = match session_wallet_lookup {
-        Some(s) => s,
-        None => return tool_error(
-            "LLM-assisted W5h path requires the session→wallet lookup.",
-        ),
-    };
-
-    // ── Step 3: User wallet — session binding only ───────────────────
-    let user_wallet_bs58 = match session_wallet_lookup.session_wallet_pubkey(session_id) {
-        Some(pk) if !pk.trim().is_empty() => pk,
-        _ => return tool_error(
-            "Connect wallet before creating a funded conditional order. \
-             Use the wallet-bind challenge/response flow to bind a Phantom \
-             wallet, then re-issue the order.",
-        ),
-    };
-
-    // ── Step 4: Cross the trusted-runtime seam ───────────────────────
+    // ── Step 2: Dep gate — draft store MUST be wired ─────────────────
     //
-    // validated.to_w5h_parsed() converts the schema-validated typed
-    // intent into the SAME `W5hParsed` shape the deterministic parser
-    // emits. `handle_w5h_from_parsed` then runs the SAME canonical
-    // hash / WatchRule / FundingIntent pipeline. From this point
-    // onward the LLM path is INDISTINGUISHABLE from the deterministic
-    // path at runtime.
-    let parsed = validated.to_w5h_parsed();
-    match crate::stage2_w5h_bridge::handle_w5h_from_parsed(
-        apr_fetcher,
-        save_apy,
-        rule_repo,
-        intent_repo,
-        &user_wallet_bs58,
-        message,
-        &parsed,
-    )
-    .await
-    {
-        Ok(dto) => {
-            ChatRouteOutcome::Ok(ChatResponse::W5hConditionalOrder { result: dto })
+    // Pre-finalize zero-DB-write invariant: we refuse to fall back to
+    // direct dispatch into the W5h bridge. If the draft store isn't
+    // wired the user sees an explicit refusal rather than a silent
+    // regression to Phase 5b behaviour.
+    let draft_store = match draft_store {
+        Some(s) => s,
+        None => return tool_error(
+            "LLM-assisted W5h path requires the Phase 5c-lite draft store; \
+             daemon is missing the in-process DraftIntentStore wiring.",
+        ),
+    };
+
+    // ── Step 3: Build the canonicalized DraftIntent ──────────────────
+    //
+    // We do NOT look up the user's wallet here — the draft binds only
+    // the controlled wallet + ATA (the destination the user funds).
+    // The user wallet binding happens at finalize time when the W5h
+    // funding-intent row is minted. Keeping the draft preimage
+    // free of the user-wallet pubkey lets the same draft survive a
+    // wallet re-bind between draft and finalize (an edge case).
+    use crate::stage2_demo_apr_bridge::controlled_wallet_addresses;
+    use crate::stage2_phase5c_draft::{
+        sha256_hex, session_id_hex, DraftIntent,
+        PHASE5C_EXPIRY_SECONDS_AFTER_FINALIZE,
+    };
+    let (controlled_wallet, controlled_usdc_ata) = controlled_wallet_addresses();
+    let draft_id = uuid::Uuid::new_v4().simple().to_string();
+    let original_user_message_hash = sha256_hex(message);
+    let review_copy = format!(
+        "If Save APY > {pct}%, deposit {amt_label} USDC (= {raw} raw) into \
+         Solend Main Pool USDC. Funding window 3 minutes after confirm.",
+        pct = format_threshold_pct(validated.threshold_bps),
+        amt_label = format_amount_usdc_label(validated.amount_raw),
+        raw = validated.amount_raw,
+    );
+    let draft = DraftIntent {
+        action: DraftIntent::ACTION,
+        protocol: DraftIntent::PROTOCOL,
+        asset: DraftIntent::ASSET,
+        display_source: DraftIntent::DISPLAY_SOURCE,
+        comparison: DraftIntent::COMPARISON,
+        threshold_bps: validated.threshold_bps,
+        amount_raw: validated.amount_raw,
+        expiry_seconds_after_finalize: PHASE5C_EXPIRY_SECONDS_AFTER_FINALIZE,
+        controlled_wallet: controlled_wallet.clone(),
+        controlled_usdc_ata: controlled_usdc_ata.clone(),
+        original_user_message_hash: original_user_message_hash.clone(),
+        draft_id: draft_id.clone(),
+        parser_source: DraftIntent::PARSER_SOURCE,
+        warnings: Vec::new(),
+        review_copy: review_copy.clone(),
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
+        session_id_hex: session_id_hex(session_id),
+    };
+
+    // ── Step 4: Compute hash + persist ───────────────────────────────
+    let draft_hash = draft.compute_hash();
+    let created_at_ms = draft.created_at_ms;
+    // Approximate expiry = now + TTL. The store knows the authoritative
+    // TTL; we surface the value to the frontend so it can render a
+    // countdown without a second round-trip.
+    let expires_at_ms = created_at_ms
+        + (crate::stage2_phase5c_draft::DEFAULT_DRAFT_TTL_SECONDS as i64) * 1000;
+    draft_store.insert(draft.clone());
+
+    let dto = DraftIntentReviewDto {
+        draft_id,
+        draft_hash,
+        parser_source: draft.parser_source.to_string(),
+        action: draft.action.to_string(),
+        protocol: draft.protocol.to_string(),
+        asset: draft.asset.to_string(),
+        display_source: draft.display_source.to_string(),
+        comparison: draft.comparison.to_string(),
+        threshold_bps: draft.threshold_bps,
+        threshold_pct_label: format_threshold_pct(draft.threshold_bps),
+        amount_raw: draft.amount_raw,
+        amount_usdc_label: format_amount_usdc_label(draft.amount_raw),
+        expiry_seconds_after_finalize: draft.expiry_seconds_after_finalize,
+        controlled_wallet,
+        controlled_usdc_ata,
+        original_user_message_hash,
+        created_at_ms,
+        expires_at_ms,
+        warnings: Vec::new(),
+        review_copy,
+    };
+    ChatRouteOutcome::Ok(ChatResponse::DraftIntentReviewRequired { draft: dto })
+}
+
+/// Format a basis-point threshold into the percent label the UI shows.
+/// 100 → `"1"`, 250 → `"2.5"`, 75 → `"0.75"`.
+fn format_threshold_pct(bps: u32) -> String {
+    if bps % 100 == 0 {
+        (bps / 100).to_string()
+    } else {
+        let whole = bps / 100;
+        let frac = bps % 100;
+        if frac % 10 == 0 {
+            format!("{whole}.{}", frac / 10)
+        } else {
+            format!("{whole}.{frac:02}")
         }
-        Err(e) => tool_error(e.to_string()),
+    }
+}
+
+/// Format a raw USDC amount into the human-readable label. 500_000 →
+/// `"0.5"`, 1_000_000 → `"1"`, 100_000 → `"0.1"`, 123_456 → `"0.123456"`.
+fn format_amount_usdc_label(raw: u64) -> String {
+    let whole = raw / 1_000_000;
+    let frac = raw % 1_000_000;
+    if frac == 0 {
+        whole.to_string()
+    } else {
+        let mut s = format!("{:06}", frac);
+        // Trim trailing zeros from the fractional part for readability.
+        while s.ends_with('0') {
+            s.pop();
+        }
+        format!("{whole}.{s}")
     }
 }
 
@@ -2417,8 +2536,12 @@ mod p5e_env_gate_tests {
     fn p5e_wire_with_registry_returns_none_when_env_disabled() {
         let env = MockEnv::empty();
         let result = wire_chat_handler_with_registry(&stub_registry(), &env, None, None, None, None)
-            .expect("disabled env must be Ok(None)");
-        assert!(result.is_none());
+            .expect("disabled env must be Ok(default)");
+        assert!(result.chat_handler.is_none());
+        // Phase 5c-lite: when chat is disabled, the draft store is
+        // also absent. Tests that exercise the LLM-assisted path
+        // must set the chat provider env.
+        assert!(result.draft_store.is_none());
     }
 
     // ── Bonus: wire_chat_handler_with_registry surfaces typed error when registry empty ──
@@ -2465,9 +2588,11 @@ mod p5e_env_gate_tests {
         let result =
             wire_chat_handler_with_registry(&stub_registry(), &env, None, None, None, None);
         match result {
-            Ok(Some(_)) => {}
-            Ok(None) => panic!("expected Some(handler) with provider env set"),
-            Err(e) => panic!("expected Ok(Some(_)), got Err({e})"),
+            Ok(out) if out.chat_handler.is_some() && out.draft_store.is_some() => {}
+            Ok(_) => panic!(
+                "expected both chat_handler AND draft_store wired with provider env set"
+            ),
+            Err(e) => panic!("expected Ok(...), got Err({e})"),
         }
     }
 
@@ -2480,10 +2605,10 @@ mod p5e_env_gate_tests {
         let env = MockEnv::empty();
         let result =
             wire_chat_handler_with_registry(&stub_registry(), &env, None, None, None, None)
-                .expect("env-unset must be Ok(None)");
+                .expect("env-unset must be Ok(default)");
         assert!(
-            result.is_none(),
-            "no chat handler and therefore no extractor when CLAW_CHAT_PROVIDER is unset"
+            result.chat_handler.is_none() && result.draft_store.is_none(),
+            "no chat handler, no extractor, no draft store when CLAW_CHAT_PROVIDER is unset"
         );
     }
 
@@ -3399,7 +3524,30 @@ mod phase5_llm_extractor_chat_route_tests {
         wallet: StubSessionWallet,
         extractor: Arc<dyn LlmIntentExtractor>,
     ) -> GatewayChatHandler {
-        GatewayChatHandler::new(
+        let (handler, _store) = build_handler_with_store(
+            intent_repo, rule_repo, wallet, extractor,
+        );
+        handler
+    }
+
+    /// Phase 5c-lite — same as [`build_handler`] but also returns the
+    /// shared `Arc<DraftIntentStore>` so tests can assert pre-finalize
+    /// store contents (and zero-DB-write invariant).
+    fn build_handler_with_store(
+        intent_repo: Arc<Stage2W5hFundingIntentRepository>,
+        rule_repo: Arc<Stage2WatchRuleRepository>,
+        wallet: StubSessionWallet,
+        extractor: Arc<dyn LlmIntentExtractor>,
+    ) -> (
+        GatewayChatHandler,
+        Arc<crate::stage2_phase5c_draft::DraftIntentStore>,
+    ) {
+        let store = Arc::new(
+            crate::stage2_phase5c_draft::DraftIntentStore::new(
+                crate::stage2_phase5c_draft::DEFAULT_DRAFT_TTL_SECONDS,
+            ),
+        );
+        let handler = GatewayChatHandler::new(
             // Panic-stub generic LLM — proves no fallthrough.
             Arc::new(UncallableGenericLlm),
             ToolRegistry::new(),
@@ -3412,6 +3560,8 @@ mod phase5_llm_extractor_chat_route_tests {
         .with_w5h_intent_repo(intent_repo)
         .with_session_wallet_lookup(Arc::new(wallet))
         .with_llm_intent_extractor(extractor)
+        .with_draft_store(store.clone());
+        (handler, store)
     }
 
     async fn fresh_repos() -> (Database, Arc<Stage2W5hFundingIntentRepository>, Arc<Stage2WatchRuleRepository>) {
@@ -3422,12 +3572,17 @@ mod phase5_llm_extractor_chat_route_tests {
     }
 
     // ── (1) Paraphrased English accepted by LLM extractor ─────────────
+    //
+    // Phase 5c-lite: the LLM path no longer dispatches directly to the
+    // W5h bridge. Instead it mints a `DraftIntent`, inserts into the
+    // in-process store, and returns
+    // `ChatResponse::DraftIntentReviewRequired`. **Zero DB write**.
 
     #[tokio::test]
-    async fn llm_accepts_paraphrased_english_and_dispatches_w5h_bridge() {
+    async fn llm_accepts_paraphrased_english_mints_draft_review_no_db_write() {
         let (_db, intent_repo, rule_repo) = fresh_repos().await;
         let extractor = Arc::new(StubLlmIntentExtractor::accepting(100));
-        let handler = build_handler(
+        let (handler, store) = build_handler_with_store(
             intent_repo.clone(),
             rule_repo,
             StubSessionWallet {
@@ -3443,33 +3598,42 @@ mod phase5_llm_extractor_chat_route_tests {
             )
             .await;
         match outcome {
-            ChatRouteOutcome::Ok(ChatResponse::W5hConditionalOrder { result }) => {
-                assert_eq!(result.amount_raw, 250_000);
-                assert_eq!(result.threshold_bps, 100);
-                assert_eq!(result.user_wallet, TEST_USER_WALLET);
-                // Persisted: the LLM path went through the SAME bridge.
-                let stored = intent_repo
-                    .get(&result.rule_id_hex)
-                    .await
-                    .unwrap()
-                    .expect("LLM path must persist intent via the same seam");
-                assert_eq!(stored.amount_raw, 250_000);
+            ChatRouteOutcome::Ok(ChatResponse::DraftIntentReviewRequired { draft }) => {
+                assert_eq!(draft.amount_raw, 250_000);
+                assert_eq!(draft.threshold_bps, 100);
+                assert_eq!(draft.parser_source, "llm_extractor");
+                assert_eq!(draft.protocol, "solend");
+                assert_eq!(draft.asset, "USDC");
+                assert_eq!(draft.expiry_seconds_after_finalize, 180);
+                assert_eq!(draft.draft_hash.len(), 64, "draft_hash is sha256 hex");
+                // Hash is reproducible from the store entry.
+                let stored = store
+                    .get(
+                        &crate::stage2_phase5c_draft::session_id_hex(&sid),
+                        &draft.draft_id,
+                    )
+                    .expect("draft persisted in store");
+                assert_eq!(stored.compute_hash(), draft.draft_hash);
             }
             other => panic!(
-                "expected W5hConditionalOrder from LLM path; got {other:?}"
+                "expected DraftIntentReviewRequired from LLM path; got {other:?}"
             ),
         }
         assert_eq!(extractor.calls(), 1, "extractor must be called once");
+        // **Pre-finalize zero-DB-write invariant**: no funding-intent
+        // row exists on this path.
+        let any_rows = intent_repo.list_budget_reserved(10).await.unwrap();
+        assert!(any_rows.is_empty(), "LLM path must NOT write to W5h intent table");
     }
 
     // ── (2) Paraphrased Chinese accepted ─────────────────────────────
 
     #[tokio::test]
-    async fn llm_accepts_paraphrased_chinese_and_dispatches_w5h_bridge() {
+    async fn llm_accepts_paraphrased_chinese_mints_draft_review_no_db_write() {
         let (_db, intent_repo, rule_repo) = fresh_repos().await;
         let extractor = Arc::new(StubLlmIntentExtractor::accepting(100));
-        let handler = build_handler(
-            intent_repo,
+        let (handler, store) = build_handler_with_store(
+            intent_repo.clone(),
             rule_repo,
             StubSessionWallet {
                 bound_pubkey: Some(TEST_USER_WALLET.to_string()),
@@ -3484,15 +3648,19 @@ mod phase5_llm_extractor_chat_route_tests {
             )
             .await;
         match outcome {
-            ChatRouteOutcome::Ok(ChatResponse::W5hConditionalOrder { result }) => {
-                assert_eq!(result.amount_raw, 250_000);
-                assert_eq!(result.threshold_bps, 100);
+            ChatRouteOutcome::Ok(ChatResponse::DraftIntentReviewRequired { draft }) => {
+                assert_eq!(draft.amount_raw, 250_000);
+                assert_eq!(draft.threshold_bps, 100);
+                assert_eq!(store.len(), 1);
             }
             other => panic!(
-                "expected W5hConditionalOrder from Chinese LLM path; got {other:?}"
+                "expected DraftIntentReviewRequired from Chinese LLM path; \
+                 got {other:?}"
             ),
         }
         assert_eq!(extractor.calls(), 1);
+        let any_rows = intent_repo.list_budget_reserved(10).await.unwrap();
+        assert!(any_rows.is_empty(), "Chinese LLM path must NOT write to W5h intent table");
     }
 
     // ── (3) Extractor rejection surfaces as ToolError (NO fallthrough) ─
@@ -3523,9 +3691,12 @@ mod phase5_llm_extractor_chat_route_tests {
         match outcome {
             ChatRouteOutcome::Ok(ChatResponse::ToolError { tool_name, message }) => {
                 assert_eq!(tool_name, "w5h_conditional_order");
+                // Phase 5c-lite: the user-facing rejection text was
+                // updated to describe the band rather than a single
+                // pinned amount.
                 assert!(
-                    message.contains("Only 0.25 USDC"),
-                    "user-facing rejection should explain the cap; got {message:?}"
+                    message.contains("0.1 USDC") && message.contains("1.0 USDC"),
+                    "user-facing rejection should describe the band; got {message:?}"
                 );
             }
             other => panic!(
@@ -3702,12 +3873,16 @@ mod phase5_llm_extractor_chat_route_tests {
         );
     }
 
-    // ── (8) Daemon-misconfig: extractor wired but deps missing ───────
+    // ── (8) Daemon-misconfig: extractor wired but draft store missing ─
+    //
+    // Phase 5c-lite: the LLM-assisted path requires the
+    // `DraftIntentStore`. Without it, the path fails closed with a
+    // typed `ToolError` (never silently dispatches to the bridge).
 
     #[tokio::test]
-    async fn extractor_wired_without_intent_repo_returns_typed_error() {
+    async fn extractor_wired_without_draft_store_returns_typed_error() {
         let extractor = Arc::new(StubLlmIntentExtractor::accepting(100));
-        // Note: NO intent_repo, NO rule_repo wired.
+        // Note: extractor is wired but draft_store is NOT.
         let handler = GatewayChatHandler::new(
             Arc::new(UncallableGenericLlm),
             ToolRegistry::new(),
@@ -3721,24 +3896,26 @@ mod phase5_llm_extractor_chat_route_tests {
         }))
         .with_llm_intent_extractor(extractor);
         let sid = SessionId::from(Uuid::new_v4());
+        // Use a paraphrase the deterministic W5h regex does NOT match
+        // (no "above " / "> " token), so dispatch reaches the
+        // LLM-assisted branch where the draft-store gate fires.
         let outcome = handler
             .handle_chat(
                 &sid,
-                "put 0.25 USDC in Solend if APY > 1%".to_string(),
+                "sweep 0.25 USDC into Solend whenever yield clears 1%".to_string(),
             )
             .await;
         match outcome {
             ChatRouteOutcome::Ok(ChatResponse::ToolError { tool_name, message }) => {
                 assert_eq!(tool_name, "w5h_conditional_order");
                 assert!(
-                    message.contains("WatchRule repository")
-                        || message.contains("funding-intent")
-                        || message.contains("session"),
-                    "user-facing error should mention the missing dep; got {message:?}"
+                    message.contains("draft store")
+                        || message.contains("DraftIntentStore"),
+                    "user-facing error should mention the missing draft store; got {message:?}"
                 );
             }
             other => panic!(
-                "expected ToolError for missing deps on LLM path; got {other:?}"
+                "expected ToolError for missing draft store on LLM path; got {other:?}"
             ),
         }
     }
