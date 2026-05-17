@@ -1,0 +1,28 @@
+[package]
+name        = "claw-observability"
+description = "Structured logging, metrics, and health checks for ClawSolana"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+claw-types = { workspace = true }
+
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+uuid               = { workspace = true }
+chrono             = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+async-trait        = { workspace = true }
+futures            = { workspace = true }
+
+dashmap        = { workspace = true }
+
+# Metrics
+# Using a lightweight custom approach for V1; swap for prometheus crate in V2
+# prometheus = { version = "0.13" }

@@ -1,0 +1,29 @@
+[package]
+name        = "claw-wallet-engine"
+description = "Wallet abstraction, signing pipeline, and key management for ClawSolana"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+claw-types        = { workspace = true }
+claw-observability = { workspace = true }
+claw-solana-core  = { workspace = true }
+
+solana-sdk    = { workspace = true }
+solana-client = { workspace = true }
+parking_lot   = { workspace = true }
+
+async-trait = { workspace = true }
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+chrono      = { workspace = true }
+anyhow      = { workspace = true }
+base64      = { workspace = true }
+bs58        = { workspace = true }

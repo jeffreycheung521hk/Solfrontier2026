@@ -1,0 +1,26 @@
+[package]
+name        = "claw-types"
+description = "Shared domain types for ClawSolana — the vocabulary of the entire system"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+schemars    = { workspace = true }
+thiserror   = { workspace = true }
+uuid        = { workspace = true }
+chrono      = { workspace = true }
+# Stage 1 Tail canonical intent layer (see `canonical_intent.rs`).
+# Borsh gives a deterministic byte layout for SHA-256 hashing; bs58 is
+# used solely by the JSON repr of `PubkeyBytes` (the canonical hash is
+# computed over Borsh bytes, not JSON).
+borsh       = { version = "1", features = ["derive"] }
+sha2        = "0.10"
+bs58        = "0.5"
+
+[dev-dependencies]
+toml        = { workspace = true }

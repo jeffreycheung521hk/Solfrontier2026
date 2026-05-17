@@ -1,0 +1,40 @@
+[package]
+name        = "clawsol-authority"
+description = "ClawSolana Stage 2 Authorization PDA program (skeleton). Delegated conditional execution authority record; does not implement execute_action in P1."
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name       = "clawsol_authority"
+
+[features]
+# Suppress the on-chain entrypoint when consuming this crate purely as a
+# library (off-chain PDA derivation, fixture builders, multi-program tests
+# in the same process).
+no-entrypoint = []
+
+[dependencies]
+solana-program = "=2.1.21"
+borsh          = { version = "1", features = ["derive"] }
+thiserror      = { workspace = true }
+
+[dev-dependencies]
+solana-program-test = "=2.1.21"
+solana-sdk          = { workspace = true }
+tokio               = { workspace = true }
+borsh               = { version = "1", features = ["derive"] }
+# `bincode` is used solely by `tests/functional.rs::current_clock` to
+# deserialize the Clock sysvar account bytes — solana-program-test 2.1.x
+# exposes `BanksClient::get_account` (raw bytes) rather than a typed
+# `get_sysvar`, so the tests decode Clock locally. DEV-only.
+bincode             = { workspace = true }
+# Discriminator-parity test only — proves that this crate's
+# `Stage2ActionType` discriminator values agree with the canonical
+# `WatchRuleActionType` defined in the substrate types crate.
+# DEV dependency by design: the on-chain BPF build does NOT pull in
+# the gateway-side type system.
+claw-types          = { workspace = true }

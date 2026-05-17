@@ -1,0 +1,68 @@
+[package]
+name        = "claw-gateway"
+description = "Control plane daemon — session management, event bus, and supervisor"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+claw-types          = { workspace = true }
+claw-observability  = { workspace = true }
+claw-state-store    = { workspace = true }
+claw-solana-core    = { workspace = true }
+claw-wallet-engine  = { workspace = true }
+claw-risk-engine    = { workspace = true }
+claw-tool-system    = { workspace = true }
+claw-agent-runtime  = { workspace = true }
+claw-channels       = { workspace = true }
+claw-api            = { workspace = true }
+
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+toml        = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+chrono      = { workspace = true }
+anyhow      = { workspace = true }
+futures     = { workspace = true }
+dashmap     = { workspace = true }
+parking_lot = { workspace = true }
+bincode       = { workspace = true }
+bs58          = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex           = { workspace = true }
+rand          = { workspace = true }
+solana-sdk    = { workspace = true }
+solana-client = { workspace = true }
+solana-account-decoder = { workspace = true }
+solana-transaction-status = { workspace = true }
+# Stage 1 Tail Agent I — record_intent ix builder + PDA derivation.
+# `no-entrypoint` keeps the on-chain BPF entrypoint out of the gateway
+# binary (we only consume the off-chain instruction module). Demo-mode
+# only — production path stays disabled by default; see
+# `crate::record_intent_demo`.
+clawsol-intent = { workspace = true, features = ["no-entrypoint"] }
+spl-associated-token-account = { workspace = true }
+async-trait = { workspace = true }
+base64      = { workspace = true }
+reqwest     = { workspace = true }
+
+[dev-dependencies]
+axum            = { workspace = true }
+tower           = { workspace = true, features = ["util"] }
+http-body-util  = "0.1"
+sqlx            = { workspace = true }
+ed25519-dalek   = { workspace = true }
+rand            = { workspace = true }
+# Phase 6D: virtual-time control for bounded-rebroadcast tests so the 2s
+# delay between attempts is skipped under `start_paused`. The feature is
+# additive — production builds (which only use [dependencies]) are unaffected.
+tokio           = { workspace = true, features = ["test-util"] }
+# Stage 1 Tail Agent I: tests decode the prepended record_intent ix
+# data via the program's `BorshDeserialize`. Dev-only; production
+# already gets borsh transitively via clawsol-intent.
+borsh           = { version = "1", features = ["derive"] }

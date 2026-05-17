@@ -1,0 +1,24 @@
+[package]
+name        = "claw-risk-engine"
+description = "Policy evaluation, risk checks, and anomaly detection for ClawSolana"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+claw-types        = { workspace = true }
+claw-observability = { workspace = true }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+uuid       = { workspace = true }
+chrono     = { workspace = true }
+tokio      = { workspace = true }
+anyhow     = { workspace = true }
+
+[dev-dependencies]
+proptest   = "1"

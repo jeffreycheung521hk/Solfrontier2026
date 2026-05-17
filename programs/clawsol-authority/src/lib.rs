@@ -1,0 +1,1966 @@
+//! ClawSolana Stage 2 Authorization PDA program — P1 skeleton.
+//!
+//! # What this slice is
+//!
+//! Substrate only. P1 lands the on-chain `AuthorizationRecord`
+//! plus the lifecycle ixs that bring it into and out of existence
+//! (`CreateAuthorization`, `Revoke`, `CloseAuthorization`). It does
+//! **not** include `ExecuteAction` — execution is the next slice and
+//! requires:
+//!
+//! - the conditions evaluator (Pyth + Solend on-chain re-verifiers
+//!   per Stage 2 spec § 7),
+//! - the same-tx pre/post bracket and instructions-sysvar sibling-ix
+//!   verification for Jupiter (spec § 6.1),
+//! - the Solend variant-15 `Refresh + WithdrawObligationCollateralAnd
+//!   RedeemReserveCollateral` orchestration (spec § 5.2),
+//! - the funds custody / sweep model (spec § 8 / § 11).
+//!
+//! Adding any of those in P1 would force decisions we want to make
+//! against fresh research, not buried inside a skeleton commit.
+//!
+//! # What's deferred to later slices (explicit TODO list)
+//!
+//! - `ExecuteAction` instruction + processor — gated on the
+//!   instructions-sysvar work and Solend variant-15 account ordering.
+//! - Token sweep on revoke (spec § 8.1 step 2/3) — gated on the funds
+//!   custody decision (PDA-as-authority vs delegated-wallet-signs).
+//!   `Revoke` here flips the `revoked` flag only; tokens stay where
+//!   they are.
+//! - Replay-protection state machine on `execute_action` —
+//!   `execution_nonce`, `last_execution_slot`, and `completed` are
+//!   present in the record and zero-initialised; no ix in P1 mutates
+//!   them.
+//! - Multi-use rules — `one_shot` is implicit in P1 (single execute,
+//!   completed=true, AlreadyCompleted on second attempt). The PDA has
+//!   the fields a future multi-use slice would need, but no logic
+//!   uses them yet.
+//!
+//! # Stage isolation
+//!
+//! This program does **not** touch Stage 1's `clawsol-intent`
+//! program. It does not share PDA seeds, account layouts, or
+//! canonical-hash domains. A Stage 1 record_intent intent_id and a
+//! Stage 2 rule_id collide-free as a matter of construction (different
+//! seed prefixes: `b"intent"` vs `b"authz"`, plus separate program
+//! IDs at deployment).
+//!
+//! # Sources consulted
+//!
+//! - solana-program 2.1.21 entrypoint
+//!   (https://docs.rs/solana-program-entrypoint/2.1.21/solana_program_entrypoint/macro.entrypoint.html)
+//! - PDA constraints `MAX_SEEDS = 16`, `MAX_SEED_LEN = 32`
+//!   (https://raw.githubusercontent.com/anza-xyz/agave/v2.1.21/sdk/pubkey/src/lib.rs)
+//! - `system_instruction::create_account`
+//!   (https://docs.rs/solana-program/2.1.21/solana_program/system_instruction/fn.create_account.html)
+//! - `Clock::get()` via the `Sysvar` trait (no sysvar account required)
+//!   (https://docs.rs/solana-program/2.1.21/solana_program/sysvar/clock/struct.Clock.html)
+//! - Account close pattern (assign back to system program, realloc to 0,
+//!   transfer lamports — standard SPL idiom)
+//!   (https://docs.rs/solana-program/2.1.21/solana_program/account_info/struct.AccountInfo.html)
+//! - Borsh 1.x layout: declared field order, u32-LE length prefix on
+//!   Vec, u8 enum ordinal, fixed `[u8; N]` raw, integers little-endian
+//!   (https://borsh.io)
+//! - Stage 2 Delegated Conditional Execution Spec
+//!   (`docs/STAGE2_DELEGATED_CONDITIONAL_EXECUTION_SPEC.md`,
+//!   §§ 3, 4, 5, 8)
+//! - Stage 2 Official Docs Audit
+//!   (`docs/STAGE2_OFFICIAL_DOCS_AUDIT.md`, audit-corrections record)
+
+#![allow(unexpected_cfgs)]
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    clock::Clock,
+    entrypoint::ProgramResult,
+    msg,
+    program::invoke_signed,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    rent::Rent,
+    system_instruction, system_program,
+    sysvar::Sysvar,
+};
+
+pub mod condition_verifier;
+pub mod error;
+pub mod instruction;
+pub mod jupiter_boundary;
+pub mod jupiter_bracket;
+pub mod solend_account_decode;
+pub mod solend_boundary;
+pub mod solend_cpi_builder;
+pub mod state;
+
+use crate::condition_verifier::{
+    evaluate_condition, evaluate_condition_logic, EvalCondition, EvalSnapshot,
+    PythVerificationContext, SolendVerificationContext, VerifierError,
+};
+use crate::error::AuthorityError;
+use crate::instruction::{
+    AuthorityInstruction, ConditionProofPayload, ProofCondition, MAX_PROOF_CONDITIONS,
+};
+use crate::jupiter_boundary::{verify_jupiter_boundary_skeleton, JupiterBoundaryProof};
+use crate::jupiter_bracket::{
+    process_post_jupiter_bracket_check, process_pre_jupiter_bracket_check,
+};
+use crate::solend_account_decode::{
+    decode_spl_token_account_lite, SPL_TOKEN_PROGRAM_ID,
+};
+use crate::solend_boundary::{verify_solend_delegated_boundary, SolendBoundaryProof};
+use crate::solend_cpi_builder::{
+    try_solend_cpi_skeleton, SolendCpiSubstrate, SolendWithdrawAccounts,
+    SolendWithdrawShadowExpectations, WITHDRAW_BASE_ACCOUNTS_LEN,
+};
+use crate::state::{
+    AuthorizationRecord, Stage2ActionType, STAGE2_AUTHORITY_SCHEMA_VERSION,
+};
+
+/// PDA seed prefix. Combined with `[schema_version]`, `user.as_ref()`,
+/// and `rule_id` to derive the canonical Authorization PDA. The
+/// prefix domain-separates Stage 2 PDAs from any other program in the
+/// same address space (and from Stage 1's `b"intent"` prefix).
+pub const AUTHZ_SEED_PREFIX: &[u8] = b"authz";
+
+#[cfg(not(feature = "no-entrypoint"))]
+solana_program::entrypoint!(process_instruction);
+
+/// On-chain entrypoint. Dispatches to per-variant processors.
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let instruction = AuthorityInstruction::try_from_slice(instruction_data)
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
+
+    match instruction {
+        AuthorityInstruction::CreateAuthorization {
+            schema_version,
+            rule_id,
+            executor,
+            delegated_wallet,
+            canonical_rule_hash,
+            allowed_action_type,
+            max_input_amount_raw,
+            destination,
+            expires_at_slot,
+        } => process_create_authorization(
+            program_id,
+            accounts,
+            schema_version,
+            rule_id,
+            executor,
+            delegated_wallet,
+            canonical_rule_hash,
+            allowed_action_type,
+            max_input_amount_raw,
+            destination,
+            expires_at_slot,
+        ),
+        AuthorityInstruction::Revoke => process_revoke(program_id, accounts),
+        AuthorityInstruction::CloseAuthorization => {
+            process_close_authorization(program_id, accounts)
+        }
+        AuthorityInstruction::ExecuteAction {
+            schema_version,
+            rule_id,
+            canonical_rule_hash,
+            action_type,
+            input_amount_raw,
+            execution_nonce,
+            condition_proof,
+            solend_boundary_proof,
+            jupiter_boundary_proof,
+        } => process_execute_action(
+            program_id,
+            accounts,
+            schema_version,
+            rule_id,
+            canonical_rule_hash,
+            action_type,
+            input_amount_raw,
+            execution_nonce,
+            condition_proof,
+            solend_boundary_proof,
+            jupiter_boundary_proof,
+        ),
+        // J5 BONUS PROTOTYPE — trustless dual-bracket pre-check.
+        AuthorityInstruction::PreJupiterBracketCheck { proof } => {
+            process_pre_jupiter_bracket_check(program_id, accounts, proof)
+        }
+        // J5 BONUS PROTOTYPE — trustless dual-bracket post-check.
+        AuthorityInstruction::PostJupiterBracketCheck { proof } => {
+            process_post_jupiter_bracket_check(program_id, accounts, proof)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_create_authorization(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    schema_version: u8,
+    rule_id: [u8; 16],
+    executor: Pubkey,
+    delegated_wallet: Pubkey,
+    canonical_rule_hash: [u8; 32],
+    allowed_action_type: u8,
+    max_input_amount_raw: u64,
+    destination: Pubkey,
+    expires_at_slot: u64,
+) -> ProgramResult {
+    // Cheap structural checks first — a wrong schema_version or a
+    // zero amount cap can never produce a usable authorization, so
+    // reject before consuming any compute on the PDA derive / Clock /
+    // account creation path.
+    if schema_version != STAGE2_AUTHORITY_SCHEMA_VERSION {
+        return Err(AuthorityError::UnsupportedSchemaVersion.into());
+    }
+    if Stage2ActionType::from_u8(allowed_action_type).is_none() {
+        return Err(AuthorityError::InvalidActionType.into());
+    }
+    if max_input_amount_raw == 0 {
+        return Err(AuthorityError::InvalidZeroMaxAmount.into());
+    }
+
+    let account_iter = &mut accounts.iter();
+    let user_account = next_account_info(account_iter)?;
+    let authz_pda_account = next_account_info(account_iter)?;
+    let system_program_account = next_account_info(account_iter)?;
+
+    if !user_account.is_signer {
+        return Err(AuthorityError::UserMustSign.into());
+    }
+    if system_program_account.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // Expiry must be strictly in the future. Clock::get() works without
+    // passing the sysvar account because Clock impls Sysvar.
+    let clock = Clock::get()?;
+    if clock.slot >= expires_at_slot {
+        return Err(AuthorityError::AuthorizationExpired.into());
+    }
+
+    // Derive PDA from canonical seeds and require the caller passed
+    // the matching address.
+    let schema_version_bytes = [schema_version];
+    let seeds: &[&[u8]] = &[
+        AUTHZ_SEED_PREFIX,
+        &schema_version_bytes,
+        user_account.key.as_ref(),
+        rule_id.as_ref(),
+    ];
+    let (expected_pda, bump) = Pubkey::find_program_address(seeds, program_id);
+    if expected_pda != *authz_pda_account.key {
+        return Err(AuthorityError::InvalidPda.into());
+    }
+
+    // Allocate via system_program::create_account. If the PDA already
+    // has lamports / data, create_account fails with
+    // SystemError::AccountAlreadyInUse — the runtime rejects duplicate
+    // (user, rule_id, schema_version) triples for us, no extra check
+    // needed.
+    let space = AuthorizationRecord::LEN as u64;
+    let rent = Rent::get()?;
+    let lamports = rent.minimum_balance(AuthorizationRecord::LEN);
+
+    let create_ix = system_instruction::create_account(
+        user_account.key,
+        authz_pda_account.key,
+        lamports,
+        space,
+        program_id,
+    );
+
+    let bump_arr = [bump];
+    let signer_seeds: &[&[u8]] = &[
+        AUTHZ_SEED_PREFIX,
+        &schema_version_bytes,
+        user_account.key.as_ref(),
+        rule_id.as_ref(),
+        &bump_arr,
+    ];
+
+    invoke_signed(
+        &create_ix,
+        &[
+            user_account.clone(),
+            authz_pda_account.clone(),
+            system_program_account.clone(),
+        ],
+        &[signer_seeds],
+    )?;
+
+    let record = AuthorizationRecord {
+        schema_version,
+        rule_id,
+        user: *user_account.key,
+        executor,
+        delegated_wallet,
+        canonical_rule_hash,
+        allowed_action_type,
+        max_input_amount_raw,
+        used_amount_raw: 0,
+        destination,
+        expires_at_slot,
+        revoked: false,
+        completed: false,
+        execution_nonce: 0,
+        last_execution_slot: 0,
+        bump,
+    };
+
+    record
+        .serialize(&mut &mut authz_pda_account.data.borrow_mut()[..])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    // Structured event for off-chain indexers (matches the shape of
+    // Stage 1's intent_recorded_v1 emission style).
+    solana_program::log::sol_log_data(&[
+        b"authz_created_v1",
+        &rule_id,
+        user_account.key.as_ref(),
+        executor.as_ref(),
+        delegated_wallet.as_ref(),
+        core::slice::from_ref(&allowed_action_type),
+        &canonical_rule_hash,
+        &max_input_amount_raw.to_le_bytes(),
+        &expires_at_slot.to_le_bytes(),
+        &clock.slot.to_le_bytes(),
+    ]);
+    msg!(
+        "create_authorization ok action_type={} max_input_amount_raw={} expires_at_slot={} created_at_slot={}",
+        allowed_action_type,
+        max_input_amount_raw,
+        expires_at_slot,
+        clock.slot
+    );
+
+    Ok(())
+}
+
+fn process_revoke(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    let user_account = next_account_info(account_iter)?;
+    let authz_pda_account = next_account_info(account_iter)?;
+
+    if !user_account.is_signer {
+        return Err(AuthorityError::UserMustSign.into());
+    }
+    if authz_pda_account.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let mut record = {
+        let data = authz_pda_account.data.borrow();
+        AuthorizationRecord::try_from_slice(&data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+    };
+
+    // Authority gate: the user pubkey baked into the record (set at
+    // creation) is the only key that can revoke. Cross-PDA replay
+    // attempts (passing a different user's PDA) fail here.
+    if record.user != *user_account.key {
+        return Err(AuthorityError::RevokeWrongUser.into());
+    }
+
+    // Defence in depth: even though owner == program_id and
+    // record.user matches the signer, also re-derive the PDA from the
+    // record's own fields and confirm the address matches. Closes the
+    // gap where a malicious previous-program-version PDA was repointed
+    // by a hypothetical key-recovery exploit; cheap to keep, loud to
+    // remove.
+    let schema_version_bytes = [record.schema_version];
+    let seeds: &[&[u8]] = &[
+        AUTHZ_SEED_PREFIX,
+        &schema_version_bytes,
+        record.user.as_ref(),
+        record.rule_id.as_ref(),
+    ];
+    let (expected_pda, _bump) = Pubkey::find_program_address(seeds, program_id);
+    if expected_pda != *authz_pda_account.key {
+        return Err(AuthorityError::InvalidPda.into());
+    }
+
+    if record.revoked {
+        // Idempotent: a second revoke against the same PDA is a no-op
+        // (no state change, no fail). This is the daemon-friendly
+        // choice for retry — see the design note above on revoke
+        // semantics.
+        msg!("revoke_authorization noop already_revoked=true");
+        return Ok(());
+    }
+
+    record.revoked = true;
+    record
+        .serialize(&mut &mut authz_pda_account.data.borrow_mut()[..])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    // TODO(Stage 2 spec § 8.1 steps 2–3): when the funds custody
+    // decision lands (PDA-as-authority vs delegated-wallet-signs),
+    // revoke must additionally sweep the delegated USDC ATA back to
+    // the user main wallet and (per `revoke_policy.close_token_accounts`)
+    // close empty token accounts. P1 only flips the flag.
+
+    let clock = Clock::get()?;
+    solana_program::log::sol_log_data(&[
+        b"authz_revoked_v1",
+        &record.rule_id,
+        record.user.as_ref(),
+        &clock.slot.to_le_bytes(),
+    ]);
+    msg!(
+        "revoke_authorization ok rule_id_first_byte={} revoked_at_slot={}",
+        record.rule_id[0],
+        clock.slot
+    );
+
+    Ok(())
+}
+
+fn process_close_authorization(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    let user_account = next_account_info(account_iter)?;
+    let authz_pda_account = next_account_info(account_iter)?;
+
+    if !user_account.is_signer {
+        return Err(AuthorityError::UserMustSign.into());
+    }
+    if authz_pda_account.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let record = {
+        let data = authz_pda_account.data.borrow();
+        AuthorizationRecord::try_from_slice(&data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+    };
+    if record.user != *user_account.key {
+        return Err(AuthorityError::CloseWrongUser.into());
+    }
+
+    let clock = Clock::get()?;
+    let is_expired = clock.slot >= record.expires_at_slot;
+    if !record.revoked && !record.completed && !is_expired {
+        return Err(AuthorityError::NotCloseable.into());
+    }
+
+    // Defence-in-depth PDA address re-derivation, same rationale as
+    // process_revoke.
+    let schema_version_bytes = [record.schema_version];
+    let seeds: &[&[u8]] = &[
+        AUTHZ_SEED_PREFIX,
+        &schema_version_bytes,
+        record.user.as_ref(),
+        record.rule_id.as_ref(),
+    ];
+    let (expected_pda, _bump) = Pubkey::find_program_address(seeds, program_id);
+    if expected_pda != *authz_pda_account.key {
+        return Err(AuthorityError::InvalidPda.into());
+    }
+
+    // Standard close idiom: transfer all lamports to the user, then
+    // reassign the data buffer to the system program and shrink to
+    // zero so the account is fully reclaimable.
+    let pda_lamports = authz_pda_account.lamports();
+    let new_user_lamports = user_account
+        .lamports()
+        .checked_add(pda_lamports)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    **user_account.try_borrow_mut_lamports()? = new_user_lamports;
+    **authz_pda_account.try_borrow_mut_lamports()? = 0;
+
+    authz_pda_account.assign(&system_program::ID);
+    authz_pda_account
+        .realloc(0, false)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    solana_program::log::sol_log_data(&[
+        b"authz_closed_v1",
+        &record.rule_id,
+        record.user.as_ref(),
+        &clock.slot.to_le_bytes(),
+    ]);
+    msg!(
+        "close_authorization ok rule_id_first_byte={} closed_at_slot={}",
+        record.rule_id[0],
+        clock.slot
+    );
+
+    Ok(())
+}
+
+/// Execute the action authorised by an existing authorization PDA
+/// (Stage 2 P2 boundary + P3 condition gate + P4 Solend delegated
+/// withdraw boundary + J4 Jupiter sibling-instruction verifier
+/// skeleton).
+///
+/// All `AuthorizationRecord` checks the spec demands run here. The
+/// processor performs **no** Solend / Jupiter CPI — Solend variant-15
+/// CPI and the Jupiter route execution itself remain deferred. P4
+/// added the deterministic Solend boundary gate (active only for
+/// `SolendWithdrawAllDelegated`); J4 adds the deterministic Jupiter
+/// sibling-instruction verifier (active only for
+/// `JupiterBuySolWithUsdc`). For each action type the *other* boundary
+/// proof MUST be `None`; if a hostile executor attaches the wrong
+/// proof, that proof is ignored at this layer (the future
+/// trustless-bracket slice will harden the pairing further).
+///
+/// **J4 deferral.** The Jupiter boundary verifier in this slice is the
+/// sibling-instruction part only (per-class allowlist + relative
+/// ordering + writable-set check). The trustless pre/post balance
+/// bracket — `checked_sub(post.amount, pre.amount) >=
+/// min_output_amount_raw` against on-chain SPL Token unpacks — is
+/// explicitly deferred. See `jupiter_boundary.rs` module docs and the
+/// `executor_supplied_pre_balance_is_not_trusted` test.
+///
+/// Boundary ordering (cheap → expensive, fail closed at the first
+/// mismatch):
+///   1. Account-level checks (signer, owner, PDA derivation)
+///   2. Record-shape checks (schema_version, rule_id, user, executor,
+///      hash, action_type)
+///   3. Lifecycle checks (expiry, revoked, completed)
+///   4. Cap / nonce / replay checks (input_amount, monotone nonce,
+///      same-slot replay)
+///   5. Condition verification (P3)
+///   6. **Solend delegated boundary (P4 — runs only for
+///       `Stage2ActionType::SolendWithdrawAllDelegated`)**
+///   7. **Jupiter sibling-ix boundary (J4 — runs only for
+///       `Stage2ActionType::JupiterBuySolWithUsdc`)**
+///   8. State mutation (one-shot v1)
+///
+/// Checks → Checks → Effects: every gate above must pass before
+/// `used_amount_raw`, `completed`, `execution_nonce`, and
+/// `last_execution_slot` are written.
+///
+/// Accounts (in order):
+///   0. `[signer]`   executor          — must equal record.executor
+///   1. `[writable]` authorization_pda — owned by this program
+///   2. `[]`         user              — must equal record.user
+///   3. `[]`         delegated_wallet  — readonly placeholder for P5+
+#[allow(clippy::too_many_arguments)]
+fn process_execute_action(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    schema_version: u8,
+    rule_id: [u8; 16],
+    canonical_rule_hash: [u8; 32],
+    action_type: u8,
+    input_amount_raw: u64,
+    execution_nonce: u64,
+    condition_proof: ConditionProofPayload,
+    solend_boundary_proof: Option<SolendBoundaryProof>,
+    jupiter_boundary_proof: Option<JupiterBoundaryProof>,
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    let executor_account = next_account_info(account_iter)?;
+    let authz_pda_account = next_account_info(account_iter)?;
+    let user_account = next_account_info(account_iter)?;
+    let delegated_wallet_account = next_account_info(account_iter)?;
+    // P5b-2: Solend CPI substrate accounts at slots 4..=N follow the
+    // P4-pinned base layout (executor / authz_pda / user / delegated).
+    // The slice from `accounts[4..]` is consumed by the Solend CPI
+    // skeleton orchestrator below WHEN the action is
+    // `SolendWithdrawAllDelegated` AND the optional CPI account
+    // substrate is supplied (length-gated). Existing P1/P2/P3/P4
+    // tests that pass only the 4 base accounts continue to work — the
+    // orchestrator is skipped for them.
+    // TODO(Stage 2 P5+): Jupiter sibling-ix verification via instructions sysvar
+    // TODO(Stage 2): token balance pre/post bracket assertion
+
+    // ── Boundary checks (fail-closed, in spec order) ────────────────────
+
+    // 1. Executor must sign.
+    if !executor_account.is_signer {
+        return Err(AuthorityError::MissingExecutorSignature.into());
+    }
+
+    // 2. PDA must be owned by this program. We check this BEFORE
+    //    deserializing record bytes so a foreign-owned account with
+    //    look-alike data can never advance.
+    if authz_pda_account.owner != program_id {
+        return Err(AuthorityError::AuthorizationOwnerMismatch.into());
+    }
+
+    // 3. PDA derivation: address must match seeds.
+    //    Seeds: [b"authz", [schema_version], user.as_ref(), rule_id]
+    //    — identical to create / revoke / close, keyed off the *arg*
+    //    schema_version + rule_id and the *passed* user account so the
+    //    record body checks below catch any shuffling of which user
+    //    account was supplied.
+    let schema_version_bytes = [schema_version];
+    let seeds: &[&[u8]] = &[
+        AUTHZ_SEED_PREFIX,
+        &schema_version_bytes,
+        user_account.key.as_ref(),
+        rule_id.as_ref(),
+    ];
+    let (expected_pda, _bump) = Pubkey::find_program_address(seeds, program_id);
+    if expected_pda != *authz_pda_account.key {
+        return Err(AuthorityError::InvalidAuthorizationPda.into());
+    }
+
+    // Decode the record. From here on, every check compares the on-chain
+    // record (the user's signed contract) against the caller's args.
+    let mut record = {
+        let data = authz_pda_account.data.borrow();
+        AuthorizationRecord::try_from_slice(&data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+    };
+
+    // 4. Schema version: arg vs record. (The PDA derivation above also
+    //    keys on schema_version, so a mismatch here would also fail (3),
+    //    but the explicit check produces a precise error code.)
+    if record.schema_version != schema_version {
+        return Err(AuthorityError::UnsupportedSchemaVersion.into());
+    }
+
+    // 5. Rule id: arg vs record. Same belt-and-braces argument as (4).
+    if record.rule_id != rule_id {
+        return Err(AuthorityError::InvalidAuthorizationPda.into());
+    }
+
+    // 6. User account: must match record.user.
+    if record.user != *user_account.key {
+        return Err(AuthorityError::AuthorizationUserMismatch.into());
+    }
+
+    // 7. Executor signer: must match record.executor.
+    if record.executor != *executor_account.key {
+        return Err(AuthorityError::ExecutorMismatch.into());
+    }
+
+    // 8. Canonical rule hash: arg must equal what the user signed.
+    //    This is the commitment to the off-chain WatchRule body.
+    if record.canonical_rule_hash != canonical_rule_hash {
+        return Err(AuthorityError::RuleHashMismatch.into());
+    }
+
+    // 9. Action type: arg must match the discriminator the user
+    //    authorised. Stops a daemon from re-routing a Solend-authorised
+    //    rule into a Jupiter execution.
+    if record.allowed_action_type != action_type {
+        return Err(AuthorityError::ActionTypeMismatch.into());
+    }
+
+    // 10. Expiry. Strict: `current_slot < expires_at_slot`. Mirrors the
+    //     create-time check (process_create_authorization above) so the
+    //     boundary `current_slot == expires_at_slot` is treated as
+    //     expired everywhere. Reuses the existing P1 error variant.
+    let clock = Clock::get()?;
+    if clock.slot >= record.expires_at_slot {
+        return Err(AuthorityError::AuthorizationExpired.into());
+    }
+
+    // 11. Revoked.
+    if record.revoked {
+        return Err(AuthorityError::AuthorizationRevoked.into());
+    }
+
+    // 12. Already completed (one-shot v1 — second execution rejected).
+    if record.completed {
+        return Err(AuthorityError::AuthorizationCompleted.into());
+    }
+
+    // 13. Input amount must be non-zero. Zero would advance the nonce
+    //     without consuming any cap, which is uninteresting but worse —
+    //     it would let an executor spin completed=true on a record
+    //     without using any of the user's authorised budget.
+    if input_amount_raw == 0 {
+        return Err(AuthorityError::InputAmountZero.into());
+    }
+
+    // 14. Cap: used_amount_raw + input_amount_raw must not exceed
+    //     max_input_amount_raw, with checked_add to refuse overflow.
+    let new_used = record
+        .used_amount_raw
+        .checked_add(input_amount_raw)
+        .ok_or(AuthorityError::InputAmountExceeded)?;
+    if new_used > record.max_input_amount_raw {
+        return Err(AuthorityError::InputAmountExceeded.into());
+    }
+
+    // 15. Monotone nonce: arg must be exactly record.execution_nonce + 1.
+    //     P1 zero-initialises execution_nonce, so the first valid execute
+    //     supplies arg.execution_nonce = 1. checked_add guards the
+    //     u64::MAX edge.
+    let expected_next_nonce = record
+        .execution_nonce
+        .checked_add(1)
+        .ok_or(AuthorityError::ExecutionNonceMismatch)?;
+    if execution_nonce != expected_next_nonce {
+        return Err(AuthorityError::ExecutionNonceMismatch.into());
+    }
+
+    // 16. Same-slot replay guard. P1 zero-initialises last_execution_slot,
+    //     so the sentinel `record.last_execution_slot == 0` permits the
+    //     very first execute regardless of clock.slot. Subsequent
+    //     executions (only relevant in a future multi-use slice) would
+    //     compare against the prior slot — for one-shot v1 this is dead
+    //     code on the happy path because (12) already blocks a second
+    //     execute on the same record, but we keep it for forward-compat
+    //     and to fail loudly if either invariant changes.
+    if record.last_execution_slot != 0 && clock.slot == record.last_execution_slot {
+        return Err(AuthorityError::SameSlotReplay.into());
+    }
+
+    // ── Condition gate (P3) ─────────────────────────────────────────────
+    //
+    // Cheap structural checks first:
+    //   - non-empty conditions vec (MissingConditionProof)
+    //   - count within MAX_PROOF_CONDITIONS (ConditionCountMismatch)
+    // Then per-condition verifier dispatch using on-chain Clock-derived
+    // verification contexts (the proof-supplied contexts are intentionally
+    // unused — see ProofCondition doc comment). Finally fold the
+    // per-condition booleans with the supplied condition_logic.
+    //
+    // Failures map to the most specific AuthorityError variant we have,
+    // with a catch-all (ConditionVerificationFailed) for VerifierError
+    // shapes that don't have a direct discriminant. State is NOT mutated
+    // until this whole block succeeds.
+    if condition_proof.conditions.is_empty() {
+        return Err(AuthorityError::MissingConditionProof.into());
+    }
+    if condition_proof.conditions.len() > MAX_PROOF_CONDITIONS {
+        return Err(AuthorityError::ConditionCountMismatch.into());
+    }
+
+    let pyth_ctx = PythVerificationContext {
+        current_unix_time: clock.unix_timestamp,
+    };
+    let solend_ctx = SolendVerificationContext {
+        current_slot: clock.slot,
+    };
+
+    // Fixed-size buffer keyed off MAX_PROOF_CONDITIONS so we don't
+    // allocate inside the hot path. The verified prefix length equals
+    // condition_proof.conditions.len().
+    let mut results: [bool; MAX_PROOF_CONDITIONS] = [false; MAX_PROOF_CONDITIONS];
+    for (i, proof_cond) in condition_proof.conditions.iter().enumerate() {
+        let (eval_cond, eval_snap) = match *proof_cond {
+            ProofCondition::Pyth { condition, snapshot } => (
+                EvalCondition::Pyth(condition),
+                EvalSnapshot::Pyth(snapshot, pyth_ctx),
+            ),
+            ProofCondition::Solend { condition, snapshot } => (
+                EvalCondition::Solend(condition),
+                EvalSnapshot::Solend(snapshot, solend_ctx),
+            ),
+        };
+        let outcome = evaluate_condition(&eval_cond, &eval_snap)
+            .map_err(map_verifier_error_to_authority_error)?;
+        results[i] = outcome;
+    }
+
+    let n = condition_proof.conditions.len();
+    let combined =
+        evaluate_condition_logic(condition_proof.condition_logic, &results[..n]);
+    if !combined {
+        return Err(AuthorityError::ConditionNotMet.into());
+    }
+
+    // ── Solend delegated boundary gate (P4) ─────────────────────────────
+    //
+    // Active only for SolendWithdrawAllDelegated. For Jupiter actions
+    // (or any future non-Solend action), the boundary proof MUST be
+    // `None` — if a hostile executor attaches a Solend proof to a
+    // Jupiter execute, we ignore it at this layer (rather than treat
+    // it as a tampered Jupiter call) because P4 is scoped strictly to
+    // Solend.
+    //
+    // For Solend, the proof MUST be `Some(_)`; missing fails closed
+    // with `SolendBoundaryProofMissing`.
+    if record.allowed_action_type
+        == crate::state::Stage2ActionType::SolendWithdrawAllDelegated.to_u8()
+    {
+        let proof = solend_boundary_proof
+            .as_ref()
+            .ok_or(AuthorityError::SolendBoundaryProofMissing)?;
+        verify_solend_delegated_boundary(&record, proof)?;
+    }
+    // For non-Solend actions, `solend_boundary_proof` is intentionally
+    // not consumed.
+    let _ = &solend_boundary_proof;
+
+    // ── Jupiter sibling-instruction boundary gate (J4) ──────────────────
+    //
+    // Active only for JupiterBuySolWithUsdc. For Solend (or any future
+    // non-Jupiter action), the Jupiter boundary proof MUST be `None`;
+    // if a hostile executor attaches one to a Solend execute, we
+    // ignore it at this layer (rather than treat it as a tampered
+    // Solend call) because J4 is scoped strictly to Jupiter.
+    //
+    // For Jupiter, the proof MUST be `Some(_)`; missing fails closed
+    // with `JupiterBoundaryProofMissing`.
+    //
+    // **J4 deferral.** The verifier called below validates ONLY the
+    // sibling-instruction list (per-class allowlist + relative
+    // ordering + writable-set check). The trustless pre/post balance
+    // bracket (`checked_sub(post.amount, pre.amount) >=
+    // min_output_amount_raw` against on-chain SPL Token unpacks) is
+    // explicitly deferred to a future slice — see
+    // `jupiter_boundary.rs` module docs. Pre-allocated error codes
+    // `JupiterPostBalanceUnderflow` and `JupiterBalanceDeltaTooSmall`
+    // are reserved for that slice and stay append-only here.
+    if record.allowed_action_type
+        == crate::state::Stage2ActionType::JupiterBuySolWithUsdc.to_u8()
+    {
+        let proof = jupiter_boundary_proof
+            .as_ref()
+            .ok_or(AuthorityError::JupiterBoundaryProofMissing)?;
+        verify_jupiter_boundary_skeleton(&record, proof)?;
+    }
+    // For non-Jupiter actions, `jupiter_boundary_proof` is
+    // intentionally not consumed.
+    let _ = &jupiter_boundary_proof;
+
+    // ── P5b-2 Solend CPI skeleton orchestrator (length-gated) ──────────
+    //
+    // Active only when:
+    //   1. action == SolendWithdrawAllDelegated, AND
+    //   2. the caller passed enough additional accounts to fill the
+    //      variant-15 12 base accounts + 4 substrate accounts
+    //      (solend_program, pyth_oracle, switchboard_oracle,
+    //      clock_sysvar) at fixed absolute offsets after the existing
+    //      P1/P2/P3/P4 4 base accounts.
+    //
+    // Absolute account layout when the orchestrator engages:
+    //   0  executor                 (existing)
+    //   1  authz_pda                 (existing)
+    //   2  user                      (existing)
+    //   3  delegated_wallet          (existing — must be signer in P5b-2)
+    //   4  source_collateral         (variant-15 slot 0)
+    //   5  delegated_ctoken          (variant-15 slot 1)
+    //   6  reserve                   (variant-15 slot 2)
+    //   7  obligation                (variant-15 slot 3)
+    //   8  lending_market            (variant-15 slot 4)
+    //   9  lending_market_authority  (variant-15 slot 5)
+    //  10  destination               (variant-15 slot 6)
+    //  11  reserve_collateral_mint   (variant-15 slot 7)
+    //  12  reserve_liquidity_supply  (variant-15 slot 8)
+    //  13  obligation_owner          (variant-15 slot 9 — signer)
+    //  14  user_transfer_authority   (variant-15 slot 10 — signer)
+    //  15  token_program             (variant-15 slot 11)
+    //  16  solend_program            (substrate)
+    //  17  pyth_oracle               (substrate)
+    //  18  switchboard_oracle        (substrate)
+    //  19  clock_sysvar              (substrate)
+    //  20+ deposit_reserves          (variable — at least 1 element
+    //                                  required by the orchestrator)
+    //
+    // If `accounts.len() < 21` (the absolute minimum for this layout
+    // with one deposit reserve), the orchestrator is skipped silently
+    // so existing P1/P2/P3/P4 tests that pass only the 4 base accounts
+    // continue to pass unchanged.
+    //
+    // Under Mode B (the P5b-2 production default), the orchestrator
+    // fails closed at the oracle gate after running Phase 1 validation
+    // end-to-end (signer guard, sysvar guard, shadow mapping, cToken
+    // amount read). This means callers see the most-specific error
+    // first when they violate an earlier invariant; only after every
+    // earlier check passes does the oracle fail-closed sentinel fire
+    // (`SolendCpiSuccessPathBlockedByOracleValidation`). When the
+    // orchestrator returns Err, we propagate immediately and refuse to
+    // mutate `AuthorizationRecord` — same contract as the boundary
+    // gates above.
+    const P5B2_MIN_ACCOUNTS: usize = 4 + WITHDRAW_BASE_ACCOUNTS_LEN + 4 + 1;
+    if record.allowed_action_type
+        == crate::state::Stage2ActionType::SolendWithdrawAllDelegated.to_u8()
+        && accounts.len() >= P5B2_MIN_ACCOUNTS
+    {
+        // Borrow hygiene: this whole block opens narrow, scoped borrows
+        // inside `try_solend_cpi_skeleton` and its Phase 1 validators;
+        // every borrow guard is dropped before we reach the (currently
+        // unreachable under Mode B) `invoke()` call sites in the CPI
+        // helpers. The `record` value is owned (decoded into a local
+        // above), and the only `authz_pda_account.data` borrow that
+        // happens after this block is the `borrow_mut()` for the final
+        // serialize — no overlap.
+        let withdraw_slice = &accounts[4..4 + WITHDRAW_BASE_ACCOUNTS_LEN];
+        let withdraw_accounts = SolendWithdrawAccounts::parse(withdraw_slice)?;
+        let solend_program_account = &accounts[4 + WITHDRAW_BASE_ACCOUNTS_LEN];
+        let pyth_oracle_account = &accounts[4 + WITHDRAW_BASE_ACCOUNTS_LEN + 1];
+        let switchboard_oracle_account = &accounts[4 + WITHDRAW_BASE_ACCOUNTS_LEN + 2];
+        let clock_sysvar_account = &accounts[4 + WITHDRAW_BASE_ACCOUNTS_LEN + 3];
+        let substrate = SolendCpiSubstrate {
+            solend_program: solend_program_account,
+            pyth_oracle: pyth_oracle_account,
+            switchboard_oracle: switchboard_oracle_account,
+            clock_sysvar: clock_sysvar_account,
+            extra_oracle: None,
+        };
+
+        // Deposit-reserves tail. Per Solend's
+        // `update_borrow_attribution_values(&accounts[12..])`, the
+        // remaining accounts after the substrate slots are forwarded
+        // positionally as deposit reserves. For the simple Stage 2
+        // single-deposit case this is one element equal to the
+        // withdraw reserve.
+        let deposit_reserves_start = 4 + WITHDRAW_BASE_ACCOUNTS_LEN + 4;
+        let mut deposit_reserves: Vec<&AccountInfo> =
+            Vec::with_capacity(accounts.len().saturating_sub(deposit_reserves_start));
+        for acc in accounts[deposit_reserves_start..].iter() {
+            deposit_reserves.push(acc);
+        }
+
+        // Derive expectations for the shadow-mapping validator.
+        //
+        // - `expected_obligation` / `expected_reserve` /
+        //   `expected_lending_market` / `expected_destination`
+        //   come from the Solend boundary proof (already verified
+        //   against the AuthorizationRecord in the P4 gate above).
+        //   Re-using them here makes the shadow mapping a defence-in-
+        //   depth structural check on the variant-15 AccountInfo list.
+        //
+        // - `expected_ctoken_mint` is set to `accounts[11].key` — the
+        //   variant-15 reserve_collateral_mint slot. The user's signed
+        //   WatchRule commits (via canonical_rule_hash) to this mint
+        //   being the cToken mint for the rule's reserve; the validator
+        //   then enforces that the cToken account at variant-15 slot 1
+        //   has the SAME mint in its data, which is a meaningful
+        //   structural invariant (Solend mints unique cTokens per
+        //   reserve and the user authorised redemption of *this*
+        //   reserve's cTokens).
+        //
+        // - `expected_liquidity_mint` is read from the destination
+        //   AccountInfo's data (slot 10). This is a Mode B limitation:
+        //   the boundary proof does NOT carry the liquidity mint as a
+        //   committed expectation, and the user's WatchRule's mint
+        //   commitment is not surfaced into the on-chain record. So we
+        //   peek the destination's mint here, then re-validate it
+        //   inside the shadow mapping (which is structurally identical
+        //   under Mode B but reachable code under future modes when the
+        //   commitment lands). The peek opens a narrow borrow on the
+        //   destination's data and drops it before calling the
+        //   orchestrator — no borrow guard crosses the orchestrator
+        //   call. Under Mode B the success path fails closed at the
+        //   oracle gate inside the orchestrator anyway, so this
+        //   peek-then-validate is acceptable.
+        let solend_proof = solend_boundary_proof
+            .as_ref()
+            .ok_or(AuthorityError::SolendBoundaryProofMissing)?;
+
+        let expected_ctoken_mint = *withdraw_accounts.reserve_collateral_mint.key;
+        let expected_liquidity_mint = {
+            // The destination account-level owner check the validator
+            // performs is structural; here we only need the inner mint
+            // field to thread back through the validator. Reject any
+            // non-SPL-Token destination here so the borrow path stays
+            // tight.
+            if withdraw_accounts.destination.owner != &SPL_TOKEN_PROGRAM_ID {
+                return Err(AuthorityError::SolendTokenAccountOwnerMismatch.into());
+            }
+            let dest_data = withdraw_accounts
+                .destination
+                .try_borrow_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            let decoded = decode_spl_token_account_lite(&dest_data)?;
+            // Borrow guard `dest_data` drops at end of this block —
+            // no `dest_data` reference survives past here, satisfying
+            // the borrow-not-across-CPI invariant.
+            drop(dest_data);
+            Pubkey::new_from_array(decoded.mint.to_bytes())
+        };
+
+        let expectations = SolendWithdrawShadowExpectations {
+            solend_program_id: &solend_proof.solend_program_id,
+            expected_obligation: &solend_proof.obligation_pubkey,
+            expected_reserve: &solend_proof.reserve_pubkey,
+            expected_lending_market: &solend_proof.lending_market_pubkey,
+            expected_ctoken_mint: &expected_ctoken_mint,
+            expected_liquidity_mint: &expected_liquidity_mint,
+        };
+
+        try_solend_cpi_skeleton(
+            &record,
+            delegated_wallet_account,
+            &substrate,
+            &withdraw_accounts,
+            &deposit_reserves,
+            &expectations,
+        )?;
+    }
+
+    // ── State mutations (one-shot v1) ───────────────────────────────────
+    record.used_amount_raw = new_used;
+    record.completed = true;
+    record.execution_nonce = execution_nonce;
+    record.last_execution_slot = clock.slot;
+
+    record
+        .serialize(&mut &mut authz_pda_account.data.borrow_mut()[..])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    // TODO(Stage 2 P4): Solend variant-15 refresh + withdraw CPI
+    // TODO(Stage 2 P4): Jupiter sibling-ix sysvar verification
+    // TODO(Stage 2): revoke-and-sweep handler
+
+    solana_program::log::sol_log_data(&[
+        b"authz_executed_v1",
+        &rule_id,
+        record.user.as_ref(),
+        record.executor.as_ref(),
+        core::slice::from_ref(&record.allowed_action_type),
+        &input_amount_raw.to_le_bytes(),
+        &record.used_amount_raw.to_le_bytes(),
+        &execution_nonce.to_le_bytes(),
+        &clock.slot.to_le_bytes(),
+    ]);
+    msg!(
+        "execute_action ok action_type={} input_amount_raw={} used_amount_raw={} nonce={} executed_at_slot={}",
+        record.allowed_action_type,
+        input_amount_raw,
+        record.used_amount_raw,
+        execution_nonce,
+        clock.slot
+    );
+
+    Ok(())
+}
+
+/// Translate a `condition_verifier::VerifierError` into the most
+/// specific `AuthorityError` discriminant we expose on the wire. The
+/// fine-grained mapping lets daemon logs attribute fail-closed events
+/// to the precise gate that tripped (audit-trail value); shapes
+/// without a dedicated discriminant fold into
+/// [`AuthorityError::ConditionVerificationFailed`].
+fn map_verifier_error_to_authority_error(err: VerifierError) -> ProgramError {
+    let mapped = match err {
+        VerifierError::PythFeedIdMismatch => AuthorityError::PythFeedIdMismatch,
+        VerifierError::PythPriceTooOld => AuthorityError::PythSnapshotStale,
+        VerifierError::PythVerificationLevelInsufficient => {
+            AuthorityError::PythVerificationLevelInsufficient
+        }
+        VerifierError::PythConfidenceTooWide => AuthorityError::PythConfidenceTooWide,
+        VerifierError::SolendFormulaVersionUnsupported => {
+            AuthorityError::SolendFormulaVersionUnsupported
+        }
+        VerifierError::SolendReserveStale => AuthorityError::SolendReserveStale,
+        VerifierError::PythExponentOutOfRange
+        | VerifierError::PythComputeOverflow
+        | VerifierError::BoundDirectionMismatch
+        | VerifierError::UnsupportedComparison
+        | VerifierError::UnsupportedRateKind
+        | VerifierError::SolendInvalidReserveConfig
+        | VerifierError::SolendComputeOverflow
+        | VerifierError::SolendThresholdOverflow => AuthorityError::ConditionVerificationFailed,
+    };
+    mapped.into()
+}
+
+/// Pure, deterministic PDA derivation for off-chain tx builders and
+/// tests. Seeds: `["authz", [schema_version], user.as_ref(), rule_id]`.
+pub fn derive_authorization_pda(
+    program_id: &Pubkey,
+    schema_version: u8,
+    user: &Pubkey,
+    rule_id: &[u8; 16],
+) -> (Pubkey, u8) {
+    let schema_version_bytes = [schema_version];
+    let seeds: &[&[u8]] = &[
+        AUTHZ_SEED_PREFIX,
+        &schema_version_bytes,
+        user.as_ref(),
+        rule_id.as_ref(),
+    ];
+    Pubkey::find_program_address(seeds, program_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::condition_verifier::{
+        BoundMode, Comparison, ConditionLogic, PythPriceCondition, PythPriceSnapshot,
+        RateKind, SolendReserveSnapshot, SolendSupplyAprCondition, VerificationLevel,
+        SUPPORTED_SOLEND_FORMULA_VERSION,
+    };
+    use crate::instruction::{ConditionProofPayload, ProofCondition};
+
+    /// Build a minimal one-element ConditionProofPayload for tests that
+    /// only need a structurally-valid payload. The Solend snapshot is the
+    /// "low utilisation" fixture with very high threshold so the
+    /// evaluator returns true; concrete numeric mainnet fidelity is the
+    /// job of the verifier's own fixture tests.
+    fn dummy_solend_proof() -> ConditionProofPayload {
+        ConditionProofPayload {
+            condition_logic: ConditionLogic::All,
+            conditions: vec![ProofCondition::Solend {
+                condition: SolendSupplyAprCondition {
+                    comparison: Comparison::Lt,
+                    threshold_bps: 1_000,
+                    rate_kind: RateKind::Apr,
+                    formula_version: SUPPORTED_SOLEND_FORMULA_VERSION,
+                    max_reserve_staleness_slots: 16,
+                },
+                snapshot: SolendReserveSnapshot {
+                    available_amount: 5_000_000_000_000,
+                    borrowed_amount_wads: 5_000_000_000_000u128
+                        * crate::condition_verifier::SOLEND_WAD,
+                    min_borrow_rate_pct: 0,
+                    optimal_borrow_rate_pct: 4,
+                    max_borrow_rate_pct: 30,
+                    super_max_borrow_rate_pct: 300,
+                    optimal_utilization_rate_pct: 80,
+                    max_utilization_rate_pct: 95,
+                    protocol_take_rate_pct: 20,
+                    last_update_slot: 0,
+                    stale_flag: false,
+                },
+            }],
+        }
+    }
+
+    fn dummy_pyth_proof() -> ConditionProofPayload {
+        ConditionProofPayload {
+            condition_logic: ConditionLogic::All,
+            conditions: vec![ProofCondition::Pyth {
+                condition: PythPriceCondition {
+                    feed_id: [0xAB; 32],
+                    comparison: Comparison::Gt,
+                    threshold_mantissa: 100,
+                    threshold_exponent: -2,
+                    max_age_seconds: 30,
+                    max_confidence_bps: 50,
+                    verification_level_required: VerificationLevel::Full,
+                    bound_mode: BoundMode::AdverseLowerForGt,
+                },
+                snapshot: PythPriceSnapshot {
+                    feed_id: [0xAB; 32],
+                    price_mantissa: 1_000,
+                    price_exponent: -2,
+                    conf: 1,
+                    publish_time: 0,
+                    verification_level: VerificationLevel::Full,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn pda_seeds_are_deterministic() {
+        let program_id = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let rule_id = [7u8; 16];
+        let a = derive_authorization_pda(&program_id, 1, &user, &rule_id);
+        let b = derive_authorization_pda(&program_id, 1, &user, &rule_id);
+        assert_eq!(a, b, "derive_authorization_pda must be deterministic");
+    }
+
+    #[test]
+    fn pda_changes_with_schema_version() {
+        let program_id = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let rule_id = [7u8; 16];
+        let (pda_v1, _) = derive_authorization_pda(&program_id, 1, &user, &rule_id);
+        let (pda_v2, _) = derive_authorization_pda(&program_id, 2, &user, &rule_id);
+        assert_ne!(
+            pda_v1, pda_v2,
+            "schema_version must domain-separate authorization PDAs"
+        );
+    }
+
+    #[test]
+    fn pda_changes_with_user() {
+        let program_id = Pubkey::new_unique();
+        let user_a = Pubkey::new_unique();
+        let user_b = Pubkey::new_unique();
+        let rule_id = [7u8; 16];
+        let (pda_a, _) = derive_authorization_pda(&program_id, 1, &user_a, &rule_id);
+        let (pda_b, _) = derive_authorization_pda(&program_id, 1, &user_b, &rule_id);
+        assert_ne!(pda_a, pda_b, "user must domain-separate authorization PDAs");
+    }
+
+    #[test]
+    fn pda_changes_with_rule_id() {
+        let program_id = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let (pda_a, _) = derive_authorization_pda(&program_id, 1, &user, &[1u8; 16]);
+        let (pda_b, _) = derive_authorization_pda(&program_id, 1, &user, &[2u8; 16]);
+        assert_ne!(pda_a, pda_b, "rule_id must domain-separate authorization PDAs");
+    }
+
+    #[test]
+    fn stage1_and_stage2_seed_prefixes_are_disjoint() {
+        // Stage 1's seed prefix is b"intent" (programs/clawsol-intent/src/lib.rs::INTENT_SEED_PREFIX).
+        // We don't import that crate here (no dev-dep on Stage 1) but
+        // the byte literal is part of the Stage 1 wire shape and is
+        // safe to assert against.
+        assert_ne!(AUTHZ_SEED_PREFIX, b"intent");
+        // Defensive: the byte length must also differ to avoid any
+        // accidental run-on collision.
+        assert_ne!(AUTHZ_SEED_PREFIX.len(), b"intent".len());
+    }
+
+    #[test]
+    fn authorization_record_len_matches_borsh_serialization() {
+        let record = AuthorizationRecord {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0xAA; 16],
+            user: Pubkey::new_unique(),
+            executor: Pubkey::new_unique(),
+            delegated_wallet: Pubkey::new_unique(),
+            canonical_rule_hash: [0xBB; 32],
+            allowed_action_type: Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
+            max_input_amount_raw: 5_000_000,
+            used_amount_raw: 0,
+            destination: Pubkey::new_unique(),
+            expires_at_slot: 415_700_000,
+            revoked: false,
+            completed: false,
+            execution_nonce: 0,
+            last_execution_slot: 0,
+            bump: 255,
+        };
+        let bytes = borsh::to_vec(&record).unwrap();
+        assert_eq!(
+            bytes.len(),
+            AuthorizationRecord::LEN,
+            "AuthorizationRecord::LEN ({}) must equal serialized size ({})",
+            AuthorizationRecord::LEN,
+            bytes.len()
+        );
+        // Pin the absolute size — this fails loudly if any field is
+        // added, removed, or its type changes.
+        assert_eq!(AuthorizationRecord::LEN, 221, "fixed-size record is 221 bytes");
+    }
+
+    #[test]
+    fn authorization_record_borsh_roundtrip_preserves_fields() {
+        let original = AuthorizationRecord {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0x01; 16],
+            user: Pubkey::new_unique(),
+            executor: Pubkey::new_unique(),
+            delegated_wallet: Pubkey::new_unique(),
+            canonical_rule_hash: [0x02; 32],
+            allowed_action_type: Stage2ActionType::JupiterBuySolWithUsdc.to_u8(),
+            max_input_amount_raw: u64::MAX - 7,
+            used_amount_raw: 42,
+            destination: Pubkey::new_unique(),
+            expires_at_slot: u64::MAX - 1,
+            revoked: true,
+            completed: true,
+            execution_nonce: 99,
+            last_execution_slot: 415_500_001,
+            bump: 254,
+        };
+        let bytes = borsh::to_vec(&original).unwrap();
+        let decoded = AuthorizationRecord::try_from_slice(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn authorization_record_layout_matches_borsh_field_order() {
+        // Borsh serializes structs in declared field order, integers
+        // little-endian, fixed arrays without prefix, bool as 1 byte.
+        // Anchor every field at an explicit byte offset so any future
+        // reorder is loud.
+        let user = Pubkey::new_from_array([0x33; 32]);
+        let executor = Pubkey::new_from_array([0x44; 32]);
+        let delegated_wallet = Pubkey::new_from_array([0x55; 32]);
+        let destination = Pubkey::new_from_array([0x77; 32]);
+        let record = AuthorizationRecord {
+            schema_version: 0x01,
+            rule_id: [0x22; 16],
+            user,
+            executor,
+            delegated_wallet,
+            canonical_rule_hash: [0x66; 32],
+            allowed_action_type: 0x01,
+            max_input_amount_raw: 0x0102_0304_0506_0708,
+            used_amount_raw: 0,
+            destination,
+            expires_at_slot: 0x1112_1314_1516_1718,
+            revoked: true,
+            completed: false,
+            execution_nonce: 0x2122_2324_2526_2728,
+            last_execution_slot: 0x3132_3334_3536_3738,
+            bump: 0xFE,
+        };
+        let bytes = borsh::to_vec(&record).unwrap();
+        assert_eq!(bytes[0], 0x01, "byte 0 = schema_version");
+        assert_eq!(&bytes[1..17], &[0x22u8; 16][..], "bytes 1..17 = rule_id");
+        assert_eq!(&bytes[17..49], &[0x33u8; 32][..], "bytes 17..49 = user");
+        assert_eq!(&bytes[49..81], &[0x44u8; 32][..], "bytes 49..81 = executor");
+        assert_eq!(
+            &bytes[81..113],
+            &[0x55u8; 32][..],
+            "bytes 81..113 = delegated_wallet"
+        );
+        assert_eq!(
+            &bytes[113..145],
+            &[0x66u8; 32][..],
+            "bytes 113..145 = canonical_rule_hash"
+        );
+        assert_eq!(bytes[145], 0x01, "byte 145 = allowed_action_type");
+        assert_eq!(
+            &bytes[146..154],
+            &0x0102_0304_0506_0708u64.to_le_bytes()[..],
+            "bytes 146..154 = max_input_amount_raw (LE u64)"
+        );
+        assert_eq!(
+            &bytes[154..162],
+            &0u64.to_le_bytes()[..],
+            "bytes 154..162 = used_amount_raw (LE u64)"
+        );
+        assert_eq!(
+            &bytes[162..194],
+            &[0x77u8; 32][..],
+            "bytes 162..194 = destination"
+        );
+        assert_eq!(
+            &bytes[194..202],
+            &0x1112_1314_1516_1718u64.to_le_bytes()[..],
+            "bytes 194..202 = expires_at_slot (LE u64)"
+        );
+        assert_eq!(bytes[202], 0x01, "byte 202 = revoked (true)");
+        assert_eq!(bytes[203], 0x00, "byte 203 = completed (false)");
+        assert_eq!(
+            &bytes[204..212],
+            &0x2122_2324_2526_2728u64.to_le_bytes()[..],
+            "bytes 204..212 = execution_nonce (LE u64)"
+        );
+        assert_eq!(
+            &bytes[212..220],
+            &0x3132_3334_3536_3738u64.to_le_bytes()[..],
+            "bytes 212..220 = last_execution_slot (LE u64)"
+        );
+        assert_eq!(bytes[220], 0xFE, "byte 220 = bump");
+        assert_eq!(bytes.len(), 221);
+    }
+
+    #[test]
+    fn authorization_record_does_not_carry_conditions_or_action_payload() {
+        // The PDA stores the canonical rule hash (32 bytes) — a
+        // commitment to the conditions vector and the action payload —
+        // not the conditions or payload themselves. Any future PR that
+        // grows the record into a Vec<Condition> or an ActionSpec will
+        // inflate LEN past this fixed value and trip this test.
+        assert_eq!(
+            AuthorizationRecord::LEN,
+            221,
+            "AuthorizationRecord must store only fixed scalars + a hash, not the full rule body"
+        );
+    }
+
+    #[test]
+    fn stage2_action_type_round_trip() {
+        for v in [
+            Stage2ActionType::SolendWithdrawAllDelegated,
+            Stage2ActionType::JupiterBuySolWithUsdc,
+        ] {
+            assert_eq!(Stage2ActionType::from_u8(v.to_u8()), Some(v));
+        }
+        assert_eq!(Stage2ActionType::from_u8(0), None);
+        assert_eq!(Stage2ActionType::from_u8(3), None);
+        assert_eq!(Stage2ActionType::from_u8(255), None);
+        assert_eq!(Stage2ActionType::SolendWithdrawAllDelegated.to_u8(), 1);
+        assert_eq!(Stage2ActionType::JupiterBuySolWithUsdc.to_u8(), 2);
+    }
+
+    #[test]
+    fn authority_instruction_borsh_roundtrip() {
+        let original = AuthorityInstruction::CreateAuthorization {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [9u8; 16],
+            executor: Pubkey::new_unique(),
+            delegated_wallet: Pubkey::new_unique(),
+            canonical_rule_hash: [8u8; 32],
+            allowed_action_type: Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
+            max_input_amount_raw: 5_000_000,
+            destination: Pubkey::new_unique(),
+            expires_at_slot: 1_000_000,
+        };
+        let bytes = borsh::to_vec(&original).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(original, decoded);
+
+        let revoke = AuthorityInstruction::Revoke;
+        let bytes = borsh::to_vec(&revoke).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(revoke, decoded);
+
+        let close = AuthorityInstruction::CloseAuthorization;
+        let bytes = borsh::to_vec(&close).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(close, decoded);
+    }
+
+    #[test]
+    fn execute_action_borsh_roundtrip() {
+        let original = AuthorityInstruction::ExecuteAction {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0xAB; 16],
+            canonical_rule_hash: [0xCD; 32],
+            action_type: Stage2ActionType::JupiterBuySolWithUsdc.to_u8(),
+            input_amount_raw: 5_000_000,
+            execution_nonce: 1,
+            condition_proof: dummy_solend_proof(),
+            // Jupiter action: solend_boundary_proof MUST be None.
+            solend_boundary_proof: None,
+            // J4: jupiter_boundary_proof field. Round-trip with None
+            // here; another test exercises Some(_).
+            jupiter_boundary_proof: None,
+        };
+        let bytes = borsh::to_vec(&original).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn execute_action_borsh_roundtrip_pyth_proof() {
+        // Coverage for the second ProofCondition variant — PythPrice
+        // body with a representative snapshot. Borsh-roundtrips (no
+        // semantic verifier evaluation here; that's the verifier's
+        // own test set).
+        let original = AuthorityInstruction::ExecuteAction {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0x10; 16],
+            canonical_rule_hash: [0x20; 32],
+            action_type: Stage2ActionType::JupiterBuySolWithUsdc.to_u8(),
+            input_amount_raw: 1,
+            execution_nonce: 1,
+            condition_proof: dummy_pyth_proof(),
+            solend_boundary_proof: None,
+            jupiter_boundary_proof: None,
+        };
+        let bytes = borsh::to_vec(&original).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn execute_action_borsh_roundtrip_with_solend_boundary_proof() {
+        // P4 wire shape: append-only `Option<SolendBoundaryProof>`
+        // after `condition_proof`. Roundtrip with a representative
+        // proof.
+        let proof = crate::solend_boundary::SolendBoundaryProof {
+            solend_program_id: crate::solend_boundary::SOLEND_PROGRAM_ID_MAINNET,
+            obligation_pubkey: Pubkey::new_from_array([0x11; 32]),
+            obligation: crate::solend_boundary::ObligationFixture {
+                account_owner_program: crate::solend_boundary::SOLEND_PROGRAM_ID_MAINNET,
+                obligation_authority: Pubkey::new_from_array([0xBB; 32]),
+                lending_market: Pubkey::new_from_array([0x01; 32]),
+            },
+            reserve_pubkey: Pubkey::new_from_array([0x10; 32]),
+            lending_market_pubkey: Pubkey::new_from_array([0x01; 32]),
+            destination_pubkey: Pubkey::new_from_array([0xCC; 32]),
+            sibling_instructions: vec![],
+        };
+        let original = AuthorityInstruction::ExecuteAction {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0xAB; 16],
+            canonical_rule_hash: [0xCD; 32],
+            action_type: Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
+            input_amount_raw: 5_000_000,
+            execution_nonce: 1,
+            condition_proof: dummy_solend_proof(),
+            solend_boundary_proof: Some(proof),
+            jupiter_boundary_proof: None,
+        };
+        let bytes = borsh::to_vec(&original).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn execute_action_borsh_roundtrip_with_jupiter_boundary_proof() {
+        // J4 wire shape: append-only `Option<JupiterBoundaryProof>`
+        // after `solend_boundary_proof`. Roundtrip with a
+        // representative proof (the proof's structural details are
+        // exercised in jupiter_boundary::tests).
+        use crate::jupiter_boundary::{
+            JupiterBoundaryProof, JupiterSiblingIxDescriptor, JupiterTokenAccountFixture,
+            JUPITER_V6_PROGRAM_ID_MAINNET,
+        };
+        let dest = Pubkey::new_from_array([0xCC; 32]);
+        let mint = Pubkey::new_from_array([0x12; 32]);
+        let in_ata = Pubkey::new_from_array([0x21; 32]);
+        let out_ata = Pubkey::new_from_array([0x22; 32]);
+        let proof = JupiterBoundaryProof {
+            jupiter_program_id: JUPITER_V6_PROGRAM_ID_MAINNET,
+            expected_destination_token_account: dest,
+            expected_destination_mint: mint,
+            expected_input_mint: Pubkey::new_from_array([0x11; 32]),
+            delegated_input_token_account: in_ata,
+            delegated_output_token_account: out_ata,
+            destination_pre_snapshot: JupiterTokenAccountFixture {
+                address: dest,
+                mint,
+                owner: Pubkey::new_from_array([0xDD; 32]),
+                amount: 0,
+            },
+            destination_post_snapshot: JupiterTokenAccountFixture {
+                address: dest,
+                mint,
+                owner: Pubkey::new_from_array([0xDD; 32]),
+                amount: 0,
+            },
+            min_output_amount_raw: 1_000,
+            sibling_instructions: vec![JupiterSiblingIxDescriptor {
+                program_id: JUPITER_V6_PROGRAM_ID_MAINNET,
+                variant_byte: 0xE5,
+                writable_accounts: vec![],
+            }],
+        };
+        let original = AuthorityInstruction::ExecuteAction {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0xAB; 16],
+            canonical_rule_hash: [0xCD; 32],
+            action_type: Stage2ActionType::JupiterBuySolWithUsdc.to_u8(),
+            input_amount_raw: 5_000_000,
+            execution_nonce: 1,
+            condition_proof: dummy_solend_proof(),
+            solend_boundary_proof: None,
+            jupiter_boundary_proof: Some(proof),
+        };
+        let bytes = borsh::to_vec(&original).unwrap();
+        let decoded = AuthorityInstruction::try_from_slice(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn condition_proof_payload_borsh_roundtrip_preserves_logic_and_conditions() {
+        // Pin the proof payload's own borsh shape: enum tag for
+        // ConditionLogic at byte 0 (All=0, Any=1), then a u32-LE Vec
+        // length, then per-condition variant bodies. We don't anchor
+        // the byte-by-byte body here (that's the verifier's job), but
+        // we DO assert structural invariants the program relies on.
+        let proof = ConditionProofPayload {
+            condition_logic: ConditionLogic::Any,
+            conditions: vec![],
+        };
+        let bytes = borsh::to_vec(&proof).unwrap();
+        assert_eq!(bytes[0], 1, "ConditionLogic::Any ordinal must be 1");
+        assert_eq!(
+            &bytes[1..5],
+            &0u32.to_le_bytes()[..],
+            "Vec<ProofCondition> length is u32 little-endian (Borsh spec)",
+        );
+
+        let decoded = ConditionProofPayload::try_from_slice(&bytes).unwrap();
+        assert_eq!(decoded, proof);
+
+        // Non-empty case: ensure round-trip preserves both variants.
+        let mixed = ConditionProofPayload {
+            condition_logic: ConditionLogic::All,
+            conditions: vec![
+                dummy_pyth_proof().conditions.into_iter().next().unwrap(),
+                dummy_solend_proof().conditions.into_iter().next().unwrap(),
+            ],
+        };
+        let bytes = borsh::to_vec(&mixed).unwrap();
+        assert_eq!(bytes[0], 0, "ConditionLogic::All ordinal must be 0");
+        let decoded = ConditionProofPayload::try_from_slice(&bytes).unwrap();
+        assert_eq!(decoded, mixed);
+    }
+
+    #[test]
+    fn condition_proof_invalid_logic_byte_fails_borsh_deserialize() {
+        // Construct a payload whose first byte (ConditionLogic enum
+        // tag) is out of range. Borsh enum deserialization rejects
+        // unknown tags; the program-level mapping is
+        // `ProgramError::InvalidInstructionData`.
+        let mut bytes = borsh::to_vec(&ConditionProofPayload {
+            condition_logic: ConditionLogic::All,
+            conditions: vec![],
+        })
+        .unwrap();
+        bytes[0] = 0xFF; // out of range
+        assert!(ConditionProofPayload::try_from_slice(&bytes).is_err());
+    }
+
+    #[test]
+    fn execute_action_borsh_field_order_is_pinned_through_j4() {
+        // Borsh: enum tag is `u8` ordinal in declaration order, then
+        // variant body in declared field order, integers little-endian,
+        // fixed `[u8; N]` arrays raw. ExecuteAction is the 4th variant
+        // (CreateAuthorization=0, Revoke=1, CloseAuthorization=2,
+        // ExecuteAction=3). The first 67 bytes — through `execution_nonce`
+        // — are the pinned P2 prefix; bytes 67..72 are P3's empty
+        // `condition_proof`; byte 72 is P4's `Option` tag (None) for
+        // `solend_boundary_proof`; byte 73 is J4's `Option` tag (None)
+        // for `jupiter_boundary_proof`.
+        let proof = ConditionProofPayload {
+            condition_logic: ConditionLogic::All,
+            conditions: vec![],
+        };
+        let proof_bytes = borsh::to_vec(&proof).unwrap();
+        let ix = AuthorityInstruction::ExecuteAction {
+            schema_version: 0x01,
+            rule_id: [0x22; 16],
+            canonical_rule_hash: [0x66; 32],
+            action_type: 0x02,
+            input_amount_raw: 0x0102_0304_0506_0708,
+            execution_nonce: 0x1112_1314_1516_1718,
+            condition_proof: proof,
+            solend_boundary_proof: None,
+            jupiter_boundary_proof: None,
+        };
+        let bytes = borsh::to_vec(&ix).unwrap();
+        // Pinned P2 prefix (unchanged) — 67 bytes through execution_nonce.
+        assert_eq!(bytes[0], 0x03, "byte 0 = enum tag (ExecuteAction = 3)");
+        assert_eq!(bytes[1], 0x01, "byte 1 = schema_version");
+        assert_eq!(&bytes[2..18], &[0x22u8; 16][..], "bytes 2..18 = rule_id");
+        assert_eq!(
+            &bytes[18..50],
+            &[0x66u8; 32][..],
+            "bytes 18..50 = canonical_rule_hash"
+        );
+        assert_eq!(bytes[50], 0x02, "byte 50 = action_type");
+        assert_eq!(
+            &bytes[51..59],
+            &0x0102_0304_0506_0708u64.to_le_bytes()[..],
+            "bytes 51..59 = input_amount_raw (LE u64)"
+        );
+        assert_eq!(
+            &bytes[59..67],
+            &0x1112_1314_1516_1718u64.to_le_bytes()[..],
+            "bytes 59..67 = execution_nonce (LE u64)"
+        );
+        // P3 trailing bytes — the borsh-encoded ConditionProofPayload
+        // appended after `execution_nonce`.
+        let p3_end = 67 + proof_bytes.len();
+        assert_eq!(
+            &bytes[67..p3_end],
+            &proof_bytes[..],
+            "bytes 67..p3_end = condition_proof (Borsh-encoded ConditionProofPayload)",
+        );
+        // P4 trailing byte — the borsh `Option` tag (0 = None) for
+        // solend_boundary_proof.
+        assert_eq!(
+            bytes[p3_end], 0,
+            "byte p3_end = solend_boundary_proof Option tag (0 = None)"
+        );
+        // J4 trailing byte — the borsh `Option` tag (0 = None) for
+        // jupiter_boundary_proof. Future fields append after this.
+        assert_eq!(
+            bytes[p3_end + 1],
+            0,
+            "byte p3_end+1 = jupiter_boundary_proof Option tag (0 = None)"
+        );
+        // Total length pin: 67 (P2 prefix) + 1 + 4 (P3 empty proof:
+        // ConditionLogic byte + Vec<u32 len>) + 1 (P4 Option None) + 1
+        // (J4 Option None).
+        assert_eq!(bytes.len(), 67 + 1 + 4 + 1 + 1);
+    }
+
+    #[test]
+    fn authority_instruction_variant_tags_are_stable() {
+        // Pin the Borsh enum tag for every variant. Adding a future
+        // variant must extend this list; reordering MUST fail this test.
+        let create = borsh::to_vec(&AuthorityInstruction::CreateAuthorization {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0; 16],
+            executor: Pubkey::new_from_array([0; 32]),
+            delegated_wallet: Pubkey::new_from_array([0; 32]),
+            canonical_rule_hash: [0; 32],
+            allowed_action_type: Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
+            max_input_amount_raw: 1,
+            destination: Pubkey::new_from_array([0; 32]),
+            expires_at_slot: 1,
+        })
+        .unwrap();
+        assert_eq!(create[0], 0, "CreateAuthorization tag = 0");
+
+        let revoke = borsh::to_vec(&AuthorityInstruction::Revoke).unwrap();
+        assert_eq!(revoke, vec![1], "Revoke tag = 1, no body");
+
+        let close = borsh::to_vec(&AuthorityInstruction::CloseAuthorization).unwrap();
+        assert_eq!(close, vec![2], "CloseAuthorization tag = 2, no body");
+
+        let execute = borsh::to_vec(&AuthorityInstruction::ExecuteAction {
+            schema_version: STAGE2_AUTHORITY_SCHEMA_VERSION,
+            rule_id: [0; 16],
+            canonical_rule_hash: [0; 32],
+            action_type: Stage2ActionType::SolendWithdrawAllDelegated.to_u8(),
+            input_amount_raw: 1,
+            execution_nonce: 1,
+            condition_proof: ConditionProofPayload {
+                condition_logic: ConditionLogic::All,
+                conditions: vec![],
+            },
+            solend_boundary_proof: None,
+            jupiter_boundary_proof: None,
+        })
+        .unwrap();
+        assert_eq!(execute[0], 3, "ExecuteAction tag = 3");
+
+        // J5 BONUS — append-only tags 4 and 5.
+        let pre = borsh::to_vec(&AuthorityInstruction::PreJupiterBracketCheck {
+            proof: crate::jupiter_bracket::JupiterPreBracketProof {
+                execution_nonce: 1,
+                destination_token_account: Pubkey::new_from_array([0; 32]),
+                expected_destination_mint: Pubkey::new_from_array([0; 32]),
+                min_output_amount_raw: 1,
+            },
+        })
+        .unwrap();
+        assert_eq!(pre[0], 4, "PreJupiterBracketCheck tag = 4 (J5)");
+
+        let post = borsh::to_vec(&AuthorityInstruction::PostJupiterBracketCheck {
+            proof: crate::jupiter_bracket::JupiterPostBracketProof {
+                execution_nonce: 1,
+                destination_token_account: Pubkey::new_from_array([0; 32]),
+            },
+        })
+        .unwrap();
+        assert_eq!(post[0], 5, "PostJupiterBracketCheck tag = 5 (J5)");
+    }
+
+    /// J5 BONUS — pin the J5 instruction Borsh discriminator positions
+    /// at the same level as the rest of the AuthorityInstruction
+    /// variants. If anyone reorders or inserts before tags 4 / 5 this
+    /// fires loudly.
+    #[test]
+    fn j5_instruction_variants_are_append_only() {
+        // Pre-bracket: tag 4, then nonce(8) + dest(32) + mint(32) + min_out(8) = 80 body bytes.
+        let pre = borsh::to_vec(&AuthorityInstruction::PreJupiterBracketCheck {
+            proof: crate::jupiter_bracket::JupiterPreBracketProof {
+                execution_nonce: 0x0102_0304_0506_0708,
+                destination_token_account: Pubkey::new_from_array([0xCC; 32]),
+                expected_destination_mint: Pubkey::new_from_array([0x12; 32]),
+                min_output_amount_raw: 0x1112_1314_1516_1718,
+            },
+        })
+        .unwrap();
+        assert_eq!(pre[0], 4);
+        assert_eq!(
+            &pre[1..9],
+            &0x0102_0304_0506_0708u64.to_le_bytes()[..],
+            "bytes 1..9 = execution_nonce (LE u64)"
+        );
+        assert_eq!(&pre[9..41], &[0xCCu8; 32][..], "bytes 9..41 = destination_token_account");
+        assert_eq!(&pre[41..73], &[0x12u8; 32][..], "bytes 41..73 = expected_destination_mint");
+        assert_eq!(
+            &pre[73..81],
+            &0x1112_1314_1516_1718u64.to_le_bytes()[..],
+            "bytes 73..81 = min_output_amount_raw (LE u64)"
+        );
+        assert_eq!(pre.len(), 81, "tag(1) + body(80)");
+
+        // Post-bracket: tag 5, then nonce(8) + dest(32) = 40 body bytes.
+        let post = borsh::to_vec(&AuthorityInstruction::PostJupiterBracketCheck {
+            proof: crate::jupiter_bracket::JupiterPostBracketProof {
+                execution_nonce: 0x0102_0304_0506_0708,
+                destination_token_account: Pubkey::new_from_array([0xCC; 32]),
+            },
+        })
+        .unwrap();
+        assert_eq!(post[0], 5);
+        assert_eq!(
+            &post[1..9],
+            &0x0102_0304_0506_0708u64.to_le_bytes()[..],
+            "bytes 1..9 = execution_nonce (LE u64)"
+        );
+        assert_eq!(&post[9..41], &[0xCCu8; 32][..], "bytes 9..41 = destination_token_account");
+        assert_eq!(post.len(), 41, "tag(1) + body(40)");
+    }
+
+    #[test]
+    fn authority_error_discriminants_are_pinned() {
+        // Numeric values are encoded into ProgramError::Custom(u32) and
+        // are part of the on-chain wire shape. Renumbering, reordering,
+        // or removing any value is a hard wire break.
+        assert_eq!(AuthorityError::UserMustSign as u32, 0);
+        assert_eq!(AuthorityError::InvalidPda as u32, 1);
+        assert_eq!(AuthorityError::AuthorizationExpired as u32, 2);
+        assert_eq!(AuthorityError::InvalidZeroMaxAmount as u32, 3);
+        assert_eq!(AuthorityError::UnsupportedSchemaVersion as u32, 4);
+        assert_eq!(AuthorityError::InvalidActionType as u32, 5);
+        assert_eq!(AuthorityError::RevokeWrongUser as u32, 6);
+        assert_eq!(AuthorityError::CloseWrongUser as u32, 7);
+        assert_eq!(AuthorityError::NotCloseable as u32, 8);
+        // P2 ExecuteAction additions (append-only).
+        assert_eq!(AuthorityError::MissingExecutorSignature as u32, 9);
+        assert_eq!(AuthorityError::InvalidAuthorizationPda as u32, 10);
+        assert_eq!(AuthorityError::AuthorizationOwnerMismatch as u32, 11);
+        assert_eq!(AuthorityError::AuthorizationUserMismatch as u32, 12);
+        assert_eq!(AuthorityError::ExecutorMismatch as u32, 13);
+        assert_eq!(AuthorityError::RuleHashMismatch as u32, 14);
+        assert_eq!(AuthorityError::ActionTypeMismatch as u32, 15);
+        assert_eq!(AuthorityError::AuthorizationRevoked as u32, 16);
+        assert_eq!(AuthorityError::AuthorizationCompleted as u32, 17);
+        assert_eq!(AuthorityError::InputAmountZero as u32, 18);
+        assert_eq!(AuthorityError::InputAmountExceeded as u32, 19);
+        assert_eq!(AuthorityError::ExecutionNonceMismatch as u32, 20);
+        assert_eq!(AuthorityError::SameSlotReplay as u32, 21);
+        // P3 condition gate (append-only).
+        assert_eq!(AuthorityError::MissingConditionProof as u32, 22);
+        assert_eq!(AuthorityError::ConditionCountMismatch as u32, 23);
+        assert_eq!(AuthorityError::ConditionNotMet as u32, 24);
+        assert_eq!(AuthorityError::ConditionVerificationFailed as u32, 25);
+        assert_eq!(AuthorityError::PythSnapshotStale as u32, 26);
+        assert_eq!(AuthorityError::PythFeedIdMismatch as u32, 27);
+        assert_eq!(AuthorityError::PythVerificationLevelInsufficient as u32, 28);
+        assert_eq!(AuthorityError::PythConfidenceTooWide as u32, 29);
+        assert_eq!(AuthorityError::SolendFormulaVersionUnsupported as u32, 30);
+        assert_eq!(AuthorityError::SolendReserveStale as u32, 31);
+        // P4 Solend boundary (append-only).
+        assert_eq!(AuthorityError::SolendBoundaryProofMissing as u32, 32);
+        assert_eq!(AuthorityError::UnsupportedSolendAction as u32, 33);
+        assert_eq!(AuthorityError::SolendProgramMismatch as u32, 34);
+        assert_eq!(AuthorityError::SolendObligationOwnerMismatch as u32, 35);
+        assert_eq!(AuthorityError::SolendObligationAuthorityMismatch as u32, 36);
+        assert_eq!(AuthorityError::SolendMainWalletObligationRejected as u32, 37);
+        assert_eq!(AuthorityError::SolendReserveMismatch as u32, 38);
+        assert_eq!(AuthorityError::SolendLendingMarketMismatch as u32, 39);
+        assert_eq!(AuthorityError::SolendDestinationMismatch as u32, 40);
+        assert_eq!(AuthorityError::SolendRefreshMissing as u32, 41);
+        assert_eq!(AuthorityError::SolendWithdrawMissing as u32, 42);
+        assert_eq!(AuthorityError::SolendInstructionOrderInvalid as u32, 43);
+        assert_eq!(AuthorityError::SolendDuplicateOrConflictingInstruction as u32, 44);
+        assert_eq!(AuthorityError::SolendBoundaryVerificationFailed as u32, 45);
+        // J4 Jupiter boundary verifier (append-only).
+        assert_eq!(AuthorityError::JupiterBoundaryProofMissing as u32, 46);
+        assert_eq!(AuthorityError::JupiterBoundaryVerificationFailed as u32, 47);
+        assert_eq!(AuthorityError::JupiterIllegalSiblingInstruction as u32, 48);
+        assert_eq!(AuthorityError::JupiterInstructionOrderInvalid as u32, 49);
+        assert_eq!(AuthorityError::JupiterProgramIdMismatch as u32, 50);
+        assert_eq!(AuthorityError::JupiterUnexpectedWritableAccount as u32, 51);
+        assert_eq!(AuthorityError::JupiterDestinationMismatch as u32, 52);
+        assert_eq!(AuthorityError::JupiterTokenAccountInvalid as u32, 53);
+        assert_eq!(AuthorityError::JupiterMintMismatch as u32, 54);
+        // J4-reserved (deferred trustless balance bracket).
+        assert_eq!(AuthorityError::JupiterPostBalanceUnderflow as u32, 55);
+        assert_eq!(AuthorityError::JupiterBalanceDeltaTooSmall as u32, 56);
+        assert_eq!(AuthorityError::JupiterSiblingListTooLarge as u32, 57);
+        assert_eq!(AuthorityError::JupiterBracketCheckpointMissing as u32, 58);
+        assert_eq!(AuthorityError::JupiterBracketCheckpointConsumed as u32, 59);
+        // P5a Solend account decode + boundary hardening (append-only).
+        assert_eq!(AuthorityError::SolendAccountDataTooShort as u32, 60);
+        assert_eq!(AuthorityError::SolendAccountOwnerMismatch as u32, 61);
+        assert_eq!(AuthorityError::SolendObligationDecodeFailed as u32, 62);
+        assert_eq!(AuthorityError::SolendReserveDecodeFailed as u32, 63);
+        assert_eq!(AuthorityError::SolendUnsupportedObligationVersion as u32, 64);
+        assert_eq!(AuthorityError::SolendUnsupportedReserveVersion as u32, 65);
+        assert_eq!(AuthorityError::SolendObligationLendingMarketMismatch as u32, 66);
+        assert_eq!(AuthorityError::SolendReserveLendingMarketMismatch as u32, 67);
+        assert_eq!(AuthorityError::SolendLastUpdateSlotMismatch as u32, 68);
+        assert_eq!(AuthorityError::SolendTokenAccountOwnerMismatch as u32, 69);
+        assert_eq!(AuthorityError::SolendTokenAccountMintMismatch as u32, 70);
+        assert_eq!(AuthorityError::SolendTokenAccountAuthorityMismatch as u32, 71);
+        assert_eq!(AuthorityError::SolendTokenAccountInvalidLength as u32, 72);
+        // P5b-1 Solend CPI builder shadow-mapping (append-only).
+        assert_eq!(AuthorityError::SolendCpiAccountOrderInvalid as u32, 73);
+        assert_eq!(AuthorityError::SolendCpiSysvarMismatch as u32, 74);
+        assert_eq!(AuthorityError::SolendCpiTokenProgramMismatch as u32, 75);
+        assert_eq!(AuthorityError::SolendCpiZeroCollateralAmount as u32, 76);
+        assert_eq!(AuthorityError::SolendCpiOracleUnverified as u32, 77);
+        assert_eq!(AuthorityError::SolendCpiBuilderInvariantFailed as u32, 78);
+        // P5b-2 Solend CPI skeleton (append-only).
+        assert_eq!(AuthorityError::SolendCpiDelegatedWalletMissing as u32, 79);
+        assert_eq!(AuthorityError::SolendCpiDelegatedWalletNotSigner as u32, 80);
+        assert_eq!(AuthorityError::SolendCpiDelegatedWalletMismatch as u32, 81);
+        assert_eq!(AuthorityError::SolendCpiRefreshReserveFailed as u32, 82);
+        assert_eq!(AuthorityError::SolendCpiRefreshObligationFailed as u32, 83);
+        assert_eq!(AuthorityError::SolendCpiWithdrawFailed as u32, 84);
+        assert_eq!(AuthorityError::SolendCpiSuccessPathBlockedByOracleValidation as u32, 85);
+        assert_eq!(AuthorityError::SolendCpiInsufficientAccounts as u32, 86);
+        assert_eq!(AuthorityError::SolendCpiBorrowAcrossInvokeRisk as u32, 87);
+    }
+
+    #[test]
+    fn map_verifier_error_covers_every_variant() {
+        // If condition_verifier::VerifierError grows a new variant,
+        // the match in `map_verifier_error_to_authority_error` becomes
+        // non-exhaustive at compile time. This test additionally
+        // pins the runtime mapping so a renumbered AuthorityError
+        // discriminant fails loudly here too.
+        let cases = [
+            (
+                VerifierError::PythFeedIdMismatch,
+                AuthorityError::PythFeedIdMismatch,
+            ),
+            (
+                VerifierError::PythPriceTooOld,
+                AuthorityError::PythSnapshotStale,
+            ),
+            (
+                VerifierError::PythVerificationLevelInsufficient,
+                AuthorityError::PythVerificationLevelInsufficient,
+            ),
+            (
+                VerifierError::PythConfidenceTooWide,
+                AuthorityError::PythConfidenceTooWide,
+            ),
+            (
+                VerifierError::SolendFormulaVersionUnsupported,
+                AuthorityError::SolendFormulaVersionUnsupported,
+            ),
+            (
+                VerifierError::SolendReserveStale,
+                AuthorityError::SolendReserveStale,
+            ),
+            (
+                VerifierError::PythExponentOutOfRange,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::PythComputeOverflow,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::BoundDirectionMismatch,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::UnsupportedComparison,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::UnsupportedRateKind,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::SolendInvalidReserveConfig,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::SolendComputeOverflow,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+            (
+                VerifierError::SolendThresholdOverflow,
+                AuthorityError::ConditionVerificationFailed,
+            ),
+        ];
+        for (verr, expected) in cases {
+            let got = map_verifier_error_to_authority_error(verr);
+            assert_eq!(
+                got,
+                ProgramError::Custom(expected as u32),
+                "verifier {verr:?} -> {expected:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn pda_seeds_unchanged_from_p1() {
+        // Belt-and-braces guard that P2's processor still uses the same
+        // four-component seed list as P1. If the seed scheme changes,
+        // any deployed PDA becomes unreachable — fail loudly here long
+        // before that happens on chain.
+        let program_id = Pubkey::new_from_array([7u8; 32]);
+        let user = Pubkey::new_from_array([0x11; 32]);
+        let rule_id = [0x22u8; 16];
+        let (pda, _bump) = derive_authorization_pda(&program_id, 1, &user, &rule_id);
+
+        let schema_version_bytes = [1u8];
+        let manual_seeds: &[&[u8]] = &[
+            b"authz",
+            &schema_version_bytes,
+            user.as_ref(),
+            rule_id.as_ref(),
+        ];
+        let (manual_pda, _) = Pubkey::find_program_address(manual_seeds, &program_id);
+        assert_eq!(pda, manual_pda);
+        assert_eq!(AUTHZ_SEED_PREFIX, b"authz");
+    }
+}

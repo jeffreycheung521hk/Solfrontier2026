@@ -1,0 +1,917 @@
+"use client";
+
+// Stage 2 — `/stage2/live-demo` Phantom controlled-wallet funding UI.
+//
+// Lets the operator's connected Phantom wallet transfer EXACTLY 5
+// USDC into the controlled demo wallet
+// (`BPfDMmeMBmCbMC1rWh7hwigMBoKGBrKwXxSeUu9hhs5L`). This is the
+// reliable true-RPC demo moment for Stage 2 — the controlled wallet
+// is what the (future) automation watcher/executor will eventually
+// act on, scoped by construction to those funds only.
+//
+// HARD SAFETY upheld here:
+//   - No auto-send. Operator must click the button.
+//   - Phantom always shows the approval popup before signing.
+//   - No controlled-wallet keypair on the frontend (private keys
+//     live ONLY on the operator's filesystem).
+//   - No Solend live execution. No Jupiter conditional execution.
+//   - No arbitrary amount input — the amount is pinned at exactly
+//     5 USDC = 5_000_000 base units.
+//   - The page is gated behind `NEXT_PUBLIC_STAGE2_LIVE_DEMO=1`.
+//     Without that env var set, the page renders a disabled
+//     explanation and never builds a transaction.
+//   - Disabled when not connected, or when balance < 5 USDC, or
+//     when the connected wallet equals the controlled wallet (no
+//     self-funding loops without explicit user override).
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+import { Connection, PublicKey } from "@solana/web3.js";
+import type { Transaction } from "@solana/web3.js";
+
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
+import { WalletConnect } from "@/components/wallet-connect";
+import { shortPubkey } from "@/lib/format";
+import { getPhantomProvider } from "@/lib/phantom";
+import {
+  CONTROLLED_WALLET_BASE58,
+  FUNDING_AMOUNT_BASE_UNITS,
+  FUNDING_AMOUNT_UI_LABEL,
+  LAST_SUCCESSFUL_FUNDING_SIGNATURE,
+  LAST_SUCCESSFUL_FUNDING_SLOT,
+  MAX_POLL_ATTEMPTS_DEFAULT,
+  POLL_INTERVAL_MS_DEFAULT,
+  SignatureStatusNetworkError,
+  USDC_DECIMALS,
+  USDC_MINT_BASE58,
+  buildFundingTransaction,
+  deriveAtaPubkey,
+  formatUsdcBaseUnits,
+  pollSignatureStatus,
+  solscanTxUrl,
+} from "@/lib/stage2-funding";
+
+// ── Env gates ────────────────────────────────────────────────────────────
+
+const LIVE_DEMO_ENABLED =
+  process.env.NEXT_PUBLIC_STAGE2_LIVE_DEMO === "1";
+
+/// Public RPC endpoint. Operator can override to a Helius / Triton
+/// URL via `NEXT_PUBLIC_SOLANA_RPC_URL`; any value set here is
+/// browser-visible so DO NOT include an API key the operator wouldn't
+/// already accept exposing.
+const SOLANA_RPC_URL =
+  process.env.NEXT_PUBLIC_SOLANA_RPC_URL ??
+  "https://api.mainnet-beta.solana.com";
+
+const CLUSTER_LABEL = "mainnet-beta";
+
+// ── Funding-attempt state machine ────────────────────────────────────────
+
+type FundingState =
+  | { kind: "idle" }
+  | { kind: "preparing" }
+  | { kind: "awaiting_signature" }
+  | { kind: "broadcasting" }
+  /// Right after sendRawTransaction returns. The signature is on the
+  /// wire — show signature + Solscan link immediately so the user
+  /// has the proof they can verify externally even if our poll
+  /// later times out.
+  | { kind: "submitted"; signature: string }
+  /// Polling getSignatureStatuses with searchTransactionHistory:true.
+  /// `attempts` drives both the "attempt N of M" UI label and the
+  /// "switch headline to 'Confirmation delayed'" timing (after the
+  /// first few seconds).
+  | { kind: "confirming"; signature: string; attempts: number }
+  | { kind: "finalized"; signature: string }
+  /// `signature` is optional because some pre-broadcast errors
+  /// (e.g. RPC blockhash fetch failure, Phantom rejection) never
+  /// produce a signature.
+  | { kind: "error"; reason: string; signature?: string };
+
+interface SourceAccount {
+  pubkey: PublicKey;
+  /** Source USDC ATA derived from `(connected, USDC_MINT)`. */
+  ata: PublicKey;
+  /** Balance in raw u64 base units. `null` while loading or if the
+   *  ATA does not exist on chain. */
+  balance_base_units: bigint | null;
+  /** True iff `getAccountInfo(ata) !== null`. When false, the user
+   *  has no USDC on this wallet. */
+  ata_exists: boolean;
+}
+
+export default function Stage2LiveDemoPage() {
+  // The page renders a disabled explanation when the env gate is off
+  // so we never build / submit a transaction outside of an explicit
+  // operator opt-in.
+  if (!LIVE_DEMO_ENABLED) {
+    return <EnvGateOffPanel />;
+  }
+  return <LiveDemoBody />;
+}
+
+// ── Disabled / env-gate-off panel ────────────────────────────────────────
+
+function EnvGateOffPanel() {
+  return (
+    <div className="space-y-6">
+      <header className="space-y-1">
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">
+          Stage 2 live demo
+        </div>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          Controlled wallet funding
+        </h1>
+      </header>
+      <Alert>
+        <AlertTitle className="text-sm">Live demo gated off</AlertTitle>
+        <AlertDescription className="text-xs space-y-2">
+          <span className="block">
+            This page transfers <strong>real USDC on mainnet</strong> and is
+            therefore gated behind the explicit env var{" "}
+            <code>NEXT_PUBLIC_STAGE2_LIVE_DEMO=1</code>. The current build did
+            not set the gate; no transaction can be built or sent from this
+            session.
+          </span>
+          <span className="block text-muted-foreground">
+            To enable: stop the dev server, set{" "}
+            <code>NEXT_PUBLIC_STAGE2_LIVE_DEMO=1</code> in{" "}
+            <code>frontend/.env.local</code>, restart{" "}
+            <code>npm run dev</code>, and reload this page.
+          </span>
+        </AlertDescription>
+      </Alert>
+    </div>
+  );
+}
+
+// ── Live demo body ───────────────────────────────────────────────────────
+
+function LiveDemoBody() {
+  const [walletPubkey, setWalletPubkey] = useState<string | null>(null);
+  const [source, setSource] = useState<SourceAccount | null>(null);
+  const [destinationAta, setDestinationAta] = useState<PublicKey | null>(null);
+  const [destinationAtaExists, setDestinationAtaExists] = useState<
+    boolean | null
+  >(null);
+  const [loadingBalance, setLoadingBalance] = useState(false);
+  const [state, setState] = useState<FundingState>({ kind: "idle" });
+  const [overrideSelfFunding, setOverrideSelfFunding] = useState(false);
+
+  // Single Connection per page lifetime — JSON-RPC GET-style helpers
+  // only. We never sign or broadcast from this object directly; the
+  // signed tx is sent via `sendRawTransaction` in `handleFund`.
+  const connection = useMemo(
+    () => new Connection(SOLANA_RPC_URL, "confirmed"),
+    [],
+  );
+
+  // ── ATA derivation on wallet change ───────────────────────────────────
+  useEffect(() => {
+    if (walletPubkey === null) {
+      setSource(null);
+      setDestinationAta(null);
+      setDestinationAtaExists(null);
+      return;
+    }
+    try {
+      const payer = new PublicKey(walletPubkey);
+      const usdcMint = new PublicKey(USDC_MINT_BASE58);
+      const controlled = new PublicKey(CONTROLLED_WALLET_BASE58);
+      const sourceAta = deriveAtaPubkey(payer, usdcMint);
+      const destAta = deriveAtaPubkey(controlled, usdcMint);
+      setSource({
+        pubkey: payer,
+        ata: sourceAta,
+        balance_base_units: null,
+        ata_exists: false,
+      });
+      setDestinationAta(destAta);
+    } catch (err) {
+      setState({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `wallet pubkey parse failed: ${err.message}`
+            : "wallet pubkey parse failed",
+      });
+    }
+  }, [walletPubkey]);
+
+  // ── Balance + destination-ATA-exists fetch ────────────────────────────
+  const refreshBalances = useCallback(async () => {
+    if (source === null || destinationAta === null) return;
+    setLoadingBalance(true);
+    try {
+      // Source: getTokenAccountBalance. Throws when the ATA does not
+      // exist — we catch and treat as "balance = 0, ata_exists = false".
+      let balance_base_units: bigint | null = null;
+      let ata_exists = false;
+      try {
+        const r = await connection.getTokenAccountBalance(
+          source.ata,
+          "confirmed",
+        );
+        // `r.value.amount` is a base-unit decimal string.
+        balance_base_units = BigInt(r.value.amount);
+        ata_exists = true;
+      } catch {
+        balance_base_units = BigInt(0);
+        ata_exists = false;
+      }
+      // Destination ATA: just check whether the account info exists.
+      // If it doesn't, we'll include the idempotent create-ATA ix.
+      const destInfo = await connection.getAccountInfo(
+        destinationAta,
+        "confirmed",
+      );
+      setDestinationAtaExists(destInfo !== null);
+      setSource((prev) =>
+        prev === null
+          ? prev
+          : { ...prev, balance_base_units, ata_exists },
+      );
+    } catch (err) {
+      setState({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `RPC balance lookup failed: ${err.message}`
+            : "RPC balance lookup failed",
+      });
+    } finally {
+      setLoadingBalance(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source?.pubkey?.toBase58(), destinationAta?.toBase58()]);
+
+  useEffect(() => {
+    void refreshBalances();
+  }, [refreshBalances]);
+
+  // ── Disable-state derivation ──────────────────────────────────────────
+  const isSelfFunding =
+    walletPubkey !== null &&
+    walletPubkey === CONTROLLED_WALLET_BASE58;
+  const balanceSufficient =
+    source !== null &&
+    source.balance_base_units !== null &&
+    source.balance_base_units >= FUNDING_AMOUNT_BASE_UNITS;
+
+  const inFlight =
+    state.kind === "preparing" ||
+    state.kind === "awaiting_signature" ||
+    state.kind === "broadcasting" ||
+    state.kind === "submitted" ||
+    state.kind === "confirming";
+
+  const disabled =
+    inFlight ||
+    walletPubkey === null ||
+    source === null ||
+    destinationAta === null ||
+    loadingBalance ||
+    !balanceSufficient ||
+    (isSelfFunding && !overrideSelfFunding);
+
+  // ── Fund handler ──────────────────────────────────────────────────────
+  const handleFund = useCallback(async () => {
+    if (source === null || destinationAta === null) return;
+    if (!balanceSufficient) return;
+    if (isSelfFunding && !overrideSelfFunding) return;
+
+    setState({ kind: "preparing" });
+
+    // 1. Get a recent blockhash.
+    let blockhash: string;
+    try {
+      const { blockhash: bh } = await connection.getLatestBlockhash(
+        "confirmed",
+      );
+      blockhash = bh;
+    } catch (err) {
+      setState({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `RPC blockhash fetch failed: ${err.message}`
+            : "RPC blockhash fetch failed",
+      });
+      return;
+    }
+
+    // 2. Build the unsigned transaction.
+    let tx: Transaction;
+    try {
+      tx = buildFundingTransaction({
+        payer: source.pubkey,
+        sourceAta: source.ata,
+        destinationAta,
+        // Idempotent — safe to include unconditionally; succeeds if
+        // the ATA already exists. We still surface to the operator
+        // whether it pre-existed so they understand the transaction
+        // they're approving.
+        includeCreateAta: true,
+        recentBlockhash: blockhash,
+      });
+    } catch (err) {
+      setState({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `tx build failed: ${err.message}`
+            : "tx build failed",
+      });
+      return;
+    }
+
+    // 3. Phantom signs (popup). Phantom only signs the payer slot;
+    //    nothing else in this transaction has signer flag set.
+    const provider = getPhantomProvider();
+    if (!provider) {
+      setState({
+        kind: "error",
+        reason: "Phantom provider not detected — please connect first.",
+      });
+      return;
+    }
+    setState({ kind: "awaiting_signature" });
+    let signedTx: Transaction;
+    try {
+      signedTx = await provider.signTransaction(tx);
+    } catch (err) {
+      setState({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `Phantom rejected / signing failed: ${err.message}`
+            : "Phantom rejected / signing failed",
+      });
+      return;
+    }
+
+    // 4. Submit signed bytes via JSON-RPC.
+    setState({ kind: "broadcasting" });
+    let signature: string;
+    try {
+      const raw = signedTx.serialize();
+      signature = await connection.sendRawTransaction(raw, {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+      });
+    } catch (err) {
+      setState({
+        kind: "error",
+        reason:
+          err instanceof Error
+            ? `RPC send failed: ${err.message}`
+            : "RPC send failed",
+      });
+      return;
+    }
+
+    // 5. Submitted — bytes are on the wire. Show the signature
+    //    immediately so the operator can verify on Solscan even if
+    //    the poll below times out.
+    setState({ kind: "submitted", signature });
+
+    // 6. Confirm via getSignatureStatuses polling.
+    //    Replaces the old `confirmTransaction({ blockhash,
+    //    lastValidBlockHeight: 0 }, ...)` path that raised
+    //    "block height exceeded" before late-landing txs finalized.
+    //    The poller uses `searchTransactionHistory: true` so a
+    //    signature that landed AFTER its blockhash window expired
+    //    is still observed and reported as `finalized`.
+    //    Reference: tx 5RWXZh…r6Px9 (slot 418961171, err=None) —
+    //    finalized cleanly on mainnet but the OLD path gave up at
+    //    block-height-exceeded BEFORE the tx landed.
+    try {
+      const result = await pollSignatureStatus(connection, signature, {
+        maxAttempts: MAX_POLL_ATTEMPTS_DEFAULT,
+        intervalMs: POLL_INTERVAL_MS_DEFAULT,
+        onAttempt: (n) => {
+          setState({ kind: "confirming", signature, attempts: n });
+        },
+      });
+      if (result.kind === "finalized") {
+        setState({ kind: "finalized", signature });
+        // Refresh balances so the UI shows the new state.
+        void refreshBalances();
+      } else if (result.kind === "failed_on_chain") {
+        setState({
+          kind: "error",
+          reason: `Transaction failed on chain: ${JSON.stringify(result.err)}`,
+          signature,
+        });
+      } else {
+        // timeout — the tx MAY still land; we just stopped polling.
+        // Keep the signature visible so the operator can verify on
+        // Solscan. UI renders this red per the demo-polish spec
+        // ("true errors red only when status.err is non-null or
+        // polling times out"), but the body copy makes the
+        // "may still land" caveat explicit so the operator does not
+        // assume the funds were lost.
+        setState({
+          kind: "error",
+          reason:
+            `Confirmation timeout after ${(MAX_POLL_ATTEMPTS_DEFAULT * POLL_INTERVAL_MS_DEFAULT) / 1000}s. ` +
+            "The tx may still land — verify on Solscan.",
+          signature,
+        });
+      }
+    } catch (err) {
+      if (err instanceof SignatureStatusNetworkError) {
+        setState({
+          kind: "error",
+          reason: "Network error polling status; verify on Solscan.",
+          signature,
+        });
+        return;
+      }
+      throw err;
+    }
+  }, [
+    balanceSufficient,
+    connection,
+    destinationAta,
+    isSelfFunding,
+    overrideSelfFunding,
+    refreshBalances,
+    source,
+  ]);
+
+  // ── Render ────────────────────────────────────────────────────────────
+  return (
+    <div className="space-y-6">
+      <header className="space-y-1">
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">
+          Stage 2 live demo
+        </div>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          Controlled wallet funding
+        </h1>
+        <div className="flex items-center gap-3 text-sm text-muted-foreground flex-wrap">
+          <Badge variant="default">{CLUSTER_LABEL}</Badge>
+          <span>·</span>
+          <Badge variant="outline">live mainnet · 5 USDC</Badge>
+          <span className="ml-auto">
+            <WalletConnect onChange={setWalletPubkey} />
+          </span>
+        </div>
+      </header>
+
+      <Alert className="border-amber-500/40">
+        <AlertTitle className="text-sm">Read this before you sign</AlertTitle>
+        <AlertDescription className="text-xs">
+          This transfers exactly <strong>5 USDC</strong> from your connected
+          wallet into a controlled demo wallet. Automation can only act on
+          funds inside that controlled wallet — your main wallet is never
+          delegated. No Solend / Jupiter execution is triggered from this
+          page; the only outbound action is the SPL Token transfer you
+          approve in Phantom.
+        </AlertDescription>
+      </Alert>
+
+      <LastSuccessfulFundingPanel />
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-medium">
+            Funding parameters
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-1 text-xs">
+          <KeyValueRow
+            k="cluster"
+            v={<span className="font-mono text-foreground">{CLUSTER_LABEL}</span>}
+          />
+          <KeyValueRow
+            k="connected wallet"
+            v={
+              walletPubkey === null ? (
+                <span className="text-muted-foreground italic">
+                  not connected
+                </span>
+              ) : (
+                <code className="font-mono text-foreground">
+                  {shortPubkey(walletPubkey, 6)}
+                </code>
+              )
+            }
+          />
+          <KeyValueRow
+            k="controlled wallet"
+            v={
+              <code className="font-mono text-foreground">
+                {shortPubkey(CONTROLLED_WALLET_BASE58, 6)}
+              </code>
+            }
+          />
+          <KeyValueRow
+            k="USDC mint"
+            v={
+              <code className="font-mono text-muted-foreground">
+                {shortPubkey(USDC_MINT_BASE58, 6)}
+              </code>
+            }
+          />
+          <KeyValueRow
+            k="source ATA"
+            v={
+              source === null ? (
+                <span className="text-muted-foreground italic">
+                  derived from connected wallet
+                </span>
+              ) : (
+                <code className="font-mono text-muted-foreground">
+                  {shortPubkey(source.ata.toBase58(), 6)}
+                </code>
+              )
+            }
+          />
+          <KeyValueRow
+            k="destination ATA"
+            v={
+              destinationAta === null ? (
+                <span className="text-muted-foreground italic">—</span>
+              ) : (
+                <span>
+                  <code className="font-mono text-muted-foreground">
+                    {shortPubkey(destinationAta.toBase58(), 6)}
+                  </code>
+                  {destinationAtaExists === false && (
+                    <span className="ml-2 text-amber-600">
+                      (will be created — idempotent)
+                    </span>
+                  )}
+                  {destinationAtaExists === true && (
+                    <span className="ml-2 text-muted-foreground">
+                      (already exists)
+                    </span>
+                  )}
+                </span>
+              )
+            }
+          />
+          <KeyValueRow
+            k="amount"
+            v={
+              <span>
+                <span className="font-mono text-foreground">
+                  {FUNDING_AMOUNT_UI_LABEL}
+                </span>
+                <span className="ml-2 text-muted-foreground">
+                  ({FUNDING_AMOUNT_BASE_UNITS.toString()} base units)
+                </span>
+              </span>
+            }
+          />
+          <KeyValueRow
+            k="your USDC balance"
+            v={
+              source === null || source.balance_base_units === null ? (
+                <span className="text-muted-foreground italic">
+                  {loadingBalance ? "loading…" : "connect to load"}
+                </span>
+              ) : (
+                <span
+                  className={`font-mono ${
+                    balanceSufficient
+                      ? "text-foreground"
+                      : "text-destructive font-semibold"
+                  }`}
+                >
+                  {formatUsdcBaseUnits(source.balance_base_units)}
+                </span>
+              )
+            }
+          />
+          <KeyValueRow
+            k="decimals"
+            v={
+              <span className="font-mono text-muted-foreground">
+                {USDC_DECIMALS}
+              </span>
+            }
+          />
+          <KeyValueRow
+            k="instruction"
+            v={
+              <span className="font-mono text-foreground">
+                TransferChecked (+ idempotent CreateAta if needed)
+              </span>
+            }
+          />
+        </CardContent>
+      </Card>
+
+      {isSelfFunding && (
+        <Alert variant="destructive" data-testid="self-funding-warning">
+          <AlertTitle className="text-sm">
+            Connected wallet equals controlled wallet
+          </AlertTitle>
+          <AlertDescription className="text-xs space-y-2">
+            <span className="block">
+              The connected Phantom wallet is the SAME as the controlled
+              demo wallet. Funding it from itself is a no-op — and almost
+              certainly means you connected the wrong Phantom account.
+            </span>
+            <label className="flex items-center gap-2 text-foreground">
+              <input
+                type="checkbox"
+                checked={overrideSelfFunding}
+                onChange={(e) => setOverrideSelfFunding(e.target.checked)}
+                data-testid="self-funding-override"
+              />
+              <span>
+                I understand and want to proceed anyway (explicit override).
+              </span>
+            </label>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {(state.kind === "submitted" ||
+        state.kind === "confirming" ||
+        state.kind === "finalized" ||
+        (state.kind === "error" && state.signature !== undefined)) && (
+        <SignaturePanel state={state} />
+      )}
+
+      {/* Pre-broadcast errors (no signature) get the plain red banner
+          since the user has nothing to verify on Solscan. */}
+      {state.kind === "error" && state.signature === undefined && (
+        <Alert variant="destructive">
+          <AlertTitle className="text-sm">Funding error</AlertTitle>
+          <AlertDescription className="text-xs break-words">
+            {state.reason}
+          </AlertDescription>
+        </Alert>
+      )}
+
+      <Separator />
+
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={() => void refreshBalances()}
+          disabled={source === null || loadingBalance}
+          data-testid="refresh-balance"
+        >
+          {loadingBalance ? "Refreshing…" : "Refresh balance"}
+        </Button>
+        <Button
+          type="button"
+          onClick={() => void handleFund()}
+          disabled={disabled}
+          aria-busy={inFlight}
+          data-testid="fund-controlled-wallet-button"
+        >
+          {state.kind === "preparing"
+            ? "Preparing…"
+            : state.kind === "awaiting_signature"
+              ? "Awaiting Phantom…"
+              : state.kind === "broadcasting"
+                ? "Broadcasting…"
+                : state.kind === "submitted"
+                  ? "Submitted, confirming…"
+                  : state.kind === "confirming"
+                    ? `Confirming… (attempt ${state.attempts}/${MAX_POLL_ATTEMPTS_DEFAULT})`
+                    : state.kind === "finalized"
+                      ? "Funded ✓"
+                      : "Fund Controlled Wallet (5 USDC)"}
+        </Button>
+      </div>
+
+      <div className="text-[11px] text-muted-foreground italic">
+        Phantom will show its standard approval popup. You sign one
+        transaction — a TransferChecked of 5 USDC. No Solend, Jupiter, or
+        automation action is initiated from this page.
+      </div>
+    </div>
+  );
+}
+
+// ── Sub-components ───────────────────────────────────────────────────────
+
+/// Read-only "Last successful funding tx" card.
+///
+/// Shows the empirical mainnet proof that the page's exact instruction
+/// layout (TransferChecked tag 12 + optional CreateIdempotent ATA)
+/// finalizes cleanly. This is a STATIC display — no RPC call is made
+/// to verify it on render; the signature + slot + err shape are
+/// pinned at module level (`LAST_SUCCESSFUL_FUNDING_SIGNATURE`,
+/// `LAST_SUCCESSFUL_FUNDING_SLOT`). The operator/audience can click
+/// the Solscan link to verify out-of-band.
+function LastSuccessfulFundingPanel() {
+  const sig = LAST_SUCCESSFUL_FUNDING_SIGNATURE;
+  return (
+    <Card
+      className="border-green-500/40"
+      data-testid="last-funding-tx-panel"
+    >
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm font-medium flex items-center gap-2">
+          <span>Last successful funding tx</span>
+          <Badge
+            variant="outline"
+            className="border-green-500/60 bg-green-500/10 text-green-700 dark:text-green-400"
+            data-testid="last-funding-tx-finalized-badge"
+          >
+            Finalized
+          </Badge>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-1 text-xs">
+        <KeyValueRow
+          k="tx"
+          v={
+            <a
+              href={solscanTxUrl(sig)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-mono text-foreground underline hover:no-underline break-all"
+              data-testid="last-funding-tx-solscan-link"
+            >
+              {sig.slice(0, 12)}…{sig.slice(-8)}
+            </a>
+          }
+        />
+        <KeyValueRow
+          k="slot"
+          v={
+            <span className="font-mono text-muted-foreground">
+              {LAST_SUCCESSFUL_FUNDING_SLOT.toLocaleString()}
+            </span>
+          }
+        />
+        <KeyValueRow
+          k="on-chain err"
+          v={<span className="font-mono text-muted-foreground">None</span>}
+        />
+        <div className="pt-2 text-[11px] text-muted-foreground">
+          Empirical proof on mainnet that this page&apos;s instruction layout
+          (TransferChecked + idempotent CreateAta) finalizes cleanly. Read-only
+          display — no transaction is sent on render.
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/// Threshold (in poll attempts) past which we promote the
+/// "submitted" headline to "Confirmation delayed". At
+/// POLL_INTERVAL_MS_DEFAULT = 2 000 ms this is ≈ 5 s after the
+/// first poll fires — matches the prompt's "after the first 5
+/// seconds" guidance.
+const CONFIRMATION_DELAYED_AFTER_ATTEMPTS = 3;
+
+function SignaturePanel({
+  state,
+}: {
+  state:
+    | { kind: "submitted"; signature: string }
+    | { kind: "confirming"; signature: string; attempts: number }
+    | { kind: "finalized"; signature: string }
+    | { kind: "error"; reason: string; signature?: string };
+}) {
+  const meta = panelMeta(state);
+  return (
+    <Alert
+      className={meta.borderClass}
+      data-testid={`funding-${state.kind}${
+        state.kind === "error"
+          ? meta.errorVariant === "on_chain"
+            ? "-failed-on-chain"
+            : meta.errorVariant === "timeout"
+              ? "-timeout"
+              : "-network"
+          : ""
+      }`}
+    >
+      <AlertTitle className="text-sm">{meta.headline}</AlertTitle>
+      <AlertDescription className="text-xs space-y-1">
+        <div>
+          tx{" "}
+          {state.signature !== undefined ? (
+            <a
+              href={solscanTxUrl(state.signature)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-mono underline hover:text-foreground"
+              data-testid="solscan-link"
+            >
+              {state.signature.slice(0, 8)}…{state.signature.slice(-6)}
+            </a>
+          ) : (
+            <span className="text-muted-foreground italic">—</span>
+          )}
+        </div>
+        {meta.body && (
+          <div className="text-muted-foreground">{meta.body}</div>
+        )}
+      </AlertDescription>
+    </Alert>
+  );
+}
+
+interface PanelMeta {
+  headline: string;
+  body: string | null;
+  borderClass: string;
+  /** Only set when `state.kind === "error"`; drives data-testid. */
+  errorVariant?: "on_chain" | "timeout" | "network";
+}
+
+function panelMeta(state: {
+  kind: "submitted" | "confirming" | "finalized" | "error";
+  signature?: string;
+  reason?: string;
+  attempts?: number;
+}): PanelMeta {
+  if (state.kind === "submitted") {
+    return {
+      headline: "Transaction submitted",
+      body:
+        "Signed bytes are on the wire. The frontend is now polling " +
+        "getSignatureStatuses with searchTransactionHistory enabled — " +
+        "this will observe finalization even if the blockhash window expires.",
+      // Neutral / amber — NOT red, NOT green. Not a failure.
+      borderClass: "border-amber-500/40",
+    };
+  }
+  if (state.kind === "confirming") {
+    const attempts = state.attempts ?? 0;
+    const delayed = attempts > CONFIRMATION_DELAYED_AFTER_ATTEMPTS;
+    return {
+      headline: delayed
+        ? "Confirmation delayed — checking chain status"
+        : "Transaction submitted",
+      body: `Polling getSignatureStatuses… attempt ${attempts} of ${MAX_POLL_ATTEMPTS_DEFAULT}`,
+      borderClass: "border-amber-500/40",
+    };
+  }
+  if (state.kind === "finalized") {
+    return {
+      headline: "Finalized on mainnet",
+      body:
+        `${FUNDING_AMOUNT_UI_LABEL} moved to the controlled wallet. ` +
+        "Automation may act only on this wallet's funds; your main wallet is untouched.",
+      borderClass: "border-green-500/40",
+    };
+  }
+  // state.kind === "error" (signature defined → render via panel).
+  //
+  // Per the prompt's UX rule: red is reserved for "true errors" —
+  // status.err non-null (on-chain failure) AND confirmation timeout.
+  // Transient RPC throws are amber because the tx may still land.
+  const reason = state.reason ?? "Funding error.";
+  if (/^Transaction failed on chain/i.test(reason)) {
+    return {
+      headline: "Transaction failed on chain",
+      body: reason.replace(/^Transaction failed on chain:\s*/i, ""),
+      borderClass: "border-destructive/40",
+      errorVariant: "on_chain",
+    };
+  }
+  if (/^Confirmation timeout/i.test(reason)) {
+    return {
+      headline: "Confirmation timeout",
+      body:
+        "Waited past the poll cap without seeing the tx confirm on chain. " +
+        "Verify on Solscan — if the tx finalized after the cap, the funds " +
+        "moved despite this banner.",
+      // Red — counted as a true error per the new UX rule. The
+      // Solscan link below the headline lets the operator verify
+      // out-of-band.
+      borderClass: "border-destructive/40",
+      errorVariant: "timeout",
+    };
+  }
+  // Fallback: network error during polling (> 3 consecutive RPC
+  // throws). The tx may still land — amber, not red.
+  return {
+    headline: "Network error during confirmation",
+    body:
+      "Could not reach the RPC endpoint while polling. " +
+      "The signed tx is on the wire — verify on Solscan.",
+    borderClass: "border-amber-500/40",
+    errorVariant: "network",
+  };
+}
+
+function KeyValueRow({ k, v }: { k: string; v: React.ReactNode }) {
+  return (
+    <div className="flex items-baseline gap-3">
+      <span className="text-muted-foreground min-w-[140px]">{k}</span>
+      <span className="flex-1 break-all">{v}</span>
+    </div>
+  );
+}

@@ -1,0 +1,115 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/types",
+    "crates/observability",
+    "crates/state-store",
+    "crates/solana-core",
+    "crates/wallet-engine",
+    "crates/risk-engine",
+    "crates/tool-system",
+    "crates/agent-runtime",
+    "crates/channels",
+    "crates/api",
+    "crates/gateway",
+    "bins/clawd",
+    "bins/claw",
+    "bins/keygen",
+    "bins/sign-pending",
+    "programs/clawsol-intent",
+    "programs/clawsol-authority",
+]
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2021"
+authors    = ["ClawSolana Contributors"]
+license    = "MIT"
+repository = "https://github.com/your-org/clawsolana"
+
+[workspace.dependencies]
+# async runtime
+tokio        = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1" }
+
+# web / gRPC
+axum         = { version = "0.7", features = ["ws", "macros"] }
+tower        = { version = "0.4" }
+tower-http   = { version = "0.5", features = ["trace", "cors", "auth"] }
+
+# serialization
+serde        = { version = "1", features = ["derive"] }
+serde_json   = { version = "1" }
+schemars     = { version = "0.8", features = ["uuid1"] }
+toml         = { version = "0.8" }
+
+# error handling
+anyhow       = { version = "1" }
+thiserror    = { version = "1" }
+
+# logging / tracing
+tracing                    = { version = "0.1" }
+tracing-subscriber         = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry      = { version = "0.22" }
+
+# database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "uuid", "chrono", "macros"], default-features = false }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# identity / time
+uuid     = { version = "1", features = ["v4", "serde"] }
+chrono   = { version = "0.4", features = ["serde"] }
+
+# crypto / keys
+ed25519-dalek = { version = "2" }
+rand          = { version = "0.8" }
+
+# Solana  (pinned to 2.1.x series which supports Rust 1.86)
+solana-sdk             = { version = "=2.1.21" }
+solana-client          = { version = "=2.1.21" }
+solana-transaction-status = { version = "=2.1.21" }
+solana-account-decoder = { version = "=2.1.21" }
+solana-pubsub-client   = { version = "=2.1.21" }
+spl-token              = { version = "7", features = ["no-entrypoint"] }
+spl-token-2022         = { version = "7", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "6", features = ["no-entrypoint"] }
+
+# HTTP client (for LLM calls)
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+
+# encoding
+base64    = { version = "0.21" }
+hex       = { version = "0.4" }
+bs58      = { version = "0.5" }
+bincode   = { version = "1" }
+futures   = { version = "0.3" }
+async-trait = { version = "0.1" }
+dashmap   = { version = "5" }
+parking_lot = { version = "0.12" }
+
+# workspace crates
+claw-types        = { path = "crates/types" }
+claw-observability = { path = "crates/observability" }
+claw-state-store  = { path = "crates/state-store" }
+claw-solana-core  = { path = "crates/solana-core" }
+claw-wallet-engine = { path = "crates/wallet-engine" }
+claw-risk-engine  = { path = "crates/risk-engine" }
+claw-tool-system  = { path = "crates/tool-system" }
+claw-agent-runtime = { path = "crates/agent-runtime" }
+claw-channels     = { path = "crates/channels" }
+claw-api          = { path = "crates/api" }
+claw-gateway      = { path = "crates/gateway" }
+clawsol-intent    = { path = "programs/clawsol-intent" }
+clawsol-authority = { path = "programs/clawsol-authority" }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true
+
+[profile.dev]
+opt-level = 0
+debug     = true

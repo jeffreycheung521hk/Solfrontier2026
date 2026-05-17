@@ -1,0 +1,37 @@
+[package]
+name        = "clawsol-intent"
+description = "ClawSolana canonical intent recording program (Stage 1 Tail). Tamper-evident only; not action-enforcing."
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name       = "clawsol_intent"
+
+[features]
+# Suppress the on-chain entrypoint when consuming this crate purely as a
+# library (e.g. for off-chain PDA derivation, fixture builders, or tests
+# that exercise multiple programs in the same process).
+no-entrypoint = []
+
+[dependencies]
+solana-program = "=2.1.21"
+borsh          = { version = "1", features = ["derive"] }
+thiserror      = { workspace = true }
+
+[dev-dependencies]
+solana-program-test = "=2.1.21"
+solana-sdk          = { workspace = true }
+tokio               = { workspace = true }
+borsh               = { version = "1", features = ["derive"] }
+# Stage 1 Tail convergence test only — proves that
+# `claw_types::canonical_intent::canonical_hash` (sha2 SHA-256) and
+# `solana_program::hash::hashv` (also SHA-256) produce byte-identical
+# 32-byte outputs for the three canonical fixtures.
+# DEV dependency by design: production program builds (the on-chain
+# BPF target) do NOT pull in the gateway-side type system.
+claw-types          = { workspace = true }
+hex                 = { workspace = true }

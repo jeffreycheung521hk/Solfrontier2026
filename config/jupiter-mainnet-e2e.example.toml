@@ -1,0 +1,149 @@
+# ClawSolana — Jupiter JIT Phase 1 / A1 demo policy profile
+#
+# PURPOSE
+# -------
+# This file is the Phase A1 live-validation / demo profile, and nothing else.
+# It drives the Jupiter JIT path against LIVE api.jup.ag endpoints and
+# MAINNET RPC — the single scenario devnet cannot cover (Jupiter does not
+# index devnet liquidity).
+#
+# This is NOT a general development configuration. Do NOT copy this file to
+# `claw.toml` for day-to-day work. The default config (`config/default.toml`)
+# is devnet + Jupiter-disabled by design.
+#
+# CONTROL-PLANE POSTURE (kept)
+# ----------------------------
+# Approval is NOT pulled out. The existing `SwapPolicyConfig` still owns
+# the decision:
+#
+#   - Amount within `max_input_amount`     → Approved (auto)
+#   - Amount over `max_input_amount`       → RequiresHumanApproval
+#                                            (requires `required_approver_role` token)
+#   - Slippage over `max_slippage_bps`     → Rejected (hard block)
+#   - Mint outside allow-list               → Rejected (hard block)
+#
+# For the A1 demo target (wSOL → USDC at 0.001 SOL, 100 bps slippage), the
+# verdict is Approved — i.e. small-amount auto-approve, which is the intent.
+# The caps below are what make that safe.
+#
+# SAFETY POSTURE
+# --------------
+# - `enabled = false` by default. Live validation runs MUST flip this
+#   explicitly. Accidental daemon starts do NOT fire Jupiter.
+# - `max_input_amount = 5_000_000` = 0.005 SOL upper bound when SOL is the
+#   input token. The A1 demo target is 0.001 SOL (1,000,000 lamports),
+#   comfortably inside. Anything above the cap falls through to the
+#   human-approval branch under `required_approver_role`, rather than being
+#   silently approved.
+# - Mint allowlists restrict the tool to SOL ↔ USDC only. Any other pair is
+#   rejected at the intent layer before touching Jupiter.
+# - `max_slippage_bps = 100` (1 %). Tighter than this is fine; looser is not.
+#
+# Never commit a file with a real API key or keypair material. Populate the
+# LLM API key from `CLAW_LLM_API_KEY` at run time, and the signing wallet
+# from an OS-level keystore or external Phantom wallet.
+
+# ── Daemon ─────────────────────────────────────────────────────────────────
+[daemon]
+db_path = "./data/claw-mainnet-e2e.db"
+terminal_retention_days = 14
+terminal_purge_interval_hours = 6
+
+# ── Network ────────────────────────────────────────────────────────────────
+# MAINNET. Set here so we inherit mainnet_safe_defaults at the policy layer.
+[network]
+network = "mainnet-beta"
+
+# ── RPC ────────────────────────────────────────────────────────────────────
+# Public mainnet RPC is fine for validation runs. For sustained production
+# traffic, point at a dedicated RPC provider (Helius, Triton, QuickNode).
+[rpc]
+primary_url = "https://api.mainnet-beta.solana.com"
+fallback_urls = []
+ws_url = "wss://api.mainnet-beta.solana.com"
+timeout_ms = 20000
+
+# ── Wallets ────────────────────────────────────────────────────────────────
+# External (Phantom) wallet. Pubkey only — no key material in this file.
+#
+# REPLACE THE PLACEHOLDER BELOW with the base58 pubkey of the actual Phantom
+# you control on mainnet. DO NOT copy a pubkey from a config example and
+# wire funds to it unless you can independently verify you have the seed —
+# a previous draft of this file shipped with a sample pubkey that turned
+# out to be unsignable, and any SOL routed to it was stranded.
+[[wallets]]
+label = "phantom-mainnet-e2e"
+signer_type = "external"
+pubkey = "REPLACE_WITH_YOUR_PHANTOM_MAINNET_PUBKEY"
+
+# ── Policy ─────────────────────────────────────────────────────────────────
+[policy]
+# Mainnet — leave safe defaults on.
+mainnet_safe_defaults = true
+program_allowlist = []
+destination_denylist = []
+
+# ── LLM ────────────────────────────────────────────────────────────────────
+# Not required for the live-validation HTTP path (the Jupiter flow is
+# driven directly through the tool / API, not via a chat prompt). Kept
+# here so the daemon starts cleanly.
+[llm]
+provider = "openai"
+api_key = ""
+model = "gpt-4o-mini"
+
+# ── API ────────────────────────────────────────────────────────────────────
+[api]
+bind_addr = "127.0.0.1"
+port = 7070
+
+# ── Retry / Rebroadcast ───────────────────────────────────────────────────
+[retry]
+max_retries = 3
+
+# ── Logging ────────────────────────────────────────────────────────────────
+[logging]
+format = "pretty"
+level = "info,claw_gateway=debug,claw_solana_core=debug"
+
+# ── Jupiter Swap — MAINNET LIVE VALIDATION ─────────────────────────────────
+#
+# Flip `enabled = true` only when running a deliberate validation pass.
+# Leave it `false` for routine starts of this config so accidental daemon
+# runs cannot produce a live mainnet swap.
+[jupiter]
+enabled = false
+base_url = "https://api.jup.ag"
+
+# ── Swap intent policy — hard caps ────────────────────────────────────────
+# These bound what `submit_jupiter_swap` will even evaluate. Anything outside
+# is rejected at the intent layer before reaching Jupiter or any RPC call.
+[jupiter.swap_policy]
+# Input mint allowlist: SOL (wrapped) or USDC mainnet only.
+# Nothing else can be used as input for a swap under this config.
+allowed_input_mints = [
+    "So11111111111111111111111111111111111111112",  # wSOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC mainnet
+]
+
+# Output mint allowlist: same two tokens, other direction.
+allowed_output_mints = [
+    "So11111111111111111111111111111111111111112",  # wSOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC mainnet
+]
+
+# Single-swap upper bound in the input token's base unit. For the A1 demo
+# (SOL → USDC) that's 5,000,000 lamports = 0.005 SOL ≈ US$0.75.
+# - Intents at or below this cap are auto-approved (small-amount path).
+# - Intents above this cap fall through to the human-approval path below.
+max_input_amount = 5_000_000
+
+# Hard slippage cap. Intents above this are Rejected outright (no approval
+# can override). 100 bps = 1 %.
+max_slippage_bps = 100
+
+# Approver role used ONLY when an intent exceeds `max_input_amount`.
+# For within-cap intents (the A1 demo target), this field is not consulted
+# — they auto-approve. It exists as the defence for when the A1 demo wallet
+# or operator mistake pushes a swap above the cap.
+required_approver_role = "treasury"

@@ -1,0 +1,60 @@
+# ClawSolana — minimal example configuration for the Phase 5c-lite demo
+#
+# This is a starting kit. For the full schema with every option and its
+# semantics, read `config/default.toml` (which itself is safe-by-default
+# and uses placeholders for every secret). The file you actually run is
+# whatever path you pass via `--config` or `CLAW_CONFIG`; conventionally
+# `claw.toml` at the repo root.
+#
+# To use:
+#   cp config/example.toml claw.toml
+#   $EDITOR claw.toml
+#
+# SECURITY: Never commit a config file that contains real API keys,
+# real RPC URLs with secret query params, or real keypair paths.
+# Pass those through environment variables (see `.env.example`) or
+# leave them on disk only at the location named in the env var.
+
+[daemon]
+db_path = "./data/claw.db"
+terminal_retention_days = 14
+terminal_purge_interval_hours = 6
+
+[network]
+# "mainnet-beta" for the Phase 5c-lite live proof.
+# "devnet" / "testnet" / "localnet" are also accepted.
+network = "mainnet-beta"
+
+[rpc]
+# Override at runtime with CLAW_RPC_URL or HELIUS_RPC_URL — DO NOT
+# commit a real API-key URL here.
+primary_url   = "https://api.mainnet-beta.solana.com"
+ws_url        = "wss://api.mainnet-beta.solana.com"
+fallback_urls = []
+timeout_ms    = 15000
+
+[api]
+# HTTP bind. The frontend's NEXT_PUBLIC_GATEWAY_URL must match.
+bind = "127.0.0.1"
+port = 7070
+
+# ── Wallets ────────────────────────────────────────────────────────────────
+# Phase 5c-lite uses a controlled-wallet keypair loaded from disk. Point
+# CLAW_STAGE2_DELEGATED_KEYPAIR_PATH at it in the environment (see
+# `.env.example`). Do NOT paste base58 keys here.
+#
+# For the user's main wallet binding, the chat-route's
+# challenge-response handshake handles it at runtime — no config needed.
+
+# ── Notes for Phase 5c-lite reviewers ──────────────────────────────────────
+# Required env vars at run-time (see .env.example for full list):
+#   CLAW_API_TOKEN
+#   OPENAI_API_KEY
+#   CLAW_CHAT_PROVIDER=openai
+#   CLAW_CHAT_MODEL=gpt-4o            # gpt-4o-mini is too conservative; see PHASE5C caveats
+#   CLAW_RPC_URL                       # Helius mainnet RPC URL (with api-key)
+#   CLAW_STAGE2_CLUSTER=mainnet-beta
+#   CLAW_STAGE2_DELEGATED_KEYPAIR_PATH # absolute path to a non-repo file
+#   CLAW_STAGE2_W5I_AUTO_EXECUTION=1
+#   CLAW_STAGE2_LIVE_CHAT_EXECUTION=1
+#   CLAW_STAGE2_CHAT_EXECUTION_APPROVED="W5G LIVE CHAT CONDITIONAL DEPOSIT APPROVED"

@@ -1,0 +1,310 @@
+# ClawSolana — default development configuration
+#
+# Copy this file to claw.toml and edit it for your environment.
+# Sensitive values (API keys, keypairs) should be passed via environment
+# variables (CLAW_LLM_API_KEY, CLAW_RPC_URL) rather than stored in this file.
+#
+# SECURITY: Never commit a config file that contains real API keys or private keys.
+
+# ── Daemon ─────────────────────────────────────────────────────────────────
+[daemon]
+# Path to the SQLite database file. Will be created if it does not exist.
+db_path = "./data/claw.db"
+# Optional PID file path
+# pid_file = "/tmp/clawd.pid"
+
+# How long to keep terminal (consumed/expired/rejected) pending-state rows
+# before purging. These rows are useful for post-mortem / audit correlation.
+terminal_retention_days = 14
+
+# How often the background purge task runs (in hours).
+# Set to 0 to disable periodic purge (startup purge still runs).
+terminal_purge_interval_hours = 6
+
+# ── Network ────────────────────────────────────────────────────────────────
+[network]
+# Options: "devnet" | "testnet" | "mainnet-beta" | "localnet"
+network = "devnet"
+
+# ── RPC ────────────────────────────────────────────────────────────────────
+[rpc]
+# Primary RPC endpoint. Override with CLAW_RPC_URL.
+primary_url = "https://api.devnet.solana.com"
+
+# Optional fallback endpoints (tried if primary is unavailable)
+fallback_urls = [
+    # "https://devnet.helius-rpc.com/?api-key=YOUR_KEY",
+]
+
+# WebSocket endpoint for subscriptions
+ws_url = "wss://api.devnet.solana.com"
+
+# Per-request timeout in milliseconds
+timeout_ms = 15000
+
+# ── Wallets ────────────────────────────────────────────────────────────────
+# By default no wallets are configured. The daemon will start, expose its
+# read-only and policy surfaces, and accept proposals — but actions that
+# require a signer will return a typed configuration error until a wallet
+# is added below.
+#
+# For a fresh clone (`cargo run --bin clawd`), this means:
+#   - `cargo check` / `cargo test` work out of the box (no wallet required)
+#   - the daemon starts and binds to 127.0.0.1
+#   - signing actions fail-closed until you uncomment one of the examples
+#     below and provide a real keypair / pubkey
+#
+# Choose ONE of the examples below and uncomment it.
+
+# Example 1: local keypair loaded from a JSON file.
+# Generate one first:
+#   mkdir -p data
+#   solana-keygen new --outfile data/devnet.json
+#   solana airdrop 1 $(solana-keygen pubkey data/devnet.json) --url devnet
+#
+# Rust does NOT expand ~; use an absolute or repo-relative path.
+#
+# [[wallets]]
+# label = "devnet-hot-wallet"
+# signer_type = "local_keypair"
+# keypair_path = "data/devnet.json"
+
+# Example 2: load from base58 (for testing only — never commit real keys).
+# [[wallets]]
+# label = "test-wallet"
+# signer_type = "local_keypair"
+# keypair_base58 = "PASTE_BASE58_KEY_HERE"
+
+# Example 3: external wallet (e.g., Phantom). Requires only the pubkey —
+# no key material is loaded. Transactions targeting this wallet route to
+# the external signing path (e.g., the /chat bind-wallet challenge flow).
+# [[wallets]]
+# label = "phantom-wallet"
+# signer_type = "external"
+# pubkey = "YOUR_PHANTOM_PUBKEY_BASE58"
+
+# ── Policy ─────────────────────────────────────────────────────────────────
+[policy]
+# When true, all mainnet transactions require explicit human approval.
+# STRONGLY recommended to keep this enabled.
+mainnet_safe_defaults = true
+
+# Programs that are explicitly allowed to be invoked.
+# If non-empty, any transaction referencing an unlisted program will be rejected.
+# Leave empty to allow all programs (appropriate for development).
+program_allowlist = [
+    "11111111111111111111111111111111",                # System program
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bC8",  # Associated Token Account
+    "ComputeBudget111111111111111111111111111111",     # Compute Budget
+]
+
+# Pubkeys that can never receive funds from this system.
+destination_denylist = [
+    "BurnAddress1111111111111111111111111111111",      # Example burn address
+]
+
+# ── Custom policy rules ───────────────────────────────────────────────────
+# Rules are evaluated in order; the first matching rule wins.
+# Custom rules run BEFORE the built-in defaults (mainnet-requires-human, etc.).
+
+# Rule 1: Escalate transfers >= 0.01 SOL to human approval
+[[policy.rules]]
+name = "large-transfer-requires-human"
+description = "Require human approval for transfers >= 0.01 SOL"
+condition = { type = "AmountExceedsLamports", threshold = 10_000_000 }
+action = { type = "RequireHumanApproval", reason = "transfer amount exceeds 0.01 SOL threshold" }
+
+# Rule 2: Reject transactions to denied destinations
+[[policy.rules]]
+name = "denylist-block"
+description = "Block transactions to denied destinations"
+condition = "DestinationInDenylist"
+action = { type = "Reject", reason = "destination is on the deny list" }
+
+# Rule 3: Reject transactions invoking unlisted programs
+[[policy.rules]]
+name = "allowlist-block"
+description = "Block transactions invoking programs not on the allow list"
+condition = "ProgramNotInAllowlist"
+action = { type = "Reject", reason = "program is not on the allow list" }
+
+# ── USDC / Stablecoin policy rules (Circle sponsorship demo) ──────────────
+# USDC mint addresses:
+#   Mainnet:  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+#   Devnet:   4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
+#
+# USDC has 6 decimals, so 1 USDC = 1_000_000 raw units.
+# 100 USDC = 100_000_000 raw units.
+# 10,000 USDC = 10_000_000_000 raw units.
+
+# IMPORTANT: Rules are evaluated first-match-wins. Strictest/most-specific rules
+# MUST come first. The high-value chain (10K) must be before the medium-value
+# human approval (100), otherwise 50K USDC would hit the medium rule and get
+# downgraded to single-operator approval instead of triggering the full chain.
+
+# Rule 4a: Block legacy SPL Token Transfer entirely when token policy is active.
+# Legacy Transfer (tag 3) doesn't include the mint in its accounts, so the
+# per-mint USDC rules below cannot enforce threshold/allowlist against it.
+# This rule must come FIRST so no legacy transfer can bypass USDC safety.
+[[policy.rules]]
+name = "block-legacy-token-transfer"
+description = "Reject SPL Token legacy Transfer (use TransferChecked instead)"
+condition = "LegacyTokenTransferPresent"
+action = { type = "Reject", reason = "legacy SPL Token Transfer is not allowed; use TransferChecked so the mint is visible to policy" }
+
+# Rule 4b: High-value USDC transfers require multi-step approval (risk → treasury)
+# MUST be listed BEFORE the medium-value rule (first-match-wins).
+[[policy.rules]]
+name = "usdc-high-value-chain"
+description = "Transfers >= 10,000 USDC require risk + treasury approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 10_000_000_000 }
+action = { type = "RequireApprovalChain", reason = "USDC >= 10K requires multi-stage approval", stages = [
+    { role = "risk", description = "Risk officer review for high-value USDC", min_approvals = 1 },
+    { role = "treasury", description = "Treasury sign-off for high-value USDC", min_approvals = 1 },
+]}
+
+# Rule 5: Medium-value USDC transfers require a single operator's approval
+# (reached only when the high-value rule above does not match).
+[[policy.rules]]
+name = "usdc-medium-value-requires-human"
+description = "Transfers >= 100 USDC require human approval"
+condition = { type = "TokenAmountExceeds", mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", threshold = 100_000_000 }
+action = { type = "RequireHumanApproval", reason = "USDC transfer >= 100 USDC requires operator approval" }
+
+# Rule 6: Reject any token transfer that isn't USDC or USDT (stablecoin allowlist)
+# Uncomment to enable strict stablecoin-only mode.
+# [[policy.rules]]
+# name = "stablecoin-only"
+# description = "Only USDC and USDT token transfers are allowed"
+# condition = { type = "MintNotInAllowlist", allowed_mints = [
+#     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC mainnet
+#     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT mainnet
+# ]}
+# action = { type = "Reject", reason = "only USDC and USDT are accepted as stablecoins" }
+
+# ── Per-role default policy profiles ──────────────────────────────────────
+# When a session opens with a given role, the matching profile's rules are
+# automatically injected. Caller overrides take precedence over profile rules.
+# Evaluation order: caller overrides → role profile → global rules → defaults.
+
+# Execution role: cap individual transfers at 0.1 SOL
+[[policy.role_profiles]]
+role = "execution"
+rules = [
+    { name = "exec-amount-cap", description = "Execution role: require human for transfers >= 0.1 SOL", condition = { type = "AmountExceedsLamports", threshold = 100_000_000 }, action = { type = "RequireHumanApproval", reason = "execution role: amount exceeds 0.1 SOL" } },
+]
+
+# Example: Block transactions outside business hours (Mon-Fri 9-17 HKT)
+# [[policy.rules]]
+# name = "business-hours-only"
+# description = "Block transactions outside Mon-Fri 9am-5pm HKT"
+# condition = { type = "OutsideAllowedHours", start_hour = 9, end_hour = 17, allowed_days = [1,2,3,4,5], utc_offset_hours = 8 }
+# action = { type = "Reject", reason = "transactions only allowed during business hours (Mon-Fri 9-17 HKT)" }
+
+# Research role: read-only, block all signing attempts
+# (Research agents should never reach submit_for_signing, but fail-safe here)
+[[policy.role_profiles]]
+role = "research"
+rules = [
+    { name = "research-block-all", description = "Research role: block all transactions", condition = "Always", action = { type = "Reject", reason = "research role cannot submit transactions" } },
+]
+
+# ── LLM ────────────────────────────────────────────────────────────────────
+[llm]
+# Provider: "openai" or "anthropic"
+# Auto-detected: if OPENAI_API_KEY is set, defaults to "openai".
+# Override with CLAW_LLM_PROVIDER env var.
+provider = "openai"
+
+# API key. Override with CLAW_LLM_API_KEY or OPENAI_API_KEY env var.
+api_key = ""
+
+# Model to use. Depends on provider:
+#   openai:    "gpt-4o" (default), "gpt-4o-mini", "gpt-4-turbo"
+#   anthropic: "claude-sonnet-4-6" (default), "claude-haiku-4-5-20251001"
+model = "gpt-4o-mini"
+
+# ── API ────────────────────────────────────────────────────────────────────
+[api]
+# Local bind address. Keep this as 127.0.0.1 — never expose to 0.0.0.0
+# unless you have a reverse proxy with TLS and authentication in front.
+bind_addr = "127.0.0.1"
+port = 7070
+
+# ── Retry / Rebroadcast ───────────────────────────────────────────────────
+[retry]
+# Maximum number of rebroadcast attempts for dropped transactions.
+# Solana deduplicates by signature, so resubmitting the same bytes is safe.
+max_retries = 3
+
+# ── Rate Limiting ─────────────────────────────────────────────────────────
+[rate_limit]
+# Per-token sliding window. All protected routes share one counter per bearer token.
+enabled = true
+# Maximum requests allowed per 60-second window (excluding burst).
+requests_per_minute = 60
+# Extra burst allowance above the per-minute rate.
+burst_size = 10
+
+# ── Alerting ──────────────────────────────────────────────────────────────
+[alerting]
+# When enabled, policy violations and approval events are POSTed as JSON
+# to the webhook URL. Delivery is non-blocking with retry.
+enabled = false
+# webhook_url = "https://hooks.slack.com/services/T.../B.../..."
+# max_retries = 3
+# timeout_ms = 5000
+
+# ── Logging ────────────────────────────────────────────────────────────────
+[logging]
+# "pretty" for development, "json" for production/containers
+format = "pretty"
+# RUST_LOG compatible filter string
+level = "info,claw_gateway=debug,claw_agent_runtime=debug"
+
+# ── Jupiter Swap Integration ──────────────────────────────────────────────────
+# Policy-gated JIT (Just-In-Time) token swap routing via the Jupiter Aggregator.
+#
+# Design: ClawSolana stores a SwapIntent BEFORE any transaction is built.
+# The transaction is assembled JIT only AFTER human approval, using a fresh
+# Jupiter /swap/v2/build response. This guarantees the operator approves the
+# *intent* (which tokens, how much, max slippage) rather than frozen bytes.
+#
+# Set enabled = true and configure swap_policy before using this integration.
+[jupiter]
+# Master switch. When false, the submit_jupiter_swap tool is not registered
+# and no Jupiter API calls are made. Safe default: false.
+enabled = false
+
+# Jupiter API base URL.
+# Production: https://api.jup.ag
+# Override with CLAW_JUPITER_BASE_URL env var.
+base_url = "https://api.jup.ag"
+
+# ── Swap intent policy ────────────────────────────────────────────────────────
+# These rules are evaluated BEFORE the approval workflow.
+# A rejected intent never reaches JIT build.
+[jupiter.swap_policy]
+# Mint addresses that may be used as input (source token).
+# Empty list = allow any input mint.
+# Example: allowed_input_mints = ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]
+allowed_input_mints = []
+
+# Mint addresses that may be used as output (destination token).
+# Empty list = allow any output mint.
+allowed_output_mints = []
+
+# Maximum input amount in base token units (e.g., lamports for SOL, 1e-6 for USDC).
+# 0 = no cap. Recommended for production: set to your daily risk limit.
+max_input_amount = 0
+
+# Maximum slippage tolerance in basis points (1 bps = 0.01%).
+# 0 = no cap. 50 = 0.5%, 100 = 1%, 500 = 5%.
+# Recommended for production: set to your acceptable execution risk.
+max_slippage_bps = 0
+
+# Operator role required to approve swap intents.
+# "" = any authenticated operator may approve.
+# Example: required_approver_role = "treasury"
+required_approver_role = ""
