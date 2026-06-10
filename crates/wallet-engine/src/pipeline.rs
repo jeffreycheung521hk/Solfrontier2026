@@ -43,6 +43,7 @@
 
 use std::sync::Arc;
 
+use sha2::{Sha256, Digest};
 use solana_sdk::transaction::Transaction;
 use tracing::{info, instrument, warn};
 
@@ -63,6 +64,32 @@ use crate::{
     errors::WalletError,
     signer::SignerRef,
 };
+
+// ── Approval hash-binding (Q10) ────────────────────────────────────────────────
+
+/// Domain separator for the approval commitment. Frozen on first commit — a
+/// cross-language verifier (Python/TS) re-derives the same digest from
+/// `Message::serialize()` bytes, so this literal is part of the wire contract
+/// and MUST NOT change.
+const APPROVAL_TX_DOMAIN: &[u8] = b"clawsol-approval-tx-v1";
+
+/// Computes the domain-separated SHA-256 commitment over the canonical Solana
+/// `Message` bytes (`Message::serialize()` — the EXACT bytes ed25519 signs).
+///
+/// Layout: `SHA-256( APPROVAL_TX_DOMAIN || 0x00 || message_bytes )`.
+///
+/// Binding to `Message::serialize()` (NOT `bincode::serialize` over the whole
+/// `Transaction`, which would fold in the mutable `signatures` field) keeps the
+/// commitment over exactly the signed pre-image, so verifiers need not
+/// reimplement bincode. Construction and the `sign()` re-derivation both route
+/// through this single function so the two can never diverge.
+fn approval_tx_hash(message_bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(APPROVAL_TX_DOMAIN);
+    hasher.update(&[0x00]);
+    hasher.update(message_bytes);
+    hasher.finalize().into()
+}
 
 // ── Typestate wrappers ────────────────────────────────────────────────────────
 
@@ -131,6 +158,18 @@ pub struct ApprovedTransaction {
     /// Will be either `Approved` or `RequiresHumanApproval` (never `Rejected` or `SimulationFailed`).
     /// Private: read via [`ApprovedTransaction::policy_verdict`].
     policy_verdict: PolicyVerdict,
+    /// SHA-256 commitment to the canonical Solana `Message` bytes
+    /// (`Message::serialize()` — the EXACT bytes ed25519 signs), domain-separated
+    /// with `b"clawsol-approval-tx-v1"`, captured at approval-time construction.
+    ///
+    /// Private and immutable post-construction (relies on the field privacy from
+    /// `feature-typestate-hardening`): no in-crate or downstream caller can forge
+    /// it after the fact. `TransactionReviewPipeline::sign()` re-derives this hash
+    /// from the message about to be signed and fail-closes via
+    /// [`WalletError::ApprovalTxDrift`](crate::errors::WalletError::ApprovalTxDrift)
+    /// on any mismatch, so in-process tampering between approval and sign is
+    /// detected before the signer is ever invoked.
+    approval_tx_hash: [u8; 32],
 }
 
 impl ApprovedTransaction {
@@ -141,7 +180,14 @@ impl ApprovedTransaction {
             !policy_verdict.is_blocked(),
             "ApprovedTransaction::new_unchecked called with a blocked verdict — this is a bug"
         );
-        Self { inner, policy_verdict }
+
+        // Bind this approval to the canonical Solana Message bytes at the moment
+        // of construction. After this, `approval_tx_hash` is immutable (private
+        // field), so any later mutation of the inner Message is detectable by
+        // re-deriving and comparing in `sign()`.
+        let approval_tx_hash = approval_tx_hash(&inner.inner().message.serialize());
+
+        Self { inner, policy_verdict, approval_tx_hash }
     }
 
     /// Read-only access to the underlying simulated transaction.
@@ -152,6 +198,14 @@ impl ApprovedTransaction {
     /// Read-only access to the policy verdict that approved this transaction.
     pub fn policy_verdict(&self) -> &PolicyVerdict {
         &self.policy_verdict
+    }
+
+    /// Read-only access to the approval-time commitment over the canonical
+    /// Solana `Message` bytes. `sign()` re-derives this from the message about
+    /// to be signed and fail-closes on mismatch; external verifiers can
+    /// re-derive it from `Message::serialize()` to confirm what was approved.
+    pub fn approval_tx_hash(&self) -> &[u8; 32] {
+        &self.approval_tx_hash
     }
 
     /// Convenience accessor: the underlying simulation result.
@@ -503,6 +557,25 @@ impl TransactionReviewPipeline {
             return Ok(PipelineResult::DryRun { simulation, policy_verdict });
         }
 
+        // ── Hash-binding drift guard (Q10) ────────────────────────────────────
+        // Re-derive the approval commitment from the canonical Message bytes
+        // about to be signed and compare against the hash captured at approval
+        // time. Any in-process mutation of the inner Message between approval and
+        // sign changes these bytes, so a mismatch means tampering — fail closed
+        // BEFORE the signer ever touches the transaction. Placed after DryRun
+        // (which never signs) so it gates every real signing path below.
+        let current_hash = approval_tx_hash(&approved.inner().inner().message.serialize());
+        if &current_hash != approved.approval_tx_hash() {
+            warn!(
+                proposal_id = %proposal.id,
+                "approval drift detected — canonical Message bytes changed since approval; refusing to sign"
+            );
+            return Err(WalletError::ApprovalTxDrift {
+                expected: hex::encode(approved.approval_tx_hash()),
+                actual:   hex::encode(current_hash),
+            });
+        }
+
         // HumanGranted: operator has already approved via out-of-band API — sign unconditionally.
         // This is the resume path after a parked AwaitingApproval transaction.
         // The decision was recorded and audited by GatewayApprovalHandler before this point.
@@ -754,5 +827,358 @@ mod tests {
 
         let failed = PipelineResult::SimulationFailed { error: "boom".into() };
         assert_eq!(failed.transaction_status(), TransactionStatus::Failed);
+    }
+}
+
+// ── Q10 approval hash-binding tests ─────────────────────────────────────────────
+//
+// These tests live in a descendant module of `crate::pipeline`, so they can read
+// AND mutate the private `inner` fields of `SimulatedTransaction` /
+// `ApprovedTransaction` directly. That is exactly the in-process tampering the
+// hash-binding guard exists to catch: mutate the inner `Message` AFTER approval
+// (so the immutable `approval_tx_hash` no longer matches), then drive `sign()`
+// and assert it fail-closes with `WalletError::ApprovalTxDrift` before the signer
+// is ever invoked.
+#[cfg(test)]
+mod hash_binding_tests {
+    use super::*;
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::str::FromStr;
+
+    use solana_sdk::{
+        hash::Hash,
+        instruction::{AccountMeta, Instruction},
+        message::Message,
+        pubkey::Pubkey,
+        signature::Signature,
+        system_instruction,
+        transaction::Transaction,
+    };
+
+    use claw_solana_core::{
+        BlockhashManager, RpcPool, RpcPoolConfig, SimulationClient,
+        rpc::ClawRpcClient,
+        fees::PriorityFeeStrategy,
+    };
+    use claw_types::{
+        solana::{CommitmentLevel, SolanaNetwork},
+        session::SessionId,
+        transaction::TransactionProposal,
+    };
+
+    use crate::signer::{Signer, SignerRef};
+
+    // ── Test fixtures ──────────────────────────────────────────────────────────
+
+    /// A signer that records whether it was invoked. The hash-binding guard must
+    /// fail closed *before* the signer is touched, so on drift `called()` stays
+    /// false; on a clean transaction it flips true and returns a dummy signature.
+    #[derive(Default)]
+    struct RecordingSigner {
+        called: AtomicBool,
+    }
+    impl RecordingSigner {
+        fn called(&self) -> bool {
+            self.called.load(Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl Signer for RecordingSigner {
+        fn pubkey(&self) -> Pubkey {
+            Pubkey::new_unique()
+        }
+        async fn sign_transaction(&self, _tx: &mut Transaction) -> Result<Signature, WalletError> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(Signature::default())
+        }
+        fn description(&self) -> String {
+            "recording-test-signer".to_string()
+        }
+        fn is_automatic(&self) -> bool {
+            true
+        }
+    }
+
+    /// Builds an offline pipeline. Construction never connects (the RPC client is
+    /// lazy), and the drift guard fires before any RPC/blockhash/sim use, so no
+    /// network is touched by these tests.
+    fn offline_pipeline(mode: ApprovalMode) -> TransactionReviewPipeline {
+        let pool = RpcPool::new(RpcPoolConfig::default());
+        let rpc = ClawRpcClient::new(pool.clone(), CommitmentLevel::Confirmed);
+        let sim = SimulationClient::new(rpc.clone());
+        let blockhash_mgr = Arc::new(BlockhashManager::new(pool));
+        TransactionReviewPipeline::new(rpc, sim, blockhash_mgr, PriorityFeeStrategy::None, mode)
+    }
+
+    fn successful_sim() -> SimulationResult {
+        SimulationResult {
+            success: true,
+            error: None,
+            compute_units_used: Some(1000),
+            logs: vec!["Program log: ok".to_string()],
+            return_data: None,
+            account_diffs: vec![],
+            fee_lamports: Some(5000),
+        }
+    }
+
+    fn test_proposal() -> TransactionProposal {
+        TransactionProposal {
+            id: uuid::Uuid::new_v4(),
+            session_id: SessionId::new(),
+            wallet_pubkey: Pubkey::new_unique().to_string(),
+            network: SolanaNetwork::MainnetBeta,
+            description: "hash-binding test".to_string(),
+            transaction_b64: String::new(),
+            instructions_summary: vec![],
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn approved_verdict() -> PolicyVerdict {
+        PolicyVerdict::Approved { rule_name: "test".into() }
+    }
+
+    // A tiny SplitMix64-style PRNG — deterministic, no `rand` dependency, and
+    // distinct per seed so each of the 1000 iterations exercises a different
+    // Message shape.
+    fn mix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A pseudo-random legacy transaction: 1..=3 system transfers with varying
+    /// recipients/amounts and a seed-derived recent blockhash.
+    fn pseudo_random_tx(seed: u64) -> Transaction {
+        let mut st = seed ^ 0xD1B5_4A32_D192_ED03;
+        let payer = Pubkey::new_unique();
+        let n_ix = (mix(&mut st) % 3 + 1) as usize;
+        let mut ixs = Vec::with_capacity(n_ix);
+        for _ in 0..n_ix {
+            let to = Pubkey::new_unique();
+            let lamports = mix(&mut st) % 1_000_000 + 1;
+            ixs.push(system_instruction::transfer(&payer, &to, lamports));
+        }
+        let mut msg = Message::new(&ixs, Some(&payer));
+        let mut bh = [0u8; 32];
+        bh[..8].copy_from_slice(&mix(&mut st).to_le_bytes());
+        bh[8..16].copy_from_slice(&mix(&mut st).to_le_bytes());
+        msg.recent_blockhash = Hash::new_from_array(bh);
+        Transaction::new_unsigned(msg)
+    }
+
+    /// Mutate the inner Message so `Message::serialize()` is guaranteed to differ
+    /// — modelling a real in-process tamper (redirected recipient, altered
+    /// amount, swapped blockhash). Falls back to a blockhash bit-flip if the
+    /// chosen mutation somehow leaves the bytes unchanged, so the post-state
+    /// always drifts.
+    fn tamper_message(tx: &mut Transaction, seed: u64) {
+        let before = tx.message.serialize();
+        let mut st = seed ^ 0x2545_F491_4F6C_DD1D;
+        match mix(&mut st) % 3 {
+            0 => {
+                // Redirect: rewrite the last account key (attacker recipient).
+                let last = tx.message.account_keys.len() - 1;
+                tx.message.account_keys[last] = Pubkey::new_unique();
+            }
+            1 => {
+                // Tamper amount/opcode: flip a byte of the first instruction data.
+                if let Some(ix) = tx.message.instructions.first_mut() {
+                    if ix.data.is_empty() {
+                        ix.data.push(0xFF);
+                    } else {
+                        ix.data[0] ^= 0xFF;
+                    }
+                }
+            }
+            _ => {
+                // Swap blockhash (replay/lifetime tamper).
+                let mut bh = tx.message.recent_blockhash.to_bytes();
+                bh[0] = bh[0].wrapping_add(1);
+                tx.message.recent_blockhash = Hash::new_from_array(bh);
+            }
+        }
+        if tx.message.serialize() == before {
+            let mut bh = tx.message.recent_blockhash.to_bytes();
+            bh[0] ^= 0xFF;
+            tx.message.recent_blockhash = Hash::new_from_array(bh);
+        }
+    }
+
+    // ── Tests ──────────────────────────────────────────────────────────────────
+
+    /// Positive control: an UNMUTATED approval signs cleanly. This proves the
+    /// guard does not false-positive (otherwise the 1000/1000 detection below
+    /// would be vacuous).
+    #[tokio::test]
+    async fn approval_hash_binding_allows_unmutated_transaction() {
+        let pipeline = offline_pipeline(ApprovalMode::HumanGranted);
+        let simulated = SimulatedTransaction::new_unchecked(pseudo_random_tx(42), successful_sim(), 1000);
+        let approved = ApprovedTransaction::new_unchecked(simulated, approved_verdict());
+
+        let signer_impl = Arc::new(RecordingSigner::default());
+        let signer: SignerRef = signer_impl.clone();
+        let result = pipeline.sign(&test_proposal(), approved, &signer).await;
+
+        assert!(
+            matches!(result, Ok(PipelineResult::Signed { .. })),
+            "unmutated approval must sign, got {result:?}"
+        );
+        assert!(signer_impl.called(), "signer must be invoked for a clean transaction");
+    }
+
+    /// Q10 property test: 1000 random ApprovedTransaction states, each mutated
+    /// after approval-time hash capture. EVERY sign() must fail closed with
+    /// `ApprovalTxDrift`, and the signer must never be reached. Detection must be
+    /// exactly 1000/1000.
+    #[tokio::test]
+    async fn approval_hash_binding_detects_all_message_drift() {
+        const N: usize = 1000;
+        let pipeline = offline_pipeline(ApprovalMode::HumanGranted);
+        let mut detected = 0usize;
+
+        for i in 0..N {
+            let seed = i as u64;
+            let simulated = SimulatedTransaction::new_unchecked(pseudo_random_tx(seed), successful_sim(), 1000);
+            let mut approved = ApprovedTransaction::new_unchecked(simulated, approved_verdict());
+
+            // Tamper the inner Message AFTER the approval hash was captured.
+            // (Reaching `approved.inner.inner` is only possible because this test
+            // module is a descendant of `crate::pipeline` — the exact in-process
+            // adversary the binding defends against.)
+            let before = approved.inner.inner.message.serialize();
+            tamper_message(&mut approved.inner.inner, seed);
+            assert_ne!(
+                before,
+                approved.inner.inner.message.serialize(),
+                "iter {i}: tamper must change canonical Message bytes"
+            );
+
+            let signer_impl = Arc::new(RecordingSigner::default());
+            let signer: SignerRef = signer_impl.clone();
+            let result = pipeline.sign(&test_proposal(), approved, &signer).await;
+
+            match result {
+                Err(WalletError::ApprovalTxDrift { expected, actual }) => {
+                    assert_ne!(expected, actual, "iter {i}: drift hashes must differ");
+                    assert!(!signer_impl.called(), "iter {i}: signer must NOT run on drift");
+                    detected += 1;
+                }
+                other => panic!("iter {i}: expected ApprovalTxDrift, got {other:?}"),
+            }
+        }
+
+        assert_eq!(detected, N, "Q10 drift detection rate must be {N}/{N}");
+        println!("Q10 hash-binding property test: {detected}/{N} message mutations detected");
+    }
+
+    /// Integration test against a Phase 5c-lite-shaped Solend USDC deposit
+    /// message (SPL TransferChecked → Solend Deposit → memo carrying the W5i
+    /// auto-execute `claw:` tag). Demonstrates: (a) the unmodified deposit signs,
+    /// and (b) tampering the Solend deposit amount after approval is caught as
+    /// `ApprovalTxDrift` before signing.
+    #[tokio::test]
+    async fn approval_hash_binding_detects_drift_on_phase5c_lite_solend_deposit() {
+        let token_prog = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let solend_prog = Pubkey::from_str("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo").unwrap();
+        let memo_prog = Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr").unwrap();
+
+        // Controlled wallet (authority) + Phase 5c-lite accounts.
+        let authority = Pubkey::new_unique();
+        let source_ata = Pubkey::new_unique();
+        let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        let dest_reserve = Pubkey::new_unique();
+        let obligation = Pubkey::from_str("BdFLjCcP9j7yzd9KaBoxUF5h7hZ9SXqp3xj9hnHKra1wN")
+            .unwrap_or_else(|_| Pubkey::new_unique());
+
+        // 0.5 USDC, 6 decimals (Phase 5c-lite variable-amount deposit).
+        let amount: u64 = 500_000;
+
+        // SPL TransferChecked: [12, amount(8 LE), decimals(1)].
+        let mut transfer_data = vec![12u8];
+        transfer_data.extend_from_slice(&amount.to_le_bytes());
+        transfer_data.push(6u8);
+        let ix_transfer = Instruction::new_with_bytes(
+            token_prog,
+            &transfer_data,
+            vec![
+                AccountMeta::new(source_ata, false),
+                AccountMeta::new_readonly(usdc_mint, false),
+                AccountMeta::new(dest_reserve, false),
+                AccountMeta::new_readonly(authority, true),
+            ],
+        );
+
+        // Solend DepositReserveLiquidity (tag 4) + amount(8 LE).
+        let mut deposit_data = vec![4u8];
+        deposit_data.extend_from_slice(&amount.to_le_bytes());
+        let ix_deposit = Instruction::new_with_bytes(
+            solend_prog,
+            &deposit_data,
+            vec![
+                AccountMeta::new(source_ata, false),
+                AccountMeta::new(dest_reserve, false),
+                AccountMeta::new(obligation, false),
+                AccountMeta::new_readonly(authority, true),
+            ],
+        );
+
+        // W5i auto-execute memo tag.
+        let ix_memo = Instruction::new_with_bytes(
+            memo_prog,
+            b"claw:w5h:6400deadbeef9a62dace:609aPhase5cLite097f",
+            vec![AccountMeta::new_readonly(authority, true)],
+        );
+
+        let build_tx = || {
+            let msg = Message::new(&[ix_transfer.clone(), ix_deposit.clone(), ix_memo.clone()], Some(&authority));
+            Transaction::new_unsigned(msg)
+        };
+        let make_approved = || {
+            let simulated = SimulatedTransaction::new_unchecked(build_tx(), successful_sim(), 1234);
+            ApprovedTransaction::new_unchecked(simulated, approved_verdict())
+        };
+
+        let pipeline = offline_pipeline(ApprovalMode::HumanGranted);
+
+        // (a) Unmodified Phase 5c-lite deposit signs cleanly.
+        let clean_signer = Arc::new(RecordingSigner::default());
+        let clean_ref: SignerRef = clean_signer.clone();
+        let clean_result = pipeline.sign(&test_proposal(), make_approved(), &clean_ref).await;
+        assert!(
+            matches!(clean_result, Ok(PipelineResult::Signed { .. })),
+            "clean Solend deposit must sign, got {clean_result:?}"
+        );
+        assert!(clean_signer.called(), "signer should run for the clean deposit");
+
+        // (b) Tamper the Solend deposit AMOUNT after approval → must be caught.
+        let mut tampered = make_approved();
+        let approval_hash = *tampered.approval_tx_hash();
+        // instructions[1] is the Solend deposit; bytes 1..9 are the LE amount.
+        let deposit_ix = &mut tampered.inner.inner.message.instructions[1];
+        // Drain the controlled wallet: rewrite amount to u64::MAX.
+        deposit_ix.data[1..9].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let evil_signer = Arc::new(RecordingSigner::default());
+        let evil_ref: SignerRef = evil_signer.clone();
+        let tampered_result = pipeline.sign(&test_proposal(), tampered, &evil_ref).await;
+
+        match tampered_result {
+            Err(WalletError::ApprovalTxDrift { expected, actual }) => {
+                assert_eq!(
+                    expected,
+                    hex::encode(approval_hash),
+                    "expected hash must equal the approval-time commitment"
+                );
+                assert_ne!(expected, actual, "tampered re-derivation must differ");
+                assert!(!evil_signer.called(), "signer must NOT run on a tampered deposit");
+            }
+            other => panic!("expected ApprovalTxDrift on amount tamper, got {other:?}"),
+        }
     }
 }
