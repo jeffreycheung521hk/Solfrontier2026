@@ -372,10 +372,10 @@ impl Tool for SubmitForSigningTool {
             }
         };
 
-        let simulation = approved.inner.simulation.clone();
-        let policy_verdict = approved.policy_verdict.clone();
-        let last_valid_block_height = approved.inner.last_valid_block_height;
-        let finalized_tx = approved.inner.inner;
+        let simulation = approved.inner().simulation().clone();
+        let policy_verdict = approved.policy_verdict().clone();
+        let last_valid_block_height = approved.inner().last_valid_block_height();
+        let finalized_tx = approved.inner().inner().clone();
 
         // ── Policy observability: audit + per-rule counter ─────────────────────
         if let Some(rule) = policy_verdict.rule_name() {

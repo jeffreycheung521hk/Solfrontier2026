@@ -52,7 +52,6 @@ use claw_types::{
 use claw_wallet_engine::{
     errors::WalletError,
     keystore::SecretKeystore,
-    pipeline::{ApprovedTransaction, SimulatedTransaction},
     signer::{Signer, SignerRef},
 };
 
@@ -477,18 +476,22 @@ async fn duplicate_decision_rejected() {
         "duplicate decision must return AlreadyDecided (workflow is terminal)");
 }
 
-/// Typestate integrity: SimulatedTransaction requires success==true,
-/// ApprovedTransaction requires non-blocked verdict.
+/// Typestate integrity: the semantic preconditions that gate construction.
+///
+/// `SimulatedTransaction` may only wrap a successful simulation and
+/// `ApprovedTransaction` may only wrap a non-blocked verdict. Both
+/// `new_unchecked` constructors are now `pub(crate)` and all fields are private,
+/// so this downstream crate can no longer build the typestates directly — the
+/// only path is `TransactionReviewPipeline::{simulate, evaluate_policy}`. That
+/// external construction is a privacy compile error is verified by the
+/// `compile_fail` doctest in `claw_wallet_engine::pipeline`; here we assert the
+/// verdict/simulation semantics those constructors depend on.
 #[tokio::test]
 async fn typestate_integrity_preserved() {
-    let tx = make_test_tx();
     let sim = make_successful_sim();
-    assert!(sim.success, "precondition: sim must be successful");
+    assert!(sim.success, "precondition: a SimulatedTransaction may only wrap a successful sim");
 
-    // SimulatedTransaction::new_unchecked succeeds with successful sim.
-    let simulated = SimulatedTransaction::new_unchecked(tx, sim, 1000);
-
-    // ApprovedTransaction::new_unchecked succeeds with non-blocked verdict.
+    // A non-blocked verdict is the precondition for ApprovedTransaction.
     let verdict = PolicyVerdict::RequiresHumanApproval {
         reason:    "test".into(),
         rule_name: "test-rule".into(),
@@ -496,8 +499,8 @@ async fn typestate_integrity_preserved() {
         approval_chain: None,
     };
     assert!(!verdict.is_blocked(), "RequiresHumanApproval must not be blocked");
-    let _approved = ApprovedTransaction::new_unchecked(simulated, verdict);
 
+    // A blocked verdict can never reach ApprovedTransaction.
     let blocked = PolicyVerdict::Rejected {
         reason:    "blocked".into(),
         rule_name: "deny-all".into(),

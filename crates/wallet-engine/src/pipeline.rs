@@ -18,10 +18,23 @@
 //! It is a compile error to call `sign()` on a `SimulatedTransaction` without policy approval.
 //! SimulationFailed transactions cannot reach the sign stage at all.
 //!
-//! # Stage constructors are `pub(crate)` or private
+//! # Stage constructors are `pub(crate)`; fields are private
 //!
-//! `SimulatedTransaction::new` is `pub(crate)` — only this module can create one,
-//! ensuring the only path is through `simulate()`.
+//! `SimulatedTransaction::new_unchecked` and `ApprovedTransaction::new_unchecked`
+//! are `pub(crate)`, and every field of both typestates is private. Only this
+//! crate can build them, and only via `simulate()` / `evaluate_policy()`. The
+//! enforcement is structural privacy, not a naming convention: a downstream crate
+//! cannot fabricate an `ApprovedTransaction` to skip simulation or policy, nor
+//! reach inside one to mutate its proof fields. The following fails to compile
+//! purely because the field is private:
+//!
+//! ```compile_fail
+//! // `policy_verdict` is a private field of `ApprovedTransaction`; external
+//! // crates may only read it through the `policy_verdict()` accessor.
+//! fn _forge(approved: claw_wallet_engine::pipeline::ApprovedTransaction) {
+//!     let _ = approved.policy_verdict;   // error[E0616]: field is private
+//! }
+//! ```
 //!
 //! # Exception: DryRun
 //!
@@ -65,26 +78,41 @@ use crate::{
 /// - `recent_blockhash` has been set to a fresh value
 pub struct SimulatedTransaction {
     /// The underlying Solana transaction with a fresh blockhash attached.
-    /// Kept pub so the gateway can reconstruct this type from a parked tx.
-    pub inner: Transaction,
+    /// Private: read via [`SimulatedTransaction::inner`]; construction is gated
+    /// by the `pub(crate)` constructor so the only path is `simulate()`.
+    inner: Transaction,
     /// The simulation result that granted this token.
-    pub simulation: SimulationResult,
+    simulation: SimulationResult,
     /// The `lastValidBlockHeight` from the blockhash used in this transaction.
     /// Used downstream for lifecycle tracking expiry calculations.
-    pub last_valid_block_height: u64,
+    last_valid_block_height: u64,
 }
 
 impl SimulatedTransaction {
-    // pub(crate) keeps this within the wallet-engine crate only.
-    // The gateway uses this via the `resume_signing_after_approval` path,
-    // which is safe because it only reconstructs from a previously-verified simulation.
-    pub fn new_unchecked(inner: Transaction, simulation: SimulationResult, last_valid_block_height: u64) -> Self {
+    // pub(crate) keeps this within the wallet-engine crate only, so external
+    // crates cannot bypass simulation by constructing this typestate directly.
+    pub(crate) fn new_unchecked(inner: Transaction, simulation: SimulationResult, last_valid_block_height: u64) -> Self {
         // INVARIANT: caller MUST have verified simulation.success == true before calling this.
         debug_assert!(
             simulation.success,
             "SimulatedTransaction::new_unchecked called with a failed simulation — this is a bug"
         );
         Self { inner, simulation, last_valid_block_height }
+    }
+
+    /// Read-only access to the finalized underlying Solana transaction.
+    pub fn inner(&self) -> &Transaction {
+        &self.inner
+    }
+
+    /// Read-only access to the simulation result that granted this token.
+    pub fn simulation(&self) -> &SimulationResult {
+        &self.simulation
+    }
+
+    /// The `lastValidBlockHeight` for the blockhash attached to this transaction.
+    pub fn last_valid_block_height(&self) -> u64 {
+        self.last_valid_block_height
     }
 }
 
@@ -96,19 +124,34 @@ impl SimulatedTransaction {
 /// Holds proof (the `policy_verdict`) that no policy rule blocked this transaction.
 /// `verdict.is_blocked() == false` is a pre-condition for construction.
 pub struct ApprovedTransaction {
-    pub inner:         SimulatedTransaction,
+    /// The simulated transaction this approval wraps.
+    /// Private: read via [`ApprovedTransaction::inner`].
+    inner:          SimulatedTransaction,
     /// The policy verdict that approved this transaction.
     /// Will be either `Approved` or `RequiresHumanApproval` (never `Rejected` or `SimulationFailed`).
-    pub policy_verdict: PolicyVerdict,
+    /// Private: read via [`ApprovedTransaction::policy_verdict`].
+    policy_verdict: PolicyVerdict,
 }
 
 impl ApprovedTransaction {
-    pub fn new_unchecked(inner: SimulatedTransaction, policy_verdict: PolicyVerdict) -> Self {
+    // pub(crate): only `evaluate_policy()` in this crate may construct this
+    // typestate, so a blocked verdict can never reach the sign stage.
+    pub(crate) fn new_unchecked(inner: SimulatedTransaction, policy_verdict: PolicyVerdict) -> Self {
         debug_assert!(
             !policy_verdict.is_blocked(),
             "ApprovedTransaction::new_unchecked called with a blocked verdict — this is a bug"
         );
         Self { inner, policy_verdict }
+    }
+
+    /// Read-only access to the underlying simulated transaction.
+    pub fn inner(&self) -> &SimulatedTransaction {
+        &self.inner
+    }
+
+    /// Read-only access to the policy verdict that approved this transaction.
+    pub fn policy_verdict(&self) -> &PolicyVerdict {
+        &self.policy_verdict
     }
 
     /// Convenience accessor: the underlying simulation result.
